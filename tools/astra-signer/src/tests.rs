@@ -555,6 +555,117 @@ fn the_ca_pq_command_refuses_a_journal_astra_has_confirmed() {
     assert!(!out.exists());
 }
 
+/// A prepared CA-PQ journal binds the output destination as well as all signed
+/// state. Resuming it under another path must not apply any of its files.
+#[test]
+fn the_ca_pq_command_refuses_to_resume_to_a_different_output_path() {
+    let directory = tempfile::tempdir().expect("dir");
+    let (path, out, _) = interrupted_ca_pq_rotation(directory.path());
+    let journal_path = astra_operator::rotation_journal::path_beside(&path);
+    let legacy_path = astra_operator::rotation_journal::legacy_ca_pq_path_beside(&path);
+    astra_operator::rotation_journal::adopt_legacy(&path)
+        .expect("adopted")
+        .expect("a journal");
+    let wrong_out = directory.path().join("substituted-transition.json");
+    let vault_before = std::fs::read(&path).expect("vault before");
+    let handoff_path = astra_operator::handoff::path_beside(&path);
+    let handoff_before = std::fs::read(&handoff_path).expect("handoff before");
+    let legacy_before = std::fs::read(&legacy_path).expect("legacy journal before");
+
+    let error = resume_ca_pq(&path, &wrong_out).expect_err("output path is bound by journal");
+
+    assert!(
+        format!("{error:#}").contains(&out.display().to_string()),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read(&path).expect("vault after"), vault_before);
+    assert_eq!(
+        std::fs::read(&handoff_path).expect("handoff after"),
+        handoff_before
+    );
+    assert_eq!(
+        std::fs::read(&legacy_path).expect("legacy journal after"),
+        legacy_before
+    );
+    assert!(
+        journal_path.exists(),
+        "the adoption journal remains resumable"
+    );
+    assert!(!out.exists());
+    assert!(!wrong_out.exists());
+}
+
+/// An unparseable journal is not permission to generate another transition or
+/// to partially apply the one whose contents could not be verified.
+#[test]
+fn the_ca_pq_command_keeps_an_unreadable_legacy_journal_and_changes_nothing() {
+    let directory = tempfile::tempdir().expect("dir");
+    let (path, out, _) = interrupted_ca_pq_rotation(directory.path());
+    let journal_path = astra_operator::rotation_journal::path_beside(&path);
+    let legacy_path = astra_operator::rotation_journal::legacy_ca_pq_path_beside(&path);
+    astra_operator::rotation_journal::adopt_legacy(&path)
+        .expect("adopted")
+        .expect("a journal");
+    std::fs::write(&legacy_path, b"{not-json").expect("corrupt only the legacy journal");
+    let vault_before = std::fs::read(&path).expect("vault before");
+    let handoff_path = astra_operator::handoff::path_beside(&path);
+    let handoff_before = std::fs::read(&handoff_path).expect("handoff before");
+
+    let error = resume_ca_pq(&path, &out).expect_err("unreadable journal is refused");
+
+    assert!(format!("{error:#}").contains("reprise de la rotation CA-PQ préparée"));
+    assert_eq!(std::fs::read(&path).expect("vault after"), vault_before);
+    assert_eq!(
+        std::fs::read(&handoff_path).expect("handoff after"),
+        handoff_before
+    );
+    assert_eq!(
+        std::fs::read(&legacy_path).expect("legacy after"),
+        b"{not-json"
+    );
+    assert!(journal_path.exists(), "the adoption journal remains intact");
+    assert!(!out.exists());
+}
+
+/// A structurally readable journal with an unsupported version must fail its
+/// validation before the vault, bindings, handoff or transition are written.
+#[test]
+fn the_ca_pq_command_preserves_state_when_the_legacy_journal_version_is_unsupported() {
+    let directory = tempfile::tempdir().expect("dir");
+    let (path, out, _) = interrupted_ca_pq_rotation(directory.path());
+    let journal_path = astra_operator::rotation_journal::path_beside(&path);
+    let legacy_path = astra_operator::rotation_journal::legacy_ca_pq_path_beside(&path);
+    astra_operator::rotation_journal::adopt_legacy(&path)
+        .expect("adopted")
+        .expect("a journal");
+    let mut journal: astra_operator::rotation_journal::LegacyCaPqJournal =
+        documents::read(&legacy_path).expect("read valid journal");
+    journal.format_version = u16::MAX;
+    documents::write(&legacy_path, &journal).expect("write unsupported version");
+    let vault_before = std::fs::read(&path).expect("vault before");
+    let bindings_path = astra_operator::credentials::path_beside(&path);
+    assert!(!bindings_path.exists(), "fixture has no bindings file yet");
+    let handoff_path = astra_operator::handoff::path_beside(&path);
+    let handoff_before = std::fs::read(&handoff_path).expect("handoff before");
+    let legacy_before = std::fs::read(&legacy_path).expect("journal before");
+
+    let error = resume_ca_pq(&path, &out).expect_err("unsupported journal version is refused");
+
+    assert!(format!("{error:#}").contains("version de journal de rotation CA-PQ non supportée"));
+    assert_eq!(std::fs::read(&path).expect("vault after"), vault_before);
+    assert!(!bindings_path.exists(), "invalid journal wrote no bindings");
+    assert_eq!(
+        std::fs::read(&handoff_path).expect("handoff after"),
+        handoff_before
+    );
+    assert_eq!(
+        std::fs::read(&legacy_path).expect("journal after"),
+        legacy_before
+    );
+    assert!(journal_path.exists(), "the adoption journal remains intact");
+    assert!(!out.exists());
+}
+
 /// The exception is for that command alone: the CA-TLS one still refuses.
 #[test]
 fn the_ca_tls_command_refuses_an_unconfirmed_adoption_too() {
