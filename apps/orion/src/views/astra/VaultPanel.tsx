@@ -28,6 +28,8 @@ export function VaultPanel({ onCeremony }: { onCeremony: (status: OperatorStatus
   const { overview, error, refresh } = useOverview()
   const [location, setLocation] = useState<VaultLocationView | null>(null)
   const [locationError, setLocationError] = useState<string | null>(null)
+  const [exported, setExported] = useState(false)
+  const [exportError, setExportError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
   const [removing, setRemoving] = useState<SlotView | null>(null)
@@ -78,6 +80,17 @@ export function VaultPanel({ onCeremony }: { onCeremony: (status: OperatorStatus
     }
   }
 
+  // A private copy of the vault's bytes, written where the operator chooses. Nothing is sent.
+  const exportVault = async () => {
+    setExported(false)
+    setExportError(null)
+    try {
+      if (await api.operatorExportVault()) setExported(true)
+    } catch (cause) {
+      setExportError(String(cause))
+    }
+  }
+
   // The location block comes first and always renders: an unreadable setting
   // or a failed read must still leave « Changer… » and « Emplacement par
   // défaut » within reach, or the operator has no way out of it.
@@ -102,7 +115,7 @@ export function VaultPanel({ onCeremony }: { onCeremony: (status: OperatorStatus
           {location.error}
         </Alert>
       )}
-      {location && (location.picker_available || !location.is_default) && (
+      {location && (location.picker_available || !location.is_default || overview?.exists) && (
         <Stack direction="row" spacing={1} sx={{ mt: 1 }}>
           {location.picker_available && (
             <Button
@@ -122,11 +135,30 @@ export function VaultPanel({ onCeremony }: { onCeremony: (status: OperatorStatus
               Emplacement par défaut
             </Button>
           )}
+          {overview?.exists && (
+            <Button
+              size="small"
+              sx={{ minHeight: 26, fontSize: 11 }}
+              onClick={() => void exportVault()}
+            >
+              Exporter le coffre
+            </Button>
+          )}
         </Stack>
       )}
       {locationError && (
         <Alert severity="error" variant="outlined" sx={{ mt: 1, fontSize: 11.5 }}>
           {locationError}
+        </Alert>
+      )}
+      {exported && (
+        <Alert severity="success" variant="outlined" sx={{ mt: 1, fontSize: 11.5 }}>
+          Coffre exporté
+        </Alert>
+      )}
+      {exportError && (
+        <Alert severity="error" variant="outlined" sx={{ mt: 1, fontSize: 11.5 }}>
+          {exportError}
         </Alert>
       )}
     </Paper>

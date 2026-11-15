@@ -574,8 +574,27 @@ export function vaultCopyPrerequisite(o: RotationsOverview): Prerequisite {
     ok: false,
     fix: sendable ? 'Envoyer' : null,
     fixAction: sendable ? 'send_vault_copy' : null,
-    detail: held === null ? 'Absente' : sameVault ? 'Document ancien' : 'Ancienne',
+    detail: copyDetail(o, authority, held, sameVault),
   }
+}
+
+/**
+ * What the copy line says when it is red. A copy Astra holds at a newer revision wins over the
+ * rest: the send is then refused unless forced, so it is the first thing to know.
+ */
+function copyDetail(
+  o: RotationsOverview,
+  authority: OperatorAuthorityStatus,
+  held: string | null,
+  sameVault: boolean,
+): string {
+  const astraRevision = authority.vault_copy_revision
+  const localRevision = o.localVaultRevision
+  if (astraRevision !== null && localRevision !== null && astraRevision > localRevision) {
+    return 'Plus récente sur Astra'
+  }
+  if (held === null) return 'Absente'
+  return sameVault ? 'Document ancien' : 'Ancienne'
 }
 
 function domainPrerequisite(o: RotationsOverview): Prerequisite {

@@ -1076,6 +1076,8 @@ export interface OperatorAuthorityStatus {
   } | null
   /** Empreinte de la copie du coffre qu'Astra détient. */
   vault_copy_fingerprint: string | null
+  /** Révision de la copie du coffre qu'Astra détient ; `null` : aucune copie, ou non lue. */
+  vault_copy_revision: number | null
   /** `null` : Astra ne sert aucun document. Ce n'est pas l'époque 0. */
   credential_registry_epoch: number | null
   /** Le plan « Tout renouveler » qu'Astra tient ; `null` : aucun plan. Absent d'un Astra plus ancien. */
@@ -1164,6 +1166,8 @@ export interface RotationsOverview {
   /** `illisible` (coffre) ou `emplacement` ; le détail, qui nomme des chemins, reste au journal. */
   vaultError: 'illisible' | 'emplacement' | null
   localVaultFingerprint: string | null
+  /** Révision du coffre à côté de ce poste ; `null` quand le coffre est illisible. */
+  localVaultRevision: number | null
   localCaEpoch: number | null
   localCaTlsEpoch: number | null
   /** Fin de la CA TLS inscrite au relais du coffre ; `null` si le relais n'en porte pas. */
@@ -1286,6 +1290,8 @@ export type VaultCopyOutcome =
       document_waits: boolean
     }
   | { state: 'held_back' }
+  /** Astra holds a newer or diverging vault: nothing is written, only a forced send replaces it. */
+  | { state: 'stale' }
 
 /** Une invitation du registre de ce poste, telle que l'écran Enrôlement la liste. */
 export interface InvitationView {

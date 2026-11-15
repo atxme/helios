@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import type { RotationsOverview } from '../../types'
+import type { OperatorAuthorityStatus, RotationsOverview } from '../../types'
 import {
   DAY,
   NOW,
@@ -838,5 +838,54 @@ describe('the CA-PQ replacement without a campaign', () => {
     // A journal from before the field reads as before: Astra is asked while it is signed.
     const before = overview({ resumable: true, journal: { ...journal, withoutCampaign: false } })
     expect(prerequisites(before, 'resume').map((p) => p.label)).toContain('Service Astra')
+  })
+})
+
+describe('a vault copy newer on Astra', () => {
+  const copyLine = (o: RotationsOverview) =>
+    prerequisites(o, 'replace_ca_tls').find((p) => p.label === 'Copie du coffre')
+
+  // The local vault is revision 4 and another one; Astra holds revision 5 of a third.
+  const newerOnAstra = (
+    authority: Partial<OperatorAuthorityStatus> = {},
+    extra: Partial<RotationsOverview> = {},
+  ) =>
+    overview({
+      localVaultFingerprint: '11'.repeat(32),
+      localVaultRevision: 4,
+      authority: {
+        state: 'ok',
+        value: authorityRead({
+          vault_copy_fingerprint: '22'.repeat(32),
+          vault_copy_revision: 5,
+          ...authority,
+        }),
+      },
+      ...extra,
+    })
+
+  it('is_said_newer_on_astra_and_its_send_is_still_offered', () => {
+    expect(copyLine(newerOnAstra())).toMatchObject({
+      ok: false,
+      detail: 'Plus récente sur Astra',
+      fix: 'Envoyer',
+      fixAction: 'send_vault_copy',
+    })
+  })
+
+  it('wins_over_document_ancien_when_the_vault_is_the_same', () => {
+    const o = overview({
+      localCredentialRegistryEpoch: 6,
+      localVaultRevision: 4,
+      authority: { state: 'ok', value: authorityRead({ vault_copy_revision: 5 }) },
+    })
+    expect(copyLine(o)?.detail).toBe('Plus récente sur Astra')
+  })
+
+  it('without_a_revision_on_either_side_the_details_are_unchanged', () => {
+    expect(copyLine(newerOnAstra({ vault_copy_revision: null }))?.detail).toBe('Ancienne')
+    expect(copyLine(newerOnAstra({}, { localVaultRevision: null }))?.detail).toBe('Ancienne')
+    const same = overview({ localCredentialRegistryEpoch: 6, localVaultRevision: null })
+    expect(copyLine(same)?.detail).toBe('Document ancien')
   })
 })

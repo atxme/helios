@@ -417,6 +417,12 @@ export const operatorSendVaultCopy = (replaceNewer = false) =>
   invoke<VaultCopyOutcome>('operator_send_vault_copy', { replaceNewer })
 
 /**
+ * Écrit une copie privée du coffre à un chemin choisi dans la boîte d'export. `false` si
+ * l'opérateur annule ; le coffre n'est pas modifié.
+ */
+export const operatorExportVault = () => invoke<boolean>('operator_export_vault')
+
+/**
  * Ouvre une campagne (postes ou délégation de l'émetteur). Un 403 revient tel quel :
  * la porte répond ainsi quand une opération est déjà ouverte, lire alors `pending`.
  */

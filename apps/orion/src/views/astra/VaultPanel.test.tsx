@@ -14,6 +14,7 @@ const api = vi.hoisted(() => ({
   resetVaultLocation: vi.fn(),
   operatorRotationsOverview: vi.fn(),
   operatorSendVaultCopy: vi.fn(),
+  operatorExportVault: vi.fn(),
   onEvent: vi.fn(),
 }))
 vi.mock('../../api', () => api)
@@ -72,6 +73,29 @@ beforeEach(() => {
 afterEach(cleanup)
 
 describe('VaultPanel', () => {
+  it('the_vault_is_exported_once_and_its_result_is_said', async () => {
+    api.operatorExportVault.mockResolvedValue(true)
+    render(<VaultPanel onCeremony={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Exporter le coffre' }))
+    expect(await screen.findByText('Coffre exporté')).toBeTruthy()
+    expect(api.operatorExportVault).toHaveBeenCalledTimes(1)
+  })
+
+  it('a_cancelled_export_shows_nothing', async () => {
+    api.operatorExportVault.mockResolvedValue(false)
+    render(<VaultPanel onCeremony={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Exporter le coffre' }))
+    await waitFor(() => expect(api.operatorExportVault).toHaveBeenCalledTimes(1))
+    expect(screen.queryByText('Coffre exporté')).toBeNull()
+  })
+
+  it('a_failed_export_shows_its_message', async () => {
+    api.operatorExportVault.mockRejectedValue('le coffre est illisible')
+    render(<VaultPanel onCeremony={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Exporter le coffre' }))
+    expect(await screen.findByText('le coffre est illisible')).toBeTruthy()
+  })
+
   it('the_vault_panel_shows_slots_and_fingerprint', async () => {
     render(<VaultPanel onCeremony={vi.fn()} />)
     expect(await screen.findByText('YubiKey bureau')).toBeTruthy()
