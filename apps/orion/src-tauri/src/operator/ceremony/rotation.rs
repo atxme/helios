@@ -574,8 +574,10 @@ fn refusal_of_open(error: &anyhow::Error) -> Refusal {
     if let Some(refused) = error.downcast_ref::<OpenRefusal>() {
         return match refused {
             OpenRefusal::KeyNotApprovable => Refusal::SignerRevoked,
-            OpenRefusal::RotationInFlight | OpenRefusal::CaTlsToFinish => Refusal::RotationInFlight,
-            OpenRefusal::AnchorsDisagree => Refusal::DomainConflict,
+            OpenRefusal::RotationInFlight
+            | OpenRefusal::CaTlsToFinish
+            | OpenRefusal::CaPqToFinish => Refusal::RotationInFlight,
+            OpenRefusal::AnchorsDisagree | OpenRefusal::OriginRecorded => Refusal::DomainConflict,
         };
     }
     match error.downcast_ref::<TunnelRefusal>() {

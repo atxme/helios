@@ -416,6 +416,10 @@ impl RotationRemote for Remote {
             .expect("an authority"))
     }
 
+    fn gateway_identity(&self) -> anyhow::Result<astra_operator::tunnel::GatewayIdentityRead> {
+        panic!("the campaign path reads the authority, not the gateway identity")
+    }
+
     fn send_vault_copy(&self, copy: &OperatorVaultCopy) -> anyhow::Result<VaultCopySent> {
         self.note("send_vault_copy");
         self.sent_with_credentials
