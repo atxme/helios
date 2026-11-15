@@ -150,16 +150,117 @@ pub(crate) fn export_logs(
     stem: String,
     contents: String,
 ) -> Result<String, String> {
-    if contents.len() > MAX_LOG_EXPORT_BYTES {
-        return Err("journal trop volumineux pour être exporté".to_string());
-    }
+    validate_log_export_contents(&contents)?;
     let dir = app
         .path()
         .document_dir()
         .or_else(|_| app.path().app_data_dir())
         .map_err(|e| format!("aucun répertoire d'export disponible : {e}"))?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("création de {} : {e}", dir.display()))?;
-    let path = dir.join(format!("{}.log", sanitize_stem(&stem)));
+    export_logs_to(&dir, &stem, &contents).map(|path| path.display().to_string())
+}
+
+fn export_logs_to(
+    dir: &std::path::Path,
+    stem: &str,
+    contents: &str,
+) -> Result<std::path::PathBuf, String> {
+    validate_log_export_contents(contents)?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("création de {} : {e}", dir.display()))?;
+    let path = dir.join(format!("{}.log", sanitize_stem(stem)));
     std::fs::write(&path, contents).map_err(|e| format!("écriture de {} : {e}", path.display()))?;
-    Ok(path.display().to_string())
+    Ok(path)
+}
+
+fn validate_log_export_contents(contents: &str) -> Result<(), String> {
+    if contents.len() > MAX_LOG_EXPORT_BYTES {
+        return Err("journal trop volumineux pour être exporté".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{export_logs_to, sanitize_stem, window_size_for, MAX_LOG_EXPORT_BYTES};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            loop {
+                let path = std::env::temp_dir().join(format!(
+                    "orion-app-command-tests-{}-{}",
+                    std::process::id(),
+                    NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create scratch directory: {error}"),
+                }
+            }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn sanitizes_export_stems_and_uses_a_fallback_when_empty() {
+        assert_eq!(sanitize_stem("../session!2026"), "session2026");
+        assert_eq!(sanitize_stem("é /.."), "orion-journal");
+        assert_eq!(sanitize_stem(&"a".repeat(80)), "a".repeat(64));
+    }
+
+    #[test]
+    fn assigns_each_view_its_window_size_and_unknown_views_use_connection_size() {
+        assert_eq!(window_size_for("profiles"), (800.0, 720.0));
+        assert_eq!(window_size_for("certificates"), (680.0, 620.0));
+        assert_eq!(window_size_for("speedtest"), (520.0, 620.0));
+        assert_eq!(window_size_for("logs"), (760.0, 640.0));
+        assert_eq!(window_size_for("unknown"), (520.0, 560.0));
+    }
+
+    #[test]
+    fn exports_only_to_a_sanitized_log_name() {
+        let scratch = Scratch::new();
+        let path = export_logs_to(&scratch.0, "../session!2026", "journal")
+            .expect("the bounded journal is written");
+
+        assert_eq!(path, scratch.0.join("session2026.log"));
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read exported journal"),
+            "journal"
+        );
+    }
+
+    #[test]
+    fn refuses_an_oversized_export_before_creating_its_directory() {
+        let scratch = Scratch::new();
+        let output = scratch.0.join("not-created");
+        let contents = "x".repeat(MAX_LOG_EXPORT_BYTES + 1);
+
+        let error = export_logs_to(&output, "journal", &contents)
+            .expect_err("oversized frontend content is refused");
+
+        assert_eq!(error, "journal trop volumineux pour être exporté");
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn reports_export_directory_creation_failures() {
+        let scratch = Scratch::new();
+        let blocking_file = scratch.0.join("file");
+        std::fs::write(&blocking_file, "not a directory").expect("create blocking file");
+
+        let error = export_logs_to(&blocking_file.join("child"), "journal", "text")
+            .expect_err("a file cannot be used as an export directory");
+
+        assert!(error.starts_with("création de "));
+    }
 }

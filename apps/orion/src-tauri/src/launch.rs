@@ -158,3 +158,31 @@ fn is_elevated(token: &Token) -> Result<bool, String> {
     }
     Ok(elevation.TokenIsElevated != 0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::should_launch;
+
+    #[test]
+    fn launch_is_allowed_only_for_a_non_elevated_ui() {
+        assert!(should_launch(false));
+        assert!(!should_launch(true));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_refuses_to_open_an_ssh_terminal() {
+        let error = super::spawn_ssh_terminal("gateway.example:22")
+            .expect_err("there is no selected terminal on this platform");
+        assert_eq!(
+            error,
+            "l'ouverture d'un terminal SSH n'est disponible que sur Windows"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_has_no_elevation_to_refuse() {
+        assert_eq!(super::refuse_if_elevated(), Ok(()));
+    }
+}
