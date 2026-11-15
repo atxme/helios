@@ -398,10 +398,28 @@ pub fn write_relay(vault_path: &Path, update: &RelayUpdate) -> Result<handoff::D
         relay.astra_service_key_epoch = Some(epoch);
     }
     if let Some(value) = &update.astra_authority_url {
+        ensure_no_origin_during_rotation_without_campaign(vault_path)?;
         relay.astra_authority_url = Some(authority_origin(value)?);
     }
     handoff::save(&handoff::path_beside(vault_path), &relay)?;
     Ok(relay)
+}
+
+/// The origin is recorded once a rotation without campaign is over: until then the
+/// domain would name an Astra that its journal never asks. A journal too damaged to
+/// read refuses too, since it may be that rotation.
+fn ensure_no_origin_during_rotation_without_campaign(vault_path: &Path) -> Result<()> {
+    match crate::rotation_journal::load(&crate::rotation_journal::path_beside(vault_path)) {
+        Ok(Some(journal)) if journal.without_campaign => bail!(
+            "une rotation CA-PQ sans campagne est en cours : l'origine Astra s'ajoute une fois \
+             terminée. Rien n'a été modifié."
+        ),
+        Ok(_) => Ok(()),
+        Err(_) => bail!(
+            "le journal de rotation est illisible : l'origine Astra ne s'ajoute pas tant qu'il \
+             ne se lit pas. Rien n'a été modifié."
+        ),
+    }
 }
 
 /// Moving a domain to another gateway is a gateway transition, never an edit

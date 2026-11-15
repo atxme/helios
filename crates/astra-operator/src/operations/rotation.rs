@@ -773,6 +773,15 @@ pub fn advance(
         authority: None,
         gateway_next: GatewayAnchor::NotRead,
     };
+    // A domain that gained an origin after its adoption never reaches the no-campaign
+    // path: nothing moves, and the gateway is not read. An unreadable relay goes up.
+    if journal.without_campaign
+        && handoff::load(&handoff::path_beside(vault_path))?
+            .astra_authority_url
+            .is_some()
+    {
+        return Ok(ResumeStep::DomainConflict);
+    }
     let mut install_sent = false;
     loop {
         match next_step(journal, &facts) {

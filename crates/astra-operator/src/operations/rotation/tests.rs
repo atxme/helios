@@ -2677,6 +2677,7 @@ struct WithoutCampaign {
     outgoing: Fingerprint,
     next: Fingerprint,
     installs: Cell<u32>,
+    reads: Cell<u32>,
 }
 
 impl RotationRemote for WithoutCampaign {
@@ -2716,6 +2717,7 @@ impl RotationRemote for WithoutCampaign {
 
     fn gateway_next_anchor(&self, kind: RotationKind) -> Result<Option<Fingerprint>> {
         assert_eq!(kind, RotationKind::CaPq);
+        self.reads.set(self.reads.get() + 1);
         Ok(Some(if self.installs.get() == 0 {
             self.outgoing
         } else {
@@ -2727,11 +2729,13 @@ impl RotationRemote for WithoutCampaign {
 #[test]
 fn advance_without_campaign_finishes_without_the_copy() {
     let domain = domain();
+    let signed = domain.signed(RotationKind::CaPq);
+    without_origin(&domain);
     let mut journal = RotationJournal {
         without_campaign: true,
         deposit: None,
         stage: JournalStage::Accepted,
-        ..domain.signed(RotationKind::CaPq)
+        ..signed
     };
     let next_vault = journal.next.as_ref().expect("next").vault.clone();
     rotation_journal::save(&rotation_journal::path_beside(&domain.path), &journal).expect("saved");
@@ -2739,6 +2743,7 @@ fn advance_without_campaign_finishes_without_the_copy() {
         outgoing: journal.transition.outgoing_anchor_fingerprint(),
         next: journal.next_anchor_fingerprint,
         installs: Cell::new(0),
+        reads: Cell::new(0),
     };
 
     let step = advance(&remote, &domain.path, &mut journal, NOW).expect("advanced");
@@ -2799,4 +2804,35 @@ fn legacy_file_stays_until_applied_without_campaign() {
     rotation_journal::apply_local(&domain.path, &mut journal).expect("applied");
 
     assert!(!legacy_path.exists());
+}
+
+/// A domain that gained an origin after its journal was adopted: it never reaches the
+/// no-campaign path. Stopped before any step, with the gateway and the vault untouched.
+#[test]
+fn advance_without_campaign_stops_when_the_relay_names_an_origin() {
+    let domain = domain();
+    let signed = domain.signed(RotationKind::CaPq);
+    let journal = RotationJournal {
+        without_campaign: true,
+        deposit: None,
+        stage: JournalStage::Accepted,
+        ..signed
+    };
+    rotation_journal::save(&rotation_journal::path_beside(&domain.path), &journal).expect("saved");
+    let before = domain.files();
+    let remote = WithoutCampaign {
+        outgoing: journal.transition.outgoing_anchor_fingerprint(),
+        next: journal.next_anchor_fingerprint,
+        installs: Cell::new(0),
+        reads: Cell::new(0),
+    };
+    let mut held = journal.clone();
+
+    let step = advance(&remote, &domain.path, &mut held, NOW).expect("stopped");
+
+    assert_eq!(step, ResumeStep::DomainConflict);
+    assert_eq!(remote.reads.get(), 0, "the gateway is not read");
+    assert_eq!(remote.installs.get(), 0, "nothing is installed");
+    assert_eq!(held, journal);
+    assert_eq!(domain.files(), before, "the vault and the journal stay");
 }
