@@ -609,6 +609,23 @@ fn a_vault_copy_held_back_is_its_own_result() {
     assert_eq!(answer, VaultCopySent::HeldBack);
 }
 
+/// A copy Astra refuses as stale (412) is an answer, not a failure: the vault behind or
+/// diverging from Astra's own is said so, and the operator decides whether to force it.
+#[test]
+fn a_vault_copy_refused_as_stale_is_its_own_result() {
+    let stub = Stub::serving(vec![(412, "{}".into())]);
+    let copy = OperatorVaultCopy {
+        replace_newer: false,
+        vault_base64: "e30=".into(),
+        credentials: None,
+    };
+    let answer = Tunnel::new(&stub.base)
+        .expect("tunnel")
+        .send_vault_copy(&copy)
+        .expect("not a failure");
+    assert_eq!(answer, VaultCopySent::Stale);
+}
+
 /// A copy refused for what it is will not pass later: it stays a failure, and
 /// says so apart from a body over the bound.
 #[test]

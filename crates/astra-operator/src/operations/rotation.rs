@@ -1082,7 +1082,9 @@ fn finish_with_the_copy(
     }
     match vault_copy(vault_path).and_then(|copy| remote.send_vault_copy(&copy)) {
         Ok(VaultCopySent::HeldBack) => Ok(ResumeStep::SendVaultCopy),
-        Ok(VaultCopySent::Copied(_)) | Err(_) => {
+        // A stale copy is Astra's answer about the vault, not about this rotation: the
+        // rotation is on the gateway, and the operator decides about a forced send.
+        Ok(VaultCopySent::Copied(_) | VaultCopySent::Stale) | Err(_) => {
             rotation_journal::clear(&journal_path)?;
             Ok(ResumeStep::Finished)
         }

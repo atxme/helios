@@ -305,22 +305,36 @@ pub fn check_renewal_with(
         .map_err(|refusal| page_sentence(&refusal))
 }
 
+/// Said when a forced send is asked while a rotation waits to be resumed: the same
+/// sentence the screen gives for a rotation in progress.
+const FORCED_SEND_IN_FLIGHT: &str = "Rotation en cours. La mener à son terme d’abord.";
+
 /// The manual send. `authority` is read only once the gateway has been checked.
+///
+/// `replace_newer` is the operator's « Remplacer quand même »: Astra then takes the copy
+/// even when it is behind or diverges from the one it holds. Refused while a rotation
+/// waits to be resumed, whose copy is the one Astra must take, never this one.
 pub fn send_copy_with(
     remote: &dyn RotationRemote,
     vault_path: &Path,
     target: &GatewayTarget,
+    replace_newer: bool,
     authority: impl FnOnce() -> Reach<AuthorityStatusRead>,
 ) -> Result<VaultCopyOutcome, String> {
     ensure_domains_gateway(vault_path, target)?;
+    let resumable =
+        rotation_journal::something_to_resume(vault_path).map_err(|error| format!("{error:#}"))?;
+    if replace_newer && resumable {
+        return Err(FORCED_SEND_IN_FLIGHT.to_string());
+    }
     let authority = match authority() {
         Reach::Ok(authority) => authority,
         other => return Err(unreached(&other).unwrap_or_default()),
     };
-    let resumable =
-        rotation_journal::something_to_resume(vault_path).map_err(|error| format!("{error:#}"))?;
-    let copy =
+    // Read from disk by this call: a forced send carries the vault as it is now.
+    let mut copy =
         copy_to_send(vault_path, &authority, resumable).map_err(|error| format!("{error:#}"))?;
+    copy.replace_newer = replace_newer;
     let carried_a_document = copy.credentials.is_some();
     let local_epoch = local_credentials_epoch(vault_path);
     let mut sent = remote
@@ -330,7 +344,6 @@ pub fn send_copy_with(
     // copy back with it. The vault alone passes, and the document follows later.
     if carried_a_document && sent == VaultCopySent::HeldBack {
         let alone = OperatorVaultCopy {
-            replace_newer: false,
             credentials: None,
             ..copy
         };
@@ -339,6 +352,46 @@ pub fn send_copy_with(
             .map_err(|error| format!("{error:#}"))?;
     }
     Ok(VaultCopyOutcome::of(sent, local_epoch))
+}
+
+/// The name a vault export proposes: the vault's name with the Europe/Paris date of
+/// `now`, as `authority-vault-AAAA-MM-JJ.json`. `None` when the date cannot be read.
+#[cfg(any(windows, test))]
+pub fn export_file_name(now: u64) -> Option<String> {
+    aether::display_time::format_paris_date(now).map(|date| format!("authority-vault-{date}.json"))
+}
+
+/// Writes a copy of the vault at `target`: the bytes on disk, never opened, written
+/// privately and atomically. A target that resolves to the vault itself is refused, under
+/// any spelling of its path, so the export cannot overwrite the vault it copies.
+#[cfg(any(windows, test))]
+pub fn export_vault(vault_path: &Path, target: &Path) -> Result<(), String> {
+    let vault = std::fs::canonicalize(vault_path)
+        .map_err(|error| format!("lecture du coffre : {error}"))?;
+    if resolved_target(target)? == vault {
+        return Err("le coffre ne peut pas être exporté sur lui-même".to_string());
+    }
+    let bytes =
+        std::fs::read(vault_path).map_err(|error| format!("lecture du coffre : {error}"))?;
+    aether::private_file::write_private_atomic(target, &bytes)
+        .map_err(|error| format!("écriture de {} : {error}", target.display()))
+}
+
+/// Where `target` lands, with links and `.`/`..` resolved: the file itself when it exists,
+/// else its folder's resolved path joined with its name.
+#[cfg(any(windows, test))]
+fn resolved_target(target: &Path) -> Result<std::path::PathBuf, String> {
+    if let Ok(resolved) = std::fs::canonicalize(target) {
+        return Ok(resolved);
+    }
+    let unresolved = || format!("emplacement d'export illisible : {}", target.display());
+    let name = target.file_name().ok_or_else(unresolved)?;
+    let folder = match target.parent() {
+        Some(folder) if !folder.as_os_str().is_empty() => folder,
+        _ => Path::new("."),
+    };
+    let folder = std::fs::canonicalize(folder).map_err(|_| unresolved())?;
+    Ok(folder.join(name))
 }
 
 /// The epoch of the credential document beside the vault, read without verifying it:
@@ -527,6 +580,8 @@ pub struct Local {
     /// Whether the relay beside the vault names an Astra origin. `None` when the relay cannot
     /// be read: that is not « no origin », and « Remplacer la CA-PQ sans campagne » is not offered.
     pub relay_names_origin: Option<bool>,
+    /// The revision of the vault beside this machine. `None` when the vault cannot be read.
+    pub vault_revision: Option<u64>,
 }
 
 /// The journal and whether anything calls for a resumption, read from the files beside
@@ -637,6 +692,9 @@ pub fn read_local(vault_path: &Result<std::path::PathBuf, String>, now: u64) -> 
         retained_ca_pq_not_after: retained_ca_pq_not_after(path),
         gateway_pending: gateway_pending_of(path, now),
         relay_names_origin: relay_names_origin(path),
+        vault_revision: astra_operator::store::load(path)
+            .ok()
+            .map(|vault| vault.revision),
     }
 }
 
@@ -744,6 +802,9 @@ pub struct RotationsOverview {
     pub gateway_pending: Option<GatewayPendingView>,
     /// Whether the relay names an Astra origin: `None` when the relay cannot be read.
     pub relay_names_origin: Option<bool>,
+    /// The revision of the vault beside this machine, to compare with the one Astra
+    /// holds. `None` when the vault cannot be read.
+    pub local_vault_revision: Option<u64>,
 }
 
 impl RotationsOverview {
@@ -767,6 +828,7 @@ impl RotationsOverview {
             retained_ca_pq_not_after,
             gateway_pending,
             relay_names_origin,
+            vault_revision,
         } = local;
         let ca_pq_overlap = authority
             .ok()
@@ -803,6 +865,7 @@ impl RotationsOverview {
             workstations: workstations_of(certificates),
             gateway_pending,
             relay_names_origin,
+            local_vault_revision: vault_revision,
         }
     }
 }
@@ -824,6 +887,9 @@ pub enum VaultCopyOutcome {
     /// A live operation or a rotation holds the copy back. Nothing was written, the
     /// same copy passes later, and this is an answer rather than a failure.
     HeldBack,
+    /// Astra holds a newer vault, or one that diverges from this copy, and refuses it.
+    /// Nothing was written; only a forced send replaces what Astra holds.
+    Stale,
 }
 
 impl VaultCopyOutcome {
@@ -840,6 +906,7 @@ impl VaultCopyOutcome {
                 }),
             },
             VaultCopySent::HeldBack => Self::HeldBack,
+            VaultCopySent::Stale => Self::Stale,
         }
     }
 }
@@ -895,6 +962,64 @@ pub fn vault_bytes_of(copy: &OperatorVaultCopy) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
         .decode(&copy.vault_base64)
         .expect("base64")
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use crate::operator::location::VAULT_FILE_NAME;
+    use std::path::PathBuf;
+
+    const NOON_ON_THE_15TH_UTC: u64 = 1_794_744_000;
+    const AFTER_MIDNIGHT_IN_PARIS: u64 = 1_794_785_400;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("orion-export-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).expect("folder");
+        dir
+    }
+
+    #[test]
+    fn export_writes_the_vault_bytes() {
+        let dir = scratch("bytes");
+        let vault = dir.join(VAULT_FILE_NAME);
+        std::fs::write(&vault, b"{\"vault\":true}").expect("vault");
+        let target = dir.join("export.json");
+
+        export_vault(&vault, &target).expect("exported");
+
+        assert_eq!(std::fs::read(&target).expect("export"), b"{\"vault\":true}");
+    }
+
+    #[test]
+    fn export_refuses_the_vault_itself_under_every_spelling() {
+        let dir = scratch("itself");
+        let vault = dir.join(VAULT_FILE_NAME);
+        std::fs::write(&vault, b"vault").expect("vault");
+        let spellings = [
+            vault.clone(),
+            dir.join(".").join(VAULT_FILE_NAME),
+            dir.join("sub").join("..").join(VAULT_FILE_NAME),
+        ];
+        for target in spellings {
+            let error = export_vault(&vault, &target).expect_err("refused");
+            assert_eq!(error, "le coffre ne peut pas être exporté sur lui-même");
+            assert_eq!(std::fs::read(&vault).expect("vault"), b"vault");
+        }
+    }
+
+    #[test]
+    fn the_proposed_name_carries_the_paris_date() {
+        assert_eq!(
+            export_file_name(NOON_ON_THE_15TH_UTC).as_deref(),
+            Some("authority-vault-2026-11-15.json")
+        );
+        assert_eq!(
+            export_file_name(AFTER_MIDNIGHT_IN_PARIS).as_deref(),
+            Some("authority-vault-2026-11-16.json")
+        );
+    }
 }
 
 #[cfg(test)]

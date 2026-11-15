@@ -1949,6 +1949,26 @@ fn a_copy_held_back_keeps_the_journal_and_is_retried_at_the_next_look() {
     assert_eq!(domain.journal_on_disk(), None);
 }
 
+/// Spec §5.9: a copy Astra refuses as stale (412) is an answer at the end of a rotation.
+/// The rotation finishes like a copy that landed: the journal is gone, and the stale copy
+/// is not sent again by the resumption.
+#[test]
+fn a_stale_copy_at_the_end_of_a_rotation_finishes_it() {
+    let domain = domain();
+    let mut journal = domain.signed(RotationKind::CaPq);
+    let remote = Remote::watching(&domain.path);
+    remote
+        .copies
+        .borrow_mut()
+        .push_back(Ok(VaultCopySent::Stale));
+
+    let step = advance(&remote, &domain.path, &mut journal, NOW).expect("not a failure");
+
+    assert_eq!(step, ResumeStep::Finished);
+    assert!(remote.called("send_vault_copy"));
+    assert_eq!(domain.journal_on_disk(), None);
+}
+
 /// Spec §5.9: during a CA-PQ overlap Astra refuses a document in the copy. Its
 /// document comes through the accepted object, and it adopts that at `not_after`.
 #[test]

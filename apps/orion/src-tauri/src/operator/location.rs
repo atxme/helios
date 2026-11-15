@@ -329,6 +329,36 @@ fn settings_path() -> anyhow::Result<PathBuf> {
     Ok(base.join(SETTINGS_FILE_NAME))
 }
 
+/// What a save dialog shows: its title, the file types it offers, and the extension
+/// appended to a name typed without one.
+#[cfg(windows)]
+struct SaveDialog {
+    title: &'static str,
+    /// Pairs of NUL-terminated strings, ended by an empty one, as the dialog reads them.
+    filter: &'static str,
+    extension: &'static str,
+    /// Said, with the dialog's error code, when the dialog itself fails.
+    failure: &'static str,
+}
+
+/// The dialog that chooses the vault's place.
+#[cfg(windows)]
+const LOCATION_DIALOG: SaveDialog = SaveDialog {
+    title: "Emplacement du coffre opérateur",
+    filter: "Coffre opérateur (authority-vault.json)\0authority-vault.json\0\0",
+    extension: "json",
+    failure: "la boîte de choix de l'emplacement du coffre a échoué",
+};
+
+/// The dialog that exports a copy of the vault.
+#[cfg(windows)]
+const EXPORT_DIALOG: SaveDialog = SaveDialog {
+    title: "Exporter le coffre opérateur",
+    filter: "Coffre opérateur (*.json)\0*.json\0\0",
+    extension: "json",
+    failure: "la boîte d'export du coffre a échoué",
+};
+
 /// Asks the operator where the vault is, in a save dialog owned by `owner`.
 ///
 /// A save dialog rather than an open one: the vault may not exist yet, and
@@ -340,6 +370,30 @@ fn settings_path() -> anyhow::Result<PathBuf> {
 /// thread of its own, not from a runtime or pooled worker.
 #[cfg(windows)]
 pub fn pick(owner: isize, current: &Path) -> Result<Option<PathBuf>, String> {
+    save_dialog(owner, &LOCATION_DIALOG, current.parent(), VAULT_FILE_NAME)
+}
+
+/// Asks where to export the vault, in a save dialog owned by `owner`, proposing the
+/// file name of `proposed`. `None` when the operator cancels. The same thread rules as
+/// [`pick`] apply.
+#[cfg(windows)]
+pub fn pick_export(owner: isize, proposed: &Path) -> Result<Option<PathBuf>, String> {
+    let name = proposed
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "le nom proposé pour l'export n'est pas du texte".to_string())?;
+    save_dialog(owner, &EXPORT_DIALOG, proposed.parent(), name)
+}
+
+/// Shows the save dialog described by `dialog`, opened in `directory` when there is one
+/// and proposing `file_name`.
+#[cfg(windows)]
+fn save_dialog(
+    owner: isize,
+    dialog: &SaveDialog,
+    directory: Option<&Path>,
+    file_name: &str,
+) -> Result<Option<PathBuf>, String> {
     use std::ffi::OsString;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use windows_sys::Win32::System::Com::{
@@ -371,32 +425,29 @@ pub fn pick(owner: isize, current: &Path) -> Result<Option<PathBuf>, String> {
     let _apartment = (initialized >= 0).then_some(Apartment);
 
     let wide = |text: &str| -> Vec<u16> { text.encode_utf16().chain(std::iter::once(0)).collect() };
-    let title = wide("Emplacement du coffre opérateur");
+    let title = wide(dialog.title);
     // Appended when the operator types a name without an extension.
-    let extension = wide("json");
-    // Pairs of NUL-terminated strings, ended by an empty one.
-    let filter: Vec<u16> = "Coffre opérateur (authority-vault.json)\0authority-vault.json\0\0"
-        .encode_utf16()
-        .collect();
-    let directory: Vec<u16> = current
-        .parent()
+    let extension = wide(dialog.extension);
+    let filter: Vec<u16> = dialog.filter.encode_utf16().collect();
+    // Absent when there is no folder to open in: the dialog then picks its own.
+    let folder: Option<Vec<u16>> = directory
         .map(|parent| parent.as_os_str().encode_wide().collect::<Vec<u16>>())
-        .unwrap_or_default()
-        .into_iter()
-        .chain(std::iter::once(0))
-        .collect();
+        .filter(|folder| !folder.is_empty())
+        .map(|folder| folder.into_iter().chain(std::iter::once(0)).collect());
     let mut file = vec![0u16; FILE_BUFFER];
-    for (slot, unit) in file.iter_mut().zip(VAULT_FILE_NAME.encode_utf16()) {
+    for (slot, unit) in file.iter_mut().zip(file_name.encode_utf16()) {
         *slot = unit;
     }
 
-    let mut dialog = OPENFILENAMEW {
+    let mut request = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: owner as windows_sys::Win32::Foundation::HWND,
         lpstrFilter: filter.as_ptr(),
         lpstrFile: file.as_mut_ptr(),
         nMaxFile: FILE_BUFFER as u32,
-        lpstrInitialDir: directory.as_ptr(),
+        lpstrInitialDir: folder
+            .as_ref()
+            .map_or(std::ptr::null(), |folder| folder.as_ptr()),
         lpstrTitle: title.as_ptr(),
         lpstrDefExt: extension.as_ptr(),
         // `OFN_NOCHANGEDIR`: without it the dialog leaves this process's
@@ -406,19 +457,17 @@ pub fn pick(owner: isize, current: &Path) -> Result<Option<PathBuf>, String> {
         Flags: OFN_PATHMUSTEXIST | OFN_NOREADONLYRETURN | OFN_NOCHANGEDIR,
         ..Default::default()
     };
-    // SAFETY: `dialog` and the five buffers it points at are alive for the
-    // call; the strings are NUL-terminated, the filter doubly, and `nMaxFile`
-    // is the length of `file`. A null owner is allowed.
-    let chosen = unsafe { GetSaveFileNameW(&mut dialog) };
+    // SAFETY: `request` and the buffers it points at are alive for the call;
+    // the strings are NUL-terminated, the filter doubly, and `nMaxFile` is the
+    // length of `file`. A null owner and a null folder are allowed.
+    let chosen = unsafe { GetSaveFileNameW(&mut request) };
     if chosen == 0 {
         // SAFETY: reads the dialog's last error, with no pointer.
         let error = unsafe { CommDlgExtendedError() };
         return if error == 0 {
             Ok(None)
         } else {
-            Err(format!(
-                "la boîte de choix de l'emplacement du coffre a échoué (code {error:#x})"
-            ))
+            Err(format!("{} (code {error:#x})", dialog.failure))
         };
     }
     let length = file
