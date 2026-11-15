@@ -802,6 +802,14 @@ pub fn adopt_legacy(vault_path: &Path) -> Result<Option<RotationJournal>> {
         // and the older file is what remains to go.
         if !in_place.without_deposit_unapplied() {
             remove_legacy_ca_pq(vault_path)?;
+            return Ok(Some(in_place));
+        }
+        // An adoption by an Orion that did not know the mark: unmarked, with no deposit
+        // and a relay naming no origin, it would wait for an Astra that does not exist.
+        let mut in_place = in_place;
+        if adopted.without_campaign && !in_place.without_campaign {
+            in_place.without_campaign = true;
+            save(&journal_path, &in_place)?;
         }
         return Ok(Some(in_place));
     }

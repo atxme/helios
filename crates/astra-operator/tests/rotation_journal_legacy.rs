@@ -516,6 +516,49 @@ fn adopting_again_after_a_stop_keeps_the_journal_further_along() {
     assert!(!legacy_path.exists());
 }
 
+/// A journal adopted by an Orion older than the mark, in a domain with no origin, would
+/// loop on the read of an Astra that is not there: the next adoption marks it.
+#[test]
+fn an_unmarked_adoption_of_a_domain_without_origin_is_marked_in_place() {
+    let domain = domain();
+    let legacy = legacy_ca_pq(&domain);
+    let relay_path = handoff::path_beside(&domain.path);
+    let mut relay = handoff::load(&relay_path).expect("relay");
+    // The state an older Orion left: adopted while the relay was read as "with origin".
+    relay.astra_authority_url = Some(AUTHORITY_URL.into());
+    handoff::save(&relay_path, &relay).expect("relay saved");
+    let legacy_path = write_legacy_ca_pq(&domain.path, &legacy);
+    let unmarked = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+    assert!(!unmarked.without_campaign);
+
+    // With the origin still named, nothing changes, however many times it is read.
+    let again = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+    assert_eq!(again, unmarked);
+    assert!(legacy_path.exists());
+
+    relay.astra_authority_url = None;
+    handoff::save(&relay_path, &relay).expect("relay saved");
+    let marked = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+
+    assert!(marked.without_campaign);
+    assert!(!marked.awaits_confirmation());
+    assert_eq!(
+        rotation_journal::load(&rotation_journal::path_beside(&domain.path)).expect("load"),
+        Some(marked),
+        "saved, not only returned"
+    );
+    assert!(
+        legacy_path.exists(),
+        "the older file waits for the apply, as before"
+    );
+}
+
 /// Two different rotations: not this code's to choose, and nothing is lost.
 #[test]
 fn a_legacy_ca_pq_journal_against_another_journal_is_refused_with_both_intact() {
