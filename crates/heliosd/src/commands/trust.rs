@@ -283,7 +283,6 @@ fn now_unix() -> anyhow::Result<u64> {
 /// of the same registry — a second shape here would be a second thing to keep
 /// equal by hand.
 pub(crate) fn show_trust_enrolment(public_key: &str) -> anyhow::Result<()> {
-    use aether::certificates::encoding::WireGuardKey;
     use helios_provisioning::certificates::CertificateRegistry;
 
     let path = CertificateRegistry::path();
@@ -295,6 +294,20 @@ pub(crate) fn show_trust_enrolment(public_key: &str) -> anyhow::Result<()> {
                  absent registry is not an empty one — the lifecycle routes stay closed."
             )
         })?;
+    let view = trust_enrolment_view(&registry, public_key)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&view).context("encoding the trust block")?
+    );
+    Ok(())
+}
+
+fn trust_enrolment_view(
+    registry: &helios_provisioning::certificates::CertificateRegistry,
+    public_key: &str,
+) -> anyhow::Result<helios_api::certificates::TrustEnrolmentView> {
+    use aether::certificates::encoding::WireGuardKey;
+
     let key = WireGuardKey::parse(public_key.trim())
         .map_err(|error| anyhow::anyhow!("invalid WireGuard public key: {error}"))?;
     let peer = registry.peer(&key).ok_or_else(|| {
@@ -303,12 +316,7 @@ pub(crate) fn show_trust_enrolment(public_key: &str) -> anyhow::Result<()> {
              or `helios peer add`"
         )
     })?;
-    let view = certificates::enrolment_view(registry.state(), peer);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&view).context("encoding the trust block")?
-    );
-    Ok(())
+    Ok(certificates::enrolment_view(registry.state(), peer))
 }
 
 /// The client `CA-TLS` a fresh registry records as generation 1.
@@ -401,11 +409,8 @@ pub(crate) fn init_trust_domain(
     webauthn_rp_id: &str,
     client_tls_ca: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
-    use aether::certificates::encoding::{MlDsa87PublicKey, TrustDomainId, WireGuardKey};
-    use aether::certificates::state::{
-        AstraProfile, ClientTlsCaState, GatewayCertificateState, TrustLedger,
-    };
-    use helios_provisioning::certificates::{CertificateRegistry, RegistryState};
+    use aether::certificates::encoding::{MlDsa87PublicKey, TrustDomainId};
+    use helios_provisioning::certificates::CertificateRegistry;
 
     let trust_domain_id =
         TrustDomainId::parse_hex(trust_domain_id).context("reading the trust domain identifier")?;
@@ -431,78 +436,20 @@ pub(crate) fn init_trust_domain(
              init-key-negotiation`, complete the CA-PQ ceremony, then retry"
         );
     };
-    let gateway_wg_public_key = WireGuardKey::parse(&served.pq_certificate.wireguard_public_key)
-        .context("reading the WireGuard identity out of the served PQ leaf")?;
-    let server_name = served.pq_certificate.subject.clone();
-    let astra_policy_fingerprint = aether::certificates::AstraIssuancePolicy::standard(
+    let state = initial_trust_domain_state(
         trust_domain_id,
-        gateway_wg_public_key,
-        server_name.clone(),
-    )
-    .pin()
-    .context("building the pinned Astra issuance policy")?;
-
-    let domain_client_tls_ca = domain_client_tls_ca(client_tls_ca, served.client_tls_ca)?;
-    let state = RegistryState {
-        trust_domain_id,
-        gateway: GatewayCertificateState {
-            trust_domain_id,
-            gateway_wg_public_key,
-            server_name: server_name.clone(),
-            ca_epoch: 1,
-            current_ca_public_key: ca_public_key.clone(),
-            next_ca_public_key: None,
-            next_ca_transition_fingerprint: None,
-            ca_activation_at: None,
-            ca_retire_active_at: None,
-            active_gateway_identity_epoch: 1,
-            gateway_decision_epoch: 1,
-            next_gateway_identity_epoch: None,
-            next_transition_fingerprint: None,
-            last_aborted_transition: None,
-            active_gateway_tls_certificate: served.tls_certificate,
-            next_gateway_tls_certificate: None,
-            active_gateway_certificate: served.pq_certificate,
-            next_gateway_certificate: None,
-            activation_at: None,
-            retire_active_at: None,
-            published: false,
-            revoked: false,
-            revocation_epoch: 0,
-            service_rollback: None,
-            awaited_replacement: None,
+        ca_public_key.clone(),
+        astra_service_public_key,
+        ServedIdentityMaterials {
+            tls_certificate: served.tls_certificate,
+            pq_certificate: served.pq_certificate,
+            client_tls_ca: served.client_tls_ca,
         },
-        client_tls_ca: ClientTlsCaState {
-            ca_tls_epoch: 1,
-            active_client_tls_ca_certificate: domain_client_tls_ca,
-            next_client_tls_ca_certificate: None,
-            next_transition_fingerprint: None,
-            activation_at: None,
-            retire_active_at: None,
-        },
-        astra: AstraProfile {
-            authority_url: authority_url.to_string(),
-            webauthn_rp_id: webauthn_rp_id.to_string(),
-            astra_policy_fingerprint,
-            credential_registry_epoch: 1,
-            credential_bindings: Default::default(),
-            active_astra_service_public_key: astra_service_public_key,
-            next_astra_service_public_key: None,
-            next_service_key_transition_fingerprint: None,
-            astra_service_key_epoch: 1,
-            service_key_activation_at: None,
-            service_key_retire_active_at: None,
-            service_key_revocation_epoch: 0,
-            last_emergency_replacement_fingerprint: None,
-        },
-        issuer: None,
-        // Peers are not seeded from `network.toml`: admission records
-        // fingerprints, and the registry needs the leaves themselves — it has
-        // to *verify* signatures made by them, not merely compare. Each peer
-        // enters at its first staging.
-        peers: Default::default(),
-        ledger: TrustLedger::default(),
-    };
+        authority_url,
+        webauthn_rp_id,
+        client_tls_ca,
+    )?;
+    let server_name = state.gateway.server_name.clone();
 
     let registry = CertificateRegistry::bootstrap(path.clone(), state)
         .context("creating the certificate registry")?;
@@ -543,13 +490,197 @@ pub(crate) fn init_trust_domain(
     Ok(())
 }
 
+struct ServedIdentityMaterials {
+    tls_certificate: aether::certificates::encoding::DerCertificate,
+    pq_certificate: aether::key_negotiation::PqCertificate,
+    client_tls_ca: aether::certificates::encoding::DerCertificate,
+}
+
+fn initial_trust_domain_state(
+    trust_domain_id: aether::certificates::encoding::TrustDomainId,
+    ca_public_key: aether::certificates::encoding::MlDsa87PublicKey,
+    astra_service_public_key: aether::certificates::encoding::MlDsa87PublicKey,
+    served: ServedIdentityMaterials,
+    authority_url: &str,
+    webauthn_rp_id: &str,
+    client_tls_ca: Option<&std::path::Path>,
+) -> anyhow::Result<helios_provisioning::certificates::RegistryState> {
+    use aether::certificates::encoding::WireGuardKey;
+    use aether::certificates::state::{
+        AstraProfile, ClientTlsCaState, GatewayCertificateState, TrustLedger,
+    };
+    use helios_provisioning::certificates::RegistryState;
+
+    let ServedIdentityMaterials {
+        tls_certificate,
+        pq_certificate,
+        client_tls_ca: served_client_tls_ca,
+    } = served;
+    let gateway_wg_public_key = WireGuardKey::parse(&pq_certificate.wireguard_public_key)
+        .context("reading the WireGuard identity out of the served PQ leaf")?;
+    let server_name = pq_certificate.subject.clone();
+    let astra_policy_fingerprint = aether::certificates::AstraIssuancePolicy::standard(
+        trust_domain_id,
+        gateway_wg_public_key,
+        server_name.clone(),
+    )
+    .pin()
+    .context("building the pinned Astra issuance policy")?;
+    let domain_client_tls_ca = domain_client_tls_ca(client_tls_ca, served_client_tls_ca)?;
+
+    Ok(RegistryState {
+        trust_domain_id,
+        gateway: GatewayCertificateState {
+            trust_domain_id,
+            gateway_wg_public_key,
+            server_name,
+            ca_epoch: 1,
+            current_ca_public_key: ca_public_key,
+            next_ca_public_key: None,
+            next_ca_transition_fingerprint: None,
+            ca_activation_at: None,
+            ca_retire_active_at: None,
+            active_gateway_identity_epoch: 1,
+            gateway_decision_epoch: 1,
+            next_gateway_identity_epoch: None,
+            next_transition_fingerprint: None,
+            last_aborted_transition: None,
+            active_gateway_tls_certificate: tls_certificate,
+            next_gateway_tls_certificate: None,
+            active_gateway_certificate: pq_certificate,
+            next_gateway_certificate: None,
+            activation_at: None,
+            retire_active_at: None,
+            published: false,
+            revoked: false,
+            revocation_epoch: 0,
+            service_rollback: None,
+            awaited_replacement: None,
+        },
+        client_tls_ca: ClientTlsCaState {
+            ca_tls_epoch: 1,
+            active_client_tls_ca_certificate: domain_client_tls_ca,
+            next_client_tls_ca_certificate: None,
+            next_transition_fingerprint: None,
+            activation_at: None,
+            retire_active_at: None,
+        },
+        astra: AstraProfile {
+            authority_url: authority_url.to_string(),
+            webauthn_rp_id: webauthn_rp_id.to_string(),
+            astra_policy_fingerprint,
+            credential_registry_epoch: 1,
+            credential_bindings: Default::default(),
+            astra_service_key_epoch: 1,
+            active_astra_service_public_key: astra_service_public_key,
+            next_astra_service_public_key: None,
+            next_service_key_transition_fingerprint: None,
+            service_key_activation_at: None,
+            service_key_retire_active_at: None,
+            service_key_revocation_epoch: 0,
+            last_emergency_replacement_fingerprint: None,
+        },
+        issuer: None,
+        // Peers enter through admission, when their certificate fingerprints
+        // and signed leaves can be recorded together.
+        peers: Default::default(),
+        ledger: TrustLedger::default(),
+    })
+}
+
 #[cfg(test)]
 mod trust_domain_seeding_tests {
-    use super::domain_client_tls_ca;
-    use aether::certificates::encoding::DerCertificate;
+    use super::{domain_client_tls_ca, initial_trust_domain_state, trust_enrolment_view};
+    use aether::certificates::client::ClientCertificateGeneration;
+    use aether::certificates::encoding::{
+        generate_ml_dsa_87_keypair, DerCertificate, Fingerprint, TrustDomainId, WireGuardKey,
+    };
+    use aether::certificates::state::ClientCertificateState;
+    use helios_provisioning::certificates::{CertificateRegistry, PeerCertificates};
+
+    const AUTHORITY_URL: &str = "https://astra.example";
+    const RP_ID: &str = "astra.example";
 
     fn certificate(byte: u8) -> DerCertificate {
         DerCertificate::new(vec![0x30, 0x03, 0x02, 0x01, byte]).expect("certificate")
+    }
+
+    fn gateway_identity(wg_public_key: &str) -> super::ServedIdentityMaterials {
+        use aether::key_negotiation::{issue_pq_certificate, PqCertificate, PqCertificateRole};
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let (ca_private, _) = generate_ml_dsa_87_keypair().expect("CA keypair");
+        let (_, subject_public) = generate_ml_dsa_87_keypair().expect("leaf keypair");
+        let pq_certificate = issue_pq_certificate(
+            PqCertificate {
+                version: aether::key_negotiation::PQ_CERTIFICATE_VERSION,
+                serial: [1; 16],
+                subject: "gateway.example".into(),
+                issuer: "CA-PQ".into(),
+                role: PqCertificateRole::Gateway,
+                wireguard_public_key: wg_public_key.into(),
+                ml_dsa_87_public_key: STANDARD.encode(subject_public.as_bytes()),
+                not_before_unix: 0,
+                not_after_unix: 1_000_000,
+                ml_dsa_87_signature: String::new(),
+            },
+            &ca_private,
+        )
+        .expect("issue gateway leaf");
+        super::ServedIdentityMaterials {
+            tls_certificate: certificate(2),
+            pq_certificate,
+            client_tls_ca: certificate(1),
+        }
+    }
+
+    fn initial_state(
+        served: super::ServedIdentityMaterials,
+    ) -> helios_provisioning::certificates::RegistryState {
+        let (_, ca_public) = generate_ml_dsa_87_keypair().expect("CA keypair");
+        let (_, service_public) = generate_ml_dsa_87_keypair().expect("service keypair");
+        initial_trust_domain_state(
+            TrustDomainId::new([8; 16]).expect("trust domain"),
+            ca_public,
+            service_public,
+            served,
+            AUTHORITY_URL,
+            RP_ID,
+            None,
+        )
+        .expect("initial registry state")
+    }
+
+    fn registry_with_peer() -> (CertificateRegistry, tempfile::TempDir, WireGuardKey) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let peer_key = WireGuardKey::from_bytes([3; 32]);
+        let mut state = initial_state(gateway_identity(&key(9).to_base64()));
+        state.peers.insert(
+            peer_key.to_base64(),
+            PeerCertificates {
+                name: "workstation".into(),
+                state: ClientCertificateState::new(ClientCertificateGeneration {
+                    generation: 7,
+                    ca_tls_epoch: 1,
+                    tls_ca_certificate_fingerprint: Fingerprint::of(b"client CA"),
+                    tls_certificate_fingerprint: Fingerprint::of(b"client TLS"),
+                    pq_certificate_fingerprint: Fingerprint::of(b"client PQ"),
+                    not_before: 100,
+                    not_after: 10_000,
+                }),
+                active_pq_certificate: state.gateway.active_gateway_certificate.clone(),
+                staged_pq_certificate: None,
+                distribution: None,
+            },
+        );
+        let registry =
+            CertificateRegistry::bootstrap(directory.path().join("certificates.json"), state)
+                .expect("registry");
+        (registry, directory, peer_key)
+    }
+
+    fn key(seed: u8) -> WireGuardKey {
+        WireGuardKey::from_bytes([seed; 32])
     }
 
     /// The domain's own anchor wins over the admission CA that was served.
@@ -593,5 +724,168 @@ mod trust_domain_seeding_tests {
 
         let absent = directory.path().join("absent.der");
         assert!(domain_client_tls_ca(Some(&absent), certificate(1)).is_err());
+    }
+
+    #[test]
+    fn initial_registry_state_uses_the_served_identity_and_starts_closed() {
+        let wg = key(9);
+        let served = gateway_identity(&wg.to_base64());
+        let active_tls = served.tls_certificate.clone();
+        let active_pq = served.pq_certificate.clone();
+        let state = initial_state(served);
+
+        assert_eq!(
+            state.trust_domain_id,
+            TrustDomainId::new([8; 16]).expect("domain")
+        );
+        assert_eq!(state.gateway.gateway_wg_public_key, wg);
+        assert_eq!(state.gateway.server_name, "gateway.example");
+        assert_eq!(state.gateway.active_gateway_tls_certificate, active_tls);
+        assert_eq!(state.gateway.active_gateway_certificate, active_pq);
+        assert_eq!(state.gateway.ca_epoch, 1);
+        assert_eq!(state.gateway.active_gateway_identity_epoch, 1);
+        assert_eq!(state.gateway.gateway_decision_epoch, 1);
+        assert!(state.gateway.next_gateway_certificate.is_none());
+        assert!(state.gateway.next_gateway_tls_certificate.is_none());
+        assert_eq!(state.client_tls_ca.ca_tls_epoch, 1);
+        assert_eq!(
+            state.client_tls_ca.active_client_tls_ca_certificate,
+            certificate(1)
+        );
+        assert_eq!(state.astra.authority_url, AUTHORITY_URL);
+        assert_eq!(state.astra.webauthn_rp_id, RP_ID);
+        assert_eq!(state.astra.astra_service_key_epoch, 1);
+        let expected_policy = aether::certificates::AstraIssuancePolicy::standard(
+            state.trust_domain_id,
+            wg,
+            "gateway.example".into(),
+        )
+        .pin()
+        .expect("policy pin");
+        assert_eq!(
+            state.astra.astra_policy_fingerprint.fingerprint(),
+            expected_policy.fingerprint()
+        );
+        assert!(state.issuer.is_none());
+        assert!(state.peers.is_empty());
+    }
+
+    #[test]
+    fn invalid_bootstrap_arguments_are_named_before_gateway_files_are_read() {
+        let (_, ca_public) = generate_ml_dsa_87_keypair().expect("CA keypair");
+        let (_, service_public) = generate_ml_dsa_87_keypair().expect("service keypair");
+        let valid_domain = TrustDomainId::new([8; 16]).expect("domain").to_hex();
+        let certificate_path = std::path::Path::new("not-read-before-argument-validation");
+
+        let invalid_domain = super::init_trust_domain(
+            "not-a-domain-id",
+            &ca_public.to_base64(),
+            certificate_path,
+            &service_public.to_base64(),
+            AUTHORITY_URL,
+            RP_ID,
+            None,
+        )
+        .expect_err("invalid trust domain identifier is rejected");
+        assert!(format!("{invalid_domain:#}").contains("reading the trust domain identifier"));
+
+        let invalid_ca = super::init_trust_domain(
+            &valid_domain,
+            "%%%",
+            certificate_path,
+            &service_public.to_base64(),
+            AUTHORITY_URL,
+            RP_ID,
+            None,
+        )
+        .expect_err("invalid CA-PQ key is rejected");
+        assert!(format!("{invalid_ca:#}").contains("reading the CA-PQ public key"));
+
+        let invalid_service = super::init_trust_domain(
+            &valid_domain,
+            &ca_public.to_base64(),
+            certificate_path,
+            "%%%",
+            AUTHORITY_URL,
+            RP_ID,
+            None,
+        )
+        .expect_err("invalid Astra key is rejected");
+        assert!(format!("{invalid_service:#}").contains("reading the Astra service public key"));
+    }
+
+    #[test]
+    fn invalid_served_wireguard_identity_fails_before_client_ca_file_read() {
+        let mut served = gateway_identity(&key(9).to_base64());
+        served.pq_certificate.wireguard_public_key = "not-a-wireguard-key".into();
+        let (_, ca_public) = generate_ml_dsa_87_keypair().expect("CA keypair");
+        let (_, service_public) = generate_ml_dsa_87_keypair().expect("service keypair");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let missing_ca = directory.path().join("missing.der");
+
+        let error = initial_trust_domain_state(
+            TrustDomainId::new([8; 16]).expect("trust domain"),
+            ca_public,
+            service_public,
+            served,
+            AUTHORITY_URL,
+            RP_ID,
+            Some(&missing_ca),
+        )
+        .expect_err("the identity in the served leaf is authoritative");
+
+        assert!(error
+            .to_string()
+            .contains("WireGuard identity out of the served PQ leaf"));
+        assert!(!format!("{error:#}").contains("reading the domain client CA-TLS"));
+    }
+
+    #[test]
+    fn invalid_policy_identity_fails_before_client_ca_file_read() {
+        let mut served = gateway_identity(&key(9).to_base64());
+        served.pq_certificate.subject = "not a server name".into();
+        let (_, ca_public) = generate_ml_dsa_87_keypair().expect("CA keypair");
+        let (_, service_public) = generate_ml_dsa_87_keypair().expect("service keypair");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let missing_ca = directory.path().join("missing.der");
+
+        let error = initial_trust_domain_state(
+            TrustDomainId::new([8; 16]).expect("trust domain"),
+            ca_public,
+            service_public,
+            served,
+            AUTHORITY_URL,
+            RP_ID,
+            Some(&missing_ca),
+        )
+        .expect_err("the issuance policy must be valid before seeding");
+
+        assert!(format!("{error:#}").contains("building the pinned Astra issuance policy"));
+        assert!(!format!("{error:#}").contains("reading the domain client CA-TLS"));
+    }
+
+    #[test]
+    fn trust_enrolment_rejects_bad_and_unadmitted_keys_and_trims_valid_keys() {
+        let (registry, _directory, peer_key) = registry_with_peer();
+
+        let invalid = trust_enrolment_view(&registry, "%%%")
+            .expect_err("invalid keys are refused before peer lookup");
+        assert!(invalid.to_string().contains("invalid WireGuard public key"));
+
+        let absent = trust_enrolment_view(&registry, &key(4).to_base64())
+            .expect_err("unadmitted peers have no trust block");
+        assert!(absent
+            .to_string()
+            .contains("no such peer in the certificate registry"));
+
+        let view = trust_enrolment_view(&registry, &format!("  {}\n", peer_key.to_base64()))
+            .expect("the command trims the key it receives");
+        assert_eq!(
+            view.trust_domain_id,
+            registry.state().trust_domain_id.to_hex()
+        );
+        assert_eq!(view.client_generation, 7);
+        assert_eq!(view.astra_authority_url, AUTHORITY_URL);
+        assert_eq!(view.webauthn_rp_id, RP_ID);
     }
 }
