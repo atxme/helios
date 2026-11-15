@@ -253,6 +253,94 @@ fn readiness_marker_refuses_parent_creation_errors_without_a_partial_marker() {
     assert_eq!(std::fs::read(parent).expect("blocker remains"), b"blocker");
 }
 
+#[tokio::test(start_paused = true)]
+async fn api_readiness_wait_returns_when_ready_and_fails_after_its_deadline() {
+    let ready = AtomicBool::new(true);
+    wait_api_ready(&ready)
+        .await
+        .expect("a ready API releases the daemon immediately");
+
+    let unavailable = AtomicBool::new(false);
+    let error = wait_api_ready(&unavailable)
+        .await
+        .expect_err("the daemon must not report ready when its API never starts");
+    assert!(error.to_string().contains("did not reach its ready state"));
+}
+
+#[tokio::test]
+async fn update_status_prints_the_persisted_release_and_activation_state() {
+    const CHILD: &str = "HELIOS_TEST_UPDATE_STATUS_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        check_update(false)
+            .await
+            .expect("read the isolated update status");
+        return;
+    }
+
+    let directory = tempfile::tempdir().expect("temporary update staging directory");
+    let staging = directory.path();
+    std::fs::create_dir_all(staging.join("14")).expect("create staged release");
+    std::fs::write(
+        staging.join("state.json"),
+        serde_json::to_vec(&helios_update::UpdateState {
+            highest_confirmed_sequence: 13,
+            active_version: Some("3.4.2".into()),
+        })
+        .expect("encode update state"),
+    )
+    .expect("write update state");
+    std::fs::write(
+        staging.join("14/finalized.json"),
+        serde_json::to_vec(&helios_update::FinalizedRelease {
+            release_sequence: 14,
+            version: "3.4.3".into(),
+            sha256: "a".repeat(64),
+        })
+        .expect("encode staged release"),
+    )
+    .expect("write staged release");
+    std::fs::write(
+        staging.join("activate.json"),
+        serde_json::to_vec(&helios_update::ActivationRequest {
+            release_sequence: 14,
+            requested_at_unix: 1_000,
+            delay_seconds: 2,
+        })
+        .expect("encode activation request"),
+    )
+    .expect("write activation request");
+
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "orchestrator::tests::update_status_prints_the_persisted_release_and_activation_state",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("HELIOS_UPDATE_STAGING", staging)
+        .env("HELIOS_UPDATE_CHANNEL", "test-channel")
+        .output()
+        .expect("isolated update status test starts");
+
+    assert!(
+        output.status.success(),
+        "isolated update status command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("channel          : test-channel"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("active sequence  : 13"), "{stdout}");
+    assert!(stdout.contains("confirmed version: 3.4.2"), "{stdout}");
+    assert!(stdout.contains("staged releases  : 1"), "{stdout}");
+    assert!(
+        stdout.contains("activation       : sequence 14 pending"),
+        "{stdout}"
+    );
+}
+
 #[async_trait::async_trait]
 impl FirewallBackend for UnsupportedMssFirewall {
     fn capabilities(&self) -> FirewallCapabilities {
