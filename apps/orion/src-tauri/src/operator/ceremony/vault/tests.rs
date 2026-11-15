@@ -9,6 +9,9 @@ use super::*;
 use crate::operator::ceremony::run;
 use crate::operator::ceremony::tests::{no_key_was_asked, Domain};
 use aether::certificates::operator_session::OperationKind;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// Runs one vault gesture with the presses already abandoned.
 fn run_vault_gesture(
@@ -49,14 +52,18 @@ struct Folder(std::path::PathBuf);
 
 impl Folder {
     fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "orion-vault-{label}-{}-{}",
-            std::process::id(),
-            now_unix()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("folder");
-        Self(path)
+        loop {
+            let path = std::env::temp_dir().join(format!(
+                "orion-vault-{label}-{}-{}",
+                std::process::id(),
+                NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create vault test folder: {error}"),
+            }
+        }
     }
 
     fn vault_path(&self) -> std::path::PathBuf {
@@ -456,6 +463,108 @@ fn an_unknown_slot_is_refused_before_the_key() {
     refused_before_the_key(&published, Refusal::HandoffMismatch);
 }
 
+#[test]
+fn malformed_slot_identifiers_are_refused_before_loading_or_touching_a_key() {
+    let domain = Domain::new("remove-malformed");
+    for slot_id in ["", "not-hex", "00", "0123456789abcdef0123456789abcde"] {
+        let (outcome, published, artifacts) = run_vault_gesture(
+            crate::operator::VaultGesture::RemoveKey {
+                slot_id: slot_id.to_string(),
+            },
+            &domain.vault_path,
+        );
+
+        let error = outcome.expect_err("malformed slot identifier is refused");
+        assert!(error.contains("32 caractères hexadécimaux"), "{error}");
+        refused_before_the_key(&published, Refusal::HandoffMismatch);
+        assert!(artifacts.is_empty());
+    }
+}
+
+#[test]
+fn a_removal_shows_which_slot_and_role_will_be_removed_before_the_key() {
+    let domain = Domain::new("remove-manifest").full();
+    let vault = astra_operator::store::load(&domain.vault_path).expect("vault");
+    let removed = &vault.slots[0];
+    let slot_id = Id16::new(removed.slot_id).expect("slot").to_hex();
+    let removed_label = removed.label.clone();
+    let removed_role = crate::operator::KeyRole::of(removed.role).name();
+
+    let (outcome, published, _) = run_vault_gesture(
+        crate::operator::VaultGesture::RemoveKey {
+            slot_id: slot_id.clone(),
+        },
+        &domain.vault_path,
+    );
+
+    outcome.expect("abandoning the key prompt is not an operation failure");
+    let offered = published
+        .iter()
+        .find(|status| matches!(status.gesture, GestureState::AwaitingKey { .. }))
+        .expect("the opening key is requested");
+    assert_eq!(
+        offered.gesture,
+        GestureState::AwaitingKey {
+            index: 1,
+            of: 1,
+            purpose: KeyPurpose::OpenVault,
+        }
+    );
+    match offered
+        .manifest
+        .as_ref()
+        .expect("manifest precedes key request")
+    {
+        AstraManifest::KeyRemoval(manifest) => {
+            assert_eq!(manifest.slot_id, slot_id);
+            assert_eq!(manifest.label, removed_label);
+            assert_eq!(manifest.role, removed_role);
+        }
+        other => panic!("unexpected manifest: {other:?}"),
+    }
+    assert_eq!(
+        published.last().expect("abandonment status").gesture,
+        GestureState::Cancelled
+    );
+}
+
+#[test]
+fn marking_manifests_show_both_lost_and_restored_states_before_the_key() {
+    let domain = Domain::new("mark-manifest").with_document();
+    let slot_id = first_slot_id(&domain);
+
+    for lost in [true, false] {
+        let (outcome, published, _) = run_vault_gesture(
+            crate::operator::VaultGesture::MarkKey {
+                slot_id: slot_id.clone(),
+                lost,
+            },
+            &domain.vault_path,
+        );
+        outcome.expect("abandoning the key prompt is not an operation failure");
+        let offered = published
+            .iter()
+            .find(|status| matches!(status.gesture, GestureState::AwaitingKey { .. }))
+            .expect("the signing key is requested");
+        match offered
+            .manifest
+            .as_ref()
+            .expect("manifest precedes key request")
+        {
+            AstraManifest::KeyMarking(manifest) => {
+                assert_eq!(manifest.slot_id, slot_id);
+                assert_eq!(manifest.lost, lost);
+                assert_eq!(manifest.label, "quotidienne");
+            }
+            other => panic!("unexpected manifest: {other:?}"),
+        }
+        assert_eq!(
+            published.last().expect("abandonment status").gesture,
+            GestureState::Cancelled
+        );
+    }
+}
+
 /// The addition names the key it will register, then asks first for a key
 /// the vault already opens for.
 #[test]
@@ -761,6 +870,41 @@ fn refusals_of_the_bootstrap_are_named() {
     ] {
         assert_eq!(refusal_of_setup(setup), window);
         assert_eq!(refusal_of(&anyhow::Error::from(setup)), window);
+    }
+}
+
+#[test]
+fn every_vault_setup_refusal_maps_to_its_closed_operator_refusal() {
+    let cases = [
+        (SetupRefusal::VaultExists, Refusal::VaultExists),
+        (
+            SetupRefusal::LocationUnavailable,
+            Refusal::LocationUnavailable,
+        ),
+        (SetupRefusal::VaultFull, Refusal::VaultFull),
+        (SetupRefusal::MinimumKeys, Refusal::MinimumKeys),
+        (SetupRefusal::UnknownSlot, Refusal::HandoffMismatch),
+        (SetupRefusal::KeyBeingRemoved, Refusal::KeyBeingRemoved),
+        (SetupRefusal::KeyRevoked, Refusal::HandoffMismatch),
+        (
+            SetupRefusal::GatewayIdentityMissing,
+            Refusal::GatewayIdentityMissing,
+        ),
+        (SetupRefusal::DomainComplete, Refusal::DomainComplete),
+        (SetupRefusal::OtherGateway, Refusal::OtherGateway),
+        (
+            SetupRefusal::BootstrapRequestInvalid,
+            Refusal::BootstrapRequestInvalid,
+        ),
+        (SetupRefusal::SignerRevoked, Refusal::SignerRevoked),
+        (SetupRefusal::PlanChanged, Refusal::DomainChanged),
+        (SetupRefusal::RotationInFlight, Refusal::RotationInFlight),
+    ];
+
+    for (setup, expected) in cases {
+        assert_eq!(refusal_of_setup(setup), expected, "{setup}");
+        let nested = anyhow::Error::from(setup).context("checking the vault");
+        assert_eq!(refusal_of(&nested), expected, "{setup}");
     }
 }
 
