@@ -616,6 +616,14 @@ dans Orion ») et, pour les suivis, dans `ROADMAP.md` (F14-a à F14-f).
   couverte. Deux postes tenant un même domaine peuvent écraser une copie plus
   récente d'Astra, seul le domaine étant contrôlé. `write_domain_relay` n'est
   pas couvert par la garde d'écrasement.
+  *Amendement du 15 novembre 2026 (F14-f) : la révision du coffre, en clair et
+  hors du scellement, fait refuser par Astra (`412`) une copie plus ancienne ou
+  divergente ; « Remplacer quand même » lève ce refus, et « Exporter le coffre »
+  fait une sauvegarde hors de la gateway. `write_domain_relay` attend un coffre
+  scellé comme les gestes sur les clés. Restent : un administrateur du tunnel
+  peut remplacer la copie et gonfler le compteur, une génération précédente
+  gardée (conception `docs/superpowers/specs/2026-11-15-f14-f-copie-coffre-design.md`,
+  §4 et §6).*
 - **De `not_after` à la re-délégation**, l'émission en ligne est refusée (§5.8).
 - Une écriture qui échoue après son renommage, suivie de la mort de la
   campagne avant un rejeu, efface le journal alors que le fichier d'Astra tient
