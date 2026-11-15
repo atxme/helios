@@ -81,6 +81,18 @@ describe('VaultPanel', () => {
     expect(api.operatorExportVault).toHaveBeenCalledTimes(1)
   })
 
+  it('without_the_native_picker_the_export_is_not_offered', async () => {
+    api.operatorVaultLocation.mockResolvedValue({
+      path: 'C:\\astra',
+      is_default: true,
+      picker_available: false,
+      error: null,
+    })
+    render(<VaultPanel onCeremony={vi.fn()} />)
+    expect(await screen.findByText('YubiKey bureau')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Exporter le coffre' })).toBeNull()
+  })
+
   it('a_cancelled_export_shows_nothing', async () => {
     api.operatorExportVault.mockResolvedValue(false)
     render(<VaultPanel onCeremony={vi.fn()} />)

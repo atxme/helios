@@ -135,7 +135,7 @@ export function VaultPanel({ onCeremony }: { onCeremony: (status: OperatorStatus
               Emplacement par défaut
             </Button>
           )}
-          {overview?.exists && (
+          {location.picker_available && overview?.exists && (
             <Button
               size="small"
               sx={{ minHeight: 26, fontSize: 11 }}
