@@ -625,4 +625,202 @@ none
 ";
         assert_eq!(parse_window_state(output).unwrap(), WindowState::None);
     }
+
+    /// Keep the fake command environment in a child test process: changing PATH
+    /// in this process would race with the rest of the parallel test suite.
+    #[cfg(unix)]
+    #[test]
+    fn update_run_preflight_and_order_use_mock_subprocesses() {
+        const CHILD: &str = "HELIOS_UPDATE_MOCK_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            run_mocked_scenario();
+            return;
+        }
+        // Do not shadow a real installed gateway daemon if this suite happens
+        // to run on a deployed gateway.
+        if std::path::Path::new(INSTALLED_HELIOSD).is_file() {
+            return;
+        }
+
+        use std::{os::unix::fs::PermissionsExt as _, process::Command as ProcessCommand};
+
+        let executable = std::env::current_exe().expect("test executable path");
+        for scenario in [
+            "sealed_no_updates",
+            "readiness_unavailable",
+            "already_armed",
+            "firmware_refused",
+            "unsealed_kernel_upgrade",
+            "sealed_kernel_reboot_not_occurred",
+        ] {
+            let directory = tempfile::tempdir().expect("mock command directory");
+            let path = directory.path().join("PATH");
+            std::fs::create_dir(&path).expect("create mock PATH");
+            let log = directory.path().join("commands.log");
+            for (name, script) in [
+                (
+                    "sudo",
+                    "#!/bin/sh\ncase \"${1-}\" in DEBIAN_FRONTEND=*) shift;; esac\ncase \"${1-}\" in apt-get|heliosd) exec \"$@\";; *) exit 125;; esac\n",
+                ),
+                (
+                    "sh",
+                    "#!/bin/sh\nif [ \"${1-}\" = -c ] && [ \"${2-}\" = 'command -v heliosd' ]; then printf '%s\\n' heliosd; else exit 125; fi\n",
+                ),
+                (
+                    "apt-get",
+                    "#!/bin/sh\nprintf 'apt-get %s\\n' \"$*\" >> \"$MOCK_LOG\"\nif [ \"$*\" = '-s upgrade' ]; then printf '%s\\n' \"$MOCK_PENDING\"; fi\n",
+                ),
+                (
+                    "heliosd",
+                    "#!/bin/sh\nprintf 'heliosd %s\\n' \"$*\" >> \"$MOCK_LOG\"\ncase \"$*\" in\n  'tpm sealing-status') printf '%s\\n' \"$MOCK_SEALING\";;\n  'tpm update-status') printf '%s\\n' \"$MOCK_WINDOW\";;\n  'tpm update-readiness') printf '%s\\n' \"$MOCK_READINESS\";;\n  'tpm prepare-update --reboot') exit 0;;\n  *) exit 64;;\nesac\n",
+                ),
+            ] {
+                let executable_path = path.join(name);
+                std::fs::write(&executable_path, script).expect("write mock command");
+                let mut permissions = std::fs::metadata(&executable_path)
+                    .expect("mock command metadata")
+                    .permissions();
+                permissions.set_mode(0o700);
+                std::fs::set_permissions(&executable_path, permissions)
+                    .expect("make mock command executable");
+            }
+
+            let output = ProcessCommand::new(&executable)
+                .args([
+                    "--exact",
+                    "update::tests::update_run_preflight_and_order_use_mock_subprocesses",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("HELIOS_UPDATE_MOCK_SCENARIO", scenario)
+                .env("MOCK_LOG", &log)
+                .env("MOCK_PENDING", mock_pending(scenario))
+                .env("MOCK_SEALING", mock_sealing(scenario))
+                .env("MOCK_WINDOW", mock_window(scenario))
+                .env("MOCK_READINESS", mock_readiness(scenario))
+                .env("PATH", path)
+                .output()
+                .expect("spawn isolated mock scenario");
+            assert!(
+                output.status.success(),
+                "scenario {scenario} failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn run_mocked_scenario() {
+        let scenario = std::env::var("HELIOS_UPDATE_MOCK_SCENARIO")
+            .expect("scenario is supplied by the parent test");
+        let result = run(true);
+        let log = std::fs::read_to_string(std::env::var("MOCK_LOG").expect("mock log path"))
+            .expect("read mock command log");
+
+        let expected_commands: &[&str] = match scenario.as_str() {
+            "sealed_no_updates" => {
+                result.expect("sealed gateway with no pending packages is a no-op");
+                &[
+                    "heliosd tpm sealing-status",
+                    "heliosd tpm update-status",
+                    "heliosd tpm update-readiness",
+                    "apt-get update",
+                    "apt-get -s upgrade",
+                ]
+            }
+            "readiness_unavailable" => {
+                let error = result.expect_err("unavailable TPM must stop before apt");
+                assert!(error
+                    .to_string()
+                    .contains("this boot cannot arm an update window"));
+                &[
+                    "heliosd tpm sealing-status",
+                    "heliosd tpm update-status",
+                    "heliosd tpm update-readiness",
+                ]
+            }
+            "already_armed" => {
+                let error = result.expect_err("an armed window must refuse a second run");
+                assert!(error.to_string().contains("a window is already armed"));
+                &["heliosd tpm sealing-status", "heliosd tpm update-status"]
+            }
+            "firmware_refused" => {
+                let error = result.expect_err("PCR 0/7 packages must be refused");
+                assert!(error
+                    .downcast_ref::<crate::firmware::FirmwareError>()
+                    .is_some());
+                &[
+                    "heliosd tpm sealing-status",
+                    "heliosd tpm update-status",
+                    "heliosd tpm update-readiness",
+                    "apt-get update",
+                    "apt-get -s upgrade",
+                ]
+            }
+            "unsealed_kernel_upgrade" => {
+                result.expect("unsealed gateway can upgrade without a window");
+                &[
+                    "heliosd tpm sealing-status",
+                    "apt-get update",
+                    "apt-get -s upgrade",
+                    "apt-get -y upgrade",
+                ]
+            }
+            "sealed_kernel_reboot_not_occurred" => {
+                let error = result.expect_err("returning from prepare-update means no reboot");
+                assert!(error.to_string().contains("machine did not reboot"));
+                &[
+                    "heliosd tpm sealing-status",
+                    "heliosd tpm update-status",
+                    "heliosd tpm update-readiness",
+                    "apt-get update",
+                    "apt-get -s upgrade",
+                    "apt-get -y upgrade",
+                    "heliosd tpm prepare-update --reboot",
+                ]
+            }
+            other => panic!("unknown mock scenario {other}"),
+        };
+        let actual_commands: Vec<_> = log.lines().collect();
+        assert_eq!(actual_commands, expected_commands, "scenario {scenario}");
+    }
+
+    #[cfg(unix)]
+    fn mock_pending(scenario: &str) -> &'static str {
+        match scenario {
+            "firmware_refused" => "Inst secureboot-db [old] (new)",
+            "unsealed_kernel_upgrade" | "sealed_kernel_reboot_not_occurred" => {
+                "Inst linux-image-amd64 [old] (new)"
+            }
+            _ => "",
+        }
+    }
+
+    #[cfg(unix)]
+    fn mock_sealing(scenario: &str) -> &'static str {
+        if scenario == "unsealed_kernel_upgrade" {
+            "disabled"
+        } else {
+            "enabled"
+        }
+    }
+
+    #[cfg(unix)]
+    fn mock_window(scenario: &str) -> &'static str {
+        if scenario == "already_armed" {
+            "armed"
+        } else {
+            "none"
+        }
+    }
+
+    #[cfg(unix)]
+    fn mock_readiness(scenario: &str) -> &'static str {
+        if scenario == "readiness_unavailable" {
+            "unavailable"
+        } else {
+            "ready"
+        }
+    }
 }
