@@ -337,6 +337,8 @@ struct SaveDialog {
     /// Pairs of NUL-terminated strings, ended by an empty one, as the dialog reads them.
     filter: &'static str,
     extension: &'static str,
+    /// The dialog's `OFN_*` flags, besides the ones every dialog here sets.
+    flags: u32,
     /// Said, with the dialog's error code, when the dialog itself fails.
     failure: &'static str,
 }
@@ -347,6 +349,8 @@ const LOCATION_DIALOG: SaveDialog = SaveDialog {
     title: "Emplacement du coffre opérateur",
     filter: "Coffre opérateur (authority-vault.json)\0authority-vault.json\0\0",
     extension: "json",
+    // Choosing an existing vault is the usual case and nothing is written here.
+    flags: 0,
     failure: "la boîte de choix de l'emplacement du coffre a échoué",
 };
 
@@ -356,6 +360,8 @@ const EXPORT_DIALOG: SaveDialog = SaveDialog {
     title: "Exporter le coffre opérateur",
     filter: "Coffre opérateur (*.json)\0*.json\0\0",
     extension: "json",
+    // The export writes: Windows asks before replacing a file.
+    flags: windows_sys::Win32::UI::Controls::Dialogs::OFN_OVERWRITEPROMPT,
     failure: "la boîte d'export du coffre a échoué",
 };
 
@@ -454,7 +460,7 @@ fn save_dialog(
         // working directory in the folder browsed, and a process whose
         // working directory is on a removable medium holds that medium — the
         // one the vault is often chosen on could then not be ejected.
-        Flags: OFN_PATHMUSTEXIST | OFN_NOREADONLYRETURN | OFN_NOCHANGEDIR,
+        Flags: OFN_PATHMUSTEXIST | OFN_NOREADONLYRETURN | OFN_NOCHANGEDIR | dialog.flags,
         ..Default::default()
     };
     // SAFETY: `request` and the buffers it points at are alive for the call;

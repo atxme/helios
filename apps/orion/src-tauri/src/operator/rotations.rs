@@ -363,18 +363,49 @@ pub fn export_file_name(now: u64) -> Option<String> {
 
 /// Writes a copy of the vault at `target`: the bytes on disk, never opened, written
 /// privately and atomically. A target that resolves to the vault itself is refused, under
-/// any spelling of its path, so the export cannot overwrite the vault it copies.
+/// any spelling of its path, so the export cannot overwrite the vault it copies; so is a
+/// target that is one of the files kept beside the vault (relay, credentials, rotation
+/// journal, prepared record, legacy CA-PQ record), which can hold the only copy of a state.
 #[cfg(any(windows, test))]
 pub fn export_vault(vault_path: &Path, target: &Path) -> Result<(), String> {
     let vault = std::fs::canonicalize(vault_path)
         .map_err(|error| format!("lecture du coffre : {error}"))?;
-    if resolved_target(target)? == vault {
+    let resolved = resolved_target(target)?;
+    if resolved == vault {
         return Err("le coffre ne peut pas être exporté sur lui-même".to_string());
+    }
+    if is_companion_file(&vault, &resolved) {
+        return Err("ce fichier est conservé à côté du coffre : choisir un autre nom".to_string());
     }
     let bytes =
         std::fs::read(vault_path).map_err(|error| format!("lecture du coffre : {error}"))?;
     aether::private_file::write_private_atomic(target, &bytes)
         .map_err(|error| format!("écriture de {} : {error}", target.display()))
+}
+
+/// Whether `resolved` is, by folder and name (ASCII case ignored, as Windows does), one of the
+/// files kept beside `vault`.
+#[cfg(any(windows, test))]
+fn is_companion_file(vault: &Path, resolved: &Path) -> bool {
+    let beside = [
+        astra_operator::handoff::path_beside(vault),
+        credentials::path_beside(vault),
+        rotation_journal::path_beside(vault),
+        prepared::path_beside(vault),
+        vault
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(rotation_journal::LEGACY_CA_PQ_JOURNAL_FILE),
+    ];
+    let (Some(folder), Some(name)) = (resolved.parent(), resolved.file_name()) else {
+        return false;
+    };
+    beside.iter().any(|companion| {
+        companion.parent() == Some(folder)
+            && companion
+                .file_name()
+                .is_some_and(|companion| companion.eq_ignore_ascii_case(name))
+    })
 }
 
 /// Where `target` lands, with links and `.`/`..` resolved: the file itself when it exists,
@@ -1007,6 +1038,37 @@ mod export_tests {
             assert_eq!(error, "le coffre ne peut pas être exporté sur lui-même");
             assert_eq!(std::fs::read(&vault).expect("vault"), b"vault");
         }
+    }
+
+    #[test]
+    fn export_refuses_every_file_kept_beside_the_vault() {
+        let dir = scratch("companions");
+        let vault = dir.join(VAULT_FILE_NAME);
+        std::fs::write(&vault, b"vault").expect("vault");
+        let companions = [
+            astra_operator::handoff::path_beside(&vault),
+            credentials::path_beside(&vault),
+            rotation_journal::path_beside(&vault),
+            prepared::path_beside(&vault),
+            dir.join(rotation_journal::LEGACY_CA_PQ_JOURNAL_FILE),
+            dir.join("sub")
+                .join("..")
+                .join(credentials::CREDENTIALS_FILE),
+        ];
+        for target in companions {
+            std::fs::write(&target, b"companion").expect("companion");
+            let error = export_vault(&vault, &target).expect_err("refused");
+            assert_eq!(
+                error,
+                "ce fichier est conservé à côté du coffre : choisir un autre nom"
+            );
+            assert_eq!(std::fs::read(&target).expect("companion"), b"companion");
+        }
+        // Another name in the same folder is still an export.
+        export_vault(&vault, &dir.join("authority-vault-2026-11-15.json")).expect("exported");
+        // The same name in another folder is not a companion.
+        export_vault(&vault, &dir.join("sub").join(credentials::CREDENTIALS_FILE))
+            .expect("exported elsewhere");
     }
 
     #[test]
