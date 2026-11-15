@@ -4387,6 +4387,45 @@ fn the_transition_file_is_read_beside_the_vault_while_the_applied_journal_lasts(
 }
 
 #[test]
+fn the_transition_file_is_withheld_once_the_relay_names_an_origin() {
+    let bench = bench_without_origin();
+    let vault = Ok(bench.path.clone());
+    let gateway = GatewayOnly::of(&bench);
+    gateway.unreachable_install.store(true, Ordering::SeqCst);
+    let ran = bench.drive_against(
+        &gateway,
+        RotationGesture::ReplaceCaPqWithoutCampaign,
+        Bench::all_the_way,
+    );
+    let [offered] = ran.artifacts.as_slice() else {
+        panic!("one transition offered");
+    };
+    assert_eq!(
+        rotations::read_transition_file(&vault).as_ref(),
+        Some(offered)
+    );
+
+    // The relay gains an origin: the transition is no longer the operator's to pose.
+    let relay_path = handoff::path_beside(&bench.path);
+    let mut relay = bench.relay();
+    relay.astra_authority_url = Some(AUTHORITY_URL.into());
+    handoff::save(&relay_path, &relay).expect("relay saved");
+    assert_eq!(
+        rotations::read_transition_file(&vault),
+        None,
+        "origin named"
+    );
+
+    // A relay that cannot be read is fail-closed as well.
+    std::fs::remove_file(&relay_path).expect("relay removed");
+    assert_eq!(
+        rotations::read_transition_file(&vault),
+        None,
+        "relay unreadable"
+    );
+}
+
+#[test]
 fn a_campaign_journal_offers_no_transition_file() {
     let campaign = bench_with_origin(true);
     campaign

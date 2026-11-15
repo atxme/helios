@@ -372,7 +372,8 @@ export function RotationsPanel({
             </Button>
             {row.action === 'resume' &&
               overview.journal?.withoutCampaign === true &&
-              overview.journal.stage === 'applied' && (
+              overview.journal.stage === 'applied' &&
+              overview.relayNamesOrigin === false && (
                 <>
                   <Button
                     size="small"

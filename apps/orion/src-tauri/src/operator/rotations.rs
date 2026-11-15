@@ -580,11 +580,16 @@ pub fn transition_artifact(journal: &RotationJournal) -> Option<OperatorArtifact
 /// The transition file of a rotation without a campaign whose vault has moved and whose
 /// gateway has not taken it, read beside the vault: no tunnel, no key, no session. The
 /// file stays downloadable as long as that journal does, across restarts. Nothing for any
-/// other journal, and nothing for a journal that cannot be read.
+/// other journal, and nothing for a journal that cannot be read. Nothing either once the
+/// relay names an Astra origin, or when the relay cannot be read: the operator poses the
+/// transition by hand only in a domain without Astra.
 pub fn read_transition_file(
     vault_path: &Result<std::path::PathBuf, String>,
 ) -> Option<OperatorArtifact> {
     let path = vault_path.as_ref().ok()?;
+    if relay_names_origin(path) != Some(false) {
+        return None;
+    }
     let journal = rotation_journal::load(&rotation_journal::path_beside(path))
         .ok()
         .flatten()?;

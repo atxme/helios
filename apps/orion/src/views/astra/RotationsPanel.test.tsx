@@ -543,7 +543,7 @@ describe('the transition file of a rotation without a campaign', () => {
   const BUTTON = 'Télécharger la transition'
 
   it('is offered by the resume row only for an applied journal without a campaign', async () => {
-    await show(overview({ resumable: true, journal: journal() }))
+    await show(overview({ resumable: true, relayNamesOrigin: false, journal: journal() }))
     expect(screen.getByRole('button', { name: BUTTON })).toBeTruthy()
     cleanup()
     for (const other of [
@@ -551,12 +551,22 @@ describe('the transition file of a rotation without a campaign', () => {
       journal({ stage: 'installed' }),
       journal({ withoutCampaign: false }),
     ]) {
-      await show(overview({ resumable: true, journal: other }))
+      await show(overview({ resumable: true, relayNamesOrigin: false, journal: other }))
       expect(screen.queryByRole('button', { name: BUTTON })).toBeNull()
       cleanup()
     }
-    await show(overview({ resumable: true, journal: null }))
+    await show(overview({ resumable: true, relayNamesOrigin: false, journal: null }))
     expect(screen.queryByRole('button', { name: BUTTON })).toBeNull()
+  })
+
+  it('stays shut unless the relay is known to name no origin', async () => {
+    for (const relayNamesOrigin of [true, null] as const) {
+      await show(overview({ resumable: true, relayNamesOrigin, journal: journal() }))
+      expect(screen.queryByRole('button', { name: BUTTON })).toBeNull()
+      cleanup()
+    }
+    await show(overview({ resumable: true, relayNamesOrigin: false, journal: journal() }))
+    expect(screen.getByRole('button', { name: BUTTON })).toBeTruthy()
   })
 
   it('saves what the backend reads beside the vault, with no ceremony', async () => {
@@ -570,7 +580,9 @@ describe('the transition file of a rotation without a campaign', () => {
     const revokeObjectURL = vi.fn()
     Object.assign(URL, { createObjectURL, revokeObjectURL })
     const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
-    await show(overview({ resumable: true, journal: journal(), tunnel: false }))
+    await show(
+      overview({ resumable: true, relayNamesOrigin: false, journal: journal(), tunnel: false }),
+    )
     fireEvent.click(screen.getByRole('button', { name: BUTTON }))
     await waitFor(() => expect(click).toHaveBeenCalled())
     expect(api.operatorRotationTransitionFile).toHaveBeenCalledTimes(1)
@@ -580,7 +592,7 @@ describe('the transition file of a rotation without a campaign', () => {
 
   it('says so when there is nothing to download', async () => {
     api.operatorRotationTransitionFile.mockResolvedValue(null)
-    await show(overview({ resumable: true, journal: journal() }))
+    await show(overview({ resumable: true, relayNamesOrigin: false, journal: journal() }))
     fireEvent.click(screen.getByRole('button', { name: BUTTON }))
     expect(await screen.findByText('Aucune transition à télécharger')).toBeTruthy()
   })
