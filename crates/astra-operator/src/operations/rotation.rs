@@ -1192,7 +1192,12 @@ impl CaTlsFinish {
         }
         ensure_vault_holds(&vault, &opening, &incoming)?;
         match signing::advance_ca_tls(&mut vault, &opening, now)? {
-            CaTlsAdvance::Rotated { .. } => store::save(vault_path, &vault)?,
+            CaTlsAdvance::Rotated { .. } => {
+                store::save(vault_path, &vault)?;
+                // The save wrote a revision of its own: the relay names the vault
+                // as it landed.
+                vault = store::load(vault_path)?;
+            }
             CaTlsAdvance::Idle => {}
             CaTlsAdvance::Awaiting { at } => return Err(FinishRefusal::NotYet { at }.into()),
         }

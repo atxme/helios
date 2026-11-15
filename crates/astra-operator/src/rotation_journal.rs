@@ -514,10 +514,14 @@ pub fn apply_local(vault_path: &Path, journal: &mut RotationJournal) -> Result<(
         // Built first: a journal that cannot name it moves nothing.
         let record = promotion_record(journal)?;
         store::save(vault_path, &next.vault)?;
+        // The save writes a revision of its own, so the relay names the vault as
+        // it landed, not the copy the journal carried.
+        let mut relay = next.handoff.clone();
+        relay.adopt(&store::load(vault_path)?)?;
         if let Some(registry) = &next.credentials {
             credentials::save(&credentials::path_beside(vault_path), registry)?;
         }
-        handoff::save(&handoff::path_beside(vault_path), &next.handoff)?;
+        handoff::save(&handoff::path_beside(vault_path), &relay)?;
         if let Some(record) = record {
             prepared::save(&prepared::path_beside(vault_path), &record)?;
         }
@@ -1060,6 +1064,7 @@ mod tests {
                 wrapped_master: format!("maître enveloppé {seed}"),
             }],
             sealed_payload: format!("corps scellé {seed}"),
+            revision: 0,
         }
     }
 
@@ -1898,22 +1903,29 @@ mod tests {
 
     // Applying.
 
-    fn assert_applied(place: &Place, applied: &RotationJournal) {
+    fn assert_applied(place: &Place, applied: &RotationJournal, replaced: u64) {
         let next = next_local();
         assert_eq!(applied.stage, JournalStage::Applied);
         assert_eq!(applied.next, None);
+        let landed = AuthorityVault {
+            revision: next.vault.revision.max(replaced).saturating_add(1),
+            ..next.vault.clone()
+        };
         assert_eq!(
             crate::store::load(&place.vault_path).expect("vault"),
-            next.vault
+            landed
         );
         assert_eq!(
             crate::credentials::load(&crate::credentials::path_beside(&place.vault_path))
                 .expect("credentials"),
             next.credentials
         );
+        // The relay names the vault as it landed, and is otherwise the journal's.
+        let mut relay = next.handoff.clone();
+        relay.vault_fingerprint = landed.fingerprint().expect("fingerprint").to_hex();
         assert_eq!(
             crate::handoff::load(&crate::handoff::path_beside(&place.vault_path)).expect("relay"),
-            next.handoff
+            relay
         );
         assert_eq!(
             load(&place.journal_path).expect("load").as_ref(),
@@ -1948,9 +1960,27 @@ mod tests {
                 )
                 .expect("relay");
             }
+            let replaced = crate::store::revision_on_disk(&place.vault_path);
             apply_local(&place.vault_path, &mut accepted).expect("apply");
-            assert_applied(&place, &accepted);
+            assert_applied(&place, &accepted, replaced);
         }
+    }
+
+    /// The vault applied from the journal is written above the one it replaces,
+    /// even though the journal's copy was built at revision zero.
+    #[test]
+    fn apply_local_lands_above_the_vault_it_replaces() {
+        let place = place();
+        for _ in 0..3 {
+            crate::store::save(&place.vault_path, &vault(1)).expect("vault");
+        }
+        assert_eq!(crate::store::revision_on_disk(&place.vault_path), 4);
+        let mut accepted = journal(JournalStage::Accepted);
+        save(&place.journal_path, &accepted).expect("save");
+
+        apply_local(&place.vault_path, &mut accepted).expect("apply");
+
+        assert_eq!(crate::store::revision_on_disk(&place.vault_path), 5);
     }
 
     /// Once applied, replaying must not touch the vault a later gesture may

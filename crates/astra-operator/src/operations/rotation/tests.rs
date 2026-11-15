@@ -27,6 +27,15 @@ use crate::signing::{self, CampaignApprovalSession};
 use crate::tunnel::admin_refusal;
 use crate::{credentials, documents, handoff, store};
 
+/// `next` as `store::save` lands it: one revision past the newer of the copy and
+/// the file it replaces, and nothing else changed.
+fn landed(next: &AuthorityVault, replaced: u64) -> AuthorityVault {
+    AuthorityVault {
+        revision: next.revision.max(replaced).saturating_add(1),
+        ..next.clone()
+    }
+}
+
 fn terms() -> RotationTerms {
     RotationTerms {
         existing_operation: None,
@@ -1280,6 +1289,7 @@ fn the_journal_is_written_before_any_deposit() {
 fn a_rotation_goes_from_its_signature_to_the_end_with_no_key() {
     for kind in [RotationKind::CaPq, RotationKind::CaTls] {
         let domain = domain();
+        let replaced = store::revision_on_disk(&domain.path);
         let mut journal = domain.signed(kind);
         let touches = domain.touches();
         let next = journal.next.clone().expect("next");
@@ -1290,8 +1300,17 @@ fn a_rotation_goes_from_its_signature_to_the_end_with_no_key() {
         assert_eq!(step, ResumeStep::Finished);
         assert_eq!(domain.touches(), touches);
         assert_eq!(domain.journal_on_disk(), None);
-        assert_eq!(store::load(&domain.path).expect("vault"), next.vault);
-        assert_eq!(domain.relay(), next.handoff);
+        assert_eq!(
+            store::load(&domain.path).expect("vault"),
+            landed(&next.vault, replaced)
+        );
+        // The relay names the vault as it landed, and is otherwise the journal's.
+        let mut relay = next.handoff.clone();
+        relay.vault_fingerprint = landed(&next.vault, replaced)
+            .fingerprint()
+            .expect("fingerprint")
+            .to_hex();
+        assert_eq!(domain.relay(), relay);
     }
 }
 
@@ -1361,6 +1380,7 @@ fn a_finished_client_tls_rotation_leaves_the_incoming_anchor_for_the_promotion()
 #[test]
 fn a_stop_inside_apply_local_replays_to_the_same_record() {
     let domain = domain();
+    let replaced = store::revision_on_disk(&domain.path);
     let mut journal = domain.signed(RotationKind::CaTls);
     let next = journal.next.clone().expect("next");
     rotation_journal::record_accepted(&domain.path, &mut journal).expect("accepted");
@@ -1374,7 +1394,10 @@ fn a_stop_inside_apply_local_replays_to_the_same_record() {
     let remote = Remote::watching(&domain.path);
     advance(&remote, &domain.path, &mut journal, NOW).expect_err("stopped");
     assert_eq!(domain.journal_on_disk(), Some(accepted.clone()));
-    assert_eq!(store::load(&domain.path).expect("vault"), next.vault);
+    assert_eq!(
+        store::load(&domain.path).expect("vault"),
+        landed(&next.vault, replaced)
+    );
     assert!(!remote.called("install_client_tls_ca_transition"));
     std::fs::remove_dir(&record_path).expect("out of the way");
 
@@ -1467,9 +1490,11 @@ fn accepted_runs_apply_install_copy_in_that_order() {
         (RotationKind::CaTls, "install_client_tls_ca_transition"),
     ] {
         let domain = domain();
+        let replaced = store::revision_on_disk(&domain.path);
         let mut journal = domain.signed(kind);
         rotation_journal::record_accepted(&domain.path, &mut journal).expect("accepted");
-        let next_vault = journal.next.as_ref().expect("next").vault.fingerprint();
+        let next_vault =
+            landed(&journal.next.as_ref().expect("next").vault, replaced).fingerprint();
         let remote = Remote::watching(&domain.path);
 
         let step = advance(&remote, &domain.path, &mut journal, NOW).expect("advanced");
@@ -1600,6 +1625,7 @@ fn a_transient_status_on_the_deposit_keeps_the_rotation() {
 fn a_500_with_nothing_held_keeps_the_rotation_and_the_replay_lands() {
     for kind in [RotationKind::CaPq, RotationKind::CaTls] {
         let domain = domain();
+        let replaced = store::revision_on_disk(&domain.path);
         let mut journal = domain.signed(kind);
         let before = journal.clone();
         let next = journal.next.clone().expect("next");
@@ -1622,7 +1648,10 @@ fn a_500_with_nothing_held_keeps_the_rotation_and_the_replay_lands() {
         let step = advance(&remote, &domain.path, &mut resumed, NOW).expect("advanced");
 
         assert_eq!(step, ResumeStep::Finished, "{kind:?}");
-        assert_eq!(store::load(&domain.path).expect("vault"), next.vault);
+        assert_eq!(
+            store::load(&domain.path).expect("vault"),
+            landed(&next.vault, replaced)
+        );
         let deposits = remote
             .calls()
             .iter()
@@ -1778,6 +1807,7 @@ fn an_unconfirmed_adoption_with_astra_silent_moves_nothing() {
 #[test]
 fn an_adoption_astra_holds_runs_to_the_end() {
     let domain = domain();
+    let replaced = store::revision_on_disk(&domain.path);
     let mut journal = adopted_legacy_journal(&domain);
     let next = journal.next.clone().expect("next");
     let remote = Remote::watching(&domain.path);
@@ -1787,7 +1817,10 @@ fn an_adoption_astra_holds_runs_to_the_end() {
 
     assert_eq!(step, ResumeStep::Finished);
     assert!(!remote.called("submit_campaign"));
-    assert_eq!(store::load(&domain.path).expect("vault"), next.vault);
+    assert_eq!(
+        store::load(&domain.path).expect("vault"),
+        landed(&next.vault, replaced)
+    );
     assert_eq!(domain.journal_on_disk(), None);
 }
 
@@ -1871,6 +1904,7 @@ fn the_journal_is_gone_once_the_copy_was_attempted() {
 #[test]
 fn a_failed_copy_does_not_undo_the_rotation() {
     let domain = domain();
+    let replaced = store::revision_on_disk(&domain.path);
     let mut journal = domain.signed(RotationKind::CaPq);
     let next = journal.next.clone().expect("next");
     let anchor = journal.next_anchor_fingerprint;
@@ -1880,7 +1914,10 @@ fn a_failed_copy_does_not_undo_the_rotation() {
     let step = advance(&remote, &domain.path, &mut journal, NOW).expect("advanced");
 
     assert_eq!(step, ResumeStep::Finished);
-    assert_eq!(store::load(&domain.path).expect("vault"), next.vault);
+    assert_eq!(
+        store::load(&domain.path).expect("vault"),
+        landed(&next.vault, replaced)
+    );
     assert_eq!(*remote.gateway_anchor.borrow(), Some(anchor));
 }
 
@@ -1914,6 +1951,7 @@ fn a_copy_held_back_keeps_the_journal_and_is_retried_at_the_next_look() {
 #[test]
 fn the_copy_of_a_rotation_carries_the_vault_alone() {
     let domain = domain();
+    let replaced = store::revision_on_disk(&domain.path);
     let mut journal = domain.signed(RotationKind::CaPq);
     let next = journal.next.clone().expect("next");
     let remote = Remote::watching(&domain.path);
@@ -1930,7 +1968,9 @@ fn the_copy_of_a_rotation_carries_the_vault_alone() {
         .expect("base64");
     assert_eq!(
         Fingerprint::of(&bytes),
-        next.vault.fingerprint().expect("fingerprint"),
+        landed(&next.vault, replaced)
+            .fingerprint()
+            .expect("fingerprint"),
         "what Astra reports is what the screen compares to the vault's own"
     );
 }
@@ -2171,7 +2211,11 @@ fn a_stop_between_the_vault_and_the_relay_is_finished_by_the_next_press() {
     );
     assert_eq!(
         relay.vault_fingerprint,
-        vault.fingerprint().expect("fingerprint").to_hex()
+        store::load(&domain.path)
+            .expect("vault")
+            .fingerprint()
+            .expect("fingerprint")
+            .to_hex()
     );
     assert_eq!(record_of(&domain), None);
     assert!(remote.called("send_vault_copy"));
@@ -2501,6 +2545,7 @@ fn resume_after_a_stop_at_each_stage_asks_no_key() {
             JournalStage::Installed,
         ] {
             let domain = domain();
+            let replaced = store::revision_on_disk(&domain.path);
             let mut journal = domain.signed(kind);
             let next = journal.next.clone().expect("next");
             let held_back = Remote::watching(&domain.path);
@@ -2532,7 +2577,10 @@ fn resume_after_a_stop_at_each_stage_asks_no_key() {
             assert_eq!(step, ResumeStep::Finished, "{kind:?} {stage:?}");
             assert_eq!(domain.touches(), touches);
             assert_eq!(domain.journal_on_disk(), None);
-            assert_eq!(store::load(&domain.path).expect("vault"), next.vault);
+            assert_eq!(
+                store::load(&domain.path).expect("vault"),
+                landed(&next.vault, replaced)
+            );
         }
     }
 }
@@ -2738,6 +2786,7 @@ impl RotationRemote for WithoutCampaign {
 #[test]
 fn advance_without_campaign_finishes_without_the_copy() {
     let domain = domain();
+    let replaced = store::revision_on_disk(&domain.path);
     let signed = domain.signed(RotationKind::CaPq);
     without_origin(&domain);
     let mut journal = RotationJournal {
@@ -2761,7 +2810,10 @@ fn advance_without_campaign_finishes_without_the_copy() {
     assert_eq!(step, ResumeStep::Finished);
     assert_eq!(remote.installs.get(), 1);
     assert_eq!(domain.journal_on_disk(), None);
-    assert_eq!(store::load(&domain.path).expect("vault"), next_vault);
+    assert_eq!(
+        store::load(&domain.path).expect("vault"),
+        landed(&next_vault, replaced)
+    );
 }
 
 /// Without an origin, the file beside the vault is a rotation with no campaign.

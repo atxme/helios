@@ -360,6 +360,7 @@ pub struct RelayUpdate {
 /// change, because every document and leaf of the domain names that gateway,
 /// and moving to another is a gateway transition, not an edit.
 pub fn write_relay(vault_path: &Path, update: &RelayUpdate) -> Result<handoff::DomainHandoff> {
+    crate::rotation_journal::ensure_vault_not_awaiting_overwrite(vault_path)?;
     let vault = store::load(vault_path)?;
     let mut relay = handoff::DomainHandoff::beside(vault_path, &vault)?;
     if let Some(value) = &update.gateway_wg_public_key {
