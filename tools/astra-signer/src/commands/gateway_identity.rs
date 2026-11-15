@@ -529,11 +529,7 @@ pub(crate) fn sign_gateway_rollback(
             "le recouvrement est terminé : après not_after, ramener l'ancienne feuille serait un              rollback d'état, pas un rollback de service (§4.4)."
         );
     }
-    let expires_at = hours
-        .checked_mul(3_600)
-        .and_then(|seconds| now.checked_add(seconds))
-        .context("durée hors bornes")?
-        .min(transition.window.not_after);
+    let expires_at = service_rollback_expiration(now, hours, transition.window.not_after)?;
 
     // Resolved from the transition `CA-PQ` signed, never from a command line:
     // a campaign whose target an operator typed would describe a decision the
@@ -634,6 +630,16 @@ pub(crate) fn sign_gateway_rollback(
     Ok(())
 }
 
+/// Bounds a service rollback to both its requested lifetime and the transition
+/// overlap in which the outgoing identity is still valid (spec §4.4).
+fn service_rollback_expiration(now: u64, hours: u64, not_after: u64) -> Result<u64> {
+    hours
+        .checked_mul(3_600)
+        .and_then(|seconds| now.checked_add(seconds))
+        .context("durée hors bornes")
+        .map(|requested_expiration| requested_expiration.min(not_after))
+}
+
 /// Writes the signed decision out, then deposits it.
 ///
 /// The file first. The operator carries it to the gateway, and a deposit that
@@ -699,9 +705,13 @@ pub(crate) fn document_nu(
 mod tests {
     use super::*;
     use aether::certificates::{
-        authority::RotationReason,
-        encoding::{Fingerprint, TrustDomainId, WireGuardKey},
+        authority::{CaTransition, ClientTlsCaTransition, RotationReason},
+        encoding::{DerCertificate, Fingerprint, Id16, TrustDomainId, WireGuardKey},
         gateway::GatewayIdentityTransition,
+        status::{
+            AstraRotationCampaign, AstraSignerRequest, CampaignApproval, CampaignScope,
+            CampaignTarget, CertificateKind,
+        },
         window::TransitionWindow,
         CERTIFICATE_FORMAT_VERSION, CERTIFICATE_PROTOCOL_VERSION,
     };
@@ -913,5 +923,172 @@ mod tests {
             .expect("gateway abort document"),
             abort
         );
+    }
+
+    #[test]
+    fn gateway_and_authority_install_documents_are_serialized_without_routing_envelopes() {
+        let fixture = Fixture::new();
+        let gateway = fixture.transition(100, 200);
+        let gateway_object =
+            aether::certificates::transport::TrustUpdateObject::GatewayIdentityTransition(
+                Box::new(gateway.clone()),
+            );
+        let gateway_bytes = document_nu(&gateway_object).expect("gateway document");
+        let gateway_json: serde_json::Value =
+            serde_json::from_slice(&gateway_bytes).expect("gateway JSON");
+        assert!(gateway_json.get("kind").is_none());
+        assert_eq!(
+            serde_json::from_slice::<GatewayIdentityTransition>(&gateway_bytes)
+                .expect("bare gateway transition"),
+            gateway
+        );
+
+        let (_, next_ca) = aether::certificates::encoding::generate_ml_dsa_87_keypair()
+            .expect("next CA-PQ keypair");
+        let ca_pq = CaTransition {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: fixture.trust_domain_id,
+            current_ca_epoch: 1,
+            next_ca_epoch: 2,
+            current_ca_fingerprint: Fingerprint::of(b"active CA-PQ"),
+            next_ca_public_key: next_ca,
+            next_ca_fingerprint: Fingerprint::of(b"next CA-PQ"),
+            window: TransitionWindow::new(1, 2, 3).expect("CA-PQ window"),
+            current_ca_signature: aether::certificates::encoding::MlDsa87Signature::new(vec![
+                0;
+                4627
+            ])
+            .expect("current CA-PQ signature shape"),
+            next_ca_signature: aether::certificates::encoding::MlDsa87Signature::new(vec![1; 4627])
+                .expect("next CA-PQ signature shape"),
+        };
+        let ca_pq_object = aether::certificates::transport::TrustUpdateObject::CaTransition(
+            Box::new(ca_pq.clone()),
+        );
+        let ca_pq_bytes = document_nu(&ca_pq_object).expect("CA-PQ document");
+        let ca_pq_json: serde_json::Value =
+            serde_json::from_slice(&ca_pq_bytes).expect("CA-PQ JSON");
+        assert!(ca_pq_json.get("kind").is_none());
+        assert_eq!(
+            serde_json::from_slice::<CaTransition>(&ca_pq_bytes).expect("bare CA-PQ transition"),
+            ca_pq
+        );
+
+        let ca_tls = ClientTlsCaTransition {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: fixture.trust_domain_id,
+            ca_epoch: 1,
+            current_ca_tls_epoch: 1,
+            next_ca_tls_epoch: 2,
+            active_client_tls_ca_fingerprint: Fingerprint::of(b"active CA-TLS"),
+            next_client_tls_ca_certificate: DerCertificate::new(vec![0x30, 0x00])
+                .expect("CA-TLS certificate shape"),
+            window: TransitionWindow::new(1, 2, 3).expect("CA-TLS window"),
+            ca_pq_signature: aether::certificates::encoding::MlDsa87Signature::new(vec![2; 4627])
+                .expect("CA-TLS signature shape"),
+        };
+        let ca_tls_object =
+            aether::certificates::transport::TrustUpdateObject::ClientTlsCaTransition(Box::new(
+                ca_tls.clone(),
+            ));
+        let ca_tls_bytes = document_nu(&ca_tls_object).expect("CA-TLS document");
+        let ca_tls_json: serde_json::Value =
+            serde_json::from_slice(&ca_tls_bytes).expect("CA-TLS JSON");
+        assert!(ca_tls_json.get("kind").is_none());
+        assert_eq!(
+            serde_json::from_slice::<ClientTlsCaTransition>(&ca_tls_bytes)
+                .expect("bare CA-TLS transition"),
+            ca_tls
+        );
+    }
+
+    #[test]
+    fn failed_gateway_deposit_keeps_the_bare_decision_for_offline_recovery() {
+        let fixture = Fixture::new();
+        let operation_id = Id16::new([0x51; 16]).expect("operation id");
+        let campaign = AstraRotationCampaign {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            campaign_id: Id16::new([0x52; 16]).expect("campaign id"),
+            trust_domain_id: fixture.trust_domain_id,
+            gateway_wg_public_key: fixture.gateway_key,
+            server_name: "gateway.example".into(),
+            created_at: 1,
+            expires_at: 2,
+            scope: CampaignScope::GatewayIdentity,
+            targets: vec![CampaignTarget {
+                certificate_kind: CertificateKind::GatewayTls,
+                identity_key: fixture.gateway_key,
+                epoch: 1,
+                generation: 1,
+                active_tls_certificate_fingerprint: Fingerprint::of(b"active TLS"),
+                active_pq_certificate_fingerprint: Fingerprint::of(b"active PQ"),
+            }],
+            reason: "test reason".into(),
+            requested_by: "test operator".into(),
+            policy_fingerprint: Fingerprint::of(b"policy"),
+            required_credentials: 1,
+        };
+        let request = astra_operator::origin::CampaignRequest {
+            operation_id,
+            signer_request: Box::new(AstraSignerRequest {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                operation_id,
+                campaign_fingerprint: campaign.fingerprint(),
+                authority_url: "https://astra.example".into(),
+                encrypted_vault_fingerprint: Fingerprint::of(b"vault"),
+                required_credentials: 1,
+                created_at: 1,
+                expires_at: 2,
+                astra_service_key_epoch: 1,
+                astra_signature: aether::certificates::encoding::MlDsa87Signature::new(vec![
+                    0;
+                    4627
+                ])
+                .expect("signer request signature shape"),
+            }),
+            campaign: Box::new(campaign.clone()),
+            webauthn_rp_id: "astra.example".into(),
+            webauthn_origin: "https://astra.example".into(),
+            result_token: "test-only-token".into(),
+            vault_token: None,
+        };
+        let approval = CampaignApproval {
+            campaign_id: campaign.campaign_id,
+            campaign_fingerprint: campaign.fingerprint(),
+            required_credentials: 1,
+            approved_at: 1,
+            approvals: Vec::new(),
+        };
+        let transition = fixture.transition(100, 200);
+        let object = aether::certificates::transport::TrustUpdateObject::GatewayIdentityTransition(
+            Box::new(transition.clone()),
+        );
+        let out = fixture._directory.path().join("gateway-transition.json");
+        let client = astra_operator::campaign::Campaign::select(None, Some("http://127.0.0.1:0"))
+            .expect("local tunnel endpoint");
+
+        let error =
+            deposit_gateway_decision(&client, &request, &approval, object, &out, "transition")
+                .expect_err("the local endpoint has no listener");
+
+        assert!(format!("{error:#}").contains("dépôt de l'approbation"));
+        let bytes = std::fs::read(&out).expect("signed decision remains available");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("decision JSON");
+        assert!(json.get("kind").is_none());
+        assert_eq!(
+            serde_json::from_slice::<GatewayIdentityTransition>(&bytes)
+                .expect("gateway can read the retained decision"),
+            transition
+        );
+    }
+
+    #[test]
+    fn service_rollback_expiration_never_outlives_the_transition_overlap() {
+        assert_eq!(
+            service_rollback_expiration(1_000, 1, 10_000).unwrap(),
+            4_600
+        );
+        assert_eq!(service_rollback_expiration(1_000, 2, 5_000).unwrap(), 5_000);
+        assert!(service_rollback_expiration(1_000, u64::MAX, 5_000).is_err());
     }
 }
