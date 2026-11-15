@@ -1139,3 +1139,176 @@ async fn a_renewal_that_lost_the_data_plane_installs_nothing() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(dry.rekeyed_psks().is_empty());
 }
+
+struct FailingIdentityProvider {
+    calls: std::sync::atomic::AtomicUsize,
+    message: &'static str,
+}
+
+#[async_trait::async_trait]
+impl crate::key_negotiation::IdentityProvider for FailingIdentityProvider {
+    async fn load(
+        &self,
+        _identity: &str,
+    ) -> anyhow::Result<crate::key_negotiation::ClientIdentity> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        anyhow::bail!("{}", self.message)
+    }
+}
+
+fn negotiation_profile() -> ClientProfile {
+    let mut profile = profile();
+    profile.profile_type = Some(crate::config::ProfileKind::HeliosKeyNegotiation);
+    profile.endpoint = "localhost:51820".into();
+    profile.private_key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".into();
+    let gateway_pq_certificate = aether::key_negotiation::PqCertificate {
+        version: aether::key_negotiation::PQ_CERTIFICATE_VERSION,
+        serial: [3; 16],
+        subject: "gateway.example".into(),
+        issuer: "gateway.example".into(),
+        role: aether::key_negotiation::PqCertificateRole::Gateway,
+        wireguard_public_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".into(),
+        ml_dsa_87_public_key: String::new(),
+        not_before_unix: 0,
+        not_after_unix: u64::MAX,
+        ml_dsa_87_signature: String::new(),
+    };
+    profile.key_negotiation = Some(crate::config::KeyNegotiationSettings {
+        mode: aether::key_negotiation::ProtectionMode::MlKem,
+        minimum_mode: aether::key_negotiation::ProtectionMode::MlKem,
+        endpoint: "localhost:51821".into(),
+        server_name: "gateway.example".into(),
+        gateway_ca_der: "Q0E=".into(),
+        gateway_pq_certificate: base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            serde_json::to_vec(&gateway_pq_certificate).expect("serialize gateway PQ fixture"),
+        ),
+        identity: "test".into(),
+        trust: None,
+    });
+    profile
+}
+
+#[tokio::test]
+async fn key_negotiation_fails_closed_without_a_protected_identity_provider() {
+    let backend: Arc<dyn VpnBackend> = Arc::new(DryRunBackend::default());
+    let (sink, logs) = logging_sink();
+    let installed = Mutex::new(None);
+    let link_lost = Arc::new(AtomicBool::new(true));
+
+    let error = connect_with_key_negotiation(
+        &backend,
+        &negotiation_profile(),
+        &sink,
+        None,
+        &installed,
+        &link_lost,
+    )
+    .await
+    .expect_err("the shell must supply its protected identity store");
+
+    assert!(error
+        .to_string()
+        .contains("protected key-negotiation identity store"));
+    assert!(!backend.adapter_is_up());
+    assert!(installed.lock().await.is_none());
+    assert!(link_lost.load(Ordering::SeqCst));
+    assert!(logs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn terminal_certificate_failure_stops_negotiation_after_one_attempt() {
+    let backend: Arc<dyn VpnBackend> = Arc::new(DryRunBackend::default());
+    let identities = FailingIdentityProvider {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        message: "invalid peer certificate: BadSignature",
+    };
+    let (sink, logs) = logging_sink();
+    let installed = Mutex::new(None);
+    let link_lost = Arc::new(AtomicBool::new(true));
+
+    let error = connect_with_key_negotiation(
+        &backend,
+        &negotiation_profile(),
+        &sink,
+        Some(&identities),
+        &installed,
+        &link_lost,
+    )
+    .await
+    .expect_err("a pinned certificate failure is terminal");
+
+    assert!(
+        format!("{error:#}").contains("invalid peer certificate"),
+        "{error:#}"
+    );
+    assert_eq!(identities.calls.load(Ordering::SeqCst), 1);
+    assert!(!backend.adapter_is_up());
+    assert!(installed.lock().await.is_none());
+    assert!(link_lost.load(Ordering::SeqCst));
+    let logs = logs.lock().unwrap();
+    assert!(logs
+        .iter()
+        .any(|line| line.contains("échec cryptographique définitif")));
+    assert!(!logs.iter().any(|line| line.contains("négociation 2/3")));
+}
+
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn transient_identity_failures_use_the_bounded_negotiation_retries() {
+    let backend: Arc<dyn VpnBackend> = Arc::new(DryRunBackend::default());
+    let identities = FailingIdentityProvider {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        message: "identity store temporarily unavailable",
+    };
+    let (sink, logs) = logging_sink();
+    let installed = Mutex::new(None);
+    let link_lost = Arc::new(AtomicBool::new(true));
+
+    let error = connect_with_key_negotiation(
+        &backend,
+        &negotiation_profile(),
+        &sink,
+        Some(&identities),
+        &installed,
+        &link_lost,
+    )
+    .await
+    .expect_err("the identity store keeps failing");
+
+    assert!(
+        format!("{error:#}").contains("identity store temporarily unavailable"),
+        "{error:#}"
+    );
+    assert_eq!(identities.calls.load(Ordering::SeqCst), 3);
+    assert!(!backend.adapter_is_up());
+    assert!(installed.lock().await.is_none());
+    assert!(link_lost.load(Ordering::SeqCst));
+    let logs = logs.lock().unwrap();
+    for attempt in 1..=3 {
+        assert!(logs
+            .iter()
+            .any(|line| line.contains(&format!("négociation {attempt}/3"))));
+    }
+    assert!(logs
+        .iter()
+        .any(|line| line.contains("négociation abandonnée après 3 tentatives")));
+    assert!(logs
+        .iter()
+        .all(|line| !line.contains("échec cryptographique définitif")));
+}
+
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+async fn only_a_fresh_wireguard_handshake_confirms_negotiation() {
+    let backend = Arc::new(DryRunBackend::default());
+    let backend_trait: Arc<dyn VpnBackend> = backend.clone();
+    let prepared_at = tokio::time::Instant::now() - Duration::from_secs(2);
+
+    backend.set_handshake_age(Some(Duration::ZERO));
+    assert!(wait_for_new_handshake(&backend_trait, prepared_at, Duration::from_secs(2),).await);
+
+    backend.set_handshake_age(Some(Duration::from_secs(10)));
+    assert!(!wait_for_new_handshake(&backend_trait, prepared_at, Duration::from_secs(2),).await);
+
+    backend.set_handshake_age(None);
+    assert!(!wait_for_new_handshake(&backend_trait, prepared_at, Duration::from_secs(2),).await);
+}
