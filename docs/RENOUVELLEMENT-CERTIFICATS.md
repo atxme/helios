@@ -234,15 +234,16 @@ les clés : « Aucune autorité ne vérifie ce remplacement : le coffre avance s
 geste. À réserver à un domaine sans Astra. » Deux clés sont validées, sans toucher
 d'approbation, puis les durées et la signature. Le coffre, les credentials (s'il en existe
 un ; il n'est pas requis) et le relais avancent sur ce geste, puis Orion pose la transition
-sur la gateway par le tunnel. La cérémonie refuse avant toute clé si le relais nomme une
-origine, si le tunnel atteint une gateway que le relais ne nomme pas, si une rotation est en
-cours, si la gateway annonce déjà une CA-PQ suivante ou une ancre CA TLS, si sa CA-PQ courante
-n'est pas celle du coffre, ou si la CA-PQ sortante est encore gardée (« Terminer la rotation
-CA-PQ » d'abord).
+sur la gateway par le tunnel. Avant toute clé, la cérémonie refuse si le relais nomme une
+origine, si le tunnel atteint une gateway que le relais ne nomme pas, ou si une rotation est
+en cours. Les autres contrôles passent après les deux validations et les durées : un
+recouvrement ouvert, la CA-PQ sortante encore gardée (« Terminer la rotation CA-PQ »
+d'abord), une CA-PQ ou une CA TLS suivante déjà annoncée par la gateway, une CA-PQ courante de
+la gateway qui n'est pas celle du coffre.
 
 Si la pose n'aboutit pas, `ca-pq-transition.json` est offert en téléchargement : à installer
 à la main avec `heliosd install-ca-transition` ou depuis l'écran *Certificats* de la gateway.
-« Reprendre » finit la rotation plus tard, sans Astra. Un journal de rotation hors campagne
+La ligne « Reprendre » le garde sous « Télécharger la transition » tant que le journal existe, tunnel coupé ou Orion relancé. « Reprendre » finit la rotation plus tard, sans Astra. Un journal de rotation hors campagne
 laissé par `astra-signer rotate-ca-pq` dans un domaine sans origine se reprend de la même
 façon ; dans un domaine avec origine, la reprise lit Astra d'abord, comme avant.
 

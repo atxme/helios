@@ -1546,20 +1546,22 @@ action, puis état attendu.
 
 125. **Domaine sans origine : la ligne remplace « Remplacer la CA-PQ ».** Ouvrir *Rotations*
     sur un domaine dont le relais ne nomme aucune origine. Attendu : « Remplacer la CA-PQ
-    sans campagne… » (bouton « Remplacer ») est offert à la place de « Remplacer la CA-PQ ».
+    sans campagne » (bouton « Remplacer ») est offert à la place de « Remplacer la CA-PQ ».
     Ouvrir la ligne : l'avertissement « Aucune autorité ne vérifie ce remplacement : le coffre
     avance sur votre seul geste. À réserver à un domaine sans Astra. » s'affiche avant les
     clés. Annuler sans valider de clé.
 126. **Remplacement complet.** **[cible]** (deux clés, gateway cible). Suivre la cérémonie :
     durées, « Clé 1 » et « Clé 2 » validées, signature, sans toucher d'approbation. Attendu :
-    l'écran final montre « Empreinte entrante » en groupes ; comparer cette empreinte à la
-    prochaine CA-PQ de la gateway (écran *Certificats*), et à celle créée. Sur la
-    gateway (écran *Certificats*), l'ancre CA-PQ courante est la nouvelle. Le coffre garde la
+    l'écran final montre « Empreinte entrante » en groupes ; comparer cette empreinte à la CA-PQ
+    suivante de la gateway (écran *Certificats*), et à celle créée. Jusqu'à `activation_at`, la
+    nouvelle ancre est la CA-PQ suivante de la gateway, non sa courante ; elle devient la
+    courante à `activation_at`. Le coffre garde la
     CA-PQ sortante : « Terminer la rotation CA-PQ » n'est offert qu'après `not_after`, et
     relancer « Remplacer la CA-PQ sans campagne » est refusé d'ici là.
 127. **Tunnel coupé après la signature.** **[cible]** (deux clés). Pendant la cérémonie, couper
     le tunnel après la signature, avant la pose. Attendu : la pose échoue, et
-    `ca-pq-transition.json` est offert au téléchargement. Rétablir le tunnel, puis
+    `ca-pq-transition.json` est offert au téléchargement, et la ligne « Reprendre » porte
+    « Télécharger la transition », y compris après un redémarrage d'Orion et tunnel coupé. Rétablir le tunnel, puis
     « Reprendre ». Attendu : la rotation finit sans demander de clé, sans passer par Astra ; la
     gateway montre la nouvelle ancre, et le fichier n'est plus offert. (Recours : installer le
     fichier à la main avec `heliosd install-ca-transition`.)
