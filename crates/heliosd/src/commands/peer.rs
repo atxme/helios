@@ -221,6 +221,7 @@ fn admission_floor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     #[test]
     fn admission_floor_defaults_to_the_strongest_available_identity() {
@@ -337,6 +338,286 @@ mod tests {
         .expect_err("missing TLS certificate is an admission error");
 
         assert!(error.to_string().contains("missing-client.der"));
+    }
+
+    const ISOLATED_PEER_SCENARIO: &str = "HELIOSD_PEER_COMMAND_SCENARIO";
+
+    /// Runs command scenarios in a child process because all three production
+    /// paths are process-wide environment overrides.
+    fn run_isolated_scenario(name: &str) -> bool {
+        if std::env::var(ISOLATED_PEER_SCENARIO).as_deref() == Ok(name) {
+            return false;
+        }
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                &format!("commands::peer::tests::{name}"),
+                "--nocapture",
+            ])
+            .env(ISOLATED_PEER_SCENARIO, name)
+            .env(
+                "HELIOS_NETWORK_CONFIG",
+                directory.path().join("network.toml"),
+            )
+            .env("HELIOS_IDENTITY_DIR", directory.path().join("identity"))
+            .env(
+                "HELIOS_CERTIFICATE_REGISTRY",
+                directory.path().join("certificates.json"),
+            )
+            .output()
+            .expect("isolated command scenario starts");
+        assert!(
+            output.status.success(),
+            "isolated {name} failed:
+{}
+{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "isolated {name} must execute exactly one test:
+{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        true
+    }
+
+    fn test_fingerprint(byte: u8) -> String {
+        format!("{byte:02x}").repeat(32)
+    }
+
+    fn add_command(
+        name: &str,
+        public_key: &str,
+        certificate: Option<std::path::PathBuf>,
+        pq_certificate: Option<std::path::PathBuf>,
+    ) -> PeerCommand {
+        PeerCommand::Add {
+            name: name.into(),
+            public_key: public_key.into(),
+            admin: false,
+            key_negotiation_certificate_sha256: Some(test_fingerprint(0x11)),
+            key_negotiation_pq_certificate_sha256: Some(test_fingerprint(0x22)),
+            certificate,
+            pq_certificate,
+            minimum_mode: None,
+        }
+    }
+
+    fn admitted_peer(name: &str, public_key: &str) -> aether::WgPeer {
+        aether::WgPeer {
+            name: name.into(),
+            public_key: public_key.into(),
+            address: "100.64.1.2/32".into(),
+            address_v6: None,
+            admin: false,
+            preshared_key: None,
+            key_negotiation_certificate_sha256: Some(test_fingerprint(0x11)),
+            key_negotiation_pq_certificate_sha256: Some(test_fingerprint(0x22)),
+            minimum_key_negotiation_mode: Some(aether::key_negotiation::ProtectionMode::MlKem),
+            persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
+        }
+    }
+
+    #[test]
+    fn peer_add_persists_ipam_admission_and_the_certificate_inbox_entry() {
+        use aether::certificates::encoding::Fingerprint;
+        use base64::Engine as _;
+
+        if run_isolated_scenario("peer_add_persists_ipam_admission_and_the_certificate_inbox_entry")
+        {
+            return;
+        }
+        let config_path = NetworkConfig::path();
+        let registry_path = helios_provisioning::certificates::CertificateRegistry::path();
+        std::fs::write(&registry_path, b"registry marker").expect("trust domain marker");
+        let directory = registry_path.parent().expect("test registry directory");
+        let tls_path = directory.join("client.der");
+        let pq_path = directory.join("client-pq.json");
+        std::fs::write(&tls_path, [0x30, 0x01, 0xff]).expect("TLS certificate fixture");
+        std::fs::write(&pq_path, br#"{"leaf":"pq"}"#).expect("PQ certificate fixture");
+        let public_key = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+
+        peer_command(
+            NetworkConfig::default(),
+            add_command(
+                "alice",
+                &public_key,
+                Some(tls_path.clone()),
+                Some(pq_path.clone()),
+            ),
+        )
+        .expect("new peer is admitted");
+
+        let initial_config = std::fs::read(&config_path).expect("first admission persists");
+        std::fs::write(&tls_path, b"replacement TLS leaf").expect("replacement TLS fixture");
+        std::fs::write(&pq_path, b"replacement PQ leaf").expect("replacement PQ fixture");
+        peer_command(
+            NetworkConfig::load().expect("readmitted config loads"),
+            add_command("alice", &public_key, Some(tls_path), Some(pq_path)),
+        )
+        .expect("unchanged readmission succeeds");
+        assert_eq!(
+            std::fs::read(&config_path).expect("config after readmission"),
+            initial_config,
+            "unchanged readmission must not rewrite the persisted peer table"
+        );
+
+        let persisted = NetworkConfig::load().expect("persisted configuration loads");
+        assert_eq!(persisted.peers.len(), 1);
+        let peer = &persisted.peers[0];
+        assert_eq!(peer.name, "alice");
+        assert_eq!(peer.public_key, public_key);
+        assert_eq!(
+            peer.address,
+            format!(
+                "{}/32",
+                helios_provisioning::ipam::derive_cgnat_ip(&[9u8; 32], 0)
+            )
+        );
+        assert_eq!(peer.preshared_key, None, "admission never invents a PSK");
+        assert_eq!(
+            peer.minimum_key_negotiation_mode,
+            Some(aether::key_negotiation::ProtectionMode::MlKem)
+        );
+        let serialized = std::fs::read_to_string(&config_path).expect("public config file");
+        assert!(!serialized.contains("preshared_key"));
+        assert!(serialized.contains("wg_private_key = \"\""));
+
+        let admission_path = heliosd_admission_path(&registry_path, &public_key);
+        let queued: certificates::QueuedAdmission =
+            serde_json::from_slice(&std::fs::read(&admission_path).expect("queued admission"))
+                .expect("queued admission is valid JSON");
+        assert_eq!(queued.name, "alice");
+        assert_eq!(queued.client_wg_public_key, public_key);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(queued.tls_certificate)
+                .unwrap(),
+            [0x30, 0x01, 0xff]
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(queued.pq_certificate)
+                .unwrap(),
+            br#"{"leaf":"pq"}"#
+        );
+        assert_eq!(
+            Fingerprint::of(public_key.as_bytes()).to_hex(),
+            admission_path.file_stem().unwrap().to_string_lossy()
+        );
+    }
+
+    fn heliosd_admission_path(registry_path: &Path, public_key: &str) -> std::path::PathBuf {
+        use aether::certificates::encoding::Fingerprint;
+        registry_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("admissions")
+            .join(format!(
+                "{}.json",
+                Fingerprint::of(public_key.as_bytes()).to_hex()
+            ))
+    }
+
+    #[test]
+    fn trust_domain_certificate_read_failure_precedes_admission_persistence() {
+        if run_isolated_scenario(
+            "trust_domain_certificate_read_failure_precedes_admission_persistence",
+        ) {
+            return;
+        }
+        let registry_path = helios_provisioning::certificates::CertificateRegistry::path();
+        std::fs::write(&registry_path, b"registry marker").expect("trust domain marker");
+        let directory = registry_path.parent().expect("test registry directory");
+        let pq_path = directory.join("client-pq.json");
+        std::fs::write(&pq_path, b"pq").expect("PQ certificate fixture");
+        let public_key = base64::engine::general_purpose::STANDARD.encode([10u8; 32]);
+
+        let error = peer_command(
+            NetworkConfig::default(),
+            add_command(
+                "alice",
+                &public_key,
+                Some(directory.join("missing-client.der")),
+                Some(pq_path),
+            ),
+        )
+        .expect_err("missing trust certificate blocks admission");
+
+        assert!(error.to_string().contains("missing-client.der"));
+        assert!(
+            !NetworkConfig::path().exists(),
+            "a failed certificate read must not persist the peer"
+        );
+        assert!(
+            !registry_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("admissions")
+                .exists(),
+            "no admission is queued when certificate reads fail"
+        );
+    }
+
+    #[test]
+    fn duplicate_name_refusal_leaves_the_persisted_peer_table_unchanged() {
+        if run_isolated_scenario("duplicate_name_refusal_leaves_the_persisted_peer_table_unchanged")
+        {
+            return;
+        }
+        let first_key = base64::engine::general_purpose::STANDARD.encode([11u8; 32]);
+        let second_key = base64::engine::general_purpose::STANDARD.encode([12u8; 32]);
+        let network = NetworkConfig {
+            peers: vec![admitted_peer("alice", &first_key)],
+            ..NetworkConfig::default()
+        };
+        network.save().expect("initial peer table");
+        let before = std::fs::read(NetworkConfig::path()).expect("saved table");
+
+        let error = peer_command(network, add_command("alice", &second_key, None, None))
+            .expect_err("a name cannot be rebound to another WireGuard key");
+
+        assert!(error.to_string().contains("already admitted"), "{error:#}");
+        assert_eq!(std::fs::read(NetworkConfig::path()).unwrap(), before);
+        let persisted = NetworkConfig::load().expect("original table remains valid");
+        assert_eq!(persisted.peers.len(), 1);
+        assert_eq!(persisted.peers[0].public_key, first_key);
+    }
+
+    #[test]
+    fn peer_remove_persists_revocation_and_unknown_names_are_noops() {
+        if run_isolated_scenario("peer_remove_persists_revocation_and_unknown_names_are_noops") {
+            return;
+        }
+        let public_key = base64::engine::general_purpose::STANDARD.encode([13u8; 32]);
+        let network = NetworkConfig {
+            peers: vec![admitted_peer("alice", &public_key)],
+            ..NetworkConfig::default()
+        };
+        network.save().expect("initial peer table");
+
+        peer_command(
+            network,
+            PeerCommand::Remove {
+                name: "alice".into(),
+            },
+        )
+        .expect("known peer is revoked");
+        assert!(NetworkConfig::load().unwrap().peers.is_empty());
+        let after_remove = std::fs::read(NetworkConfig::path()).unwrap();
+
+        let error = peer_command(
+            NetworkConfig::load().unwrap(),
+            PeerCommand::Remove {
+                name: "unknown".into(),
+            },
+        )
+        .expect_err("unknown peer removal must be refused");
+        assert!(error.to_string().contains("unknown"));
+        assert_eq!(std::fs::read(NetworkConfig::path()).unwrap(), after_remove);
     }
 
     #[test]
