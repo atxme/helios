@@ -1632,9 +1632,10 @@ action, puis état attendu.
     terme, refaire le geste : il passe.
 137. **Export puis recouvrement d'un poste en retard.** **[cible]** (suite de 132). Sur A,
     « Exporter le coffre » : « Coffre exporté ». Copier le fichier sur B dans un dossier à lui
-    et le renommer `authority-vault.json`. Sur B, « Changer… » sous « Coffre opérateur », puis
-    choisir ce fichier. Attendu : l'empreinte affichée de B est celle de A, et la
-    ligne « Copie du coffre » de B est à jour, sans détail, comme sur A.
+    et le renommer `authority-vault.json`. Copier aussi `astra-credentials.json` depuis le dossier
+    du coffre de A dans ce même dossier sur B (l'export ne le porte pas). Sur B, « Changer… » sous
+    « Coffre opérateur », puis choisir ce fichier. Attendu : l'empreinte affichée de B est celle
+    de A, et la ligne « Copie du coffre » de B est à jour, sans détail, comme sur A.
 138. **[cible] Geste sur les clés sur le poste en retard.** Suite de 132, sur B, tunnel
     monté, avec un coffre plus ancien que celui d'Astra. Faire le même geste sur une clé que
     sur A (« Marquer perdue »). Attendu : le refus « Astra tient un coffre plus récent que

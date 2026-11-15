@@ -133,6 +133,8 @@ prix des clés à chaque envoi, contre un adversaire qui administre déjà la ga
   canonisés comparés *(mon choix ; un lien physique vers le coffre n'est pas détecté)*. La WebView ne
   reçoit que « Coffre exporté » ou l'erreur. Hors Windows, comme le choix d'emplacement.
 - L'export ne contient que le coffre : le relais se reconstruit depuis le coffre et la gateway.
+  Le document de credentials (`astra-credentials.json`) n'en fait pas partie ; au recouvrement,
+  on le copie à la main depuis le coffre à jour, à côté du coffre exporté.
 
 ### 4.4 Garde du relais
 

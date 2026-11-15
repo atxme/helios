@@ -1518,9 +1518,11 @@ dans [ROADMAP.md](ROADMAP.md) (F14-a à F14-f).
   demande avant de remplacer un fichier existant. Pour remettre à jour un poste
   en retard, exporter le coffre depuis le poste qui le tient, le copier sur le
   poste en retard dans un dossier à lui, le renommer `authority-vault.json`
-  (« Changer… » n'accepte que ce nom), puis « Changer… » sous « Coffre
-  opérateur » pour choisir ce fichier. Le relais se reconstruit depuis le coffre
-  et la gateway ; le document de credentials part avec la copie (« Envoyer »).
+  (« Changer… » n'accepte que ce nom), copier aussi `astra-credentials.json`
+  depuis le dossier du coffre du poste à jour dans ce même dossier (l'export ne
+  le porte pas), puis « Changer… » sous « Coffre opérateur » pour choisir ce
+  fichier. Le relais se reconstruit depuis le coffre et la gateway ; l'export ne
+  porte que le coffre, pas le document de credentials, d'où cette copie à la main.
 - **Compatibilité du compteur.** Un Orion ou un `astra-signer` antérieur ne lit
   plus un coffre qui porte la révision ; les deux sont livrés ensemble. Un
   coffre qui n'a pas été réécrit depuis reste lisible par eux. Un Orion
