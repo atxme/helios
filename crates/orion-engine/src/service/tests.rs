@@ -963,3 +963,139 @@ async fn delete_profile_of_an_unknown_name() {
     );
     assert_eq!(service.config.lock().await.profiles.len(), 1);
 }
+
+#[tokio::test]
+async fn ssh_command_rejects_shell_metacharacters_before_checking_tunnel_state() {
+    let scratch = Scratch::new("ssh-rejects-shell-input");
+    let service = service_with_selected_profile(&scratch);
+    service.config.lock().await.profiles[0].ssh_target = Some("host;touch /tmp/marker".into());
+    let (client, _events) = crate::client::in_process(Arc::clone(&service))
+        .await
+        .expect("the session opens");
+
+    let error = client
+        .call(EngineCommand::SshCommand { name: None })
+        .await
+        .expect_err("shell metacharacters are not valid SSH targets");
+
+    assert!(error.contains("destination SSH"), "{error}");
+    assert!(
+        !error.contains("/tmp/marker"),
+        "untrusted target echoed: {error}"
+    );
+    assert_eq!(service.controller.state(), TunnelState::Down);
+}
+
+#[tokio::test]
+async fn ssh_command_requires_the_tunnel_then_uses_the_selected_profile_target() {
+    let scratch = Scratch::new("ssh-target-requires-tunnel");
+    let service = service_with_selected_profile(&scratch);
+    service.config.lock().await.profiles[0].ssh_target = Some("admin@vpn.example:2222".into());
+    let (client, mut events) = crate::client::in_process(Arc::clone(&service))
+        .await
+        .expect("the session opens");
+
+    let error = client
+        .call(EngineCommand::SshCommand { name: None })
+        .await
+        .expect_err("SSH is reachable only through the tunnel");
+    assert!(error.contains("le tunnel n'est pas monté"), "{error}");
+
+    client
+        .call(EngineCommand::Connect { name: None })
+        .await
+        .expect("the connection starts");
+    states_until_up(&mut events).await;
+
+    assert!(matches!(
+        client.call(EngineCommand::SshCommand { name: None }).await,
+        Ok(EngineReply::SshCommand(command)) if command == "ssh admin@vpn.example:2222"
+    ));
+}
+
+#[tokio::test]
+async fn invalid_staged_secrets_are_not_echoed_or_retained() {
+    let scratch = Scratch::new("invalid-staged-secrets");
+    let service = EngineService::open(
+        paths_under(&scratch.0),
+        Arc::new(DryRunBackend::default()),
+        None,
+        "0.0.0-test",
+    )
+    .expect("the service opens on a fresh directory");
+    let (client, _events) = crate::client::in_process(Arc::clone(&service))
+        .await
+        .expect("the session opens");
+    let private_marker = "ORION_INVALID_PRIVATE_SENTINEL";
+    let psk_marker = "ORION_INVALID_PSK_SENTINEL";
+
+    let private_error = client
+        .call(EngineCommand::AdoptPrivateKey {
+            private_key: SecretInput::from(private_marker.to_owned()),
+        })
+        .await
+        .expect_err("invalid WireGuard private key is refused");
+    let psk_error = client
+        .call(EngineCommand::AdoptPresharedKey {
+            preshared_key: SecretInput::from(psk_marker.to_owned()),
+        })
+        .await
+        .expect_err("invalid WireGuard PSK is refused");
+
+    assert!(!private_error.contains(private_marker));
+    assert!(!psk_error.contains(psk_marker));
+    assert!(service.staged_key.lock().await.is_none());
+    assert!(service.staged_psk.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn explicit_unencrypted_volume_consent_is_persisted_and_idempotent() {
+    let scratch = Scratch::new("unencrypted-volume-consent");
+    let paths = paths_under(&scratch.0);
+    {
+        let service = EngineService::open(
+            paths.clone(),
+            Arc::new(DryRunBackend::default()),
+            None,
+            "0.0.0-test",
+        )
+        .expect("the service opens on a fresh directory");
+        let (client, _events) = crate::client::in_process(Arc::clone(&service))
+            .await
+            .expect("the session opens");
+
+        for attempt in 0..2 {
+            let reply = client
+                .call(EngineCommand::AllowUnencryptedVolume)
+                .await
+                .expect("the explicit user choice is recorded");
+            let EngineReply::VaultPosture(posture) = reply else {
+                panic!("unexpected reply: {reply:?}");
+            };
+            assert!(posture.unencrypted_volume_waived, "attempt {attempt}");
+        }
+
+        client
+            .call(EngineCommand::Shutdown)
+            .await
+            .expect("the engine shuts down cleanly");
+        tokio::time::timeout(std::time::Duration::from_secs(10), client.closed())
+            .await
+            .expect("the in-process session ends before reopening the service");
+    }
+
+    let reopened = EngineService::open(
+        paths,
+        Arc::new(DryRunBackend::default()),
+        None,
+        "0.0.0-test",
+    )
+    .expect("the service reopens the same scratch paths");
+    assert!(
+        reopened
+            .vault_posture()
+            .expect("the reopened posture is readable")
+            .unencrypted_volume_waived,
+        "the explicit consent must survive service reconstruction"
+    );
+}
