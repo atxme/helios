@@ -5,6 +5,7 @@ mod fixtures;
 mod generation_limits;
 mod identity;
 mod interop;
+mod reclaimer;
 mod renewal;
 mod server_startup;
 mod transaction;

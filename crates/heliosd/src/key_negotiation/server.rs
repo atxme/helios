@@ -149,7 +149,9 @@ pub async fn start(
             );
         }
     }
-    spawn_psk_reclaimer(Arc::clone(&handler), peer_runtime);
+    // Drop detaches the loop, preserving its process-lifetime ownership while
+    // leaving tests able to abort the returned handle deterministically.
+    drop(spawn_psk_reclaimer(Arc::clone(&handler), peer_runtime));
     tokio::spawn(aether_key_negotiation::serve(
         endpoint,
         Arc::clone(&handler) as Arc<dyn NegotiationHandler>,
@@ -185,10 +187,10 @@ const RECLAIM_POLL: std::time::Duration = std::time::Duration::from_secs(10);
 /// `NetworkConfig::validate` makes mandatory for every negotiated peer: an
 /// idle tunnel without them produces no handshake, and a peer that is fine
 /// would look long gone.
-fn spawn_psk_reclaimer(
+pub(super) fn spawn_psk_reclaimer(
     handler: Arc<GatewayHandler>,
     peer_runtime: Arc<RwLock<Vec<helios_wireguard::PeerStatus>>>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(RECLAIM_POLL);
         loop {
@@ -211,5 +213,5 @@ fn spawn_psk_reclaimer(
                 }
             }
         }
-    });
+    })
 }
