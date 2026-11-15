@@ -683,6 +683,21 @@ mod campaign_approval_precondition_tests {
     }
 
     #[test]
+    fn unsupported_campaign_format_is_rejected_before_requesting_a_key() {
+        let fixture = Fixture::new();
+        let mut campaign = fixture.campaign(CampaignScope::GatewayIdentity);
+        campaign.format_version = u16::MAX;
+        let campaign_path = fixture.write_campaign(&campaign);
+        let out = fixture._directory.path().join("approval.json");
+
+        let error = fixture.approve_file(&campaign_path, &out);
+
+        assert!(format!("{error:#}").contains("version"), "{error:#}");
+        assert!(!format!("{error:#}").contains("terminal"));
+        assert!(!out.exists());
+    }
+
+    #[test]
     fn offline_campaign_requires_a_usable_credential_registry_before_requesting_a_key() {
         let fixture = Fixture::new();
         let campaign = fixture.campaign(CampaignScope::GatewayIdentity);
@@ -692,6 +707,25 @@ mod campaign_approval_precondition_tests {
         let error = fixture.approve_file(&campaign_path, &out);
 
         assert!(format!("{error:#}").contains("empty document"), "{error:#}");
+        assert!(!format!("{error:#}").contains("terminal"));
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn credential_registry_for_another_gateway_is_rejected_before_requesting_a_key() {
+        let fixture = Fixture::new();
+        let path = credentials::path_beside(&fixture.vault_path);
+        let mut registry = credentials::load(&path)
+            .expect("registry can be read")
+            .expect("fixture registry exists");
+        registry.gateway_wg_public_key = WireGuardKey::from_bytes([0x77; 32]);
+        credentials::save(&path, &registry).expect("save mismatched registry");
+
+        let campaign = fixture.campaign_file(CampaignScope::GatewayIdentity);
+        let out = fixture._directory.path().join("approval.json");
+        let error = fixture.approve_file(&campaign, &out);
+
+        assert!(format!("{error:#}").contains("gateway"), "{error:#}");
         assert!(!format!("{error:#}").contains("terminal"));
         assert!(!out.exists());
     }
@@ -715,6 +749,7 @@ mod sequential_approval_tests {
     struct RecordingAuthenticator<'a> {
         inner: &'a TestKey,
         offered: OfferedHistory,
+        fail_approval: bool,
     }
 
     impl Authenticator for RecordingAuthenticator<'_> {
@@ -746,6 +781,11 @@ mod sequential_approval_tests {
             pin: &str,
         ) -> std::result::Result<Approval, AuthenticatorError> {
             self.offered.borrow_mut().push(credentials.to_vec());
+            if self.fail_approval {
+                return Err(AuthenticatorError::Device(
+                    "simulated assertion failure".into(),
+                ));
+            }
             self.inner
                 .approve(rp_id, credentials, client_data_json, pin)
         }
@@ -810,9 +850,18 @@ mod sequential_approval_tests {
         inner: &'a TestKey,
         history: &OfferedHistory,
     ) -> Box<dyn Authenticator + 'a> {
+        recording_key_with_failure(inner, history, false)
+    }
+
+    fn recording_key_with_failure<'a>(
+        inner: &'a TestKey,
+        history: &OfferedHistory,
+        fail_approval: bool,
+    ) -> Box<dyn Authenticator + 'a> {
         Box::new(RecordingAuthenticator {
             inner,
             offered: Rc::clone(history),
+            fail_approval,
         })
     }
 
@@ -878,5 +927,41 @@ mod sequential_approval_tests {
         assert!(!offered[1].contains(&first_id));
         assert!(offered[1].contains(&second_id));
         assert!(format!("{error:#}").contains("credential"));
+    }
+
+    #[test]
+    fn assertion_failure_stops_before_connecting_the_next_key() {
+        let fixture = CampaignFixture::new();
+        let history = Rc::new(RefCell::new(Vec::new()));
+        let first_key = &fixture.domain.keys[0];
+        let mut supplied = 0;
+
+        let error = approve_campaign_sequentially(fixture.session, |_| {
+            supplied += 1;
+            Ok((
+                recording_key_with_failure(first_key, &history, true),
+                Zeroizing::new(String::new()),
+            ))
+        })
+        .expect_err("an authenticator assertion error must abort the ceremony");
+
+        assert_eq!(supplied, 1, "no second device should be requested");
+        assert_eq!(history.borrow().len(), 1);
+        assert!(format!("{error:#}").contains("simulated assertion failure"));
+    }
+
+    #[test]
+    fn connection_failure_stops_before_attempting_an_assertion() {
+        let fixture = CampaignFixture::new();
+        let mut supplied = 0;
+
+        let error = approve_campaign_sequentially(fixture.session, |_| {
+            supplied += 1;
+            Err(anyhow::anyhow!("simulated device connection failure"))
+        })
+        .expect_err("a device connection error must abort the ceremony");
+
+        assert_eq!(supplied, 1);
+        assert!(format!("{error:#}").contains("simulated device connection failure"));
     }
 }
