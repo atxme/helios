@@ -783,3 +783,87 @@ fn a_stale_document_outside_a_transition_reads_null() {
         None
     );
 }
+
+#[test]
+fn a_staged_document_is_returned_while_its_transition_is_registered() {
+    let transition = staged_transition(4);
+
+    assert_eq!(
+        staged_answer(true, Some(transition.clone())).expect("answer"),
+        Some(transition)
+    );
+}
+
+#[test]
+fn an_optional_document_distinguishes_absent_and_malformed_files() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("transition.json");
+    assert_eq!(
+        read_staged_transition(&path).expect("absent is optional"),
+        None
+    );
+
+    std::fs::write(&path, b"{not-json").expect("write malformed document");
+    let error = read_staged_transition(&path).expect_err("malformed persisted state fails closed");
+    assert!(error
+        .to_string()
+        .contains("decoding the staged gateway transition"));
+}
+
+#[test]
+fn document_writes_create_parents_and_replace_the_old_file() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory
+        .path()
+        .join("nested")
+        .join("gateway-transition.json");
+    let first = staged_transition(4);
+    write_document(&path, &first, "transition").expect("initial write");
+    let replacement = staged_transition(5);
+    write_document(&path, &replacement, "transition").expect("atomic replacement");
+
+    assert_eq!(
+        read_staged_transition(&path).expect("read replacement"),
+        Some(replacement)
+    );
+    assert!(!path.with_extension("tmp").exists());
+}
+
+#[test]
+fn document_writes_refuse_a_parent_that_is_a_file() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let parent = directory.path().join("not-a-directory");
+    std::fs::write(&parent, b"occupied").expect("write parent file");
+    let path = parent.join("transition.json");
+
+    let error = write_document(&path, &staged_transition(4), "transition")
+        .expect_err("a non-directory parent must refuse the write");
+
+    assert!(error.to_string().contains("creating"));
+}
+
+#[test]
+fn removing_a_document_is_idempotent_but_surfaces_other_io_errors() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("transition.json");
+    remove_document(&path).expect("missing documents are already removed");
+
+    std::fs::write(&path, b"document").expect("write document");
+    remove_document(&path).expect("remove existing document");
+    remove_document(&path).expect("second removal is harmless");
+
+    let error = remove_document(directory.path()).expect_err("directories are not documents");
+    assert!(error.to_string().contains("removing"));
+}
+
+#[test]
+fn signed_document_reader_reports_missing_and_malformed_inputs() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("abort.json");
+    assert!(read_signed_document::<GatewayTransitionAbort>(&path, "abort").is_err());
+
+    std::fs::write(&path, b"{not-json").expect("write malformed document");
+    let error = read_signed_document::<GatewayTransitionAbort>(&path, "abort")
+        .expect_err("malformed signed input is refused");
+    assert!(error.to_string().contains("decoding the abort"));
+}
