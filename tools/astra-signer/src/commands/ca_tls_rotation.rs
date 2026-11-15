@@ -492,6 +492,49 @@ mod preflight_tests {
     }
 
     #[test]
+    fn resuming_an_already_submitted_rotation_does_not_contact_or_rewrite_it() {
+        let directory = tempfile::tempdir().expect("directory");
+        let vault_path = directory.path().join("missing-vault.json");
+        let prepared_path = prepared::path_beside(&vault_path);
+        let saved = record("01".repeat(16).as_str(), Some("bearer"), true);
+        prepared::save(&prepared_path, &saved).expect("save submitted record");
+        let before = std::fs::read(&prepared_path).expect("prepared bytes before");
+
+        resume_rotation(&vault_path, unreachable_channel())
+            .expect("submitted rotations are not submitted twice");
+
+        assert_eq!(
+            std::fs::read(&prepared_path).expect("prepared bytes after"),
+            before
+        );
+        assert_eq!(
+            prepared::load(&prepared_path).expect("read record"),
+            Some(saved)
+        );
+    }
+
+    #[test]
+    fn malformed_prepared_state_is_refused_without_contacting_the_channel() {
+        let directory = tempfile::tempdir().expect("directory");
+        let vault_path = directory.path().join("missing-vault.json");
+        let prepared_path = prepared::path_beside(&vault_path);
+        std::fs::write(&prepared_path, b"{not-json").expect("write malformed state");
+        let before = std::fs::read(&prepared_path).expect("prepared bytes before");
+
+        let error = resume_rotation(&vault_path, unreachable_channel())
+            .expect_err("malformed prepared state must fail closed");
+
+        assert!(
+            format!("{error:#}").contains("rotation préparée"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&prepared_path).expect("prepared bytes after"),
+            before
+        );
+    }
+
+    #[test]
     fn promotion_refuses_a_missing_record_before_requesting_a_key() {
         let directory = tempfile::tempdir().expect("directory");
         let vault_path = directory.path().join("authority-vault.json");
@@ -502,6 +545,57 @@ mod preflight_tests {
         assert!(error
             .to_string()
             .contains("aucune rotation CA-TLS en cours"));
+    }
+
+    #[test]
+    fn promotion_refuses_an_unsubmitted_record_before_requesting_a_key_or_mutating_the_vault() {
+        let directory = tempfile::tempdir().expect("directory");
+        let vault_path = directory.path().join("authority-vault.json");
+        test_vault(&vault_path);
+        let prepared_path = prepared::path_beside(&vault_path);
+        let saved = record("01".repeat(16).as_str(), Some("bearer"), false);
+        prepared::save(&prepared_path, &saved).expect("save unsubmitted record");
+        let vault_before = std::fs::read(&vault_path).expect("vault before");
+        let prepared_before = std::fs::read(&prepared_path).expect("prepared bytes before");
+
+        let error = promote_ca_tls(&vault_path, Transport::Hid)
+            .expect_err("a transition Astra has not received cannot be promoted");
+
+        assert!(
+            format!("{error:#}").contains("jamais été déposée"),
+            "{error:#}"
+        );
+        assert!(!format!("{error:#}").contains("terminal"));
+        assert_eq!(
+            std::fs::read(&vault_path).expect("vault after"),
+            vault_before
+        );
+        assert_eq!(
+            std::fs::read(&prepared_path).expect("prepared bytes after"),
+            prepared_before
+        );
+    }
+
+    #[test]
+    fn record_to_promote_requires_a_submitted_prepared_decision() {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("prepared.json");
+
+        let missing = record_to_promote(&path).expect_err("missing rotation");
+        assert!(missing.to_string().contains("aucune rotation CA-TLS"));
+
+        let saved = record("01".repeat(16).as_str(), Some("bearer"), false);
+        prepared::save(&path, &saved).expect("save unsubmitted record");
+        let unsubmitted = record_to_promote(&path).expect_err("unsubmitted rotation");
+        assert!(format!("{unsubmitted:#}").contains("jamais été déposée"));
+        assert_eq!(prepared::load(&path).expect("read record"), Some(saved));
+
+        let submitted = record("02".repeat(16).as_str(), Some("bearer"), true);
+        prepared::save(&path, &submitted).expect("save submitted record");
+        assert_eq!(
+            record_to_promote(&path).expect("submitted rotation"),
+            submitted
+        );
     }
 
     #[test]
