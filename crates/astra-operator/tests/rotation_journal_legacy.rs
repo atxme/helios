@@ -217,6 +217,7 @@ fn with_authority(status: OperatorAuthorityStatus) -> ResumeFacts {
 
 fn nothing_in_flight() -> OperatorAuthorityStatus {
     OperatorAuthorityStatus {
+        vault_copy_revision: None,
         chain: None,
         ca_epoch: 1,
         ca_fingerprint: Fingerprint::of(b"ca en service"),
@@ -322,6 +323,7 @@ fn an_offline_record_astra_does_not_hold_conflicts_and_moves_nothing() {
     for status in [
         nothing_in_flight(),
         OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_fingerprint: Some(Fingerprint::of(b"une autre")),
             ..nothing_in_flight()
         },
@@ -363,10 +365,12 @@ fn an_offline_record_whose_vault_already_moved_is_not_discarded() {
 #[test]
 fn a_legacy_ca_pq_journal_astra_holds_applies_and_only_then_lets_the_file_go() {
     let next_in_flight = |anchor| OperatorAuthorityStatus {
+        vault_copy_revision: None,
         next_ca_fingerprint: Some(anchor),
         ..nothing_in_flight()
     };
     let promoted = |anchor| OperatorAuthorityStatus {
+        vault_copy_revision: None,
         ca_fingerprint: anchor,
         ..nothing_in_flight()
     };
@@ -809,6 +813,7 @@ fn a_prepared_record_is_never_discarded() {
         rotation_journal::next_step(
             &journal,
             &dead(OperatorAuthorityStatus {
+                vault_copy_revision: None,
                 next_ca_tls_fingerprint: Some(Fingerprint::of(b"une autre")),
                 ..nothing_in_flight()
             })
@@ -819,6 +824,7 @@ fn a_prepared_record_is_never_discarded() {
         rotation_journal::next_step(
             &journal,
             &dead(OperatorAuthorityStatus {
+                vault_copy_revision: None,
                 next_ca_tls_fingerprint: Some(journal.next_anchor_fingerprint),
                 ..nothing_in_flight()
             })

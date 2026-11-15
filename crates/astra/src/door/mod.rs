@@ -69,6 +69,7 @@ use crate::signing::SigningError;
 pub use lock::{VolumeLock, VolumeWrites, VolumeWritesHeld, VOLUME_LOCK_FILE};
 use open::Resolved;
 pub use open::{MAX_OPENING_WINDOW_SECS, MAX_REASON_CHARS, MAX_REQUESTED_BY_CHARS};
+pub(crate) use vault_copy::revision_of;
 pub use vault_copy::VaultBytes;
 
 /// The service's Unix socket in the state volume, the console's connector.
@@ -202,6 +203,9 @@ pub enum DoorRequest {
     VaultCopy {
         vault: VaultBytes,
         credentials: Option<Box<CredentialRegistry>>,
+        /// Lets a copy behind the one held replace it (§5.9). Off by default,
+        /// and logged as forced when it lifts the refusal.
+        replace_newer: bool,
     },
 }
 
@@ -496,6 +500,11 @@ pub enum DoorRefusal {
     )]
     VaultCopyRefused,
     #[error(
+        "cette copie est antérieure à celle détenue, ou en diverge à révision égale : rien n'a \
+         été écrit"
+    )]
+    VaultCopyStale,
+    #[error(
         "ce document de credentials est d'une époque inférieure à celui en service : le remplacer \
          ferait reculer la liste des clés, et rien n'a été écrit"
     )]
@@ -527,10 +536,11 @@ impl DoorRefusal {
     /// A malformed text is the caller's own input and says nothing about the
     /// domain; a full store is a budget. Every decision about the domain —
     /// policy, uniqueness, targets, vault — is the same indistinct refusal.
-    /// The one exception is not decided here: `POST /operator/vault-copy`
-    /// answers `409` for `AlreadyOpen` and `CredentialsDuringRotation`, because
-    /// the sender retries them and only an administrator reaches that route
-    /// (spec §8.5.4).
+    /// The exceptions are not decided here: `POST /operator/vault-copy` answers
+    /// `409` for `AlreadyOpen` and `CredentialsDuringRotation`, because the
+    /// sender retries them, and `412` for `VaultCopyStale`, which a copy with a
+    /// newer revision passes. Only an administrator reaches that route (spec
+    /// §8.5.4).
     pub fn class(&self) -> ServiceError {
         match self {
             Self::TextMissing
@@ -562,6 +572,7 @@ impl DoorRefusal {
             | Self::VaultCopyRefused
             | Self::CredentialsRollback
             | Self::CredentialsDuringRotation => ServiceError::Refused,
+            Self::VaultCopyStale => ServiceError::Stale,
             Self::Store(SigningError::Full) => ServiceError::Throttled,
             Self::Store(_)
             | Self::GatewayChannelUnavailable
@@ -853,8 +864,13 @@ impl AstraService {
                 )
                 .await
             }
-            DoorRequest::VaultCopy { vault, credentials } => {
-                self.copy_vault(vault, credentials, now_unix).await
+            DoorRequest::VaultCopy {
+                vault,
+                credentials,
+                replace_newer,
+            } => {
+                self.copy_vault(connector, vault, credentials, now_unix, replace_newer)
+                    .await
             }
         }
     }

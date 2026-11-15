@@ -330,6 +330,7 @@ pub fn send_copy_with(
     // copy back with it. The vault alone passes, and the document follows later.
     if carried_a_document && sent == VaultCopySent::HeldBack {
         let alone = OperatorVaultCopy {
+            replace_newer: false,
             credentials: None,
             ..copy
         };

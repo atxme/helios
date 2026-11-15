@@ -932,6 +932,7 @@ pub fn vault_copy(vault_path: &Path) -> Result<OperatorVaultCopy> {
     let vault = store::load(vault_path)?;
     let bytes = serde_json::to_vec(&vault).context("sérialisation du coffre")?;
     Ok(OperatorVaultCopy {
+        replace_newer: false,
         vault_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
         credentials: None,
     })

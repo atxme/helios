@@ -1210,6 +1210,7 @@ mod tests {
 
     fn authority() -> OperatorAuthorityStatus {
         OperatorAuthorityStatus {
+            vault_copy_revision: None,
             chain: None,
             ca_epoch: 1,
             ca_fingerprint: Fingerprint::of(b"ancre sortante"),
@@ -1315,6 +1316,7 @@ mod tests {
         let fingerprint = signed.next_anchor_fingerprint;
         // Accepted, its answer lost: still in flight on Astra.
         let in_flight = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_tls_fingerprint: Some(fingerprint),
             ..authority()
         };
@@ -1324,6 +1326,7 @@ mod tests {
         );
         // Accepted so long ago that Astra has already promoted it.
         let promoted = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             ca_tls_fingerprint: Some(fingerprint),
             ..authority()
         };
@@ -1340,6 +1343,7 @@ mod tests {
         let signed = ca_pq_journal(JournalStage::Signed);
         let fingerprint = signed.next_anchor_fingerprint;
         let in_flight = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_fingerprint: Some(fingerprint),
             ..authority()
         };
@@ -1348,6 +1352,7 @@ mod tests {
             ResumeStep::ApplyLocal
         );
         let promoted = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             ca_fingerprint: fingerprint,
             ..authority()
         };
@@ -1356,6 +1361,7 @@ mod tests {
             ResumeStep::ApplyLocal
         );
         let other_family = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_tls_fingerprint: Some(fingerprint),
             ..authority()
         };
@@ -1397,6 +1403,7 @@ mod tests {
         );
         // An authority that holds the anchor is read as such at once: nothing waits.
         let held = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_tls_fingerprint: Some(signed.next_anchor_fingerprint),
             ..authority()
         };
@@ -1417,6 +1424,7 @@ mod tests {
             ca_pq
         }] {
             let elsewhere = OperatorAuthorityStatus {
+                vault_copy_revision: None,
                 ca_fingerprint: Fingerprint::of(b"ancre d'un autre domaine"),
                 ca_tls_fingerprint: Some(Fingerprint::of(b"ancre d'un autre domaine")),
                 ..authority()
@@ -1429,6 +1437,7 @@ mod tests {
             );
             // An authority naming no anchor of that family at all.
             let silent = OperatorAuthorityStatus {
+                vault_copy_revision: None,
                 ca_tls_fingerprint: None,
                 ..authority()
             };
@@ -1445,6 +1454,7 @@ mod tests {
     fn dead_and_another_rotation_in_flight_conflicts() {
         let signed = journal(JournalStage::Signed);
         let other = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_tls_fingerprint: Some(Fingerprint::of(b"une autre")),
             ..authority()
         };
@@ -1568,10 +1578,12 @@ mod tests {
         let fingerprint = adopted.next_anchor_fingerprint;
         for status in [
             OperatorAuthorityStatus {
+                vault_copy_revision: None,
                 next_ca_fingerprint: Some(fingerprint),
                 ..authority()
             },
             OperatorAuthorityStatus {
+                vault_copy_revision: None,
                 ca_fingerprint: fingerprint,
                 ..authority()
             },
@@ -1591,10 +1603,12 @@ mod tests {
         for status in [
             authority(),
             OperatorAuthorityStatus {
+                vault_copy_revision: None,
                 next_ca_fingerprint: Some(Fingerprint::of(b"une autre")),
                 ..authority()
             },
             OperatorAuthorityStatus {
+                vault_copy_revision: None,
                 next_ca_tls_fingerprint: Some(adopted.next_anchor_fingerprint),
                 ..authority()
             },

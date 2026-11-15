@@ -52,10 +52,12 @@ fn holding(vault_path: &Path, journal: &RotationJournal) -> OperatorAuthoritySta
     let next = Some(journal.next_anchor_fingerprint);
     match journal.kind {
         RotationKind::CaPq => OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_fingerprint: next,
             ..nothing_in_flight(vault_path)
         },
         RotationKind::CaTls => OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_tls_fingerprint: next,
             ..nothing_in_flight(vault_path)
         },
@@ -1707,6 +1709,7 @@ fn a_dead_campaign_is_decided_by_the_authority_and_never_deposited() {
     let before = domain_other.files();
     let remote = Remote::watching(&domain_other.path);
     *remote.authority.borrow_mut() = Some(OperatorAuthorityStatus {
+        vault_copy_revision: None,
         next_ca_fingerprint: Some(Fingerprint::of(b"une autre")),
         ..nothing_in_flight(&domain_other.path)
     });

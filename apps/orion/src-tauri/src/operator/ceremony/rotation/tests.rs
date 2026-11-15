@@ -767,6 +767,7 @@ impl Bench {
         let client_tls = DerCertificate::parse(relay.ca_tls_certificate.as_ref().expect("CA-TLS"))
             .expect("certificate");
         OperatorAuthorityStatus {
+            vault_copy_revision: None,
             ca_epoch: identity.ca_epoch,
             ca_fingerprint: anchor.authority_fingerprint(),
             next_ca_fingerprint: None,
@@ -1034,6 +1035,7 @@ fn an_approval_with_a_chain_step_obtains_it_instead_of_opening() {
 fn a_refusal_before_the_opening_takes_no_chain_step() {
     let bench = bench();
     *bench.remote.authority.lock().expect("lock") = Some(OperatorAuthorityStatus {
+        vault_copy_revision: None,
         next_ca_fingerprint: Some(Fingerprint::of(b"suivante")),
         ..bench.nothing_in_flight()
     });
@@ -1248,10 +1250,12 @@ fn a_key_marked_lost_publishes_a_retry_at_its_validation() {
 #[test]
 fn the_refusals_at_approval_are_worded_by_their_cause() {
     let overlap = |bench: &Bench| OperatorAuthorityStatus {
+        vault_copy_revision: None,
         next_ca_fingerprint: Some(Fingerprint::of(b"suivante")),
         ..bench.nothing_in_flight()
     };
     let other_anchor = |bench: &Bench| OperatorAuthorityStatus {
+        vault_copy_revision: None,
         ca_fingerprint: Fingerprint::of(b"une autre ancre"),
         ..bench.nothing_in_flight()
     };
@@ -2057,6 +2061,7 @@ fn another_rotation_at_the_authority_conflicts_and_keeps_the_journal() {
     let bench = bench();
     bench.remote.deposits.lock().expect("lock").push_back(409);
     let other = OperatorAuthorityStatus {
+        vault_copy_revision: None,
         next_ca_fingerprint: Some(Fingerprint::of(b"une autre")),
         ..bench.nothing_in_flight()
     };
@@ -2227,6 +2232,7 @@ fn an_adoption_reads_as_deposited_once_the_authority_confirms_it() {
     let bench = bench();
     let journal = adopted_with_no_deposit(&bench);
     *bench.remote.authority.lock().expect("lock") = Some(OperatorAuthorityStatus {
+        vault_copy_revision: None,
         next_ca_fingerprint: Some(journal.next_anchor_fingerprint),
         ..bench.nothing_in_flight()
     });
@@ -3552,12 +3558,14 @@ mod overview {
         assert_eq!(quiet.ca_pq_overlap, Some(false));
 
         let tls = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_tls_fingerprint: Some(Fingerprint::of(b"suivante")),
             ..bench.nothing_in_flight()
         };
         assert_eq!(assembled(&bench, tls).ca_pq_overlap, Some(false));
 
         let pq = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_fingerprint: Some(Fingerprint::of(b"suivante")),
             ..bench.nothing_in_flight()
         };
@@ -3716,6 +3724,7 @@ mod overview {
         let held = send_copy_with(&bench.remote, &bench.path, &target_of(&bench), || {
             Reach::Ok(
                 OperatorAuthorityStatus {
+                    vault_copy_revision: None,
                     credential_registry_epoch: Some(u64::MAX),
                     ..bench.nothing_in_flight()
                 }
@@ -3765,6 +3774,7 @@ mod overview {
         assert!(with.credentials.is_some(), "the document beside the vault");
 
         let overlap: AuthorityStatusRead = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_fingerprint: Some(Fingerprint::of(b"suivante")),
             ..bench.nothing_in_flight()
         }
@@ -3844,6 +3854,7 @@ mod overview {
         let overview = assembled(
             &bench,
             OperatorAuthorityStatus {
+                vault_copy_revision: None,
                 credential_registry_epoch: Some(before),
                 ..bench.nothing_in_flight()
             },
@@ -3908,6 +3919,7 @@ mod overview {
         let overlap = || {
             Reach::Ok(
                 OperatorAuthorityStatus {
+                    vault_copy_revision: None,
                     next_ca_fingerprint: Some(Fingerprint::of(b"suivante")),
                     credential_registry_epoch: Some(before),
                     ..bench.nothing_in_flight()
@@ -3948,6 +3960,7 @@ mod overview {
 
     fn served(bench: &Bench, epoch: Option<u64>) -> AuthorityStatusRead {
         OperatorAuthorityStatus {
+            vault_copy_revision: None,
             credential_registry_epoch: epoch,
             ..bench.nothing_in_flight()
         }

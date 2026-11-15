@@ -288,6 +288,7 @@ impl OperatorCampaignRelay for SpyCampaign {
 
 fn authority_status() -> astra_channel::OperatorAuthorityStatus {
     astra_channel::OperatorAuthorityStatus {
+        vault_copy_revision: None,
         chain: None,
         ca_epoch: 2,
         ca_fingerprint: Fingerprint::of(b"ca"),
