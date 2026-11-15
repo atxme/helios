@@ -523,6 +523,23 @@ function keysPrerequisite(o: RotationsOverview): Prerequisite {
 }
 
 /**
+ * The keys line of the replacement without a campaign: two keys in the vault, nothing more.
+ * A domain without Astra has usually never issued a credential document, and the ceremony
+ * accepts it absent (the backend still refuses keys a present document marks lost).
+ */
+function keysInVaultPrerequisite(o: RotationsOverview): Prerequisite {
+  const count = keyCount(o)
+  const ok = count >= 2
+  return {
+    label: 'Deux clés enregistrées',
+    ok,
+    fix: ok ? null : count === 1 ? 'Enregistrer une seconde clé' : 'Enregistrer deux clés',
+    fixAction: null,
+    detail: null,
+  }
+}
+
+/**
  * Whether the credential document beside the vault is ahead of the one Astra serves, where
  * « Envoyer » would carry it: a key added, removed or marked lost changes the document, and
  * a marking leaves the vault bytes as they were. Not during a CA-PQ overlap, where Astra
@@ -618,7 +635,7 @@ export function prerequisites(o: RotationsOverview, action: RotationAction): Pre
   }
   // Two keys and the vault: nothing is asked of Astra, and no copy is sent to it.
   if (action === 'replace_ca_pq_without_campaign') {
-    return [tunnel, admin, vaultPrerequisite(o), keysPrerequisite(o), domainPrerequisite(o)]
+    return [tunnel, admin, vaultPrerequisite(o), keysInVaultPrerequisite(o), domainPrerequisite(o)]
   }
   if (action === 'resume' && resumesOnTheGatewayAlone(o)) {
     return [tunnel, admin, vaultPrerequisite(o)]
@@ -690,6 +707,11 @@ export function stopSentence(
     return journal?.kind === 'ca_pq'
       ? 'Gateway sans CA-PQ suivante, ou mise à jour requise. Rotation conservée.'
       : 'Gateway sans CA TLS, ou mise à jour requise. Rotation conservée.'
+  }
+  // Without a campaign the domain named no origin when the rotation began: a conflict
+  // means the relay has gained one, and the signer would only conflict with the journal.
+  if (journal?.withoutCampaign) {
+    return 'Le relais nomme désormais une origine Astra : rotation conservée.'
   }
   return journal?.kind === 'ca_pq' && journal.offline
     ? 'Domaine en désaccord. Intervention manuelle requise : astra-signer rotate-ca-pq.'

@@ -539,6 +539,14 @@ describe('the stops', () => {
     expect(sentence).toMatch(/Intervention manuelle requise/)
   })
 
+  it('a_conflict_on_a_rotation_without_a_campaign_says_the_relay_gained_an_origin', () => {
+    for (const offline of [false, true]) {
+      expect(stopSentence('domain_conflict', { ...journal, withoutCampaign: true, offline })).toBe(
+        'Le relais nomme désormais une origine Astra : rotation conservée.',
+      )
+    }
+  })
+
   it('the_outdated_gateway_names_the_kind_of_the_journal', () => {
     expect(stopSentence('gateway_names_no_anchor', journal)).toMatch(/CA-PQ/)
     expect(stopSentence('gateway_names_no_anchor', journal)).not.toMatch(/CA TLS/)
@@ -759,6 +767,51 @@ describe('the CA-PQ replacement without a campaign', () => {
       'Domaine concordant',
     ])
     expect(allGreen(lines)).toBe(true)
+  })
+
+  it('on a gateway without Astra the administrator line is green and the start is offered', () => {
+    // The gateway answers 503 to the pending read for an administrator, 403 to anyone else.
+    const o = overview({
+      relayNamesOrigin: false,
+      pending: { state: 'astra_unavailable' },
+      authority: { state: 'astra_unavailable' },
+    })
+    const lines = prerequisites(o, 'replace_ca_pq_without_campaign')
+    expect(lines.find((p) => p.label === 'Administrateur du tunnel')?.ok).toBe(true)
+    expect(allGreen(lines)).toBe(true)
+    const peer = overview({ relayNamesOrigin: false, pending: { state: 'not_admin' } })
+    expect(
+      prerequisites(peer, 'replace_ca_pq_without_campaign').find(
+        (p) => p.label === 'Administrateur du tunnel',
+      )?.ok,
+    ).toBe(false)
+  })
+
+  it('its keys line asks two keys in the vault, not a credential document', () => {
+    const noDocument = overview({
+      relayNamesOrigin: false,
+      vault: vaultOverview({ credentials_complete: false }),
+    })
+    const lines = prerequisites(noDocument, 'replace_ca_pq_without_campaign')
+    expect(lines.find((p) => p.label === 'Deux clés enregistrées')?.ok).toBe(true)
+    expect(allGreen(lines)).toBe(true)
+    expect(row(noDocument, 'replace_ca_pq_without_campaign')?.disabledReason).toBeNull()
+    // The campaign replacement still asks the document.
+    expect(
+      prerequisites(noDocument, 'replace_ca_pq').find((p) => p.label === 'Deux clés enregistrées')?.ok,
+    ).toBe(false)
+    const oneKey = overview({
+      relayNamesOrigin: false,
+      vault: vaultOverview({
+        credentials_complete: false,
+        slots: [{ slot_id: 'a', label: 'Clé 1', role: 'principale', state: 'active' }],
+      }),
+    })
+    const line = prerequisites(oneKey, 'replace_ca_pq_without_campaign').find(
+      (p) => p.label === 'Deux clés enregistrées',
+    )
+    expect(line?.ok).toBe(false)
+    expect(line?.fix).toBe('Enregistrer une seconde clé')
   })
 
   it('a resumption of a journal written without a campaign speaks to the gateway alone', () => {

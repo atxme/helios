@@ -12,6 +12,7 @@ const api = vi.hoisted(() => ({
   beginRotationCeremony: vi.fn(),
   operatorCeremonyStatus: vi.fn(),
   operatorChainHeld: vi.fn(),
+  operatorRotationTransitionFile: vi.fn(),
 }))
 vi.mock('../../api', () => api)
 
@@ -509,5 +510,78 @@ describe('the CA-PQ replacement without a campaign', () => {
     await show(overview({ relayNamesOrigin: true }))
     choose('Remplacer la CA-PQ')
     expect(screen.queryByText(WARNING)).toBeNull()
+  })
+
+  it('hands its ceremony over marked, and the campaign replacement unmarked', async () => {
+    api.beginRotationCeremony.mockResolvedValue(ceremony)
+    const onCeremony = vi.fn()
+    api.operatorRotationsOverview.mockResolvedValue(overview({ relayNamesOrigin: false }))
+    render(
+      <RotationsPanel
+        onCeremony={onCeremony}
+        renderStep={(context) => <RotationSteps {...context} />}
+      />,
+    )
+    await screen.findByRole('region', { name: 'Renouveler les postes' })
+    choose(ROW)
+    fireEvent.click(await screen.findByRole('button', { name: 'Continuer' }))
+    await waitFor(() => expect(onCeremony).toHaveBeenCalledWith(ceremony, null, undefined, true))
+  })
+})
+
+describe('the transition file of a rotation without a campaign', () => {
+  const journal = (extra: Partial<NonNullable<RotationsOverview['journal']>> = {}) => ({
+    kind: 'ca_pq' as const,
+    stage: 'applied' as const,
+    activationAt: NOW + 86_400,
+    notAfter: NOW + 30 * 86_400,
+    nextFingerprint: 'aa',
+    offline: false,
+    withoutCampaign: true,
+    ...extra,
+  })
+  const BUTTON = 'Télécharger la transition'
+
+  it('is offered by the resume row only for an applied journal without a campaign', async () => {
+    await show(overview({ resumable: true, journal: journal() }))
+    expect(screen.getByRole('button', { name: BUTTON })).toBeTruthy()
+    cleanup()
+    for (const other of [
+      journal({ stage: 'accepted' }),
+      journal({ stage: 'installed' }),
+      journal({ withoutCampaign: false }),
+    ]) {
+      await show(overview({ resumable: true, journal: other }))
+      expect(screen.queryByRole('button', { name: BUTTON })).toBeNull()
+      cleanup()
+    }
+    await show(overview({ resumable: true, journal: null }))
+    expect(screen.queryByRole('button', { name: BUTTON })).toBeNull()
+  })
+
+  it('saves what the backend reads beside the vault, with no ceremony', async () => {
+    const file = {
+      file_name: 'ca-pq-transition.json',
+      contents: '{}\n',
+      encoding: 'text' as const,
+    }
+    api.operatorRotationTransitionFile.mockResolvedValue(file)
+    const createObjectURL = vi.fn(() => 'blob:x')
+    const revokeObjectURL = vi.fn()
+    Object.assign(URL, { createObjectURL, revokeObjectURL })
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    await show(overview({ resumable: true, journal: journal(), tunnel: false }))
+    fireEvent.click(screen.getByRole('button', { name: BUTTON }))
+    await waitFor(() => expect(click).toHaveBeenCalled())
+    expect(api.operatorRotationTransitionFile).toHaveBeenCalledTimes(1)
+    expect(createObjectURL).toHaveBeenCalled()
+    click.mockRestore()
+  })
+
+  it('says so when there is nothing to download', async () => {
+    api.operatorRotationTransitionFile.mockResolvedValue(null)
+    await show(overview({ resumable: true, journal: journal() }))
+    fireEvent.click(screen.getByRole('button', { name: BUTTON }))
+    expect(await screen.findByText('Aucune transition à télécharger')).toBeTruthy()
   })
 })

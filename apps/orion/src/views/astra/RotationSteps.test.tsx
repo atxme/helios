@@ -201,6 +201,24 @@ describe('the approval', () => {
     )
   })
 
+  it('the terms of a replacement without a campaign ask no reason and no second touch', async () => {
+    const { onStatus } = shown(approval(), { withoutCampaign: true })
+    toApproval()
+    expect(screen.queryByLabelText('Motif')).toBeNull()
+    expect(screen.queryByText('Garder la clé 2 branchée')).toBeNull()
+    const next = status({ gesture: 'verifying', keys: [first, second] })
+    api.approveRotationCeremony.mockResolvedValue(next)
+    fireEvent.click(button('Approuver'))
+    await waitFor(() => expect(onStatus).toHaveBeenCalledWith(next))
+    // The fixed reason is all the backend receives; nothing records it.
+    expect(api.approveRotationCeremony.mock.calls[0][0]).toMatchObject({
+      existing_operation: null,
+      reason: 'Remplacement de la CA-PQ',
+      prepare_days: 7,
+      overlap_days: 30,
+    })
+  })
+
   it('names the action and keeps both keys in view', () => {
     shown(approval({ operation: 'rotate_client_tls_ca' }))
     toApproval()
@@ -364,7 +382,10 @@ describe('the follow-up', () => {
       gesture: 'done',
       remote: 'deposited',
       allowed: [],
-      manifest: manifest({ next_anchor_fingerprint: 'cd'.repeat(32) }),
+      manifest: manifest({
+        next_anchor_fingerprint: 'cd'.repeat(32),
+        campaign: { campaign: { targets: [] } as never, fingerprint: 'ee'.repeat(32) },
+      }),
       ...extra,
     })
 
@@ -386,6 +407,40 @@ describe('the follow-up', () => {
     }
     expect(screen.queryByText(/^À installer avant le /)).toBeNull()
     expect(screen.getByText(/^Fin de rotation le /)).toBeTruthy()
+  })
+
+  it('a rotation without a campaign has no deposit and no vault copy step', () => {
+    shown(
+      status({ gesture: 'idle', remote: 'prepared', allowed: [], manifest: manifest() }),
+      { journal: journal({ stage: 'applied', withoutCampaign: true }) },
+    )
+    expect(screen.queryByText('Déposée')).toBeNull()
+    expect(screen.queryByText('Copie du coffre')).toBeNull()
+    expect(row('Signée').getByText('Fait')).toBeTruthy()
+    expect(row('Installée sur la gateway').getByText('À faire')).toBeTruthy()
+  })
+
+  it('a finished rotation without a campaign still shows neither, once the journal is gone', () => {
+    shown(finished({ manifest: manifest({ next_anchor_fingerprint: 'cd'.repeat(32) }) }), {
+      journal: null,
+    })
+    expect(screen.queryByText('Déposée')).toBeNull()
+    expect(screen.queryByText('Copie du coffre')).toBeNull()
+    expect(row('Installée sur la gateway').getByText('Fait')).toBeTruthy()
+  })
+
+  it('a finished campaign rotation keeps both steps', () => {
+    shown(
+      finished({
+        manifest: manifest({
+          next_anchor_fingerprint: 'cd'.repeat(32),
+          campaign: { campaign: { targets: [] } as never, fingerprint: 'ee'.repeat(32) },
+        }),
+      }),
+      { journal: null },
+    )
+    expect(row('Déposée').getByText('Fait')).toBeTruthy()
+    expect(row('Copie du coffre').getByText('Fait')).toBeTruthy()
   })
 
   it('a copy held back is pending and not finished', () => {

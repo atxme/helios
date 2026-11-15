@@ -403,6 +403,13 @@ export const operatorRotationJournal = () =>
   invoke<LocalRotationJournal>('operator_rotation_journal')
 
 /**
+ * La transition CA-PQ d'un remplacement sans campagne que la gateway n'a pas prise : lue
+ * à côté du coffre, sans tunnel ni clé. Rien une fois le journal parti.
+ */
+export const operatorRotationTransitionFile = () =>
+  invoke<OperatorArtifact | null>('operator_rotation_transition_file')
+
+/**
  * Envoie la copie du coffre à Astra, sans rien nommer : le coffre et ses credentials
  * sont lus côté Rust. « Retenue » est une réponse, pas un échec.
  */

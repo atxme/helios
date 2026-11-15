@@ -23,7 +23,7 @@ export function artifactBytes(artifact: OperatorArtifact): Uint8Array {
 }
 
 /** Offers one artifact as a download link, the way EnrollmentPanel offers a request. */
-function saveArtifact(artifact: OperatorArtifact) {
+export function saveArtifact(artifact: OperatorArtifact) {
   const blob = new Blob([artifactBytes(artifact) as BlobPart], {
     type: artifact.encoding === 'text' ? 'text/plain' : 'application/octet-stream',
   })

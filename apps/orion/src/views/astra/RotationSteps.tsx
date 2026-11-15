@@ -128,7 +128,9 @@ export function RotationSteps({
         }
         existing = liveOperation(fresh, action)?.operation_id ?? null
       }
-      onCeremony(await api.beginRotationCeremony(GESTURES[kind]), existing)
+      const status = await api.beginRotationCeremony(GESTURES[kind])
+      if (kind === 'replace_ca_pq_without_campaign') onCeremony(status, existing, undefined, true)
+      else onCeremony(status, existing)
     } catch (cause) {
       setError(String(cause))
     } finally {
@@ -292,6 +294,12 @@ function FollowUp({
   if (done) copy = journal === undefined ? 'reading' : journal === null ? 'done' : 'waiting'
   else if (installed) copy = 'waiting'
 
+  // Nothing is deposited and no vault copy is sent: the operator's gesture is the acceptance.
+  // The journal says so while it lasts; at the end only the manifest is left.
+  const withoutCampaign =
+    journal?.withoutCampaign === true ||
+    (!journal && status.operation === 'rotate_anchor' && !!manifest && !manifest.campaign)
+
   const incoming = manifest?.next_anchor_fingerprint || journal?.nextFingerprint || null
   // From the journal and this clock alone: the resumption's own refusal is the dead end,
   // said by the ceremony.
@@ -305,9 +313,9 @@ function FollowUp({
     <Box sx={{ mt: 1.25, pt: 1.25, borderTop: `1px solid ${RULE}` }}>
       <Box component="ul" sx={{ m: 0, p: 0 }}>
         <Step label="Signée" state={signed || deposited ? 'done' : 'todo'} />
-        <Step label="Déposée" state={deposited ? 'done' : 'todo'} />
+        {!withoutCampaign && <Step label="Déposée" state={deposited ? 'done' : 'todo'} />}
         <Step label="Installée sur la gateway" state={installed ? 'done' : 'todo'} />
-        <Step label="Copie du coffre" state={copy} />
+        {!withoutCampaign && <Step label="Copie du coffre" state={copy} />}
       </Box>
       {dates && !installed && (
         <Typography sx={{ mt: 0.75, fontSize: 11.5, fontWeight: 600 }}>
@@ -421,10 +429,12 @@ interface Draft {
 }
 
 /** What is wrong with the terms, before any call; `null` when they can be sent. */
-function termsError(draft: Draft, tls: boolean): string | null {
+function termsError(draft: Draft, tls: boolean, recordsReason: boolean): string | null {
   const reason = draft.reason.trim()
-  if (reason.length === 0) return 'Motif : requis'
-  if (draft.reason.length > REASON_MAX_CHARS) return `Motif : ${REASON_MAX_CHARS} caractères au plus`
+  if (recordsReason && reason.length === 0) return 'Motif : requis'
+  if (recordsReason && draft.reason.length > REASON_MAX_CHARS) {
+    return `Motif : ${REASON_MAX_CHARS} caractères au plus`
+  }
   const whole = (value: string) => value.trim() !== '' && Number.isSafeInteger(Number(value))
   if (!whole(draft.prepare) || Number(draft.prepare) < 1) return 'Préparation : 1 jour au moins'
   if (!whole(draft.overlap) || Number(draft.overlap) < 1) return 'Recouvrement : 1 jour au moins'
@@ -442,6 +452,7 @@ export function RotationCeremony({
   existingOperation = null,
   existingExpiresAt = null,
   chainStep,
+  withoutCampaign: opensNoCampaign = false,
   now = Math.floor(Date.now() / 1000),
 }: {
   status: OperatorStatus
@@ -459,6 +470,11 @@ export function RotationCeremony({
    * before, so `existingOperation` is ignored.
    */
   chainStep?: ChainStepAsk
+  /**
+   * The replacement without a campaign: nothing records a reason and no touch follows the
+   * terms, so neither the Motif nor the second key's reminder is shown.
+   */
+  withoutCampaign?: boolean
   /** Seconds, for the deadline; the operator's clock when not given. */
   now?: number
 }) {
@@ -490,7 +506,7 @@ export function RotationCeremony({
 
   const approve = async () => {
     const tls = operation === 'rotate_client_tls_ca'
-    const wrong = termsError(draft, tls)
+    const wrong = termsError(draft, tls, !opensNoCampaign)
     setInvalid(wrong)
     if (wrong) return
     setBusy(true)
@@ -624,7 +640,7 @@ export function RotationCeremony({
               )}
             </Box>
           ) : (
-            field('reason', 'Motif')
+            !opensNoCampaign && field('reason', 'Motif')
           )}
           <Button
             size="small"
@@ -643,9 +659,11 @@ export function RotationCeremony({
               {tls && field('validity', 'Validité CA TLS (jours)')}
             </Box>
           )}
-          <Typography color="text.secondary" sx={{ mb: 1, fontSize: 11.5 }}>
-            Garder la clé 2 branchée
-          </Typography>
+          {!opensNoCampaign && (
+            <Typography color="text.secondary" sx={{ mb: 1, fontSize: 11.5 }}>
+              Garder la clé 2 branchée
+            </Typography>
+          )}
           {retry && status.key_retry?.refusal === 'terms_refused' && (
             <Alert severity="warning" variant="outlined" sx={{ mb: 1, fontSize: 11.5 }}>
               {retry}
