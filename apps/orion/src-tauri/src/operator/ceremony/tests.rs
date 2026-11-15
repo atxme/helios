@@ -150,6 +150,81 @@ fn verify_key_is_served() {
     assert!(last.keys.is_empty());
 }
 
+/// Gestures that need an explicit payload cannot be started from a bare
+/// locator. Keep every such operation on the same fail-closed dispatch path.
+#[test]
+fn payload_ceremonies_refuse_a_bare_locator() {
+    let vault = std::env::temp_dir().join(format!(
+        "orion-payload-ceremony-{}-absent",
+        std::process::id()
+    ));
+    for operation in [
+        OperationKind::CreateDomain,
+        OperationKind::AddKey,
+        OperationKind::RemoveKey,
+        OperationKind::MarkKey,
+        OperationKind::FinalizeDomain,
+        OperationKind::IssueGatewayBootstrap,
+        OperationKind::AuthorizeIssuer,
+        OperationKind::RotateAnchor,
+        OperationKind::RotateClientTlsCa,
+        OperationKind::RevokeCertificate,
+    ] {
+        let (presses, received) = std::sync::mpsc::channel::<Press>();
+        drop(presses);
+        let mut published = Vec::new();
+        let outcome = run(
+            Id16::new([1; 16]).expect("id"),
+            OperationLocator {
+                kind: operation,
+                operation_id: None,
+            },
+            received,
+            &mut |status| published.push(status),
+            &vault,
+        );
+
+        let error = outcome.expect_err("a bare locator cannot carry gesture terms");
+        assert!(
+            error.contains("s'ouvre par son geste"),
+            "{operation:?}: {error}"
+        );
+        assert_eq!(published.len(), 2, "{operation:?}");
+        let last = published.last().expect("terminal status");
+        assert_eq!(last.operation, operation);
+        assert_eq!(last.refusal, Some(Refusal::Internal));
+        assert_eq!(last.gesture, GestureState::Failed);
+        assert!(last.allowed.is_empty());
+    }
+}
+
+/// A locator can name operations not handled by this process. It gets an
+/// explicit terminal status instead of leaving the UI waiting forever.
+#[test]
+fn unsupported_locator_operation_is_refused_explicitly() {
+    let (presses, received) = std::sync::mpsc::channel::<Press>();
+    drop(presses);
+    let mut published = Vec::new();
+    let outcome = run(
+        Id16::new([1; 16]).expect("id"),
+        OperationLocator {
+            kind: OperationKind::GatewayIdentity,
+            operation_id: None,
+        },
+        received,
+        &mut |status| published.push(status),
+        std::path::Path::new("unused-vault.json"),
+    );
+
+    let error = outcome.expect_err("GatewayIdentity uses its dedicated gesture");
+    assert!(error.contains("n'est pas encore portée"), "{error}");
+    let last = published.last().expect("terminal status");
+    assert_eq!(last.operation, OperationKind::GatewayIdentity);
+    assert_eq!(last.refusal, Some(Refusal::Internal));
+    assert_eq!(last.gesture, GestureState::Failed);
+    assert!(last.allowed.is_empty());
+}
+
 /// A vault of this machine's making, the domain relay beside it naming one
 /// gateway, and a registry directory of its own.
 pub(super) struct Domain {
