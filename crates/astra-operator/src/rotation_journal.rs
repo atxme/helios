@@ -514,10 +514,14 @@ pub fn apply_local(vault_path: &Path, journal: &mut RotationJournal) -> Result<(
         // Built first: a journal that cannot name it moves nothing.
         let record = promotion_record(journal)?;
         store::save(vault_path, &next.vault)?;
+        // The save writes a revision of its own, so the relay names the vault as
+        // it landed, not the copy the journal carried.
+        let mut relay = next.handoff.clone();
+        relay.adopt(&store::load(vault_path)?)?;
         if let Some(registry) = &next.credentials {
             credentials::save(&credentials::path_beside(vault_path), registry)?;
         }
-        handoff::save(&handoff::path_beside(vault_path), &next.handoff)?;
+        handoff::save(&handoff::path_beside(vault_path), &relay)?;
         if let Some(record) = record {
             prepared::save(&prepared::path_beside(vault_path), &record)?;
         }
@@ -1060,6 +1064,7 @@ mod tests {
                 wrapped_master: format!("maître enveloppé {seed}"),
             }],
             sealed_payload: format!("corps scellé {seed}"),
+            revision: 0,
         }
     }
 
@@ -1205,6 +1210,7 @@ mod tests {
 
     fn authority() -> OperatorAuthorityStatus {
         OperatorAuthorityStatus {
+            vault_copy_revision: None,
             chain: None,
             ca_epoch: 1,
             ca_fingerprint: Fingerprint::of(b"ancre sortante"),
@@ -1310,6 +1316,7 @@ mod tests {
         let fingerprint = signed.next_anchor_fingerprint;
         // Accepted, its answer lost: still in flight on Astra.
         let in_flight = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_tls_fingerprint: Some(fingerprint),
             ..authority()
         };
@@ -1319,6 +1326,7 @@ mod tests {
         );
         // Accepted so long ago that Astra has already promoted it.
         let promoted = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             ca_tls_fingerprint: Some(fingerprint),
             ..authority()
         };
@@ -1335,6 +1343,7 @@ mod tests {
         let signed = ca_pq_journal(JournalStage::Signed);
         let fingerprint = signed.next_anchor_fingerprint;
         let in_flight = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_fingerprint: Some(fingerprint),
             ..authority()
         };
@@ -1343,6 +1352,7 @@ mod tests {
             ResumeStep::ApplyLocal
         );
         let promoted = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             ca_fingerprint: fingerprint,
             ..authority()
         };
@@ -1351,6 +1361,7 @@ mod tests {
             ResumeStep::ApplyLocal
         );
         let other_family = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_tls_fingerprint: Some(fingerprint),
             ..authority()
         };
@@ -1392,6 +1403,7 @@ mod tests {
         );
         // An authority that holds the anchor is read as such at once: nothing waits.
         let held = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_tls_fingerprint: Some(signed.next_anchor_fingerprint),
             ..authority()
         };
@@ -1412,6 +1424,7 @@ mod tests {
             ca_pq
         }] {
             let elsewhere = OperatorAuthorityStatus {
+                vault_copy_revision: None,
                 ca_fingerprint: Fingerprint::of(b"ancre d'un autre domaine"),
                 ca_tls_fingerprint: Some(Fingerprint::of(b"ancre d'un autre domaine")),
                 ..authority()
@@ -1424,6 +1437,7 @@ mod tests {
             );
             // An authority naming no anchor of that family at all.
             let silent = OperatorAuthorityStatus {
+                vault_copy_revision: None,
                 ca_tls_fingerprint: None,
                 ..authority()
             };
@@ -1440,6 +1454,7 @@ mod tests {
     fn dead_and_another_rotation_in_flight_conflicts() {
         let signed = journal(JournalStage::Signed);
         let other = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_tls_fingerprint: Some(Fingerprint::of(b"une autre")),
             ..authority()
         };
@@ -1563,10 +1578,12 @@ mod tests {
         let fingerprint = adopted.next_anchor_fingerprint;
         for status in [
             OperatorAuthorityStatus {
+                vault_copy_revision: None,
                 next_ca_fingerprint: Some(fingerprint),
                 ..authority()
             },
             OperatorAuthorityStatus {
+                vault_copy_revision: None,
                 ca_fingerprint: fingerprint,
                 ..authority()
             },
@@ -1586,10 +1603,12 @@ mod tests {
         for status in [
             authority(),
             OperatorAuthorityStatus {
+                vault_copy_revision: None,
                 next_ca_fingerprint: Some(Fingerprint::of(b"une autre")),
                 ..authority()
             },
             OperatorAuthorityStatus {
+                vault_copy_revision: None,
                 next_ca_tls_fingerprint: Some(adopted.next_anchor_fingerprint),
                 ..authority()
             },
@@ -1898,22 +1917,29 @@ mod tests {
 
     // Applying.
 
-    fn assert_applied(place: &Place, applied: &RotationJournal) {
+    fn assert_applied(place: &Place, applied: &RotationJournal, replaced: u64) {
         let next = next_local();
         assert_eq!(applied.stage, JournalStage::Applied);
         assert_eq!(applied.next, None);
+        let landed = AuthorityVault {
+            revision: next.vault.revision.max(replaced).saturating_add(1),
+            ..next.vault.clone()
+        };
         assert_eq!(
             crate::store::load(&place.vault_path).expect("vault"),
-            next.vault
+            landed
         );
         assert_eq!(
             crate::credentials::load(&crate::credentials::path_beside(&place.vault_path))
                 .expect("credentials"),
             next.credentials
         );
+        // The relay names the vault as it landed, and is otherwise the journal's.
+        let mut relay = next.handoff.clone();
+        relay.vault_fingerprint = landed.fingerprint().expect("fingerprint").to_hex();
         assert_eq!(
             crate::handoff::load(&crate::handoff::path_beside(&place.vault_path)).expect("relay"),
-            next.handoff
+            relay
         );
         assert_eq!(
             load(&place.journal_path).expect("load").as_ref(),
@@ -1948,9 +1974,27 @@ mod tests {
                 )
                 .expect("relay");
             }
+            let replaced = crate::store::revision_on_disk(&place.vault_path);
             apply_local(&place.vault_path, &mut accepted).expect("apply");
-            assert_applied(&place, &accepted);
+            assert_applied(&place, &accepted, replaced);
         }
+    }
+
+    /// The vault applied from the journal is written above the one it replaces,
+    /// even though the journal's copy was built at revision zero.
+    #[test]
+    fn apply_local_lands_above_the_vault_it_replaces() {
+        let place = place();
+        for _ in 0..3 {
+            crate::store::save(&place.vault_path, &vault(1)).expect("vault");
+        }
+        assert_eq!(crate::store::revision_on_disk(&place.vault_path), 4);
+        let mut accepted = journal(JournalStage::Accepted);
+        save(&place.journal_path, &accepted).expect("save");
+
+        apply_local(&place.vault_path, &mut accepted).expect("apply");
+
+        assert_eq!(crate::store::revision_on_disk(&place.vault_path), 5);
     }
 
     /// Once applied, replaying must not touch the vault a later gesture may

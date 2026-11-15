@@ -18,20 +18,27 @@ const DOCUMENT_WAITS = 'Copie envoyée · document de credentials en attente (ro
 const HELD_BACK = 'Copie retenue par une opération en cours · à renvoyer ensuite'
 /** During a CA-PQ overlap, a document newer than Astra's waits for the overlap's end (N2). */
 const DOCUMENT_WAITS_OVERLAP = 'Document en attente de la fin du recouvrement'
+export const STALE_REFUSAL =
+  'Astra tient un coffre plus récent que celui de ce poste, ou qui a divergé. Récupérez le coffre à jour sur le poste qui le tient.'
+const REPLACE_BUTTON = 'Remplacer quand même'
+const REPLACE_WARNING =
+  'La copie d’Astra sera remplacée par ce coffre. À ne faire que si vous savez que la copie d’Astra est fausse.'
 
 /** What a send came to, said: a copy held back or a document left out is never silent. */
 function outcomeLine(outcome: VaultCopyOutcome): { text: string; complete: boolean } {
   if (outcome.state === 'held_back') return { text: HELD_BACK, complete: false }
+  if (outcome.state === 'stale') return { text: STALE_REFUSAL, complete: false }
   if (outcome.document_waits) return { text: DOCUMENT_WAITS, complete: false }
   return { text: COPY_SENT, complete: true }
 }
 
 /**
- * A send held back or failed and not yet delivered, with the vault it was meant for and the
- * session that sent it. It is kept outside the components, as the sent-once set is, so the line
- * and its « Réessayer l’envoi » survive a change of view.
+ * A send held back, refused as stale or failed and not yet delivered, with the vault it was meant
+ * for and the session that sent it. A stale refusal is offered the forced replacement instead of a
+ * retry. It is kept outside the components, as the sent-once set is, so the line and its buttons
+ * survive a change of view.
  */
-type Unsettled = { text: string; vault: string | null; sessionId: string | null }
+type Unsettled = { text: string; vault: string | null; sessionId: string | null; stale: boolean }
 
 let unsettled: Unsettled | null = null
 const unsettledListeners = new Set<() => void>()
@@ -69,61 +76,106 @@ export function resetForTests(): void {
   setUnsettled(null)
 }
 
-/** The fingerprint of the local vault, or `null` when it cannot be read. */
-async function readVault(): Promise<string | null> {
+/** The local vault's fingerprint, and whether a forced replacement is offered (nothing to resume). */
+type VaultRead = { vault: string | null; canReplace: boolean }
+
+async function readVault(): Promise<VaultRead> {
   try {
-    return (await api.operatorRotationsOverview()).localVaultFingerprint ?? null
+    const found = await api.operatorRotationsOverview()
+    return { vault: found.localVaultFingerprint ?? null, canReplace: !found.resumable }
   } catch {
+    return { vault: null, canReplace: false }
+  }
+}
+
+/**
+ * Sends the vault copy through the manual send, or forces it over a newer copy Astra holds. A send
+ * held back, refused as stale or failed stays on the line until a send for the same vault goes
+ * through; the outcome of one that reached Astra is returned.
+ */
+async function sendVaultCopy(
+  vault: string | null,
+  sessionId: string | null,
+  replaceNewer = false,
+): Promise<{ text: string; complete: boolean } | null> {
+  try {
+    const outcome = await api.operatorSendVaultCopy(replaceNewer)
+    if (outcome.state === 'held_back') {
+      setUnsettled({ text: HELD_BACK, vault, sessionId, stale: false })
+    } else if (outcome.state === 'stale') {
+      setUnsettled({ text: STALE_REFUSAL, vault, sessionId, stale: true })
+    } else {
+      clearUnsettled(vault, sessionId)
+    }
+    return outcomeLine(outcome)
+  } catch (cause) {
+    setUnsettled({
+      text: `Copie non envoyée à Astra : ${String(cause)}`,
+      vault,
+      sessionId,
+      stale: false,
+    })
     return null
   }
 }
 
 /**
- * Sends the vault copy through the manual send. A send held back or failed stays on the line
- * until a send for the same vault goes through; the outcome of one that reached Astra is returned.
+ * The entry kept for a send. A stale one offers « Remplacer quand même », and only when no rotation
+ * is to be resumed, since the backend refuses a forced send then; otherwise it offers a retry.
  */
-async function sendVaultCopy(
-  vault: string | null,
-  sessionId: string | null,
-): Promise<{ text: string; complete: boolean } | null> {
-  try {
-    const outcome = await api.operatorSendVaultCopy()
-    if (outcome.state === 'held_back') setUnsettled({ text: HELD_BACK, vault, sessionId })
-    else clearUnsettled(vault, sessionId)
-    return outcomeLine(outcome)
-  } catch (cause) {
-    setUnsettled({ text: `Copie non envoyée à Astra : ${String(cause)}`, vault, sessionId })
-    return null
-  }
-}
-
 function UnsettledAlert({
   text,
+  stale,
+  canReplace,
   sending,
   onRetry,
+  onReplace,
 }: {
   text: string
+  stale: boolean
+  canReplace: boolean
   sending: boolean
   onRetry: () => void
+  onReplace: () => void
 }) {
+  const replace = stale && canReplace
   return (
     <Alert
       severity="warning"
       variant="outlined"
       sx={{ mt: 1, fontSize: 11.5, alignItems: 'center' }}
       action={
-        <Button
-          size="small"
-          color="inherit"
-          disabled={sending}
-          onClick={onRetry}
-          sx={{ fontSize: 11, whiteSpace: 'nowrap' }}
-        >
-          Réessayer l’envoi
-        </Button>
+        stale ? (
+          replace ? (
+            <Button
+              size="small"
+              color="inherit"
+              disabled={sending}
+              onClick={onReplace}
+              sx={{ fontSize: 11, whiteSpace: 'nowrap' }}
+            >
+              {REPLACE_BUTTON}
+            </Button>
+          ) : null
+        ) : (
+          <Button
+            size="small"
+            color="inherit"
+            disabled={sending}
+            onClick={onRetry}
+            sx={{ fontSize: 11, whiteSpace: 'nowrap' }}
+          >
+            Réessayer l’envoi
+          </Button>
+        )
       }
     >
       {text}
+      {replace && (
+        <Typography component="span" sx={{ display: 'block', mt: 0.5, fontSize: 11 }}>
+          {REPLACE_WARNING}
+        </Typography>
+      )}
     </Alert>
   )
 }
@@ -140,19 +192,28 @@ export function KeyChangeCopy({ status }: { status: OperatorStatus }) {
   const applies = status.gesture === 'done' && KEY_CHANGES.includes(status.operation)
   const pending = useUnsettled()
   const [vault, setVault] = useState<string | null>(null)
+  const [canReplace, setCanReplace] = useState(false)
   const [line, setLine] = useState<{ text: string; complete: boolean } | null>(null)
   const [sending, setSending] = useState(false)
 
-  const send = useCallback(async () => {
-    setSending(true)
-    const found = await readVault()
-    setVault(found)
-    setLine(await sendVaultCopy(found, status.session_id))
-    setSending(false)
-  }, [status.session_id])
+  const send = useCallback(
+    async (replaceNewer = false) => {
+      setSending(true)
+      const found = await readVault()
+      setVault(found.vault)
+      setCanReplace(found.canReplace)
+      setLine(await sendVaultCopy(found.vault, status.session_id, replaceNewer))
+      setSending(false)
+    },
+    [status.session_id],
+  )
 
   useEffect(() => {
-    if (applies) void readVault().then(setVault)
+    if (!applies) return
+    void readVault().then((found) => {
+      setVault(found.vault)
+      setCanReplace(found.canReplace)
+    })
   }, [applies])
 
   useEffect(() => {
@@ -167,7 +228,16 @@ export function KeyChangeCopy({ status }: { status: OperatorStatus }) {
     pending !== null &&
     (pending.sessionId === status.session_id || (vault !== null && pending.vault === vault))
   if (unsent && pending) {
-    return <UnsettledAlert text={pending.text} sending={sending} onRetry={() => void send()} />
+    return (
+      <UnsettledAlert
+        text={pending.text}
+        stale={pending.stale}
+        canReplace={canReplace}
+        sending={sending}
+        onRetry={() => void send()}
+        onReplace={() => void send(true)}
+      />
+    )
   }
   if (!line) {
     return sending ? (
@@ -255,9 +325,9 @@ export function VaultCopyLine() {
   // Only an entry for this vault: another vault's failure is not this line's to show.
   const unsent = pending !== null && vault !== null && pending.vault === vault ? pending : null
 
-  const sendCopy = async () => {
+  const sendCopy = async (replaceNewer = false) => {
     setBusy(true)
-    await sendVaultCopy(vault, null)
+    await sendVaultCopy(vault, null, replaceNewer)
     await read()
     setBusy(false)
   }
@@ -271,7 +341,14 @@ export function VaultCopyLine() {
         <PrerequisiteLine line={line} busy={busy} onFix={() => void sendCopy()} />
       </Box>
       {unsent && (
-        <UnsettledAlert text={unsent.text} sending={busy} onRetry={() => void sendCopy()} />
+        <UnsettledAlert
+          text={unsent.text}
+          stale={unsent.stale}
+          canReplace={!overview.resumable}
+          sending={busy}
+          onRetry={() => void sendCopy()}
+          onReplace={() => void sendCopy(true)}
+        />
       )}
       {subscriptionError && (
         <Alert severity="error" variant="outlined" sx={{ mt: 1, fontSize: 11.5 }}>

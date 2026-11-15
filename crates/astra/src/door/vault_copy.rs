@@ -14,7 +14,7 @@ use aether::certificates::encoding::{Fingerprint, TrustDomainId};
 use astra_channel::MAX_OPERATOR_VAULT_COPY_BYTES;
 use serde::{Deserialize, Serialize};
 
-use super::{DoorOutcome, DoorRefusal};
+use super::{DoorConnector, DoorOutcome, DoorRefusal};
 use crate::service::{
     verify_credentials, AstraService, CREDENTIALS_FILE, PREVIOUS_VAULT_FILE, VAULT_FILE,
 };
@@ -41,15 +41,43 @@ impl std::fmt::Debug for VaultBytes {
     }
 }
 
-/// What a vault shows without a key: enough to tell whose it is.
+/// What a vault shows without a key: enough to tell whose it is, and which
+/// write it is. The revision is absent from a vault written before it existed,
+/// which reads as zero.
 #[derive(Deserialize)]
 struct VaultHeader {
     format_version: u16,
     trust_domain_id: TrustDomainId,
+    #[serde(default)]
+    revision: u64,
+}
+
+/// The revision a copy names in its header, or zero when the header does not
+/// read: an unreadable copy is one Astra holds nothing against.
+pub(crate) fn revision_of(vault: &[u8]) -> u64 {
+    serde_json::from_slice::<VaultHeader>(vault).map_or(0, |header| header.revision)
+}
+
+/// Whether two documents are the same JSON value, whatever their layout or key
+/// order. Unreadable either way is a difference.
+fn same_json_value(left: &[u8], right: &[u8]) -> bool {
+    match (
+        serde_json::from_slice::<serde_json::Value>(left),
+        serde_json::from_slice::<serde_json::Value>(right),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 impl AstraService {
     /// Replaces the vault copy and, when one is sent, the credential document.
+    ///
+    /// A copy other than the one held is taken only when its revision is newer
+    /// than the held one's, or when it is the same vault at the same revision
+    /// in another layout. A held copy at zero, or unreadable, takes any. With
+    /// `replace_newer`, the held copy is replaced whatever the revision, and
+    /// the replacement is logged as forced.
     ///
     /// Every check runs before anything is written, so a refusal leaves both
     /// files and the memory as they were. Under the volume gate, and with the
@@ -57,9 +85,11 @@ impl AstraService {
     /// none is in flight and the write.
     pub(super) async fn copy_vault(
         &self,
+        connector: &DoorConnector,
         vault: VaultBytes,
         credentials: Option<Box<CredentialRegistry>>,
         now_unix: u64,
+        replace_newer: bool,
     ) -> Result<DoorOutcome, DoorRefusal> {
         let vault = vault.0;
         let _volume = self.volume_writes.lock().await;
@@ -77,10 +107,38 @@ impl AstraService {
         }
 
         let fingerprint = Fingerprint::of(&vault);
+        let mut forced = false;
         let held = self.encrypted_vault();
         let unchanged = held
             .as_ref()
             .is_some_and(|held| Fingerprint::of(held) == fingerprint);
+        // Only a different copy can be late or diverging: the identical one is
+        // what a retry sends, and it passes whatever it names.
+        if !unchanged {
+            let held_revision = held.as_ref().map_or(0, |held| revision_of(held));
+            let sent_revision = header.revision;
+            // At the same revision the same vault may only be laid out
+            // differently (pretty-printed by hand on the volume, compact from
+            // Orion): that is not a fork, and the copy normalizes the layout.
+            let same_content = sent_revision == held_revision
+                && held
+                    .as_ref()
+                    .is_some_and(|held| same_json_value(held, &vault));
+            if held_revision > 0 && sent_revision <= held_revision && !same_content {
+                tracing::warn!(
+                    connector = %connector,
+                    %fingerprint,
+                    held_revision,
+                    sent_revision,
+                    late = sent_revision < held_revision,
+                    "vault copy behind or diverging from the one held"
+                );
+                if !replace_newer {
+                    return Err(DoorRefusal::VaultCopyStale);
+                }
+                forced = true;
+            }
+        }
         // An operation signed the fingerprint of the vault it will download.
         // Replacing the vault under it turns that download into an error until
         // the operation expires, and blocks its family meanwhile. Registry
@@ -137,6 +195,16 @@ impl AstraService {
             write_file(&self.state_dir, CREDENTIALS_FILE, encoded)?;
         }
 
+        if forced {
+            tracing::warn!(
+                connector = %connector,
+                %fingerprint,
+                forced = true,
+                held_revision = held.as_ref().map_or(0, |held| revision_of(held)),
+                sent_revision = header.revision,
+                "vault copy replaced the one held, forced by the operator"
+            );
+        }
         if !unchanged {
             *self
                 .encrypted_vault

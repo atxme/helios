@@ -30,6 +30,7 @@ import { saveArtifact } from './ArtifactDownloads'
 import { GatewayIdentityBlock } from './GatewayIdentityBlock'
 import { RenewAllBlock } from './RenewAllBlock'
 import { PrerequisiteLine } from './PrerequisiteLine'
+import { STALE_REFUSAL } from './VaultCopy'
 
 /**
  * The overview is the one thing read here. It already carries `pending`, so nothing else
@@ -198,8 +199,10 @@ export function RotationsPanel({
     setNotice(null)
     try {
       const outcome = await api.operatorSendVaultCopy()
-      // Held back is an answer, not a failure: the same copy passes later.
+      // Held back is an answer, not a failure: the same copy passes later. A stale refusal is
+      // said here; its forced replacement is offered in Coffre et clés, beside the vault.
       if (outcome.state === 'held_back') setNotice('En attente : copie retenue')
+      else if (outcome.state === 'stale') setNotice(STALE_REFUSAL)
       else if (outcome.document_waits) setNotice('En attente : document de credentials retenu')
       await readAfter()
     } catch (cause) {

@@ -48,6 +48,7 @@ export const authorityRead = (
   next_ca_tls_fingerprint: null,
   issuer: { recorded_epoch: 4, serving_epoch: 4, ca_epoch: 3, ca_tls_epoch: 2, not_after: NOW + 300 * DAY },
   vault_copy_fingerprint: 'ef'.repeat(32),
+  vault_copy_revision: 4,
   credential_registry_epoch: 5,
   ...extra,
 })
@@ -88,6 +89,7 @@ export const overview = (extra: Partial<RotationsOverview> = {}): RotationsOverv
   vault: vaultOverview(),
   vaultError: null,
   localVaultFingerprint: 'ef'.repeat(32),
+  localVaultRevision: 4,
   localCaEpoch: 3,
   localCaTlsEpoch: 2,
   localCaTlsNotAfter: NOW + 1500 * DAY,

@@ -56,8 +56,9 @@ fn aether_base64(bytes: &[u8]) -> String {
 fn saved_vault() -> (tempfile::TempDir, std::path::PathBuf, AuthorityVault) {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("astra").join("authority-vault.json");
-    let vault = vault_with_two_slots();
-    store::save(&path, &vault).expect("save vault");
+    store::save(&path, &vault_with_two_slots()).expect("save vault");
+    // What is on disk, with the revision the save gave it.
+    let vault = store::load(&path).expect("load vault");
     (directory, path, vault)
 }
 

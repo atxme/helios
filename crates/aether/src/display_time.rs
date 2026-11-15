@@ -28,6 +28,20 @@ pub fn format_paris_timestamp(seconds: u64) -> String {
     )
 }
 
+/// The Europe/Paris civil date of a Unix timestamp, as `AAAA-MM-JJ`. `None` when the
+/// timestamp is out of range.
+pub fn format_paris_date(seconds: u64) -> Option<String> {
+    let utc = OffsetDateTime::from_unix_timestamp(i64::try_from(seconds).ok()?).ok()?;
+    let (offset, _) = paris_offset(utc)?;
+    let local = utc.to_offset(offset);
+    Some(format!(
+        "{:04}-{:02}-{:02}",
+        local.year(),
+        u8::from(local.month()),
+        local.day()
+    ))
+}
+
 /// Europe/Paris follows the EU rule: summer time starts and ends at 01:00 UTC
 /// on the last Sundays of March and October respectively.
 fn paris_offset(utc: OffsetDateTime) -> Option<(UtcOffset, &'static str)> {
@@ -93,5 +107,19 @@ mod tests {
     #[test]
     fn an_unrepresentable_timestamp_is_named() {
         assert!(format_paris_timestamp(u64::MAX).contains("hors plage"));
+    }
+
+    #[test]
+    fn the_paris_date_is_the_civil_date_and_not_the_utc_one() {
+        // 2026-11-15 23:30 UTC is already 16 November in Paris (CET).
+        assert_eq!(
+            format_paris_date(1_794_785_400).as_deref(),
+            Some("2026-11-16")
+        );
+        assert_eq!(
+            format_paris_date(1_794_744_000).as_deref(),
+            Some("2026-11-15")
+        );
+        assert_eq!(format_paris_date(u64::MAX), None);
     }
 }

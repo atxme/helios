@@ -112,6 +112,10 @@ pub enum VaultCopySent {
     /// A live operation names the vault in place, or a rotation holds the
     /// document back. Nothing was written; the same copy can be sent again.
     HeldBack,
+    /// Astra refuses a copy behind the one it holds, or one diverging from it (412).
+    /// Nothing was written; sending the same copy again changes nothing, and only a
+    /// forced send replaces what Astra holds.
+    Stale,
 }
 
 /// What the companion has to show, and what it must not believe.
@@ -706,6 +710,9 @@ impl Tunnel {
             .context("envoi de la copie du coffre")?;
         if response.status() == reqwest::StatusCode::CONFLICT {
             return Ok(VaultCopySent::HeldBack);
+        }
+        if response.status() == reqwest::StatusCode::PRECONDITION_FAILED {
+            return Ok(VaultCopySent::Stale);
         }
         Self::read_admin(response, crate::origin::MAX_ANSWER_BYTES)
             .map(VaultCopySent::Copied)

@@ -283,6 +283,8 @@ struct Remote {
     copies: Mutex<VecDeque<VaultCopySent>>,
     /// Whether each copy sent carried the credential document.
     sent_with_credentials: Mutex<Vec<bool>>,
+    /// Every copy sent, whole, to check what a send carries.
+    sent_copies: Mutex<Vec<OperatorVaultCopy>>,
     /// The last credential document a copy carried.
     sent_document: Mutex<Option<aether::certificates::approval::CredentialRegistry>>,
     /// What the chain's route answers, each time a step is asked.
@@ -424,6 +426,7 @@ impl RotationRemote for Remote {
 
     fn send_vault_copy(&self, copy: &OperatorVaultCopy) -> anyhow::Result<VaultCopySent> {
         self.note("send_vault_copy");
+        self.sent_copies.lock().expect("lock").push(copy.clone());
         self.sent_with_credentials
             .lock()
             .expect("lock")
@@ -767,6 +770,7 @@ impl Bench {
         let client_tls = DerCertificate::parse(relay.ca_tls_certificate.as_ref().expect("CA-TLS"))
             .expect("certificate");
         OperatorAuthorityStatus {
+            vault_copy_revision: None,
             ca_epoch: identity.ca_epoch,
             ca_fingerprint: anchor.authority_fingerprint(),
             next_ca_fingerprint: None,
@@ -1034,6 +1038,7 @@ fn an_approval_with_a_chain_step_obtains_it_instead_of_opening() {
 fn a_refusal_before_the_opening_takes_no_chain_step() {
     let bench = bench();
     *bench.remote.authority.lock().expect("lock") = Some(OperatorAuthorityStatus {
+        vault_copy_revision: None,
         next_ca_fingerprint: Some(Fingerprint::of(b"suivante")),
         ..bench.nothing_in_flight()
     });
@@ -1248,10 +1253,12 @@ fn a_key_marked_lost_publishes_a_retry_at_its_validation() {
 #[test]
 fn the_refusals_at_approval_are_worded_by_their_cause() {
     let overlap = |bench: &Bench| OperatorAuthorityStatus {
+        vault_copy_revision: None,
         next_ca_fingerprint: Some(Fingerprint::of(b"suivante")),
         ..bench.nothing_in_flight()
     };
     let other_anchor = |bench: &Bench| OperatorAuthorityStatus {
+        vault_copy_revision: None,
         ca_fingerprint: Fingerprint::of(b"une autre ancre"),
         ..bench.nothing_in_flight()
     };
@@ -2057,6 +2064,7 @@ fn another_rotation_at_the_authority_conflicts_and_keeps_the_journal() {
     let bench = bench();
     bench.remote.deposits.lock().expect("lock").push_back(409);
     let other = OperatorAuthorityStatus {
+        vault_copy_revision: None,
         next_ca_fingerprint: Some(Fingerprint::of(b"une autre")),
         ..bench.nothing_in_flight()
     };
@@ -2227,6 +2235,7 @@ fn an_adoption_reads_as_deposited_once_the_authority_confirms_it() {
     let bench = bench();
     let journal = adopted_with_no_deposit(&bench);
     *bench.remote.authority.lock().expect("lock") = Some(OperatorAuthorityStatus {
+        vault_copy_revision: None,
         next_ca_fingerprint: Some(journal.next_anchor_fingerprint),
         ..bench.nothing_in_flight()
     });
@@ -3552,12 +3561,14 @@ mod overview {
         assert_eq!(quiet.ca_pq_overlap, Some(false));
 
         let tls = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_tls_fingerprint: Some(Fingerprint::of(b"suivante")),
             ..bench.nothing_in_flight()
         };
         assert_eq!(assembled(&bench, tls).ca_pq_overlap, Some(false));
 
         let pq = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_fingerprint: Some(Fingerprint::of(b"suivante")),
             ..bench.nothing_in_flight()
         };
@@ -3676,6 +3687,7 @@ mod overview {
             &bench.remote,
             &bench.path,
             &towards_another_gateway(),
+            false,
             || {
                 read.set(true);
                 Reach::Ok(bench.nothing_in_flight().into())
@@ -3690,9 +3702,13 @@ mod overview {
     #[test]
     fn a_manual_send_stops_on_an_authority_it_could_not_read() {
         let bench = bench();
-        let error = send_copy_with(&bench.remote, &bench.path, &target_of(&bench), || {
-            Reach::<AuthorityStatusRead>::AstraUnavailable
-        })
+        let error = send_copy_with(
+            &bench.remote,
+            &bench.path,
+            &target_of(&bench),
+            false,
+            || Reach::<AuthorityStatusRead>::AstraUnavailable,
+        )
         .expect_err("stopped");
         assert!(error.contains("Astra"), "{error}");
         assert!(!bench.remote.called("send_vault_copy"));
@@ -3701,9 +3717,13 @@ mod overview {
     #[test]
     fn a_manual_send_goes_through_and_a_held_back_copy_is_an_answer() {
         let bench = bench();
-        let sent = send_copy_with(&bench.remote, &bench.path, &target_of(&bench), || {
-            Reach::Ok(bench.nothing_in_flight().into())
-        })
+        let sent = send_copy_with(
+            &bench.remote,
+            &bench.path,
+            &target_of(&bench),
+            false,
+            || Reach::Ok(bench.nothing_in_flight().into()),
+        )
         .expect("sent");
         assert!(matches!(sent, VaultCopyOutcome::Copied { .. }));
         bench
@@ -3713,17 +3733,113 @@ mod overview {
             .expect("lock")
             .push_back(VaultCopySent::HeldBack);
         // The served document is current: the vault goes alone, and held back stays so.
-        let held = send_copy_with(&bench.remote, &bench.path, &target_of(&bench), || {
-            Reach::Ok(
-                OperatorAuthorityStatus {
-                    credential_registry_epoch: Some(u64::MAX),
-                    ..bench.nothing_in_flight()
-                }
-                .into(),
-            )
-        })
+        let held = send_copy_with(
+            &bench.remote,
+            &bench.path,
+            &target_of(&bench),
+            false,
+            || {
+                Reach::Ok(
+                    OperatorAuthorityStatus {
+                        vault_copy_revision: None,
+                        credential_registry_epoch: Some(u64::MAX),
+                        ..bench.nothing_in_flight()
+                    }
+                    .into(),
+                )
+            },
+        )
         .expect("answered");
         assert_eq!(held, VaultCopyOutcome::HeldBack);
+    }
+
+    #[test]
+    fn a_stale_send_is_an_answer_and_says_so_on_the_wire() {
+        let bench = bench();
+        bench
+            .remote
+            .copies
+            .lock()
+            .expect("lock")
+            .push_back(VaultCopySent::Stale);
+        let answer = send_copy_with(
+            &bench.remote,
+            &bench.path,
+            &target_of(&bench),
+            false,
+            || Reach::Ok(bench.nothing_in_flight().into()),
+        )
+        .expect("an answer, not a failure");
+        assert_eq!(answer, VaultCopyOutcome::Stale);
+        let value = serde_json::to_value(&answer).expect("json");
+        assert_eq!(value["state"], "stale");
+    }
+
+    #[test]
+    fn a_forced_send_says_so_to_astra_and_reads_the_vault_at_the_call() {
+        let bench = bench();
+        send_copy_with(&bench.remote, &bench.path, &target_of(&bench), true, || {
+            Reach::Ok(bench.nothing_in_flight().into())
+        })
+        .expect("sent");
+        // Saved again between two calls: the second copy carries the vault as it is now.
+        let vault = astra_operator::store::load(&bench.path).expect("vault");
+        astra_operator::store::save(&bench.path, &vault).expect("saved again");
+        send_copy_with(&bench.remote, &bench.path, &target_of(&bench), true, || {
+            Reach::Ok(bench.nothing_in_flight().into())
+        })
+        .expect("sent");
+
+        let sent = bench.remote.sent_copies.lock().expect("lock").clone();
+        let [first, second] = sent.as_slice() else {
+            panic!("two copies");
+        };
+        assert!(first.replace_newer && second.replace_newer);
+        assert_ne!(vault_bytes_of(first), vault_bytes_of(second));
+        let now = astra_operator::store::load(&bench.path).expect("vault");
+        assert_eq!(
+            vault_bytes_of(second),
+            serde_json::to_vec(&now).expect("json")
+        );
+    }
+
+    #[test]
+    fn a_forced_send_is_refused_while_a_rotation_waits_and_an_ordinary_one_is_not() {
+        let bench = bench();
+        let _journal = with_a_journal_kept(&bench);
+        let error = send_copy_with(&bench.remote, &bench.path, &target_of(&bench), true, || {
+            Reach::Ok(bench.nothing_in_flight().into())
+        })
+        .expect_err("refused");
+        assert_eq!(error, "Rotation en cours. La mener à son terme d’abord.");
+        assert!(bench.remote.sent_copies.lock().expect("lock").is_empty());
+
+        send_copy_with(
+            &bench.remote,
+            &bench.path,
+            &target_of(&bench),
+            false,
+            || Reach::Ok(bench.nothing_in_flight().into()),
+        )
+        .expect("an ordinary send goes through");
+        let sent = bench.remote.sent_copies.lock().expect("lock").clone();
+        assert!(!sent.iter().any(|copy| copy.replace_newer));
+    }
+
+    #[test]
+    fn the_overview_reads_the_local_revision_and_none_for_an_unreadable_vault() {
+        let bench = bench();
+        let revision = astra_operator::store::revision_on_disk(&bench.path);
+        assert!(revision > 0, "a finished domain has been saved");
+        assert_eq!(
+            assembled(&bench, bench.nothing_in_flight()).local_vault_revision,
+            Some(revision)
+        );
+        std::fs::write(&bench.path, b"pas un coffre").expect("written");
+        assert_eq!(
+            assembled(&bench, bench.nothing_in_flight()).local_vault_revision,
+            None
+        );
     }
 
     #[test]
@@ -3765,6 +3881,7 @@ mod overview {
         assert!(with.credentials.is_some(), "the document beside the vault");
 
         let overlap: AuthorityStatusRead = OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_fingerprint: Some(Fingerprint::of(b"suivante")),
             ..bench.nothing_in_flight()
         }
@@ -3811,7 +3928,7 @@ mod overview {
             local,
         ) {
             VaultCopyOutcome::Copied { document_waits, .. } => document_waits,
-            VaultCopyOutcome::HeldBack => unreachable!(),
+            VaultCopyOutcome::HeldBack | VaultCopyOutcome::Stale => unreachable!(),
         };
         assert!(copied(None, Some(2)));
         assert!(copied(Some(1), Some(2)));
@@ -3844,6 +3961,7 @@ mod overview {
         let overview = assembled(
             &bench,
             OperatorAuthorityStatus {
+                vault_copy_revision: None,
                 credential_registry_epoch: Some(before),
                 ..bench.nothing_in_flight()
             },
@@ -3859,9 +3977,13 @@ mod overview {
                 fingerprint: Fingerprint::of(b"copie"),
                 credential_registry_epoch: Some(after),
             }));
-        let sent = send_copy_with(&bench.remote, &bench.path, &target_of(&bench), || {
-            Reach::Ok(served(&bench, Some(before)))
-        })
+        let sent = send_copy_with(
+            &bench.remote,
+            &bench.path,
+            &target_of(&bench),
+            false,
+            || Reach::Ok(served(&bench, Some(before))),
+        )
         .expect("sent");
 
         let carried = bench
@@ -3908,6 +4030,7 @@ mod overview {
         let overlap = || {
             Reach::Ok(
                 OperatorAuthorityStatus {
+                    vault_copy_revision: None,
                     next_ca_fingerprint: Some(Fingerprint::of(b"suivante")),
                     credential_registry_epoch: Some(before),
                     ..bench.nothing_in_flight()
@@ -3924,8 +4047,14 @@ mod overview {
                 fingerprint: Fingerprint::of(b"copie"),
                 credential_registry_epoch: Some(before),
             }));
-        let sent =
-            send_copy_with(&bench.remote, &bench.path, &target_of(&bench), overlap).expect("sent");
+        let sent = send_copy_with(
+            &bench.remote,
+            &bench.path,
+            &target_of(&bench),
+            false,
+            overlap,
+        )
+        .expect("sent");
         assert_eq!(
             *bench.remote.sent_with_credentials.lock().expect("lock"),
             vec![false]
@@ -3948,6 +4077,7 @@ mod overview {
 
     fn served(bench: &Bench, epoch: Option<u64>) -> AuthorityStatusRead {
         OperatorAuthorityStatus {
+            vault_copy_revision: None,
             credential_registry_epoch: epoch,
             ..bench.nothing_in_flight()
         }
@@ -3979,9 +4109,13 @@ mod overview {
             .lock()
             .expect("lock")
             .push_back(VaultCopySent::HeldBack);
-        let sent = send_copy_with(&bench.remote, &bench.path, &target_of(&bench), || {
-            Reach::Ok(served(&bench, None))
-        })
+        let sent = send_copy_with(
+            &bench.remote,
+            &bench.path,
+            &target_of(&bench),
+            false,
+            || Reach::Ok(served(&bench, None)),
+        )
         .expect("sent");
         assert!(matches!(sent, VaultCopyOutcome::Copied { .. }));
         assert_eq!(
@@ -4000,9 +4134,13 @@ mod overview {
             .expect("lock")
             .push_back(VaultCopySent::HeldBack);
         let mine = local_credentials_epoch(&bench);
-        let held = send_copy_with(&bench.remote, &bench.path, &target_of(&bench), || {
-            Reach::Ok(served(&bench, Some(mine)))
-        })
+        let held = send_copy_with(
+            &bench.remote,
+            &bench.path,
+            &target_of(&bench),
+            false,
+            || Reach::Ok(served(&bench, Some(mine))),
+        )
         .expect("answered");
         assert_eq!(held, VaultCopyOutcome::HeldBack);
         assert_eq!(

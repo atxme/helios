@@ -154,6 +154,7 @@ fn legacy_prepared(domain: &Domain, submitted: bool) -> (PreparedRotation, Autho
     )
     .expect("rotated");
     store::save(&domain.path, &vault).expect("the vault moves first");
+    let vault = store::load(&domain.path).expect("the vault as it landed");
     let record = PreparedRotation {
         kind: PreparedKind::CaTls,
         operation_id: Id16::new([4; 16]).expect("id").to_hex(),
@@ -216,6 +217,7 @@ fn with_authority(status: OperatorAuthorityStatus) -> ResumeFacts {
 
 fn nothing_in_flight() -> OperatorAuthorityStatus {
     OperatorAuthorityStatus {
+        vault_copy_revision: None,
         chain: None,
         ca_epoch: 1,
         ca_fingerprint: Fingerprint::of(b"ca en service"),
@@ -321,6 +323,7 @@ fn an_offline_record_astra_does_not_hold_conflicts_and_moves_nothing() {
     for status in [
         nothing_in_flight(),
         OperatorAuthorityStatus {
+            vault_copy_revision: None,
             next_ca_fingerprint: Some(Fingerprint::of(b"une autre")),
             ..nothing_in_flight()
         },
@@ -362,10 +365,12 @@ fn an_offline_record_whose_vault_already_moved_is_not_discarded() {
 #[test]
 fn a_legacy_ca_pq_journal_astra_holds_applies_and_only_then_lets_the_file_go() {
     let next_in_flight = |anchor| OperatorAuthorityStatus {
+        vault_copy_revision: None,
         next_ca_fingerprint: Some(anchor),
         ..nothing_in_flight()
     };
     let promoted = |anchor| OperatorAuthorityStatus {
+        vault_copy_revision: None,
         ca_fingerprint: anchor,
         ..nothing_in_flight()
     };
@@ -378,6 +383,7 @@ fn a_legacy_ca_pq_journal_astra_holds_applies_and_only_then_lets_the_file_go() {
         let next_handoff = legacy.handoff.clone();
         let next_bindings = legacy.bindings.clone();
         let legacy_path = write_legacy_ca_pq(&domain.path, &legacy);
+        let replaced = store::revision_on_disk(&domain.path);
 
         let mut journal = rotation_journal::adopt_legacy(&domain.path)
             .expect("adopted")
@@ -391,10 +397,29 @@ fn a_legacy_ca_pq_journal_astra_holds_applies_and_only_then_lets_the_file_go() {
         rotation_journal::apply_local(&domain.path, &mut journal).expect("applied");
 
         assert!(!legacy_path.exists());
-        assert_eq!(store::load(&domain.path).expect("vault"), next_vault);
+        // The vault lands one revision past the file it replaces, and the relay
+        // names it as it landed.
+        let landed = AuthorityVault {
+            revision: next_vault.revision.max(replaced).saturating_add(1),
+            ..next_vault
+        };
+        assert_eq!(store::load(&domain.path).expect("vault"), landed);
+        let mut next_relay = next_handoff;
+        next_relay.vault_fingerprint = landed.fingerprint().expect("fingerprint").to_hex();
         assert_eq!(
             handoff::load(&handoff::path_beside(&domain.path)).expect("relay"),
-            next_handoff
+            next_relay
+        );
+        // And the fingerprint it records is the one of the file on disk.
+        assert_eq!(
+            handoff::load(&handoff::path_beside(&domain.path))
+                .expect("relay")
+                .vault_fingerprint,
+            store::load(&domain.path)
+                .expect("vault")
+                .fingerprint()
+                .expect("fingerprint")
+                .to_hex()
         );
         assert_eq!(
             credentials::load(&credentials::path_beside(&domain.path)).expect("document"),
@@ -426,6 +451,7 @@ fn a_legacy_ca_pq_journal_for_a_vault_holding_neither_key_is_refused() {
     let (_, unrelated) = generate_ml_dsa_87_keypair().expect("keys");
     stranger.ca_pq_public_key = unrelated.to_base64();
     store::save(&domain.path, &stranger).expect("vault");
+    let stranger = store::load(&domain.path).expect("vault as saved");
 
     assert!(rotation_journal::adopt_legacy(&domain.path).is_err());
 
@@ -447,6 +473,7 @@ fn a_legacy_ca_pq_journal_whose_vault_holds_other_credentials_is_refused() {
     let mut in_place = store::load(&domain.path).expect("vault");
     in_place.slots.pop();
     store::save(&domain.path, &in_place).expect("vault");
+    let in_place = store::load(&domain.path).expect("vault as saved");
 
     let refused = rotation_journal::adopt_legacy(&domain.path).expect_err("refused");
 
@@ -786,6 +813,7 @@ fn a_prepared_record_is_never_discarded() {
         rotation_journal::next_step(
             &journal,
             &dead(OperatorAuthorityStatus {
+                vault_copy_revision: None,
                 next_ca_tls_fingerprint: Some(Fingerprint::of(b"une autre")),
                 ..nothing_in_flight()
             })
@@ -796,6 +824,7 @@ fn a_prepared_record_is_never_discarded() {
         rotation_journal::next_step(
             &journal,
             &dead(OperatorAuthorityStatus {
+                vault_copy_revision: None,
                 next_ca_tls_fingerprint: Some(journal.next_anchor_fingerprint),
                 ..nothing_in_flight()
             })
@@ -902,6 +931,37 @@ fn a_record_the_old_orion_ceremony_left_is_still_adopted() {
     assert!(kept.transition_path.is_empty());
 }
 
+/// A sealed vault waiting to overwrite this one refuses a relay update, with the
+/// same sentence as the key gestures, and the relay is left as it was.
+#[test]
+fn write_relay_refuses_while_a_sealed_vault_waits() {
+    let domain = domain();
+    write_legacy_ca_pq(&domain.path, &legacy_ca_pq(&domain));
+    let mut journal = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+    journal.stage = JournalStage::Accepted;
+    rotation_journal::save(&rotation_journal::path_beside(&domain.path), &journal).expect("saved");
+    std::fs::remove_file(rotation_journal::legacy_ca_pq_path_beside(&domain.path))
+        .expect("the older file goes");
+    let relay_path = handoff::path_beside(&domain.path);
+    let before = std::fs::read(&relay_path).expect("relay bytes");
+    let guard = rotation_journal::ensure_vault_not_awaiting_overwrite(&domain.path)
+        .expect_err("a sealed vault waits");
+
+    let refused = write_relay(
+        &domain.path,
+        &RelayUpdate {
+            astra_service_key_epoch: Some(3),
+            ..RelayUpdate::default()
+        },
+    )
+    .expect_err("refused");
+
+    assert_eq!(format!("{refused:#}"), format!("{guard:#}"));
+    assert_eq!(std::fs::read(&relay_path).expect("relay bytes"), before);
+}
+
 /// The origin of a domain with a rotation without campaign waits for its end: the
 /// relay refuses it while the journal is there, and an unreadable journal refuses too.
 #[test]
@@ -912,10 +972,17 @@ fn write_relay_refuses_an_origin_during_a_rotation_without_campaign() {
     relay.astra_authority_url = None;
     handoff::save(&relay_path, &relay).expect("relay saved");
     write_legacy_ca_pq(&domain.path, &legacy_ca_pq(&domain));
-    let journal = rotation_journal::adopt_legacy(&domain.path)
+    let mut journal = rotation_journal::adopt_legacy(&domain.path)
         .expect("adopted")
         .expect("a journal");
     assert!(journal.without_campaign);
+    // The vault has landed: nothing waits to overwrite it, and the rotation is
+    // still without campaign.
+    journal.stage = JournalStage::Applied;
+    journal.next = None;
+    rotation_journal::save(&rotation_journal::path_beside(&domain.path), &journal).expect("saved");
+    std::fs::remove_file(rotation_journal::legacy_ca_pq_path_beside(&domain.path))
+        .expect("the older file goes");
     let origin = RelayUpdate {
         astra_authority_url: Some(AUTHORITY_URL.into()),
         ..RelayUpdate::default()

@@ -571,10 +571,13 @@ pub(crate) async fn operator_peers_overview(
 /// The vault and the credentials are read here, from beside the vault; the page
 /// names nothing. The copy goes only to the gateway the domain's relay names: Orion
 /// holds several profiles and one vault, and another domain's gateway must not
-/// receive this one. A copy Astra holds back is an answer, not a failure.
+/// receive this one. A copy Astra holds back or refuses as stale is an answer, not a
+/// failure. `replace_newer` is the forced send: Astra then takes the copy whatever it
+/// holds, and the command refuses it while a rotation waits to be resumed.
 #[tauri::command]
 pub(crate) async fn operator_send_vault_copy(
     state: State<'_, AppState>,
+    replace_newer: bool,
 ) -> Result<crate::operator::rotations::VaultCopyOutcome, String> {
     ensure_no_open_ceremony(&state).await?;
     let vault_path = state.vault_location.path_to_look_at()?;
@@ -586,14 +589,71 @@ pub(crate) async fn operator_send_vault_copy(
         move || {
             let tunnel = astra_operator::tunnel::Tunnel::new(&target.address)
                 .map_err(|error| format!("{error:#}"))?;
-            crate::operator::rotations::send_copy_with(&tunnel, &vault_path, &target, || {
-                handle.block_on(orion_core::operator_rotations::authority_status(
-                    &target.address,
-                ))
-            })
+            crate::operator::rotations::send_copy_with(
+                &tunnel,
+                &vault_path,
+                &target,
+                replace_newer,
+                || {
+                    handle.block_on(orion_core::operator_rotations::authority_status(
+                        &target.address,
+                    ))
+                },
+            )
         },
     )
     .await
+}
+
+/// Asks the operator where to export the vault, in a dialog over this window, and writes
+/// a private copy of it there.
+///
+/// The path comes from the dialog and never from the WebView. `false` when the operator
+/// cancels. The vault is read where it is, and nothing is created for it.
+#[tauri::command]
+pub(crate) async fn operator_export_vault(
+    state: State<'_, AppState>,
+    window: tauri::Window,
+) -> Result<bool, String> {
+    #[cfg(target_os = "windows")]
+    {
+        // Held until this command returns, whatever the path: one dialog at a time.
+        let _picker = state.vault_location.begin_pick()?;
+        let vault_path = state.vault_location.path_to_look_at()?;
+        let owner = owner_window(&window);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .map_err(|error| format!("l'horloge du poste est avant 1970 : {error}"))?;
+        let proposed = std::path::PathBuf::from(
+            crate::operator::rotations::export_file_name(now)
+                .ok_or_else(|| "la date du jour est illisible".to_string())?,
+        );
+        // A thread of its own, as for the location dialog: it sets that thread's COM
+        // apartment, which a pooled worker would carry into unrelated work.
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("orion-vault-export".into())
+            .spawn(move || {
+                let _ = sender.send(crate::operator::location::pick_export(owner, &proposed));
+            })
+            .map_err(|error| format!("boîte d'export du coffre : {error}"))?;
+        let picked = receiver
+            .await
+            .map_err(|_| "la boîte d'export du coffre s'est arrêtée".to_string())??;
+        match picked {
+            Some(target) => {
+                crate::operator::rotations::export_vault(&vault_path, &target)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (state, window);
+        Err("l'export du coffre n'existe que sous Windows".to_string())
+    }
 }
 
 /// Opens a campaign for the actions this screen runs outside a rotation ceremony:

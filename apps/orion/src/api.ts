@@ -413,7 +413,14 @@ export const operatorRotationTransitionFile = () =>
  * Envoie la copie du coffre à Astra, sans rien nommer : le coffre et ses credentials
  * sont lus côté Rust. « Retenue » est une réponse, pas un échec.
  */
-export const operatorSendVaultCopy = () => invoke<VaultCopyOutcome>('operator_send_vault_copy')
+export const operatorSendVaultCopy = (replaceNewer = false) =>
+  invoke<VaultCopyOutcome>('operator_send_vault_copy', { replaceNewer })
+
+/**
+ * Écrit une copie privée du coffre à un chemin choisi dans la boîte d'export. `false` si
+ * l'opérateur annule ; le coffre n'est pas modifié.
+ */
+export const operatorExportVault = () => invoke<boolean>('operator_export_vault')
 
 /**
  * Ouvre une campagne (postes ou délégation de l'émetteur). Un 403 revient tel quel :

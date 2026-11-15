@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import type { RotationsOverview } from '../../types'
+import type { OperatorAuthorityStatus, RotationsOverview } from '../../types'
 import {
   DAY,
   NOW,
@@ -369,7 +369,10 @@ describe('prerequisites', () => {
       fixAction: 'send_vault_copy',
     })
     const old = overview({
-      authority: { state: 'ok', value: authorityRead({ vault_copy_fingerprint: '99'.repeat(32) }) },
+      authority: {
+        state: 'ok',
+        value: authorityRead({ vault_copy_fingerprint: '99'.repeat(32), vault_copy_revision: 3 }),
+      },
     })
     expect(find(old, 'Copie du coffre')).toMatchObject({ detail: 'Ancienne', fixAction: 'send_vault_copy' })
     expect(find(overview(), 'Copie du coffre')?.ok).toBe(true)
@@ -838,5 +841,85 @@ describe('the CA-PQ replacement without a campaign', () => {
     // A journal from before the field reads as before: Astra is asked while it is signed.
     const before = overview({ resumable: true, journal: { ...journal, withoutCampaign: false } })
     expect(prerequisites(before, 'resume').map((p) => p.label)).toContain('Service Astra')
+  })
+})
+
+describe('a vault copy newer on Astra', () => {
+  const copyLine = (o: RotationsOverview) =>
+    prerequisites(o, 'replace_ca_tls').find((p) => p.label === 'Copie du coffre')
+
+  // The local vault is revision 4 and another one; Astra holds revision 5 of a third.
+  const newerOnAstra = (
+    authority: Partial<OperatorAuthorityStatus> = {},
+    extra: Partial<RotationsOverview> = {},
+  ) =>
+    overview({
+      localVaultFingerprint: '11'.repeat(32),
+      localVaultRevision: 4,
+      authority: {
+        state: 'ok',
+        value: authorityRead({
+          vault_copy_fingerprint: '22'.repeat(32),
+          vault_copy_revision: 5,
+          ...authority,
+        }),
+      },
+      ...extra,
+    })
+
+  it('is_said_newer_on_astra_and_its_send_is_still_offered', () => {
+    expect(copyLine(newerOnAstra())).toMatchObject({
+      ok: false,
+      detail: 'Plus récente sur Astra',
+      fix: 'Envoyer',
+      fixAction: 'send_vault_copy',
+    })
+  })
+
+  it('wins_over_document_ancien_when_the_vault_is_the_same', () => {
+    const o = overview({
+      localCredentialRegistryEpoch: 6,
+      localVaultRevision: 4,
+      authority: { state: 'ok', value: authorityRead({ vault_copy_revision: 5 }) },
+    })
+    expect(copyLine(o)?.detail).toBe('Plus récente sur Astra')
+  })
+
+  it('without_a_revision_on_either_side_the_details_are_unchanged', () => {
+    expect(copyLine(newerOnAstra({ vault_copy_revision: null }))?.detail).toBe('Ancienne')
+    expect(copyLine(newerOnAstra({}, { localVaultRevision: null }))?.detail).toBe('Ancienne')
+    const same = overview({ localCredentialRegistryEpoch: 6, localVaultRevision: null })
+    expect(copyLine(same)?.detail).toBe('Document ancien')
+  })
+
+  it('at_an_equal_revision_a_different_vault_is_a_divergence', () => {
+    expect(copyLine(newerOnAstra({}, { localVaultRevision: 5 }))).toMatchObject({
+      ok: false,
+      detail: 'Plus récente sur Astra',
+      fix: 'Envoyer',
+    })
+  })
+
+  it('at_an_equal_revision_the_same_vault_is_ok', () => {
+    const o = newerOnAstra(
+      { vault_copy_fingerprint: '11'.repeat(32) },
+      { localVaultRevision: 5, localCredentialRegistryEpoch: 6 },
+    )
+    expect(copyLine(o)?.detail).not.toBe('Plus récente sur Astra')
+    const same = overview({
+      localVaultFingerprint: '11'.repeat(32),
+      localVaultRevision: 5,
+      authority: {
+        state: 'ok',
+        value: authorityRead({ vault_copy_fingerprint: '11'.repeat(32), vault_copy_revision: 5 }),
+      },
+    })
+    expect(copyLine(same)?.ok).toBe(true)
+  })
+
+  it('a_copy_at_revision_zero_is_not_newer_on_astra', () => {
+    expect(copyLine(newerOnAstra({ vault_copy_revision: 0 }, { localVaultRevision: 0 }))?.detail).toBe(
+      'Ancienne',
+    )
   })
 })

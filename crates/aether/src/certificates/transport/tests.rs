@@ -798,6 +798,7 @@ fn an_operator_status_without_the_chain_key_parses_as_no_chain() {
         next_ca_tls_fingerprint: None,
         issuer: None,
         vault_copy_fingerprint: None,
+        vault_copy_revision: None,
         credential_registry_epoch: Some(7),
         revoked_peers: Vec::new(),
         served_credentials: None,
@@ -812,4 +813,21 @@ fn an_operator_status_without_the_chain_key_parses_as_no_chain() {
     value.as_object_mut().expect("object").remove("chain");
     let parsed: OperatorAuthorityStatus = serde_json::from_value(value).expect("older status");
     assert_eq!(parsed.chain, None);
+}
+
+/// An ordinary copy says nothing about replacing a newer one: the flag is
+/// absent from what it sends, and a copy that omits it reads as not forced.
+#[test]
+fn an_ordinary_copy_carries_no_replace_newer() {
+    let copy = OperatorVaultCopy {
+        vault_base64: "e30=".into(),
+        credentials: None,
+        replace_newer: false,
+    };
+    let encoded = serde_json::to_string(&copy).expect("encoded");
+    assert!(!encoded.contains("replace_newer"), "{encoded}");
+
+    let parsed: OperatorVaultCopy =
+        serde_json::from_str(r#"{"vault_base64":"e30="}"#).expect("an older copy");
+    assert!(!parsed.replace_newer);
 }

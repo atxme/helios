@@ -629,6 +629,7 @@ impl AstraRenewalRelay {
                     400 => TrustUpdateRefusal::Protocol,
                     403 => TrustUpdateRefusal::Rejected,
                     409 => TrustUpdateRefusal::Conflict,
+                    412 => TrustUpdateRefusal::Stale,
                     429 => TrustUpdateRefusal::Throttled,
                     501 | 503 => TrustUpdateRefusal::Unavailable,
                     _ => TrustUpdateRefusal::Internal,
@@ -1071,6 +1072,19 @@ mod tests {
         assert_eq!(refusal, TrustUpdateRefusal::Conflict);
     }
 
+    /// A vault copy behind or diverging from the one the authority holds is
+    /// `412` to the administrator who sent it: collapsing it to `Internal`
+    /// would show a gateway fault for a copy that must be re-taken.
+    #[test]
+    fn relayed_412_is_stale_and_not_internal() {
+        use helios_api::certificates::TrustUpdateRefusal;
+        let refusal = AstraRenewalRelay::refuse(
+            "operator-vault-copy",
+            ::astra_channel::ChannelError::Status(axum::http::StatusCode::PRECONDITION_FAILED),
+        );
+        assert_eq!(refusal, TrustUpdateRefusal::Stale);
+    }
+
     #[test]
     fn authority_statuses_map_to_their_coarse_refusal_classes() {
         use axum::http::StatusCode;
@@ -1080,6 +1094,7 @@ mod tests {
             (StatusCode::BAD_REQUEST, Refusal::Protocol),
             (StatusCode::FORBIDDEN, Refusal::Rejected),
             (StatusCode::CONFLICT, Refusal::Conflict),
+            (StatusCode::PRECONDITION_FAILED, Refusal::Stale),
             (StatusCode::TOO_MANY_REQUESTS, Refusal::Throttled),
             (StatusCode::NOT_IMPLEMENTED, Refusal::Unavailable),
             (StatusCode::SERVICE_UNAVAILABLE, Refusal::Unavailable),

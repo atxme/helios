@@ -376,6 +376,7 @@ async fn status_relay_receives_resolved_operator_without_a_capability() {
 async fn vault_copy_is_relayed_once_without_recording_its_encrypted_content() {
     let relay = RecordingRelay::new(None);
     let copy = astra_channel::OperatorVaultCopy {
+        replace_newer: false,
         vault_base64: "Y2lwaGVydGV4dA==".into(),
         credentials: None,
     };

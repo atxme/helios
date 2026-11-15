@@ -55,7 +55,7 @@ describe('Orion Tauri bridge', () => {
 
     expect(mocks.invoke.mock.calls).toEqual([
       ['operator_rotations_overview'],
-      ['operator_send_vault_copy'],
+      ['operator_send_vault_copy', { replaceNewer: false }],
       [
         'operator_open_campaign',
         { action: { action: 'fleet_leafs' }, reason: 'raison', requestedBy: 'christophe' },

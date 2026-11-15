@@ -22,6 +22,8 @@ pub enum InternalRefusal {
     Throttled,
     /// A live operation holds this back; it can pass later.
     Conflict,
+    /// The copy is behind or diverges from the one the authority holds.
+    Stale,
     /// The gateway failed on its own side.
     Internal,
 }
@@ -34,6 +36,7 @@ impl InternalRefusal {
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Throttled => StatusCode::TOO_MANY_REQUESTS,
             Self::Conflict => StatusCode::CONFLICT,
+            Self::Stale => StatusCode::PRECONDITION_FAILED,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -47,6 +50,7 @@ impl From<TrustUpdateRefusal> for InternalRefusal {
             TrustUpdateRefusal::Unavailable => Self::Unavailable,
             TrustUpdateRefusal::Throttled => Self::Throttled,
             TrustUpdateRefusal::Conflict => Self::Conflict,
+            TrustUpdateRefusal::Stale => Self::Stale,
             TrustUpdateRefusal::Internal => Self::Internal,
         }
     }

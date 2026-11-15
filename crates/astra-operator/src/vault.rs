@@ -436,6 +436,19 @@ pub struct AuthorityVault {
     pub slots: Vec<KeySlot>,
     /// The anchors, sealed under the master key, base64.
     pub sealed_payload: String,
+    /// Write counter of this vault, set by [`crate::store::save`] to one past
+    /// the newer of the copy given and the file on disk. Absent in files written
+    /// before it existed, which read as zero.
+    ///
+    /// It is not part of the sealed context, so bumping it never re-seals the body,
+    /// and it is not authenticated. It orders copies for Astra, which refuses a copy
+    /// behind the one it holds; it grants nothing by itself.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub revision: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// What an operator must present to register a new credential.
@@ -614,6 +627,7 @@ impl AuthorityVault {
             salt: encode(&salt),
             slots,
             sealed_payload,
+            revision: 0,
         })
     }
 

@@ -269,9 +269,12 @@ fn apply_ca_pq_rotation(vault_path: &Path, journal: &CaPqRotationJournal) -> Res
     // Every write is itself atomic. The journal remains until all four have
     // landed, so any prefix of this sequence is safely replayed.
     store::save(vault_path, &journal.vault)?;
+    // The save wrote a revision of its own: the hand-off names the file as it landed.
+    let mut relay = journal.handoff.clone();
+    relay.adopt(&store::load(vault_path)?)?;
     credentials::save(&credentials::path_beside(vault_path), &journal.bindings)?;
     documents::write(&journal.output_path, &journal.transition)?;
-    handoff::save(&handoff::path_beside(vault_path), &journal.handoff)?;
+    handoff::save(&handoff::path_beside(vault_path), &relay)?;
     Ok(())
 }
 

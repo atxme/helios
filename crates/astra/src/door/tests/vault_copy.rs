@@ -60,11 +60,37 @@ fn credentials_at(ca_private: &[u8], registry_epoch: u64) -> Box<CredentialRegis
     })
 }
 
+/// A vault that names its write counter, as one written by the operator tool
+/// does.
+fn vault_at(domain: [u8; 16], marker: &str, revision: u64) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "format_version": 1,
+        "trust_domain_id": TrustDomainId::new(domain).expect("domain"),
+        "revision": revision,
+        "body": marker,
+    }))
+    .expect("vault")
+}
+
 fn send(vault: Vec<u8>, credentials: Option<Box<CredentialRegistry>>) -> DoorRequest {
     DoorRequest::VaultCopy {
         vault: vault.into(),
         credentials,
+        replace_newer: false,
     }
+}
+
+fn send_newer(vault: Vec<u8>) -> DoorRequest {
+    DoorRequest::VaultCopy {
+        vault: vault.into(),
+        credentials: None,
+        replace_newer: true,
+    }
+}
+
+/// Holds `vault` as the copy Astra serves, the way an earlier copy left it.
+fn hold(service: &AstraService, vault: &[u8]) {
+    *service.encrypted_vault.write().expect("vault lock") = Some(Arc::new(vault.to_vec()));
 }
 
 async fn tunnel_send(
@@ -313,6 +339,10 @@ fn the_vault_never_reaches_a_log_through_debug() {
 }
 
 fn relayed_copy(vault: &[u8]) -> Vec<u8> {
+    relayed_with(vault, false)
+}
+
+fn relayed_with(vault: &[u8], replace_newer: bool) -> Vec<u8> {
     serde_json::to_vec(&RelayedOperatorVaultCopy {
         operator: OperatorIdentity::WireGuard {
             public_key: tunnel_key(),
@@ -320,6 +350,7 @@ fn relayed_copy(vault: &[u8]) -> Vec<u8> {
         copy: OperatorVaultCopy {
             vault_base64: base64::engine::general_purpose::STANDARD.encode(vault),
             credentials: None,
+            replace_newer,
         },
     })
     .expect("relayed copy")
@@ -511,6 +542,7 @@ async fn the_private_route_says_credentials_wait_for_the_rotation() {
                 vault_base64: base64::engine::general_purpose::STANDARD
                     .encode(vault_of(DOMAIN, "with document")),
                 credentials: Some(credentials_at(signer, 2)),
+                replace_newer: false,
             },
         })
         .expect("relayed copy")
@@ -611,4 +643,204 @@ async fn the_private_route_takes_a_copy_above_the_ordinary_private_bound() {
     let (status, answer) = post_to(&listener, OPERATOR_VAULT_COPY_ROUTE, &body).await;
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
     assert_eq!(on_disk(&service, VAULT_FILE), Some(vault));
+}
+
+/// A copy behind the one held is refused, and nothing is written.
+#[tokio::test]
+async fn a_late_copy_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let held = vault_at(DOMAIN, "held", 3);
+    hold(&service, &held);
+
+    let refusal = tunnel_send(&service, vault_at(DOMAIN, "late", 2), None).await;
+    assert!(
+        matches!(refusal, Err(DoorRefusal::VaultCopyStale)),
+        "{refusal:?}"
+    );
+    assert_eq!(on_disk(&service, VAULT_FILE), None);
+    assert_eq!(on_disk(&service, PREVIOUS_VAULT_FILE), None);
+    assert_eq!(service.encrypted_vault().as_deref(), Some(&held));
+}
+
+/// A different copy at the revision held is a fork, not a newer copy: refused.
+#[tokio::test]
+async fn a_diverging_copy_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let held = vault_at(DOMAIN, "held", 3);
+    hold(&service, &held);
+
+    let refusal = tunnel_send(&service, vault_at(DOMAIN, "fork", 3), None).await;
+    assert!(
+        matches!(refusal, Err(DoorRefusal::VaultCopyStale)),
+        "{refusal:?}"
+    );
+    assert_eq!(on_disk(&service, VAULT_FILE), None);
+    assert_eq!(on_disk(&service, PREVIOUS_VAULT_FILE), None);
+    assert_eq!(service.encrypted_vault().as_deref(), Some(&held));
+}
+
+/// The same vault in another layout (pretty-printed by hand, compact from
+/// Orion) is not a fork: it is taken at the same revision.
+#[tokio::test]
+async fn a_reformatted_copy_of_the_same_vault_is_accepted() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let compact = vault_at(DOMAIN, "held", 3);
+    let value: serde_json::Value = serde_json::from_slice(&compact).expect("json");
+    let pretty = serde_json::to_vec_pretty(&value).expect("pretty");
+    assert_ne!(pretty, compact);
+    hold(&service, &pretty);
+
+    let outcome = tunnel_send(&service, compact.clone(), None)
+        .await
+        .expect("same content, other layout");
+    assert_eq!(
+        outcome,
+        DoorOutcome::VaultCopied {
+            fingerprint: Fingerprint::of(&compact),
+            credential_registry_epoch: None,
+        }
+    );
+    assert_eq!(service.encrypted_vault().as_deref(), Some(&compact));
+}
+
+/// Sent at revision zero over a held copy above zero: the upgrade case, refused.
+#[tokio::test]
+async fn a_copy_at_zero_over_a_counted_one_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let held = vault_at(DOMAIN, "held", 3);
+    hold(&service, &held);
+
+    let refusal = tunnel_send(&service, vault_at(DOMAIN, "uncounted", 0), None).await;
+    assert!(
+        matches!(refusal, Err(DoorRefusal::VaultCopyStale)),
+        "{refusal:?}"
+    );
+    assert_eq!(on_disk(&service, VAULT_FILE), None);
+    assert_eq!(on_disk(&service, PREVIOUS_VAULT_FILE), None);
+    assert_eq!(service.encrypted_vault().as_deref(), Some(&held));
+}
+
+/// The same bytes always pass, whatever revision they name.
+#[tokio::test]
+async fn an_identical_copy_passes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let held = vault_at(DOMAIN, "held", 3);
+    hold(&service, &held);
+
+    let outcome = tunnel_send(&service, held.clone(), None)
+        .await
+        .expect("identical");
+    assert_eq!(
+        outcome,
+        DoorOutcome::VaultCopied {
+            fingerprint: Fingerprint::of(&held),
+            credential_registry_epoch: None,
+        }
+    );
+    assert_eq!(on_disk(&service, VAULT_FILE), None, "nothing is written");
+    assert_eq!(on_disk(&service, PREVIOUS_VAULT_FILE), None);
+}
+
+/// Held at zero, or unreadable, the stale rule has nothing to compare with.
+#[tokio::test]
+async fn a_held_copy_at_zero_or_unreadable_accepts_any() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    hold(&service, &vault_of(DOMAIN, "held without a revision"));
+    tunnel_send(&service, vault_at(DOMAIN, "at zero", 0), None)
+        .await
+        .expect("held at zero accepts a copy at zero");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    // The fixture holds a placeholder that is not JSON.
+    tunnel_send(&service, vault_at(DOMAIN, "over unreadable", 0), None)
+        .await
+        .expect("an unreadable copy held accepts any");
+}
+
+/// Forced, the older copy replaces the held one, and the held one is kept.
+#[tokio::test]
+async fn replace_newer_lifts_the_stale_rule_and_keeps_the_previous() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let held = vault_at(DOMAIN, "held", 3);
+    hold(&service, &held);
+    let older = vault_at(DOMAIN, "older", 2);
+
+    let outcome = service
+        .door(tunnel(), send_newer(older.clone()), NOW)
+        .await
+        .expect("forced");
+    assert_eq!(
+        outcome,
+        DoorOutcome::VaultCopied {
+            fingerprint: Fingerprint::of(&older),
+            credential_registry_epoch: None,
+        }
+    );
+    assert_eq!(on_disk(&service, VAULT_FILE), Some(older.clone()));
+    assert_eq!(on_disk(&service, PREVIOUS_VAULT_FILE), Some(held));
+    assert_eq!(service.encrypted_vault().as_deref(), Some(&older));
+}
+
+/// A live operation holds back a newer copy, and a stale one is refused as
+/// stale: the refusal the sender must not retry blindly comes first.
+#[tokio::test]
+async fn stale_comes_before_held_back() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let held = vault_at(DOMAIN, "held", 3);
+    hold(&service, &held);
+    open_vault_operation(&service).await;
+
+    let stale = service
+        .door(tunnel(), send(vault_at(DOMAIN, "late", 2), None), NOW + 1)
+        .await;
+    assert!(
+        matches!(stale, Err(DoorRefusal::VaultCopyStale)),
+        "{stale:?}"
+    );
+    // A newer copy is still held back by the operation.
+    let newer = service
+        .door(tunnel(), send(vault_at(DOMAIN, "newer", 4), None), NOW + 1)
+        .await;
+    assert!(
+        matches!(newer, Err(DoorRefusal::AlreadyOpen { .. })),
+        "{newer:?}"
+    );
+    assert_eq!(on_disk(&service, VAULT_FILE), None);
+    assert_eq!(service.encrypted_vault().as_deref(), Some(&held));
+}
+
+/// A stale copy answers `412` on the private route, a forced one is taken.
+#[tokio::test]
+async fn the_private_route_says_a_stale_copy_is_a_precondition_failure() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    hold(&service, &vault_at(DOMAIN, "held", 3));
+    let listener = listen(Arc::clone(&service)).await;
+
+    let (status, _) = post_to(
+        &listener,
+        OPERATOR_VAULT_COPY_ROUTE,
+        &relayed_copy(&vault_at(DOMAIN, "late", 2)),
+    )
+    .await;
+    assert_eq!(status, 412);
+    assert_eq!(on_disk(&service, VAULT_FILE), None);
+
+    let (status, _) = post_to(
+        &listener,
+        OPERATOR_VAULT_COPY_ROUTE,
+        &relayed_with(&vault_at(DOMAIN, "late", 2), true),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(on_disk(&service, VAULT_FILE).is_some());
 }

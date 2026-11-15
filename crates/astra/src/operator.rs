@@ -183,9 +183,11 @@ async fn status(
     let serving_epoch = service
         .issuer()
         .map(|issuer| issuer.authorization.issuer_epoch);
-    let vault_copy_fingerprint = service
-        .encrypted_vault()
-        .map(|bytes| Fingerprint::of(&bytes));
+    let held_copy = service.encrypted_vault();
+    let vault_copy_fingerprint = held_copy.as_ref().map(|bytes| Fingerprint::of(bytes));
+    let vault_copy_revision = held_copy
+        .as_ref()
+        .map(|bytes| crate::door::revision_of(bytes));
     let chain = crate::door::chain_view(&service);
     let report = OperatorAuthorityStatus {
         ca_epoch: state.ca_epoch,
@@ -208,6 +210,7 @@ async fn status(
             not_after: issuer.authorization.not_after,
         }),
         vault_copy_fingerprint,
+        vault_copy_revision,
         credential_registry_epoch,
         revoked_peers,
         served_credentials: approval_credentials.registry.clone(),
@@ -430,6 +433,7 @@ async fn vault_copy(
         let request = DoorRequest::VaultCopy {
             vault: vault.into(),
             credentials: relayed.copy.credentials,
+            replace_newer: relayed.copy.replace_newer,
         };
         async move { service.door(connector, request, now_unix()).await }
     })
@@ -824,6 +828,31 @@ mod tests {
             serde_json::from_slice(&answer(&service).await).expect("status");
 
         assert_eq!(report.revoked_peers, vec![laptop]);
+    }
+
+    /// The revision of the held copy travels in the status, and it is absent
+    /// without a copy.
+    #[tokio::test]
+    async fn status_carries_the_revision_of_the_held_copy() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let service = fixture(directory.path());
+        let domain = service.registry.lock().await.state().trust_domain_id;
+        let held = serde_json::to_vec(&serde_json::json!({
+            "format_version": 1,
+            "trust_domain_id": domain,
+            "revision": 3,
+        }))
+        .expect("vault");
+        *service.encrypted_vault.write().expect("vault lock") = Some(Arc::new(held));
+        let service = Arc::new(service);
+        let report: OperatorAuthorityStatus =
+            serde_json::from_slice(&answer(&service).await).expect("status");
+        assert_eq!(report.vault_copy_revision, Some(3));
+
+        *service.encrypted_vault.write().expect("vault lock") = None;
+        let report: OperatorAuthorityStatus =
+            serde_json::from_slice(&answer(&service).await).expect("status");
+        assert_eq!(report.vault_copy_revision, None);
     }
 
     #[tokio::test]

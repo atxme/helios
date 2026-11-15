@@ -1577,6 +1577,73 @@ action, puis état attendu.
     reprise. Attendu : la ligne lit « Domaine en désaccord. Intervention manuelle requise », sans rien poser ; et
     avant cela, ajouter une origine pendant le journal est refusé.
 
+**M. F14-f : copie du coffre depuis Orion**
+
+Les tests Rust et Vitest couvrent la logique (`apps/orion/src/views/astra/VaultCopy.test.tsx`,
+`VaultPanel.test.tsx`, `rotationRows.test.ts`, et les tests inline de
+`apps/orion/src-tauri/src/operator/rotations.rs` et de
+`crates/astra-operator/src/rotation_journal.rs`). Les étapes marquées **[cible]**
+demandent deux postes qui tiennent le même domaine, Astra en marche, et une vraie
+copie refusée en `412`. Les autres se jouent avec le tunnel monté, sans clé, sur un
+seul poste. Onglet *Astra* › *Coffre et clés*, sauf mention contraire. Chaque étape :
+action, puis état attendu.
+
+130. **Export du coffre.** Cliquer « Exporter le coffre ». Attendu : la boîte d'enregistrement
+    (titre « Exporter le coffre opérateur ») propose `authority-vault-AAAA-MM-JJ.json`, à la date du jour. Enregistrer :
+    « Coffre exporté ». Le fichier a les mêmes octets que `authority-vault.json` au chemin
+    affiché sous « Coffre opérateur » (comparer les empreintes, par exemple avec
+    `Get-FileHash`). Refaire l'export tunnel coupé : même résultat, sans clé demandée.
+131. **Export refusé sur le coffre lui-même.** Exporter en visant le chemin du coffre affiché.
+    Windows demande de remplacer le fichier : confirmer. Attendu : « le coffre ne peut pas
+    être exporté sur lui-même » ; le fichier du coffre n'a pas changé. Refaire en visant
+    `astra-rotation-journal.json` (ou `astra-credentials.json`, `astra-domain.json`) dans le
+    même dossier, s'il existe : « ce fichier est conservé à côté du coffre : choisir un autre
+    nom » ; le fichier n'a pas changé. Viser un fichier d'export existant d'un autre nom :
+    Windows demande avant de le remplacer.
+132. **[cible] Poste en retard : envoi refusé.** Poste A : tenir le coffre à jour. Poste B :
+    tenir un coffre plus ancien, du même domaine, tunnel monté. Sur A, un geste qui envoie le
+    coffre à Astra en l'écrivant (par exemple renommer une clé, puis « Envoyer » ; « Marquer
+    perdue » n'écrit pas le coffre et n'avance pas sa révision). Sur B,
+    ouvrir *Coffre et clés*. Attendu : la ligne « Copie du coffre » affiche « Plus récente sur
+    Astra ». Cliquer « Envoyer » : l'alerte dit « Astra tient un coffre plus récent que celui de
+    ce poste, ou qui a divergé. Récupérez le coffre à jour sur le poste qui le tient. », avec
+    « Remplacer quand même » et l'avertissement « La copie d’Astra sera remplacée par ce
+    coffre. À ne faire que si vous savez que la copie d’Astra est fausse. ». Sur A, la ligne
+    « Copie du coffre » reste à jour : Astra tient encore sa copie.
+133. **[cible] « Remplacer quand même ».** Suite de 132, sur B. Cliquer « Remplacer quand
+    même ». Attendu : la copie est acceptée, et la ligne « Copie du coffre » de B redevient à
+    jour, sans détail ; l'alerte disparaît. Sur A, la ligne passe à « Ancienne » : Astra tient
+    maintenant la copie de B. La copie remplacée reste la génération précédente, gardée sur la
+    gateway.
+134. **Remplacement non proposé pendant une reprise.** **[cible]** (rotation interrompue sur B,
+    « Reprendre » offert). Ouvrir *Coffre et clés* après un envoi refusé. Attendu : le refus
+    s'affiche, sans « Remplacer quand même ». Ouvrir *Rotations* : le refus s'affiche seul,
+    sans bouton. « Reprendre » finit la rotation sans demander de clé.
+135. **[cible] Fin de rotation avec copie en retard.** Sur B, mener à son terme une rotation
+    depuis *Rotations* (par exemple la CA TLS) alors qu'Astra tient un coffre plus
+    récent. Attendu : la rotation est finie ; la ligne « Copie du coffre » reste « À faire »
+    avec « Plus récente sur Astra » ; aucun nouvel envoi n'est tenté seul.
+136. **Écriture du relais gardée.** Créer un coffre scellé en attente comme à l'étape 129 (un
+    journal portant un coffre suivant, interrompu après son écriture). Dans *Astra* ›
+    *Coffre et clés*, bloc du domaine : « Modifier », changer une valeur, « Enregistrer »,
+    « Confirmer ». Attendu : « une rotation porte un coffre qui remplacera celui-ci : la
+    mener à son terme dans Orion avant de changer les clés ou leurs noms. Rien n'a été
+    modifié. ». Le relais n'a pas changé. Une fois la rotation menée à son
+    terme, refaire le geste : il passe.
+137. **Export puis recouvrement d'un poste en retard.** **[cible]** (suite de 132). Sur A,
+    « Exporter le coffre » : « Coffre exporté ». Copier le fichier sur B dans un dossier à lui
+    et le renommer `authority-vault.json`. Copier aussi `astra-credentials.json` depuis le dossier
+    du coffre de A dans ce même dossier sur B (l'export ne le porte pas). Sur B, « Changer… » sous
+    « Coffre opérateur », puis choisir ce fichier. Attendu : l'empreinte affichée de B est celle
+    de A, et la ligne « Copie du coffre » de B est à jour, sans détail, comme sur A.
+138. **[cible] Geste sur les clés sur le poste en retard.** Suite de 132, sur B, tunnel
+    monté, avec un coffre plus ancien que celui d'Astra. Faire le même geste sur une clé que
+    sur A (« Marquer perdue »). Attendu : le refus « Astra tient un coffre plus récent que
+    celui de ce poste, ou qui a divergé. Récupérez le coffre à jour sur le poste qui le tient. »
+    s'affiche sous le geste, avec « Remplacer quand même » et l'avertissement « La copie
+    d’Astra sera remplacée par ce coffre. À ne faire que si vous savez que la copie d’Astra
+    est fausse. ». Ouvrir ensuite *Rotations* : le refus seul, sans bouton.
+
 ### Le chemin manuel
 
 Dans un autre terminal, générer deux identités de test :

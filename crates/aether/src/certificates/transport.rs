@@ -790,6 +790,9 @@ pub enum TrustUpdateRefusal {
     /// pass once it is over. Answered only where the caller can already read
     /// that operation: this is no oracle on anyone else's state.
     Conflict,
+    /// The copy is behind or diverges from the one the authority holds.
+    /// Answered only to an administrator, who must take the copy again.
+    Stale,
     /// The gateway failed on its own side.
     Internal,
 }
@@ -1309,6 +1312,11 @@ pub struct OperatorAuthorityStatus {
     pub issuer: Option<OperatorIssuerStatus>,
     /// Fingerprint of the encrypted vault copy Astra holds, if any.
     pub vault_copy_fingerprint: Option<Fingerprint>,
+    /// The write counter of the held vault copy, read from its header: zero
+    /// when the copy is an older one that names none, or one Astra cannot read.
+    /// `None` when Astra holds no copy.
+    #[serde(default)]
+    pub vault_copy_revision: Option<u64>,
     /// The epoch of the credential document Astra serves, not the registry's
     /// bootstrap floor. `None` when Astra serves no document.
     pub credential_registry_epoch: Option<u64>,
@@ -1375,12 +1383,17 @@ pub struct OperatorChainRefusal {
 /// The vault stays encrypted: this carries bytes neither the gateway nor Astra
 /// can open. The credential document, when present, is signed under `CA-PQ`
 /// and Astra verifies it itself before taking it.
+///
+/// `replace_newer` lets a copy behind the one Astra holds replace it: an
+/// operator's explicit, logged choice, never the default.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorVaultCopy {
     pub vault_base64: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials: Option<Box<crate::certificates::approval::CredentialRegistry>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_newer: bool,
 }
 
 /// Prints what the copy is made of and never its content: the vault is the
@@ -1391,6 +1404,7 @@ impl std::fmt::Debug for OperatorVaultCopy {
             .debug_struct("OperatorVaultCopy")
             .field("vault_base64_chars", &self.vault_base64.len())
             .field("credentials", &self.credentials.is_some())
+            .field("replace_newer", &self.replace_newer)
             .finish()
     }
 }

@@ -1483,26 +1483,64 @@ dans [ROADMAP.md](ROADMAP.md) (F14-a à F14-f).
   d'abord, et affiche « Domaine en désaccord » si le relais en nomme une entre-temps.
   Tant qu'une telle rotation est en cours, le relais refuse de recevoir une origine Astra.
 - **La copie du coffre sur la gateway** : un administrateur du tunnel peut la
-  remplacer (Astra n'en lit que le domaine, et ne peut pas l'ouvrir) ; une
-  génération précédente est gardée, pas davantage ; une sauvegarde hors de la
-  gateway n'est pas couverte. Deux postes tenant un même domaine peuvent écraser
-  une copie plus récente d'Astra, seul le domaine étant contrôlé. Une copie
-  de plus de 128 Kio est refusée (ce que le téléchargement porte). Une
-  copie différente envoyée pendant une opération en attente de l'opérateur
-  répond `409` : réessayer après son expiration (300 s au plus). Un document de
-  credentials joint pendant une rotation `CA-PQ`, ou avant que la promotion de
-  son document soit durable, répond `409` aussi ; Orion renvoie alors le seul
-  coffre et dit que le document attend.
+  remplacer, et gonfler le compteur de révision du coffre, puisque la copie
+  n'est pas authentifiée ; « Remplacer quand même » est alors le recours. Une
+  génération précédente est gardée, pas davantage. Une copie de plus de 128 Kio
+  est refusée (ce que le téléchargement porte). Une copie différente envoyée
+  pendant une opération en attente de l'opérateur répond `409` : réessayer
+  après son expiration (300 s au plus). Un document de credentials joint pendant
+  une rotation `CA-PQ`, ou avant que la promotion de son document soit durable,
+  répond `409` aussi ; Orion renvoie alors le seul coffre et dit que le document
+  attend.
+- **Une copie en retard ou divergente est refusée (`412`).** Le coffre porte une
+  révision en clair, augmentée à chaque écriture et sans clé. Astra refuse une
+  copie dont la révision est inférieure à la sienne, ou égale avec d'autres
+  octets. Une copie identique passe, et une copie tenue à 0 (ancienne, absente
+  ou illisible) accepte tout. Le refus passe avant le `409` d'une opération
+  vivante. Orion le dit : la ligne « Copie du coffre » de *Coffre et clés*
+  affiche « Plus récente sur Astra » quand Astra tient une révision plus haute,
+  et un envoi refusé affiche « Astra tient un coffre plus récent que celui de
+  ce poste, ou qui a divergé. Récupérez le coffre à jour sur le poste qui le
+  tient. » Le bouton « Remplacer quand même », avec l'avertissement « La copie
+  d’Astra sera remplacée par ce coffre. À ne faire que si vous savez que la
+  copie d’Astra est fausse. », n'est offert que là où l'envoi part du coffre :
+  la ligne « Copie du coffre » de *Coffre et clés*, et le résultat d'un geste sur
+  les clés (ajout, retrait, marquage). Il n'est jamais offert dans l'onglet
+  *Rotations*, qui n'affiche que le refus, ni pendant la reprise d'une rotation.
+  Une copie refusée ne remet pas une rotation en cause : à la fin d'une
+  rotation, elle l'achève, et la ligne « Copie du coffre » reste « À faire ».
+- **Sauvegarde et poste en retard.** « Exporter le coffre », dans *Coffre et
+  clés*, écrit le seul fichier chiffré du coffre, sans clé ni tunnel, dans un
+  fichier choisi dans la boîte d'enregistrement de Windows (titre « Exporter le
+  coffre opérateur »). Le nom proposé est `authority-vault-AAAA-MM-JJ.json` ;
+  le coffre ne s'exporte pas sur lui-même, ni sur un fichier gardé à côté du
+  coffre (relais, document de credentials, journal de rotation), et Windows
+  demande avant de remplacer un fichier existant. Pour remettre à jour un poste
+  en retard, exporter le coffre depuis le poste qui le tient, le copier sur le
+  poste en retard dans un dossier à lui, le renommer `authority-vault.json`
+  (« Changer… » n'accepte que ce nom), copier aussi `astra-credentials.json`
+  depuis le dossier du coffre du poste à jour dans ce même dossier (l'export ne
+  le porte pas), puis « Changer… » sous « Coffre opérateur » pour choisir ce
+  fichier. Le relais se reconstruit depuis le coffre et la gateway ; l'export ne
+  porte que le coffre, pas le document de credentials, d'où cette copie à la main.
+- **Compatibilité du compteur.** Un Orion ou un `astra-signer` antérieur ne lit
+  plus un coffre qui porte la révision ; les deux sont livrés ensemble. Un
+  coffre qui n'a pas été réécrit depuis reste lisible par eux. Un Orion
+  antérieur à ce lot ne lit plus non plus l'état d'Astra dans ses cérémonies
+  (lecture stricte du champ `vault_copy_revision`), comme pour le champ `chain`
+  du lot 6b : mettre Orion à jour avec Helios.
 - **Un écrasement raté peut effacer un journal à tort.** Si une écriture
   échoue après son renommage et que la campagne meurt avant un rejeu, Orion
   efface son journal alors que le fichier d'Astra tient l'ancre : réparation
   manuelle. Il faut un échec de synchronisation du dossier et 300 s sans rejeu,
   sur un volume déjà défaillant.
-- **`write_domain_relay` n'est pas couvert par la garde d'écrasement.** Les
-  gestes sur les clés et les renommages sont refusés tant qu'un coffre scellé
-  attend d'écraser celui en place (enregistrement `astra-signer` présent,
-  journal illisible, ou journal avec coffre suivant) ; l'écriture du relais de
-  domaine ne l'est pas.
+- **`write_domain_relay` attend comme les gestes sur les clés.** L'écriture du
+  relais de domaine (« Modifier », « Enregistrer », « Confirmer ») est refusée
+  tant qu'un coffre scellé attend d'écraser celui en place (enregistrement
+  `astra-signer` présent, journal illisible, ou journal avec coffre suivant),
+  avec la phrase « une rotation porte un coffre qui remplacera celui-ci : la
+  mener à son terme dans Orion avant de changer les clés ou leurs noms. Rien
+  n'a été modifié. ».
 - **Gateway plus ancienne que le lot** : la reprise affiche qu'il faut mettre la
   gateway à jour, sans rien effacer. Une gateway à jour sans CA TLS configurée
   se lit de même.

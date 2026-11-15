@@ -281,6 +281,7 @@ fn the_policy_table_is_exactly_the_specification() {
         DoorRequest::VaultCopy {
             vault: Vec::new().into(),
             credentials: None,
+            replace_newer: false,
         },
     ];
     let tunnels = [

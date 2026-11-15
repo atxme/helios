@@ -377,7 +377,10 @@ describe('the vault copy', () => {
   it('an_old_copy_reads_old', async () => {
     await show(
       overview({
-        authority: { state: 'ok', value: authorityRead({ vault_copy_fingerprint: '99'.repeat(32) }) },
+        authority: {
+          state: 'ok',
+          value: authorityRead({ vault_copy_fingerprint: '99'.repeat(32), vault_copy_revision: 3 }),
+        },
       }),
     )
     choose('Remplacer la CA-PQ')

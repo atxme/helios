@@ -932,6 +932,7 @@ pub fn vault_copy(vault_path: &Path) -> Result<OperatorVaultCopy> {
     let vault = store::load(vault_path)?;
     let bytes = serde_json::to_vec(&vault).context("sérialisation du coffre")?;
     Ok(OperatorVaultCopy {
+        replace_newer: false,
         vault_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
         credentials: None,
     })
@@ -1081,7 +1082,9 @@ fn finish_with_the_copy(
     }
     match vault_copy(vault_path).and_then(|copy| remote.send_vault_copy(&copy)) {
         Ok(VaultCopySent::HeldBack) => Ok(ResumeStep::SendVaultCopy),
-        Ok(VaultCopySent::Copied(_)) | Err(_) => {
+        // A stale copy is Astra's answer about the vault, not about this rotation: the
+        // rotation is on the gateway, and the operator decides about a forced send.
+        Ok(VaultCopySent::Copied(_) | VaultCopySent::Stale) | Err(_) => {
             rotation_journal::clear(&journal_path)?;
             Ok(ResumeStep::Finished)
         }
@@ -1192,7 +1195,12 @@ impl CaTlsFinish {
         }
         ensure_vault_holds(&vault, &opening, &incoming)?;
         match signing::advance_ca_tls(&mut vault, &opening, now)? {
-            CaTlsAdvance::Rotated { .. } => store::save(vault_path, &vault)?,
+            CaTlsAdvance::Rotated { .. } => {
+                store::save(vault_path, &vault)?;
+                // The save wrote a revision of its own: the relay names the vault
+                // as it landed.
+                vault = store::load(vault_path)?;
+            }
             CaTlsAdvance::Idle => {}
             CaTlsAdvance::Awaiting { at } => return Err(FinishRefusal::NotYet { at }.into()),
         }
