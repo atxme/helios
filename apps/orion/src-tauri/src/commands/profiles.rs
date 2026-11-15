@@ -51,21 +51,13 @@ pub(crate) async fn import_profile_path(
     state: State<'_, AppState>,
     path: Option<String>,
 ) -> Result<Option<ImportOutcome>, String> {
-    let path = match path {
-        Some(path) => PathBuf::from(path),
-        None => match state.pending_profile_paths.lock().unwrap().pop_front() {
-            Some(path) => path,
-            None => return Ok(None),
-        },
+    let path = match resolve_import_path(&state.pending_profile_paths, path) {
+        Some(path) => path,
+        None => return Ok(None),
     };
-    if !is_associated_profile_path(&path) {
-        return Err(format!(
-            "seuls les fichiers .{PROFILE_EXTENSION} sont acceptés par cette commande"
-        ));
-    }
     // Read here, by the process the user is in: the engine parses the text it
     // is sent and never opens a path the UI chose.
-    let (contents, file_name) = read_profile_document(&path).map_err(|error| error.to_string())?;
+    let (contents, file_name) = read_associated_profile(&path)?;
     match state
         .client
         .call(EngineCommand::ImportProfile {
@@ -248,14 +240,38 @@ pub(crate) async fn open_ssh_terminal(
         _ => return Err(unexpected_engine_reply()),
     };
     // The engine answers with the line `ssh <cible>`; only the target is launched.
-    let target = command
-        .strip_prefix("ssh ")
-        .ok_or("le moteur n'a pas rendu une commande « ssh <cible> » : rien n'est ouvert")?;
     // Checked again here, by the process that builds the command line: the
     // engine validated the profile, but this is where a string becomes a
     // shell invocation, and the allow-list costs nothing.
-    orion_core::profile_import::validate_ssh_target(target).map_err(|error| error.to_string())?;
+    let target = validated_ssh_target(&command)?;
     spawn_ssh_terminal(target)
+}
+
+fn resolve_import_path(
+    pending: &std::sync::Mutex<std::collections::VecDeque<PathBuf>>,
+    requested: Option<String>,
+) -> Option<PathBuf> {
+    match requested {
+        Some(path) => Some(PathBuf::from(path)),
+        None => pending.lock().unwrap().pop_front(),
+    }
+}
+
+fn read_associated_profile(path: &std::path::Path) -> Result<(String, String), String> {
+    if !is_associated_profile_path(path) {
+        return Err(format!(
+            "seuls les fichiers .{PROFILE_EXTENSION} sont acceptés par cette commande"
+        ));
+    }
+    read_profile_document(path).map_err(|error| error.to_string())
+}
+
+fn validated_ssh_target(command: &str) -> Result<&str, String> {
+    let target = command
+        .strip_prefix("ssh ")
+        .ok_or("le moteur n'a pas rendu une commande « ssh <cible> » : rien n'est ouvert")?;
+    orion_core::profile_import::validate_ssh_target(target).map_err(|error| error.to_string())?;
+    Ok(target)
 }
 
 /// The same command line, for the user to paste into their own terminal.
@@ -366,5 +382,151 @@ pub(crate) async fn validate_profile(
     {
         EngineReply::Issues(value) => Ok(value),
         _ => Err(unexpected_engine_reply()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_associated_profile, resolve_import_path, validated_ssh_target};
+    use std::{
+        collections::VecDeque,
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Mutex,
+        },
+    };
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            loop {
+                let path = std::env::temp_dir().join(format!(
+                    "orion-profile-command-tests-{}-{}",
+                    std::process::id(),
+                    NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create scratch directory: {error}"),
+                }
+            }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn explicit_import_path_takes_precedence_without_consuming_the_queue() {
+        let pending = Mutex::new(VecDeque::from([PathBuf::from("queued.orion")]));
+
+        assert_eq!(
+            resolve_import_path(&pending, Some("picked.orion".into())),
+            Some(PathBuf::from("picked.orion"))
+        );
+        assert_eq!(
+            pending.lock().expect("queue lock").front(),
+            Some(&PathBuf::from("queued.orion"))
+        );
+    }
+
+    #[test]
+    fn queued_import_path_is_consumed_once_and_empty_queue_stays_empty() {
+        let pending = Mutex::new(VecDeque::from([
+            PathBuf::from("first.orion"),
+            PathBuf::from("second.orion"),
+        ]));
+
+        assert_eq!(
+            resolve_import_path(&pending, None),
+            Some(PathBuf::from("first.orion"))
+        );
+        assert_eq!(
+            resolve_import_path(&pending, None),
+            Some(PathBuf::from("second.orion"))
+        );
+        assert_eq!(resolve_import_path(&pending, None), None);
+    }
+
+    #[test]
+    fn associated_profile_read_returns_decoded_text_and_its_file_name() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("gateway.orion");
+        std::fs::write(&path, "profile document").expect("write test profile");
+
+        assert_eq!(
+            read_associated_profile(&path).expect("read associated profile"),
+            ("profile document".into(), "gateway.orion".into())
+        );
+    }
+
+    #[test]
+    fn legacy_associated_profile_extension_remains_importable() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("old.orionprofile");
+        std::fs::write(&path, "legacy document").expect("write legacy profile");
+
+        assert_eq!(
+            read_associated_profile(&path).expect("read legacy profile"),
+            ("legacy document".into(), "old.orionprofile".into())
+        );
+    }
+
+    #[test]
+    fn unassociated_path_is_refused_before_file_access() {
+        let path = PathBuf::from("missing.txt");
+
+        let error = read_associated_profile(&path).expect_err("wrong extension is refused");
+
+        assert!(error.contains("seuls les fichiers"));
+        assert!(!error.contains("missing.txt"));
+    }
+
+    #[test]
+    fn associated_but_missing_path_reports_the_read_failure() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("missing.orion");
+
+        let error = read_associated_profile(&path).expect_err("missing file cannot be read");
+
+        assert!(error.starts_with("ouverture de "));
+    }
+
+    #[test]
+    fn ssh_command_must_have_the_engine_prefix_and_a_safe_target() {
+        for command in [
+            "",
+            "ssh",
+            "scp host",
+            "ssh ;whoami",
+            "ssh host;id",
+            "ssh -oProxyCommand=x host",
+            "ssh user@host:70000",
+        ] {
+            assert!(
+                validated_ssh_target(command).is_err(),
+                "unsafe engine response was accepted: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_command_returns_only_a_validated_destination() {
+        assert_eq!(
+            validated_ssh_target("ssh operator@gateway.example:2222"),
+            Ok("operator@gateway.example:2222")
+        );
+        assert_eq!(
+            validated_ssh_target("ssh gateway.example"),
+            Ok("gateway.example")
+        );
     }
 }
