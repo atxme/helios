@@ -224,8 +224,8 @@ rotation et, pendant le recouvrement, « Ancre entrante … » : **comparer cett
 empreinte à celle que l'on a créée**, car elle n'existe pas avant la signature
 et ne se montre donc qu'après. Les commandes suivantes sont le recours.
 
-**Sans origine Astra : « Remplacer la CA-PQ sans campagne… »** (F14-e). Dans un domaine
-dont le relais ne nomme aucune origine Astra, la ligne « Remplacer la CA-PQ sans campagne… »
+**Sans origine Astra : « Remplacer la CA-PQ sans campagne »** (F14-e). Dans un domaine
+dont le relais ne nomme aucune origine Astra, la ligne « Remplacer la CA-PQ sans campagne »
 remplace « Remplacer la CA-PQ » ; avec une origine, même illisible, elle n'apparaît pas. Elle
 tient lieu, hors campagne, de `astra-signer rotate-ca-pq` et des commandes de cette section :
 rien à ouvrir ni à approuver chez Astra. Prérequis : tunnel monté, administrateur du tunnel,
@@ -1477,9 +1477,9 @@ dans [ROADMAP.md](ROADMAP.md) (F14-a à F14-f).
   d'Astra, par le geste voulu de l'opérateur ; c'est une exception à la règle
   d'Orion « le coffre ne bouge qu'après l'acceptation d'Astra ». Un journal
   adopté d'un tel enregistrement se lit d'abord auprès d'Astra. Son successeur est
-  « Remplacer la CA-PQ sans campagne… » dans Orion (F14-e), et l'exception ne vaut
+  « Remplacer la CA-PQ sans campagne » dans Orion (F14-e), et l'exception ne vaut
   que dans un domaine sans origine Astra. Avec une origine, la reprise lit Astra
-  d'abord, et refuse (« conflit de domaine ») si le relais en nomme une entre-temps.
+  d'abord, et affiche « Domaine en désaccord » si le relais en nomme une entre-temps.
   Tant qu'une telle rotation est en cours, le relais refuse de recevoir une origine Astra.
 - **La copie du coffre sur la gateway** : un administrateur du tunnel peut la
   remplacer (Astra n'en lit que le domaine, et ne peut pas l'ouvrir) ; une

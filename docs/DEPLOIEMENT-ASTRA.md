@@ -301,7 +301,7 @@ astra-signer rotate-ca-pq --out ca-pq-transition.json \
   --authority-url https://astra.exemple --operation-id <identifiant>
 ```
 
-Dans un domaine sans origine Astra, la ligne « Remplacer la CA-PQ sans campagne… » de
+Dans un domaine sans origine Astra, la ligne « Remplacer la CA-PQ sans campagne » de
 *Rotations* remplace ces deux commandes hors campagne (`RENOUVELLEMENT-CERTIFICATS.md`, §3) :
 deux clés, pas d'Astra, la transition posée par le tunnel. Le fichier
 `ca-pq-transition.json` est offert tant que la pose n'a pas abouti. Avec une origine, la

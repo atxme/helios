@@ -1552,10 +1552,11 @@ action, puis état attendu.
     clés. Annuler sans valider de clé.
 126. **Remplacement complet.** **[cible]** (deux clés, gateway cible). Suivre la cérémonie :
     durées, « Clé 1 » et « Clé 2 » validées, signature, sans toucher d'approbation. Attendu :
-    l'écran final montre « Ancre entrante … » ; comparer cette empreinte à celle créée. Sur la
+    l'écran final montre « Empreinte entrante » en groupes ; comparer cette empreinte à la
+    prochaine CA-PQ de la gateway (écran *Certificats*), et à celle créée. Sur la
     gateway (écran *Certificats*), l'ancre CA-PQ courante est la nouvelle. Le coffre garde la
     CA-PQ sortante : « Terminer la rotation CA-PQ » n'est offert qu'après `not_after`, et
-    relancer « Remplacer la CA-PQ sans campagne… » est refusé d'ici là.
+    relancer « Remplacer la CA-PQ sans campagne » est refusé d'ici là.
 127. **Tunnel coupé après la signature.** **[cible]** (deux clés). Pendant la cérémonie, couper
     le tunnel après la signature, avant la pose. Attendu : la pose échoue, et
     `ca-pq-transition.json` est offert au téléchargement. Rétablir le tunnel, puis
@@ -1563,7 +1564,7 @@ action, puis état attendu.
     gateway montre la nouvelle ancre, et le fichier n'est plus offert. (Recours : installer le
     fichier à la main avec `heliosd install-ca-transition`.)
 128. **Domaine avec origine : la ligne est absente.** Sur un domaine dont le relais nomme une
-    origine Astra, ouvrir *Rotations*. Attendu : « Remplacer la CA-PQ sans campagne… »
+    origine Astra, ouvrir *Rotations*. Attendu : « Remplacer la CA-PQ sans campagne »
     n'apparaît pas ; « Remplacer la CA-PQ » reste la seule ligne. Même résultat si le relais est
     illisible.
 129. **Journal `astra-signer` hors campagne, puis « Reprendre ».** **[cible]** (un journal réel).
@@ -1571,7 +1572,7 @@ action, puis état attendu.
     identifiant d'opération) et l'interrompre après l'écriture de son journal, avant la pose.
     Attendu : « Reprendre » finit la rotation sans demander de clé ni passer par Astra, et
     installe la transition par le tunnel. Variante : donner une origine au relais avant la
-    reprise. Attendu : la reprise s'arrête avec « conflit de domaine », sans rien poser ; et
+    reprise. Attendu : la ligne lit « Domaine en désaccord. Intervention manuelle requise », sans rien poser ; et
     avant cela, ajouter une origine pendant le journal est refusé.
 
 ### Le chemin manuel
