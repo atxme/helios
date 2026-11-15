@@ -232,6 +232,7 @@ mod tests {
             next_ca_tls_fingerprint: None,
             issuer: None,
             vault_copy_fingerprint: None,
+            vault_copy_revision: None,
             credential_registry_epoch: None,
             revoked_peers,
             served_credentials: None,

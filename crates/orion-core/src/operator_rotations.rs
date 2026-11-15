@@ -173,6 +173,10 @@ pub struct AuthorityStatusRead {
     pub issuer: Option<IssuerRead>,
     #[serde(default)]
     pub vault_copy_fingerprint: Option<String>,
+    /// The write counter of the vault copy Astra holds. `None` without a copy, or from an
+    /// Astra older than the revision, which reads as absent rather than as a refusal.
+    #[serde(default)]
+    pub vault_copy_revision: Option<u64>,
     /// `None`: Astra serves no document. Not epoch 0.
     #[serde(default)]
     pub credential_registry_epoch: Option<u64>,
@@ -227,6 +231,7 @@ impl From<OperatorAuthorityStatus> for AuthorityStatusRead {
                 not_after: issuer.not_after,
             }),
             vault_copy_fingerprint: status.vault_copy_fingerprint.map(|f| f.to_hex()),
+            vault_copy_revision: status.vault_copy_revision,
             credential_registry_epoch: status.credential_registry_epoch,
             revoked_peers: status
                 .revoked_peers

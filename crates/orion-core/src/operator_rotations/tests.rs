@@ -535,3 +535,39 @@ fn authority_status_without_chain_reads_none() {
     let read: AuthorityStatusRead = serde_json::from_value(with_null).expect("read");
     assert_eq!(read.chain, None);
 }
+
+/// The revision Astra holds of its vault copy reaches the screen, so that a newer copy on Astra
+/// is said beside this machine's vault.
+#[test]
+fn the_vault_copy_revision_reaches_the_screen() {
+    let status = OperatorAuthorityStatus {
+        vault_copy_revision: Some(3),
+        chain: None,
+        ca_epoch: 4,
+        ca_fingerprint: Fingerprint::of(b"a"),
+        next_ca_fingerprint: None,
+        ca_tls_epoch: 2,
+        ca_tls_fingerprint: None,
+        next_ca_tls_fingerprint: None,
+        issuer: None,
+        vault_copy_fingerprint: Some(Fingerprint::of(b"v")),
+        credential_registry_epoch: None,
+        revoked_peers: Vec::new(),
+        served_credentials: None,
+    };
+    let read = AuthorityStatusRead::from(status);
+    assert_eq!(read.vault_copy_revision, Some(3));
+}
+
+/// An Astra older than the revision omits the key: it reads as absent, not as a refusal.
+#[test]
+fn an_authority_status_without_a_vault_copy_revision_reads_none() {
+    let body = serde_json::json!({
+        "ca_epoch": 4,
+        "ca_fingerprint": "ab".repeat(32),
+        "ca_tls_epoch": 2,
+        "vault_copy_fingerprint": "cd".repeat(32),
+    });
+    let read: AuthorityStatusRead = serde_json::from_value(body).expect("read");
+    assert_eq!(read.vault_copy_revision, None);
+}
