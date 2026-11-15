@@ -790,6 +790,9 @@ pub enum TrustUpdateRefusal {
     /// pass once it is over. Answered only where the caller can already read
     /// that operation: this is no oracle on anyone else's state.
     Conflict,
+    /// The copy is behind or diverges from the one the authority holds.
+    /// Answered only to an administrator, who must take the copy again.
+    Stale,
     /// The gateway failed on its own side.
     Internal,
 }

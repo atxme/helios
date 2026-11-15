@@ -100,6 +100,7 @@ impl TrustUpdateRefusalStatus for TrustUpdateRefusal {
             TrustUpdateRefusal::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             TrustUpdateRefusal::Throttled => StatusCode::TOO_MANY_REQUESTS,
             TrustUpdateRefusal::Conflict => StatusCode::CONFLICT,
+            TrustUpdateRefusal::Stale => StatusCode::PRECONDITION_FAILED,
             TrustUpdateRefusal::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

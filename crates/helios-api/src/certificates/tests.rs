@@ -778,6 +778,26 @@ async fn a_vault_copy_held_back_answers_a_conflict() {
     assert!(relay.seen.lock().unwrap().is_some());
 }
 
+/// A copy behind or diverging from the one the authority holds is `412`, the
+/// answer that tells the administrator to take the copy again.
+#[tokio::test]
+async fn a_stale_vault_copy_answers_a_precondition_failure() {
+    let relay = Arc::new(SpyCampaign {
+        answer: Err(TrustUpdateRefusal::Stale),
+        seen: Mutex::new(None),
+        opened: Mutex::new(None),
+    });
+    let state = state_with(None).with_operator_campaign(Arc::clone(&relay) as Arc<_>);
+    let response = operator_vault_copy(
+        State(state),
+        Extension(operator_caller_at(true)),
+        Bytes::from_static(br#"{"vault_base64":"e30="}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert!(relay.seen.lock().unwrap().is_some());
+}
+
 #[tokio::test]
 async fn status_route_refuses_a_non_admin() {
     let relay = SpyCampaign::granting();
