@@ -58,11 +58,24 @@ pub(crate) fn revision_of(vault: &[u8]) -> u64 {
     serde_json::from_slice::<VaultHeader>(vault).map_or(0, |header| header.revision)
 }
 
+/// Whether two documents are the same JSON value, whatever their layout or key
+/// order. Unreadable either way is a difference.
+fn same_json_value(left: &[u8], right: &[u8]) -> bool {
+    match (
+        serde_json::from_slice::<serde_json::Value>(left),
+        serde_json::from_slice::<serde_json::Value>(right),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
 impl AstraService {
     /// Replaces the vault copy and, when one is sent, the credential document.
     ///
     /// A copy other than the one held is taken only when its revision is newer
-    /// than the held one's. A held copy at zero, or unreadable, takes any. With
+    /// than the held one's, or when it is the same vault at the same revision
+    /// in another layout. A held copy at zero, or unreadable, takes any. With
     /// `replace_newer`, the held copy is replaced whatever the revision, and
     /// the replacement is logged as forced.
     ///
@@ -94,6 +107,7 @@ impl AstraService {
         }
 
         let fingerprint = Fingerprint::of(&vault);
+        let mut forced = false;
         let held = self.encrypted_vault();
         let unchanged = held
             .as_ref()
@@ -103,7 +117,14 @@ impl AstraService {
         if !unchanged {
             let held_revision = held.as_ref().map_or(0, |held| revision_of(held));
             let sent_revision = header.revision;
-            if held_revision > 0 && sent_revision <= held_revision {
+            // At the same revision the same vault may only be laid out
+            // differently (pretty-printed by hand on the volume, compact from
+            // Orion): that is not a fork, and the copy normalizes the layout.
+            let same_content = sent_revision == held_revision
+                && held
+                    .as_ref()
+                    .is_some_and(|held| same_json_value(held, &vault));
+            if held_revision > 0 && sent_revision <= held_revision && !same_content {
                 tracing::warn!(
                     connector = %connector,
                     %fingerprint,
@@ -115,14 +136,7 @@ impl AstraService {
                 if !replace_newer {
                     return Err(DoorRefusal::VaultCopyStale);
                 }
-                tracing::warn!(
-                    connector = %connector,
-                    %fingerprint,
-                    forced = true,
-                    held_revision,
-                    sent_revision,
-                    "vault copy replaced the one held, forced by the operator"
-                );
+                forced = true;
             }
         }
         // An operation signed the fingerprint of the vault it will download.
@@ -181,6 +195,16 @@ impl AstraService {
             write_file(&self.state_dir, CREDENTIALS_FILE, encoded)?;
         }
 
+        if forced {
+            tracing::warn!(
+                connector = %connector,
+                %fingerprint,
+                forced = true,
+                held_revision = held.as_ref().map_or(0, |held| revision_of(held)),
+                sent_revision = header.revision,
+                "vault copy replaced the one held, forced by the operator"
+            );
+        }
         if !unchanged {
             *self
                 .encrypted_vault

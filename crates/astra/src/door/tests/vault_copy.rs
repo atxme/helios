@@ -681,6 +681,49 @@ async fn a_diverging_copy_is_refused() {
     assert_eq!(service.encrypted_vault().as_deref(), Some(&held));
 }
 
+/// The same vault in another layout (pretty-printed by hand, compact from
+/// Orion) is not a fork: it is taken at the same revision.
+#[tokio::test]
+async fn a_reformatted_copy_of_the_same_vault_is_accepted() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let compact = vault_at(DOMAIN, "held", 3);
+    let value: serde_json::Value = serde_json::from_slice(&compact).expect("json");
+    let pretty = serde_json::to_vec_pretty(&value).expect("pretty");
+    assert_ne!(pretty, compact);
+    hold(&service, &pretty);
+
+    let outcome = tunnel_send(&service, compact.clone(), None)
+        .await
+        .expect("same content, other layout");
+    assert_eq!(
+        outcome,
+        DoorOutcome::VaultCopied {
+            fingerprint: Fingerprint::of(&compact),
+            credential_registry_epoch: None,
+        }
+    );
+    assert_eq!(service.encrypted_vault().as_deref(), Some(&compact));
+}
+
+/// Sent at revision zero over a held copy above zero: the upgrade case, refused.
+#[tokio::test]
+async fn a_copy_at_zero_over_a_counted_one_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = fixture(dir.path());
+    let held = vault_at(DOMAIN, "held", 3);
+    hold(&service, &held);
+
+    let refusal = tunnel_send(&service, vault_at(DOMAIN, "uncounted", 0), None).await;
+    assert!(
+        matches!(refusal, Err(DoorRefusal::VaultCopyStale)),
+        "{refusal:?}"
+    );
+    assert_eq!(on_disk(&service, VAULT_FILE), None);
+    assert_eq!(on_disk(&service, PREVIOUS_VAULT_FILE), None);
+    assert_eq!(service.encrypted_vault().as_deref(), Some(&held));
+}
+
 /// The same bytes always pass, whatever revision they name.
 #[tokio::test]
 async fn an_identical_copy_passes() {

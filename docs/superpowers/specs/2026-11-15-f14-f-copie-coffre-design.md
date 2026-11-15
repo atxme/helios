@@ -86,8 +86,9 @@ prix des clés à chaque envoi, contre un adversaire qui administre déjà la ga
   - la copie tenue est à 0 (ancienne, aucune, ou un en-tête illisible) : acceptée, rien pour
     ordonner, comme aujourd'hui *(mon choix)* ;
   - révision envoyée **inférieure** à celle tenue : refusée, « en retard » ;
-  - révision **égale**, octets différents : refusée, « divergente » (deux postes ont avancé
-    chacun de leur côté).
+  - révision **égale**, contenu différent : refusée, « divergente » (deux postes ont avancé
+    chacun de leur côté) ; le même coffre mis en page autrement (copie `scp` lisible, forme
+    compacte d'Orion) n'est pas une divergence et est accepté.
 - Une copie identique passe toujours, comme aujourd'hui.
 - **Ordre** : taille, en-tête et domaine, identique, puis le refus `412`, puis le `409` d'une
   opération vivante *(mon choix : le refus définitif d'abord, plutôt qu'une attente de 300 s
