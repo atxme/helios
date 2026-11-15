@@ -22,6 +22,9 @@ use aether_fido::authenticator::{
 use astra_operator::gestures::NewAuthority;
 use astra_operator::signing::IssuerDelegationRequest;
 use astra_operator::vault::{SlotRole, SlotSecret};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// Runs one delegation gesture with the presses already abandoned.
 fn run_issuer_gesture(
@@ -178,6 +181,22 @@ fn a_locator_does_not_open_a_delegation() {
     refused_before_the_key(&published, Refusal::Internal);
 }
 
+#[test]
+fn a_malformed_campaign_id_is_refused_by_the_ceremony_before_any_io() {
+    let domain = IssuingDomain::new("campaign-malformed-id");
+    let gesture = crate::operator::IssuerGesture::AuthorizeIssuer {
+        operation_id: "not-hex".into(),
+        request: delegation_request(stand_in_domain()),
+    };
+
+    let (outcome, published, artifacts) = run_issuer_gesture(gesture, &domain.vault_path);
+
+    let error = outcome.expect_err("malformed operation id is refused");
+    assert!(error.contains("32 caractères hexadécimaux"));
+    refused_before_the_key(&published, Refusal::HandoffMismatch);
+    assert!(artifacts.is_empty());
+}
+
 /// A token of one credential, standing for the key the operator would touch:
 /// it registers one credential and releases one fixed secret for it.
 struct OneKey;
@@ -249,13 +268,18 @@ struct IssuingDomain {
 
 impl IssuingDomain {
     fn new(label: &str) -> Self {
-        let directory = std::env::temp_dir().join(format!(
-            "orion-issuer-{label}-{}-{}",
-            std::process::id(),
-            now_unix()
-        ));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).expect("directory");
+        let directory = loop {
+            let candidate = std::env::temp_dir().join(format!(
+                "orion-issuer-{label}-{}-{}",
+                std::process::id(),
+                NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create issuer test directory: {error}"),
+            }
+        };
         let vault_path = directory.join("authority-vault.json");
         let now = now_unix();
         let opened = astra_operator::vault_gestures::create_first_key(
@@ -548,6 +572,42 @@ fn a_campaign_delegation_checks_the_domain_before_the_origin() {
         published.last().expect("a status").operation_id,
         Some(Id16::new([0x0B; 16]).expect("id"))
     );
+}
+
+#[test]
+fn a_campaign_with_a_non_https_origin_fails_closed_before_asking_for_a_key() {
+    let domain = IssuingDomain::new("campaign-non-https");
+    set_origin(
+        &domain.vault_path,
+        Some("http://not-a-trusted-origin.example"),
+    );
+    let gesture = campaign_gesture(delegation_request(stand_in_domain()));
+
+    let (outcome, published, artifacts) = run_issuer_gesture(gesture, &domain.vault_path);
+
+    let error = outcome.expect_err("campaign origin must use authenticated HTTPS");
+    assert!(error.contains("https://"), "{error}");
+    refused_before_the_key(&published, Refusal::HandoffMismatch);
+    assert!(artifacts.is_empty());
+}
+
+#[test]
+fn only_a_present_public_key_label_is_recorded_in_the_status() {
+    let mut ceremony = Ceremony::new(
+        Id16::new([6; 16]).expect("id"),
+        OperationLocator {
+            kind: OperationKind::AuthorizeIssuer,
+            operation_id: None,
+        },
+    );
+
+    record_key(&mut ceremony, None);
+    assert!(ceremony.keys.is_empty());
+
+    record_key(&mut ceremony, Some("quotidienne".into()));
+    assert_eq!(ceremony.keys.len(), 1);
+    assert_eq!(ceremony.keys[0].slot, "1");
+    assert_eq!(ceremony.keys[0].label, "quotidienne");
 }
 
 /// The verified campaign for `material` on `domain`, as `begin` would hand
