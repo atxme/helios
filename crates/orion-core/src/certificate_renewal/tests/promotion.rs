@@ -112,3 +112,82 @@ fn trusted_connection_promotion_refuses_an_empty_identity_name_before_io() {
         Err(RenewalError::Identity(message)) if message == "ce profil ne nomme aucune identité protégée"
     ));
 }
+
+#[test]
+fn a_due_promotion_refuses_a_missing_candidate_without_changing_trust_state() {
+    use crate::certificates::TrustStore;
+
+    let directory = tempfile::tempdir().expect("identity directory");
+    let domain = domain();
+    let mut state = store(directory.path(), &domain).state().clone();
+    let active_generation = state.certificates.active.generation;
+    let activation_at = NOW + 3_600;
+    let retire_at = NOW + 7_200;
+    let mut candidate = state.certificates.active.clone();
+    candidate.generation += 1;
+    state.certificates.next = Some(candidate);
+    state.certificates.activation_at = Some(activation_at);
+    state.certificates.retire_active_at = Some(retire_at);
+
+    let mut trust = TrustStore::new(directory.path().join("trust.json"), state);
+    let identities = ProtectedIdentityStore::at(directory.path().join("identities"));
+
+    let error = crate::certificate_renewal::promote_due(
+        &mut trust,
+        &identities,
+        "orion-portable",
+        activation_at,
+    )
+    .expect_err("the protected candidate must exist before promotion");
+
+    assert!(matches!(error, RenewalError::Identity(_)));
+    assert_eq!(
+        trust.state().certificates.active.generation,
+        active_generation
+    );
+    assert_eq!(
+        trust
+            .state()
+            .certificates
+            .next
+            .as_ref()
+            .map(|generation| generation.generation),
+        Some(active_generation + 1)
+    );
+    assert_eq!(
+        trust.state().certificates.activation_at,
+        Some(activation_at)
+    );
+    assert_eq!(trust.state().certificates.retire_active_at, Some(retire_at));
+}
+
+#[test]
+fn trusted_connection_promotion_refuses_an_identity_absent_from_the_protected_store() {
+    let directory = tempfile::tempdir().expect("identity directory");
+    let identities = ProtectedIdentityStore::at(directory.path().to_path_buf());
+    let domain = domain();
+    let mut profile = settings(&domain);
+    profile.identity = "identity-not-sealed-here".into();
+
+    assert!(matches!(
+        promote_local_identity_if_due(&profile, &identities, NOW),
+        Err(RenewalError::Identity(_))
+    ));
+    assert!(matches!(
+        prepare_identity_for_connection(&profile, &identities, NOW),
+        Err(RenewalError::Identity(_))
+    ));
+}
+
+#[test]
+fn rollback_refuses_an_empty_identity_name_before_opening_the_store() {
+    let domain = domain();
+    let mut profile = settings(&domain);
+    profile.identity = "  ".into();
+
+    assert!(matches!(
+        crate::certificate_renewal::rollback_to_previous(&profile, NOW),
+        Err(RenewalError::Identity(message))
+            if message == "ce profil ne nomme aucune identité protégée"
+    ));
+}
