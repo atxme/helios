@@ -48,6 +48,14 @@ fn authenticator_data(credential_id: &[u8], trailing: &[u8]) -> Vec<u8> {
     data
 }
 
+fn authenticator_data_with_attested_tail(tail: &[u8]) -> Vec<u8> {
+    let mut data = vec![0x5A; 32];
+    data.push(FLAG_ATTESTED_CREDENTIAL_DATA);
+    data.extend_from_slice(&[0; 4]);
+    data.extend_from_slice(tail);
+    data
+}
+
 /// The three public values a credential binding needs come out of the
 /// authenticator data, and out of nothing else.
 #[test]
@@ -102,4 +110,111 @@ fn a_cose_key_outside_the_shape_this_reader_claims_is_refused() {
     let mut truncated = es256_cose_key();
     truncated.truncate(truncated.len() - 1);
     assert!(cose_key_length(&truncated).is_err());
+}
+
+#[test]
+fn attested_credential_rejects_each_truncated_field_and_empty_or_oversized_ids() {
+    let truncated_aaguid = [0; 15];
+    let truncated_length = [0; 16];
+    let mut empty_id = vec![0; 16];
+    empty_id.extend_from_slice(&0u16.to_be_bytes());
+    let mut oversized_id = vec![0; 16];
+    oversized_id.extend_from_slice(&((MAX_CREDENTIAL_ID_BYTES + 1) as u16).to_be_bytes());
+    let mut truncated_id = vec![0; 16];
+    truncated_id.extend_from_slice(&2u16.to_be_bytes());
+    truncated_id.push(0x41);
+    let mut missing_cose = vec![0; 16];
+    missing_cose.extend_from_slice(&1u16.to_be_bytes());
+    missing_cose.push(0x41);
+
+    for (name, tail) in [
+        ("AAGUID", truncated_aaguid.as_slice()),
+        ("credential length", truncated_length.as_slice()),
+        ("empty identifier", empty_id.as_slice()),
+        ("oversized identifier", oversized_id.as_slice()),
+        ("truncated identifier", truncated_id.as_slice()),
+        ("missing COSE key", missing_cose.as_slice()),
+    ] {
+        assert!(
+            matches!(
+                attested_credential(&authenticator_data_with_attested_tail(tail)),
+                Err(AuthenticatorError::NoAttestedCredential(_))
+            ),
+            "accepted truncated or out-of-bounds {name}"
+        );
+    }
+}
+
+#[test]
+fn attested_credential_accepts_exact_identifier_limit_and_rejects_one_over() {
+    let maximum = vec![0xA5; MAX_CREDENTIAL_ID_BYTES];
+    let parsed = attested_credential(&authenticator_data(&maximum, &[]))
+        .expect("identifier at the documented bound");
+    assert_eq!(parsed.credential_id, maximum);
+
+    let oversized = vec![0xA5; MAX_CREDENTIAL_ID_BYTES + 1];
+    assert!(matches!(
+        attested_credential(&authenticator_data(&oversized, &[])),
+        Err(AuthenticatorError::NoAttestedCredential(_))
+    ));
+}
+
+#[test]
+fn cose_key_parser_accepts_supported_extended_integer_and_byte_string_heads() {
+    for (key, expected_len) in [
+        (vec![0xA1, 0x18, 0x01, 0x01], 4),
+        (vec![0xA1, 0x19, 0x00, 0x01, 0x01], 5),
+        (vec![0xA1, 0x1A, 0, 0, 0, 1, 0x01], 7),
+        (vec![0xA1, 0x01, 0x59, 0x00, 0x01, 0xAB], 6),
+        (vec![0xA1, 0x01, 0x5A, 0, 0, 0, 1, 0xAB], 8),
+    ] {
+        assert_eq!(
+            cose_key_length(&key).expect("supported CBOR head"),
+            expected_len
+        );
+    }
+}
+
+#[test]
+fn cose_key_parser_enforces_its_exact_encoded_size_ceiling() {
+    let map_with_scalar_pairs = |entries: u16| {
+        let mut bytes = vec![0xB9];
+        bytes.extend_from_slice(&entries.to_be_bytes());
+        for _ in 0..entries {
+            bytes.extend_from_slice(&[0x01, 0x01]);
+        }
+        bytes
+    };
+
+    let mut at_limit = vec![0xB9, 0x01, 0xFE, 0x01, 0x41, 0xAB];
+    for _ in 1..510 {
+        at_limit.extend_from_slice(&[0x01, 0x01]);
+    }
+    assert_eq!(at_limit.len(), MAX_CREDENTIAL_PUBLIC_KEY_BYTES);
+    assert_eq!(
+        cose_key_length(&at_limit).expect("key below the encoded-size ceiling"),
+        at_limit.len()
+    );
+
+    let over_limit = map_with_scalar_pairs(511);
+    assert!(over_limit.len() > MAX_CREDENTIAL_PUBLIC_KEY_BYTES);
+    assert!(matches!(
+        cose_key_length(&over_limit),
+        Err(AuthenticatorError::NoAttestedCredential(_))
+    ));
+}
+
+#[test]
+fn cose_key_parser_rejects_unsupported_head_widths_and_major_types() {
+    for malformed in [
+        &[0xA1, 0x01, 0x1B, 0, 0, 0, 0, 0, 0, 0, 1][..],
+        &[0xA1, 0x01, 0x5F, 0xFF][..],
+        &[0xA1, 0x01, 0x61, b'x'][..],
+        &[0xA1, 0x01, 0x41][..],
+    ] {
+        assert!(matches!(
+            cose_key_length(malformed),
+            Err(AuthenticatorError::NoAttestedCredential(_))
+        ));
+    }
 }
