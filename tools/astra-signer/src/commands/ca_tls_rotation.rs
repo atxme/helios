@@ -367,3 +367,174 @@ pub(crate) fn promote_ca_tls(path: &Path, transport: Transport) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+    use aether::certificates::{
+        encoding::{Fingerprint, Id16, TrustDomainId},
+        status::{AstraSignerResult, CampaignApproval},
+        CERTIFICATE_FORMAT_VERSION,
+    };
+    use astra_operator::vault::{
+        AuthoritySecrets, AuthorityVault, SlotEnrolment, SlotRole, SlotSecret,
+    };
+    use base64::Engine as _;
+
+    fn record(
+        operation_id: &str,
+        result_token: Option<&str>,
+        submitted: bool,
+    ) -> prepared::PreparedRotation {
+        prepared::PreparedRotation {
+            kind: prepared::PreparedKind::CaTls,
+            operation_id: operation_id.into(),
+            result_token: result_token.map(str::to_string),
+            result: AstraSignerResult {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                approval: Box::new(CampaignApproval {
+                    campaign_id: Id16::new([0x31; 16]).expect("campaign id"),
+                    campaign_fingerprint: Fingerprint::of(b"campaign"),
+                    required_credentials: 2,
+                    approved_at: 1,
+                    approvals: Vec::new(),
+                }),
+                objects: Vec::new(),
+                credential_registry: None,
+                issuer_authorization: None,
+            },
+            transition_path: "transition.der".into(),
+            next_ca_tls_epoch: 2,
+            next_ca_tls_certificate: "AQID".into(),
+            activation_at: 100,
+            not_after: 200,
+            submitted,
+            prepared_at: 10,
+            manifest: None,
+            adopted: false,
+        }
+    }
+
+    fn unreachable_channel() -> astra_operator::campaign::Campaign {
+        astra_operator::campaign::Campaign::select(None, Some("http://127.0.0.1:9"))
+            .expect("tunnel channel")
+    }
+
+    fn test_vault(path: &Path) {
+        let (pq_private, pq_public) =
+            aether::certificates::encoding::generate_ml_dsa_87_keypair().expect("CA-PQ keypair");
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let domain = TrustDomainId::new([0x41; 16]).expect("trust domain");
+        let vault = AuthorityVault::create(
+            domain,
+            "astra.example",
+            astra_operator::vault::draw_salt().expect("salt"),
+            &AuthoritySecrets {
+                ca_pq_private_key: encode(&pq_private),
+                ca_pq_public_key: pq_public.to_base64(),
+                ca_tls_private_key: encode(b"test-only CA-TLS private key"),
+                retained_ca_tls: None,
+                retained_outgoing_ca_pq: None,
+            },
+            SlotEnrolment {
+                role: SlotRole::Primary,
+                label: "test slot".into(),
+                credential_id: vec![0x51; 32],
+                credential_public_key: vec![0xa5, 0x01],
+                aaguid: [0; 16],
+                enrolled_at: 1,
+            },
+            &SlotSecret::new(vec![0x61; 32]),
+            1,
+        )
+        .expect("test vault");
+        store::save(path, &vault).expect("save vault");
+    }
+
+    #[test]
+    fn malformed_prepared_operation_is_refused_before_network_submission() {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("prepared.json");
+        let error = submit_prepared(
+            &unreachable_channel(),
+            &path,
+            record("not-an-operation", Some("token"), false),
+        )
+        .expect_err("invalid operation id");
+
+        assert!(format!("{error:#}").contains("rotation préparée illisible"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn prepared_operation_without_a_result_token_is_not_submitted() {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("prepared.json");
+        let error = submit_prepared(
+            &unreachable_channel(),
+            &path,
+            record("01".repeat(16).as_str(), None, false),
+        )
+        .expect_err("missing bearer token");
+
+        assert!(format!("{error:#}").contains("aucun jeton de dépôt"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_absent_rotation_is_a_safe_noop_for_resume_without_contacting_the_channel() {
+        let directory = tempfile::tempdir().expect("directory");
+        let vault_path = directory.path().join("missing-vault.json");
+
+        resume_rotation(&vault_path, unreachable_channel()).expect("nothing to resume");
+
+        assert!(!prepared::path_beside(&vault_path).exists());
+    }
+
+    #[test]
+    fn promotion_refuses_a_missing_record_before_requesting_a_key() {
+        let directory = tempfile::tempdir().expect("directory");
+        let vault_path = directory.path().join("authority-vault.json");
+        test_vault(&vault_path);
+
+        let error = promote_ca_tls(&vault_path, Transport::Hid).expect_err("no rotation");
+
+        assert!(error
+            .to_string()
+            .contains("aucune rotation CA-TLS en cours"));
+    }
+
+    #[test]
+    fn a_prepared_decision_blocks_a_second_rotation_before_campaign_fetch() {
+        let directory = tempfile::tempdir().expect("directory");
+        let vault_path = directory.path().join("authority-vault.json");
+        let out = directory.path().join("second-transition.json");
+        test_vault(&vault_path);
+        let record_path = prepared::path_beside(&vault_path);
+
+        for (submitted, expected) in [
+            (false, "jamais déposée"),
+            (true, "déposée, en attente de promotion"),
+        ] {
+            let saved = record("01".repeat(16).as_str(), Some("bearer"), submitted);
+            prepared::save(&record_path, &saved).expect("save prepared decision");
+            let error = rotate_ca_tls(
+                &vault_path,
+                unreachable_channel(),
+                "01".repeat(16).as_str(),
+                None,
+                &out,
+                (1, 30, 365),
+                Transport::Hid,
+            )
+            .expect_err("existing prepared transition");
+
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert_eq!(
+                prepared::load(&record_path).expect("read record"),
+                Some(saved)
+            );
+            assert!(!out.exists(), "no second transition is written");
+        }
+    }
+}
