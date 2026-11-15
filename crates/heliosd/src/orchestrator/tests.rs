@@ -1531,14 +1531,28 @@ async fn run_command(
     policy: &mut FirewallPolicy,
     shared_policy: &Arc<RwLock<FirewallPolicy>>,
 ) -> (anyhow::Result<()>, Vec<HeliosEvent>) {
+    run_command_with_mode(cmd, true, fw, state, shared_network, policy, shared_policy).await
+}
+
+async fn run_command_with_mode(
+    cmd: OrchestratorCmd,
+    dry_run: bool,
+    fw: &dyn FirewallBackend,
+    state: TunnelState,
+    shared_network: &Arc<RwLock<NetworkConfig>>,
+    policy: &mut FirewallPolicy,
+    shared_policy: &Arc<RwLock<FirewallPolicy>>,
+) -> (anyhow::Result<()>, Vec<HeliosEvent>) {
     let (events, mut received) = broadcast::channel(8);
     let (internal_tx, _internal_rx) = mpsc::channel(1);
+    let wg = helios_wireguard::DryRunBackend::new();
+    let shared_state = Arc::new(RwLock::new(state));
     let result = handle_external_cmd(
         cmd,
         shared_network,
-        true,
-        &helios_wireguard::DryRunBackend::new(),
-        &Arc::new(RwLock::new(state)),
+        dry_run,
+        &wg,
+        &shared_state,
         &events,
         fw,
         policy,
@@ -1554,6 +1568,248 @@ async fn run_command(
         emitted.push(event);
     }
     (result, emitted)
+}
+
+async fn run_observed_command(
+    cmd: OrchestratorCmd,
+    state: TunnelState,
+    network: &Arc<RwLock<NetworkConfig>>,
+    firewall: &dyn FirewallBackend,
+    policy: &mut FirewallPolicy,
+    shared_policy: &Arc<RwLock<FirewallPolicy>>,
+) -> (
+    anyhow::Result<()>,
+    Vec<HeliosEvent>,
+    Arc<RwLock<TunnelState>>,
+    helios_wireguard::DryRunBackend,
+) {
+    let (events, mut received) = broadcast::channel(16);
+    let (internal_tx, _internal_rx) = mpsc::channel(4);
+    let wireguard = helios_wireguard::DryRunBackend::new();
+    let shared_state = Arc::new(RwLock::new(state));
+    let result = handle_external_cmd(
+        cmd,
+        network,
+        true,
+        &wireguard,
+        &shared_state,
+        &events,
+        firewall,
+        policy,
+        &internal_tx,
+        shared_policy,
+        &helios_tpm::BootDecision::Disabled,
+        &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
+    )
+    .await;
+    let mut emitted = Vec::new();
+    while let Ok(event) = received.try_recv() {
+        emitted.push(event);
+    }
+    (result, emitted, shared_state, wireguard)
+}
+
+#[tokio::test]
+async fn connect_command_applies_connecting_firewall_state_while_wireguard_starts() {
+    let network = Arc::new(RwLock::new(configured_network()));
+    let mut policy = network.read().await.firewall_policy();
+    let shared_policy = Arc::new(RwLock::new(policy.clone()));
+    let firewall = TransitionFirewall {
+        states: std::sync::Mutex::new(Vec::new()),
+        refuse: false,
+    };
+
+    let (result, events, state, wireguard) = run_observed_command(
+        OrchestratorCmd::Connect,
+        TunnelState::Down,
+        &network,
+        &firewall,
+        &mut policy,
+        &shared_policy,
+    )
+    .await;
+
+    result.expect("connection command succeeds in dry-run");
+    assert!(wireguard.is_up());
+    assert_eq!(*state.read().await, TunnelState::Connecting);
+    assert!(state.read().await.kill_switch_engaged());
+    assert_eq!(
+        *firewall
+            .states
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        [TunnelState::Connecting],
+        "the firewall backend must receive the fail-closed connecting state"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        HeliosEvent::Log { message, .. }
+            if message == "Connection requested via the web interface"
+    )));
+}
+
+#[tokio::test]
+async fn custom_firewall_command_reports_dry_run_modes_without_mutating_policy() {
+    let network = Arc::new(RwLock::new(configured_network()));
+    let mut policy = network.read().await.firewall_policy();
+    let running = policy.clone();
+    let shared_policy = Arc::new(RwLock::new(running.clone()));
+    let firewall = TrackingFirewall::accepting();
+
+    for (dry_run, expected_level, expected_message) in [
+        (
+            true,
+            "info",
+            "[dry-run] Nftables rules received — application skipped (simulation mode)",
+        ),
+        (
+            false,
+            "warn",
+            "Custom nftables rules applied — check consistency",
+        ),
+    ] {
+        let (result, events) = run_command_with_mode(
+            OrchestratorCmd::ApplyFirewallRules("add rule".into()),
+            dry_run,
+            &firewall,
+            TunnelState::Down,
+            &network,
+            &mut policy,
+            &shared_policy,
+        )
+        .await;
+        result.expect("rules command is accepted");
+        assert!(matches!(
+            events.as_slice(),
+            [HeliosEvent::Log { level, message }]
+                if level == expected_level && message == expected_message
+        ));
+    }
+    assert_eq!(policy, running);
+    assert_eq!(*shared_policy.read().await, running);
+    assert!(
+        firewall.applied_states().is_empty(),
+        "the command does not transition the firewall policy state"
+    );
+}
+
+#[tokio::test]
+async fn captive_portal_acknowledgement_is_noop_unless_the_portal_is_active() {
+    let network = Arc::new(RwLock::new(configured_network()));
+    let mut policy = network.read().await.firewall_policy();
+    policy.captive_portal_gateway = Some("192.0.2.1".into());
+    let shared_policy = Arc::new(RwLock::new(policy.clone()));
+
+    let (result, events, state, wireguard) = run_observed_command(
+        OrchestratorCmd::AcknowledgeCaptivePortal,
+        TunnelState::Down,
+        &network,
+        &DryRunBackend,
+        &mut policy,
+        &shared_policy,
+    )
+    .await;
+    result.expect("acknowledging an absent portal is harmless");
+    assert_eq!(*state.read().await, TunnelState::Down);
+    assert!(!wireguard.is_up());
+    assert!(events.is_empty());
+
+    let mut policy = network.read().await.firewall_policy();
+    policy.captive_portal_gateway = Some("192.0.2.1".into());
+    let shared_policy = Arc::new(RwLock::new(policy.clone()));
+    let (result, events, state, wireguard) = run_observed_command(
+        OrchestratorCmd::AcknowledgeCaptivePortal,
+        TunnelState::CaptivePortal,
+        &network,
+        &DryRunBackend,
+        &mut policy,
+        &shared_policy,
+    )
+    .await;
+
+    result.expect("active portal acknowledgement reconnects");
+    assert_eq!(*state.read().await, TunnelState::Connecting);
+    assert!(state.read().await.kill_switch_engaged());
+    assert!(wireguard.is_up());
+    assert_eq!(policy.captive_portal_gateway, None);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        HeliosEvent::Log { message, .. }
+            if message == "Captive portal acknowledged — attempting to reconnect…"
+    )));
+}
+
+#[tokio::test]
+async fn gateway_key_rotation_refusal_keeps_the_running_identity() {
+    let network = Arc::new(RwLock::new(configured_network()));
+    let original_key = network.read().await.wg_private_key.expose().to_string();
+    let mut policy = network.read().await.firewall_policy();
+    let shared_policy = Arc::new(RwLock::new(policy.clone()));
+    let new_key = aether::SecretString::new(PRIVATE_KEY);
+
+    let (result, events) = run_command(
+        OrchestratorCmd::UpdateGatewayKey(new_key),
+        &DryRunBackend,
+        TunnelState::Down,
+        &network,
+        &mut policy,
+        &shared_policy,
+    )
+    .await;
+
+    result.expect("rotation refusal is reported without stopping the command loop");
+    assert_eq!(network.read().await.wg_private_key.expose(), original_key);
+    assert!(matches!(
+        events.as_slice(),
+        [HeliosEvent::Log { level, message }]
+            if level == "error" && message.contains("no TPM secret available")
+    ));
+}
+
+#[tokio::test]
+async fn set_mss_clamp_command_syncs_only_when_the_backend_accepts_it() {
+    let network = Arc::new(RwLock::new(configured_network()));
+    let mut policy = network.read().await.firewall_policy();
+    policy.mss_clamp = None;
+    let shared_policy = Arc::new(RwLock::new(policy.clone()));
+
+    let (result, events) = run_command(
+        OrchestratorCmd::SetMssClamp(1380),
+        &DryRunBackend,
+        TunnelState::Up,
+        &network,
+        &mut policy,
+        &shared_policy,
+    )
+    .await;
+    result.expect("capable dry-run backend accepts clamp");
+    assert_eq!(policy.mss_clamp, Some(1380));
+    assert_eq!(shared_policy.read().await.mss_clamp, Some(1380));
+    assert!(events.is_empty());
+
+    let running = policy.clone();
+    let shared_policy = Arc::new(RwLock::new(running.clone()));
+    let unsupported = UnsupportedMssFirewall {
+        applied: AtomicBool::new(false),
+    };
+    let (result, events) = run_command(
+        OrchestratorCmd::SetMssClamp(1360),
+        &unsupported,
+        TunnelState::Up,
+        &network,
+        &mut policy,
+        &shared_policy,
+    )
+    .await;
+    result.expect("unsupported clamp is a reported no-op");
+    assert_eq!(policy, running);
+    assert_eq!(*shared_policy.read().await, running);
+    assert!(matches!(
+        events.as_slice(),
+        [HeliosEvent::Log { level, message }]
+            if level == "warn" && message.contains("does not support clamping")
+    ));
+    assert!(!unsupported.applied.load(Ordering::Relaxed));
 }
 
 /// The one error log the refusal emitted, and nothing else: in particular no
