@@ -278,6 +278,129 @@ fn read_text(path: &Path) -> Result<String> {
         .with_context(|| format!("{} n'est pas un texte lisible", path.display()))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aether::certificates::encoding::{Fingerprint, Id16, MlDsa87Signature, WireGuardKey};
+    use aether::key_negotiation::{EnrollmentInvitation, ProtectionMode};
+    use astra_operator::enrollment::InvitationState;
+    use zeroize::Zeroizing;
+
+    fn invitation(id: u8, not_after_unix: u64) -> EnrollmentInvitation {
+        let (_, ca_public) =
+            aether::certificates::encoding::generate_ml_dsa_87_keypair().expect("CA keypair");
+        EnrollmentInvitation {
+            format_version: 1,
+            protocol_version: 5,
+            invitation_id: Id16::new([id; 16]).expect("nonzero invitation id"),
+            gateway_wg_public_key: WireGuardKey::from_bytes([0x21; 32]),
+            gateway_certificate_fingerprint: Fingerprint::from_bytes([0x31; 32]),
+            server_name: "gateway.example".into(),
+            operator_ca_public_key: ca_public,
+            wireguard_proof_public_key: WireGuardKey::from_bytes([0x41; 32]),
+            not_before_unix: 1,
+            not_after_unix,
+            minimum_mode: ProtectionMode::MlKem,
+            allow_readmission: false,
+            // Listing exercises only persisted lifecycle state; it never
+            // treats this fixture as an authorization to accept a request.
+            operator_signature: MlDsa87Signature::placeholder(),
+        }
+    }
+
+    #[test]
+    fn request_text_accepts_utf8_and_both_bom_marked_utf16_endiannesses() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("request.helios-request");
+        let text = "{\"requested_name\":\"München\"}";
+
+        for bytes in [
+            text.as_bytes().to_vec(),
+            [vec![0xEF, 0xBB, 0xBF], text.as_bytes().to_vec()].concat(),
+            [
+                vec![0xFF, 0xFE],
+                text.encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ]
+            .concat(),
+            [
+                vec![0xFE, 0xFF],
+                text.encode_utf16()
+                    .flat_map(u16::to_be_bytes)
+                    .collect::<Vec<_>>(),
+            ]
+            .concat(),
+        ] {
+            std::fs::write(&path, bytes).expect("write request text");
+            assert_eq!(read_text(&path).expect("decode request text"), text);
+        }
+    }
+
+    #[test]
+    fn request_text_rejects_truncated_utf16_and_invalid_utf8() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("request.helios-request");
+
+        for (bytes, expected) in [
+            (
+                vec![0xFF, 0xFE, b'{'],
+                "UTF-16 text with an odd number of bytes",
+            ),
+            (vec![0xFF, 0xFE, 0x00, 0xD8], "invalid UTF-16 text"),
+            (vec![0xC3, 0x28], "invalid UTF-8 text"),
+        ] {
+            std::fs::write(&path, bytes).expect("write malformed text");
+            let error = read_text(&path).expect_err("malformed text is refused");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn listing_expires_stale_invitation_and_destroys_its_proof_key() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let registry = InvitationRegistry::at(directory.path().join("registry"));
+        let before_listing = now_unix();
+        let expired = invitation(1, before_listing.saturating_sub(1));
+        let active = invitation(2, before_listing.saturating_add(3_600));
+        registry
+            .issue(&expired, Zeroizing::new([0x51; 32]))
+            .expect("issue expired invitation fixture");
+        registry
+            .issue(&active, Zeroizing::new([0x61; 32]))
+            .expect("issue active invitation fixture");
+
+        list_invitations(&registry).expect("list invitations");
+        let after_listing = now_unix();
+
+        let expired_state = registry
+            .load(&expired.invitation_id)
+            .expect("expired record")
+            .state;
+        let InvitationState::Expired { at_unix } = expired_state else {
+            panic!("listing must expire a lapsed invitation, got {expired_state:?}");
+        };
+        assert!((before_listing..=after_listing).contains(&at_unix));
+        assert_eq!(
+            registry
+                .load(&active.invitation_id)
+                .expect("active record")
+                .state,
+            InvitationState::Issued
+        );
+        let expired_file = std::fs::read_to_string(
+            directory
+                .path()
+                .join("registry")
+                .join(format!("{}.json", expired.invitation_id)),
+        )
+        .expect("read expired record");
+        let expired_json: serde_json::Value =
+            serde_json::from_str(&expired_file).expect("parse expired record");
+        assert!(expired_json.get("proof_private_key").is_none());
+    }
+}
+
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     aether::private_file::write_private_atomic(path, bytes)
         .with_context(|| format!("écriture de {}", path.display()))
