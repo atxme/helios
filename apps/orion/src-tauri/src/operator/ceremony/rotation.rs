@@ -88,12 +88,15 @@ pub fn run_rotation(
         .and_then(|target| {
             // Before any call: a resumption reads the status of whatever authority
             // answers, and sends the sealed vault to whatever gateway it reaches.
-            // « Terminer », of either kind: each sends the vault copy at its end.
+            // « Terminer », of either kind, sends the vault copy at its end. The
+            // no-campaign replacement reads the gateway's identity and posts a transition
+            // to it, so it names the gateway the relay names too.
             if matches!(
                 gesture,
                 RotationGesture::Resume
                     | RotationGesture::FinishCaTls
                     | RotationGesture::FinishCaPq
+                    | RotationGesture::ReplaceCaPqWithoutCampaign
             ) && !relay_names_peer(vault_path, &target.peer_key).unwrap_or(false)
             {
                 return Err(WRONG_GATEWAY.to_string());

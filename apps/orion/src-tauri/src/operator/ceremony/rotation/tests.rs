@@ -3085,6 +3085,31 @@ async fn a_resume_towards_another_domains_gateway_starts_nothing() {
     );
 }
 
+/// The no-campaign replacement reads the gateway and posts to it: a gateway the relay does not
+/// name is refused before any call and before any key.
+#[tokio::test(flavor = "multi_thread")]
+async fn replace_without_campaign_refuses_another_gateway() {
+    let bench = bench_without_origin();
+    let vault = bench.vault_bytes();
+    let ceremony = OperatorCeremony::default();
+
+    ceremony
+        .begin_rotation(
+            RotationGesture::ReplaceCaPqWithoutCampaign,
+            Some(towards_another_gateway()),
+            bench.path.clone(),
+            Arc::default(),
+        )
+        .await
+        .expect("a session");
+    let ended = until(&ceremony, |status| status.gesture.is_terminal()).await;
+
+    assert_eq!(ended.refusal, Some(Refusal::HandoffMismatch));
+    assert_eq!(bench.touches(), 0, "no key is touched");
+    assert!(bench.journal().is_none());
+    assert_eq!(bench.vault_bytes(), vault);
+}
+
 /// The gesture of the button says so, before any call, and moves nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_resume_gesture_is_refused_towards_another_domains_gateway() {
