@@ -1594,11 +1594,16 @@ action, puis état attendu.
     affiché sous « Coffre opérateur » (comparer les empreintes, par exemple avec
     `Get-FileHash`). Refaire l'export tunnel coupé : même résultat, sans clé demandée.
 131. **Export refusé sur le coffre lui-même.** Exporter en visant le chemin du coffre affiché.
-    Si Windows demande de remplacer le fichier, confirmer. Attendu : « le coffre ne peut pas
-    être exporté sur lui-même » ; le fichier du coffre n'a pas changé.
+    Windows demande de remplacer le fichier : confirmer. Attendu : « le coffre ne peut pas
+    être exporté sur lui-même » ; le fichier du coffre n'a pas changé. Refaire en visant
+    `astra-rotation-journal.json` (ou `astra-credentials.json`, `astra-domain.json`) dans le
+    même dossier, s'il existe : « ce fichier est conservé à côté du coffre : choisir un autre
+    nom » ; le fichier n'a pas changé. Viser un fichier d'export existant d'un autre nom :
+    Windows demande avant de le remplacer.
 132. **[cible] Poste en retard : envoi refusé.** Poste A : tenir le coffre à jour. Poste B :
     tenir un coffre plus ancien, du même domaine, tunnel monté. Sur A, un geste qui envoie le
-    coffre à Astra (par exemple « Marquer perdue » sur une clé, qui signe le document). Sur B,
+    coffre à Astra en l'écrivant (par exemple renommer une clé, puis « Envoyer » ; « Marquer
+    perdue » n'écrit pas le coffre et n'avance pas sa révision). Sur B,
     ouvrir *Coffre et clés*. Attendu : la ligne « Copie du coffre » affiche « Plus récente sur
     Astra ». Cliquer « Envoyer » : l'alerte dit « Astra tient un coffre plus récent que celui de
     ce poste, ou qui a divergé. Récupérez le coffre à jour sur le poste qui le tient. », avec
@@ -1626,8 +1631,9 @@ action, puis état attendu.
     modifié. ». Le relais n'a pas changé. Une fois la rotation menée à son
     terme, refaire le geste : il passe.
 137. **Export puis recouvrement d'un poste en retard.** **[cible]** (suite de 132). Sur A,
-    « Exporter le coffre » : « Coffre exporté ». Sur B, « Changer… » sous « Coffre opérateur »,
-    puis choisir le fichier exporté. Attendu : l'empreinte affichée de B est celle de A, et la
+    « Exporter le coffre » : « Coffre exporté ». Copier le fichier sur B dans un dossier à lui
+    et le renommer `authority-vault.json`. Sur B, « Changer… » sous « Coffre opérateur », puis
+    choisir ce fichier. Attendu : l'empreinte affichée de B est celle de A, et la
     ligne « Copie du coffre » de B est à jour, sans détail, comme sur A.
 138. **[cible] Geste sur les clés sur le poste en retard.** Suite de 132, sur B, tunnel
     monté, avec un coffre plus ancien que celui d'Astra. Faire le même geste sur une clé que

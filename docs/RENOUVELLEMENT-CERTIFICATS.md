@@ -1513,14 +1513,20 @@ dans [ROADMAP.md](ROADMAP.md) (F14-a à F14-f).
   clés*, écrit le seul fichier chiffré du coffre, sans clé ni tunnel, dans un
   fichier choisi dans la boîte d'enregistrement de Windows (titre « Exporter le
   coffre opérateur »). Le nom proposé est `authority-vault-AAAA-MM-JJ.json` ;
-  le coffre ne s'exporte pas sur lui-même. Pour remettre à jour un poste en
-  retard, exporter le coffre depuis le poste qui le tient, puis, sur le poste en
-  retard, « Changer… » sous « Coffre opérateur » pour choisir ce fichier comme
-  emplacement du coffre. Le relais se reconstruit depuis le coffre et la
-  gateway.
+  le coffre ne s'exporte pas sur lui-même, ni sur un fichier gardé à côté du
+  coffre (relais, document de credentials, journal de rotation), et Windows
+  demande avant de remplacer un fichier existant. Pour remettre à jour un poste
+  en retard, exporter le coffre depuis le poste qui le tient, le copier sur le
+  poste en retard dans un dossier à lui, le renommer `authority-vault.json`
+  (« Changer… » n'accepte que ce nom), puis « Changer… » sous « Coffre
+  opérateur » pour choisir ce fichier. Le relais se reconstruit depuis le coffre
+  et la gateway ; le document de credentials part avec la copie (« Envoyer »).
 - **Compatibilité du compteur.** Un Orion ou un `astra-signer` antérieur ne lit
   plus un coffre qui porte la révision ; les deux sont livrés ensemble. Un
-  coffre qui n'a pas été réécrit depuis reste lisible par eux.
+  coffre qui n'a pas été réécrit depuis reste lisible par eux. Un Orion
+  antérieur à ce lot ne lit plus non plus l'état d'Astra dans ses cérémonies
+  (lecture stricte du champ `vault_copy_revision`), comme pour le champ `chain`
+  du lot 6b : mettre Orion à jour avec Helios.
 - **Un écrasement raté peut effacer un journal à tort.** Si une écriture
   échoue après son renommage et que la campagne meurt avant un rejeu, Orion
   efface son journal alors que le fichier d'Astra tient l'ancre : réparation
