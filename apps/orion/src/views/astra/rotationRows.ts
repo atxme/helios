@@ -590,7 +590,15 @@ function copyDetail(
 ): string {
   const astraRevision = authority.vault_copy_revision
   const localRevision = o.localVaultRevision
-  if (astraRevision !== null && localRevision !== null && astraRevision > localRevision) {
+  // Astra refuses a copy that is not above the one it holds, so an equal revision of another
+  // vault is the same divergence: two workstations each wrote once since the last send.
+  if (
+    astraRevision !== null &&
+    localRevision !== null &&
+    astraRevision > 0 &&
+    astraRevision >= localRevision &&
+    (astraRevision > localRevision || (held !== null && !sameVault))
+  ) {
     return 'Plus récente sur Astra'
   }
   if (held === null) return 'Absente'

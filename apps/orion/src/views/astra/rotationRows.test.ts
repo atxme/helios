@@ -369,7 +369,10 @@ describe('prerequisites', () => {
       fixAction: 'send_vault_copy',
     })
     const old = overview({
-      authority: { state: 'ok', value: authorityRead({ vault_copy_fingerprint: '99'.repeat(32) }) },
+      authority: {
+        state: 'ok',
+        value: authorityRead({ vault_copy_fingerprint: '99'.repeat(32), vault_copy_revision: 3 }),
+      },
     })
     expect(find(old, 'Copie du coffre')).toMatchObject({ detail: 'Ancienne', fixAction: 'send_vault_copy' })
     expect(find(overview(), 'Copie du coffre')?.ok).toBe(true)
@@ -887,5 +890,36 @@ describe('a vault copy newer on Astra', () => {
     expect(copyLine(newerOnAstra({}, { localVaultRevision: null }))?.detail).toBe('Ancienne')
     const same = overview({ localCredentialRegistryEpoch: 6, localVaultRevision: null })
     expect(copyLine(same)?.detail).toBe('Document ancien')
+  })
+
+  it('at_an_equal_revision_a_different_vault_is_a_divergence', () => {
+    expect(copyLine(newerOnAstra({}, { localVaultRevision: 5 }))).toMatchObject({
+      ok: false,
+      detail: 'Plus récente sur Astra',
+      fix: 'Envoyer',
+    })
+  })
+
+  it('at_an_equal_revision_the_same_vault_is_ok', () => {
+    const o = newerOnAstra(
+      { vault_copy_fingerprint: '11'.repeat(32) },
+      { localVaultRevision: 5, localCredentialRegistryEpoch: 6 },
+    )
+    expect(copyLine(o)?.detail).not.toBe('Plus récente sur Astra')
+    const same = overview({
+      localVaultFingerprint: '11'.repeat(32),
+      localVaultRevision: 5,
+      authority: {
+        state: 'ok',
+        value: authorityRead({ vault_copy_fingerprint: '11'.repeat(32), vault_copy_revision: 5 }),
+      },
+    })
+    expect(copyLine(same)?.ok).toBe(true)
+  })
+
+  it('a_copy_at_revision_zero_is_not_newer_on_astra', () => {
+    expect(copyLine(newerOnAstra({ vault_copy_revision: 0 }, { localVaultRevision: 0 }))?.detail).toBe(
+      'Ancienne',
+    )
   })
 })
