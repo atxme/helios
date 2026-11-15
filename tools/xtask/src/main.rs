@@ -623,6 +623,49 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            loop {
+                let path = std::env::temp_dir().join(format!(
+                    "helios-xtask-{label}-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create test directory {}: {error}", path.display()),
+                }
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn executable_script(directory: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = directory.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make script executable");
+        path
+    }
+
     #[test]
     fn the_version_is_the_daemon_s_own() {
         let root = workspace_root().expect("root");
@@ -696,6 +739,157 @@ mod tests {
             archive,
             Path::new("/tmp/bundle/helios-0.1.0-x86_64-unknown-linux-gnu.tar.gz")
         );
+    }
+
+    #[test]
+    fn pack_refuses_unsigned_bundle_before_creating_an_archive() {
+        let directory = TestDirectory::new("unsigned-bundle");
+        let bundle = directory.path().join("helios-1.2.3-test");
+        std::fs::create_dir(&bundle).expect("create unsigned bundle");
+        std::fs::write(bundle.join("heliosd"), b"test binary").expect("write fixture");
+
+        let error = pack(&bundle, None).expect_err("unsigned bundle cannot be archived");
+
+        assert!(format!("{error:#}").contains("Sign the bundle before archiving it"));
+        assert!(!archive_path(&bundle).expect("archive path").exists());
+    }
+
+    #[test]
+    fn pack_rejects_non_directories_before_reading_a_manifest() {
+        let directory = TestDirectory::new("not-a-bundle");
+        let file = directory.path().join("bundle.txt");
+        std::fs::write(&file, b"not a directory").expect("write file");
+
+        let error = pack(&file, Some(directory.path().join("bundle.tar.gz")))
+            .expect_err("a file is not a bundle directory");
+
+        assert!(format!("{error:#}").contains("is not a bundle directory"));
+        assert!(!directory.path().join("bundle.tar.gz").exists());
+    }
+
+    #[test]
+    fn release_version_reads_only_the_package_table_and_reports_missing_version() {
+        let directory = TestDirectory::new("release-version");
+        let manifest_dir = directory.path().join("crates/heliosd");
+        std::fs::create_dir_all(&manifest_dir).expect("create manifest parent");
+        let manifest = manifest_dir.join("Cargo.toml");
+        std::fs::write(
+            &manifest,
+            "[package]\nname = \"heliosd\"\nversion = \"1.2.3\"\n\
+             [dependencies]\nversion = \"9.9.9\"\n",
+        )
+        .expect("write manifest");
+
+        assert_eq!(
+            release_version(directory.path()).expect("package version"),
+            "1.2.3"
+        );
+
+        std::fs::write(
+            &manifest,
+            "[package]\nname = \"heliosd\"\n[dependencies]\nversion = \"9.9.9\"\n",
+        )
+        .expect("remove package version");
+        let error = release_version(directory.path()).expect_err("missing package version");
+        assert!(format!("{error:#}").contains("version missing"));
+    }
+
+    #[test]
+    fn report_installers_ignores_unrelated_files_and_requires_an_installer() {
+        let directory = TestDirectory::new("installer-report");
+        let bundle = directory.path().join("bundle");
+        std::fs::create_dir_all(bundle.join("msi")).expect("create MSI directory");
+        std::fs::create_dir_all(bundle.join("nsis")).expect("create NSIS directory");
+        std::fs::write(bundle.join("msi/readme.txt"), b"ignored").expect("write unrelated file");
+
+        let empty_error = report_installers(&bundle).expect_err("no installer is an error");
+        assert!(format!("{empty_error:#}").contains("no installer found"));
+
+        std::fs::write(bundle.join("msi/orion.msi"), b"test MSI").expect("write MSI fixture");
+        std::fs::write(bundle.join("nsis/orion.exe"), b"test NSIS").expect("write NSIS fixture");
+        report_installers(&bundle).expect("both installer formats are reported");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_copy_helpers_set_manifest_stable_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("copy-permissions");
+        let source = directory.path().join("source");
+        std::fs::write(&source, b"artifact bytes").expect("write source");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600))
+            .expect("set source mode");
+        let data_copy = directory.path().join("data-copy");
+        let executable_copy = directory.path().join("executable-copy");
+
+        copy_data(&source, &data_copy).expect("copy data");
+        copy_executable(&source, &executable_copy).expect("copy executable");
+
+        assert_eq!(
+            std::fs::read(&data_copy).expect("data bytes"),
+            b"artifact bytes"
+        );
+        assert_eq!(
+            std::fs::read(&executable_copy).expect("executable bytes"),
+            b"artifact bytes"
+        );
+        assert_eq!(
+            std::fs::metadata(&data_copy)
+                .expect("data metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        assert_eq!(
+            std::fs::metadata(&executable_copy)
+                .expect("executable metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+
+        let missing = copy_data(&directory.path().join("missing"), &data_copy)
+            .expect_err("missing source is reported");
+        assert!(format!("{missing:#}").contains("copying"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_helpers_use_the_requested_directory_and_report_failures() {
+        let directory = TestDirectory::new("process-helpers");
+        let success = executable_script(
+            directory.path(),
+            "success",
+            "printf '%s\\n' \"$@\" > args.txt",
+        );
+        run(
+            directory.path(),
+            success.to_str().expect("script path"),
+            &["one", "two"],
+        )
+        .expect("successful subprocess");
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("args.txt")).expect("captured args"),
+            "one\ntwo\n"
+        );
+
+        let output = executable_script(directory.path(), "output", "printf 'controlled output\\n'");
+        assert_eq!(
+            output_of(output.to_str().expect("script path"), &[]).expect("captured output"),
+            "controlled output\n"
+        );
+
+        let failure = executable_script(directory.path(), "failure", "exit 7");
+        let error = run(
+            directory.path(),
+            failure.to_str().expect("script path"),
+            &[],
+        )
+        .expect_err("non-zero subprocess is an error");
+        assert!(format!("{error:#}").contains("failed (exit status: 7)"));
     }
 
     /// The bundle must carry everything a gateway needs. An omission would
