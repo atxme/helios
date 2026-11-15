@@ -662,3 +662,87 @@ fn a_request_resaved_by_powershell_is_read_like_a_profile_document() {
         Err(TransitTextError::InvalidUtf8)
     ));
 }
+
+fn enrolment_export(address_v6: Option<&str>) -> EnrollmentExport {
+    EnrollmentExport {
+        server_name: "vpn.example.net".into(),
+        gateway_ca_der: "MIIBszCCAVmgAwIBAgIUZ".into(),
+        gateway_pq_certificate: "eyJzdWJqZWN0IjoiZ2F0ZXdheSJ9".into(),
+        pq_certificate_sha256: "a".repeat(64),
+        wireguard_public_key: "gYm5qNHl7P0cQzKdoqD3S7ZyE9Wv0A1d8fH2jK4lMnA=".into(),
+        negotiation_port: Some(4443),
+        gateway_wg_address: "10.8.0.1".into(),
+        peer_public_key: "Q2xpZW50UHVibGljS2V5Zm9yVGVzdGluZ29ubHk9".into(),
+        address: "10.8.0.2".into(),
+        address_v6: address_v6.map(Into::into),
+        trust: serde_json::json!({
+            "domain": "vpn.example.net",
+            "ca_pq": "b".repeat(64),
+        }),
+    }
+}
+
+#[test]
+fn enrolment_export_round_trips_exactly() {
+    for export in [enrolment_export(None), enrolment_export(Some("fd00:8::2"))] {
+        let text = encode_enrolment_export_file(&export);
+        let decoded = decode_enrolment_export_file(&text).expect("export");
+        assert_eq!(decoded, export);
+
+        let decoded = decode_enrolment_export_file(&format!("\u{feff}{text}")).expect("bom");
+        assert_eq!(decoded, export);
+    }
+}
+
+#[test]
+fn enrolment_export_refuses_another_format() {
+    let export = enrolment_export(None);
+    let mut value: serde_json::Value =
+        serde_json::from_str(&encode_enrolment_export_file(&export)).expect("json");
+    value["format"] = serde_json::json!("helios-enrollment-request");
+    assert!(matches!(
+        decode_enrolment_export_file(&value.to_string()),
+        Err(EnrollmentError::Format("not an enrolment export"))
+    ));
+    // A request file is not an export.
+    let operator = operator();
+    let invitation = invitation(&operator);
+    let client = request(&invitation, "laptop-alice");
+    assert!(decode_enrolment_export_file(&encode_request_file(&client.request)).is_err());
+}
+
+#[test]
+fn enrolment_export_refuses_unknown_fields() {
+    let export = enrolment_export(None);
+    let text = encode_enrolment_export_file(&export);
+
+    let mut value: serde_json::Value = serde_json::from_str(&text).expect("json");
+    value["export"]["extra"] = serde_json::json!(true);
+    assert!(decode_enrolment_export_file(&value.to_string()).is_err());
+
+    let mut value: serde_json::Value = serde_json::from_str(&text).expect("json");
+    value["extra"] = serde_json::json!(true);
+    assert!(decode_enrolment_export_file(&value.to_string()).is_err());
+}
+
+#[test]
+fn enrolment_export_refuses_a_trust_that_is_not_an_object() {
+    let export = enrolment_export(None);
+    let mut value: serde_json::Value =
+        serde_json::from_str(&encode_enrolment_export_file(&export)).expect("json");
+    value["export"]["trust"] = serde_json::Value::Null;
+    assert!(matches!(
+        decode_enrolment_export_file(&value.to_string()),
+        Err(EnrollmentError::Format("not an enrolment export"))
+    ));
+}
+
+#[test]
+fn enrolment_export_accepts_a_leading_bom() {
+    let export = enrolment_export(Some("fd00:8::2"));
+    let text = format!("\u{feff}{}", encode_enrolment_export_file(&export));
+    assert_eq!(
+        decode_enrolment_export_file(&text).expect("bom accepted"),
+        export
+    );
+}

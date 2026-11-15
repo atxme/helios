@@ -55,6 +55,8 @@ pub const ENROLLMENT_CLOCK_SKEW_SECS: u64 = 300;
 pub const INVITATION_FILE_FORMAT: &str = "helios-enrollment-invitation";
 /// `format` of a `.helios-request` file.
 pub const REQUEST_FILE_FORMAT: &str = "helios-enrollment-request";
+/// `format` of the file `heliosd export-enrolment` prints.
+pub const ENROLMENT_EXPORT_FILE_FORMAT: &str = "helios-enrolment-export-v1";
 
 const INVITATION_DOMAIN: &[u8] = b"helios-key-negotiation-enrollment-invitation-v5";
 const REQUEST_DOMAIN: &[u8] = b"helios-key-negotiation-enrollment-request-v5";
@@ -375,6 +377,36 @@ struct RequestFile {
     request: EnrollmentRequest,
 }
 
+/// What a gateway hands a first administrator so that the enrolment can be
+/// signed without a tunnel. Public material only: no secret is ever in it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentExport {
+    pub server_name: String,
+    /// Base64 DER of the gateway's CA.
+    pub gateway_ca_der: String,
+    /// Base64 of the PQ leaf JSON, as `/api/key-negotiation` serves it.
+    pub gateway_pq_certificate: String,
+    pub pq_certificate_sha256: String,
+    pub wireguard_public_key: String,
+    pub negotiation_port: Option<u16>,
+    pub gateway_wg_address: String,
+    pub peer_public_key: String,
+    pub address: String,
+    #[serde(default)]
+    pub address_v6: Option<String>,
+    /// The trust block the operator checks against the vault. Kept as a JSON
+    /// value so that its fields are compared where they are used.
+    pub trust: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrolmentExportFile {
+    format: String,
+    export: EnrollmentExport,
+}
+
 /// Reads a `.helios-invite`: envelope, shape. Not the signature — the CA is
 /// not pinned yet when a person first opens the file.
 pub fn decode_invitation_file(text: &str) -> Result<EnrollmentInvitation, EnrollmentError> {
@@ -411,6 +443,24 @@ pub fn encode_request_file(request: &EnrollmentRequest) -> String {
     encode(&RequestFile {
         format: REQUEST_FILE_FORMAT.into(),
         request: request.clone(),
+    })
+}
+
+/// Reads the file `heliosd export-enrolment` prints: envelope and trust shape.
+pub fn decode_enrolment_export_file(text: &str) -> Result<EnrollmentExport, EnrollmentError> {
+    let file: EnrolmentExportFile = serde_json::from_str(strip_bom(text))
+        .map_err(|_| EnrollmentError::Format("not an enrolment export"))?;
+    if file.format != ENROLMENT_EXPORT_FILE_FORMAT || !file.export.trust.is_object() {
+        return Err(EnrollmentError::Format("not an enrolment export"));
+    }
+    Ok(file.export)
+}
+
+/// Writes the file `heliosd export-enrolment` prints.
+pub fn encode_enrolment_export_file(export: &EnrollmentExport) -> String {
+    encode(&EnrolmentExportFile {
+        format: ENROLMENT_EXPORT_FILE_FORMAT.into(),
+        export: export.clone(),
     })
 }
 
