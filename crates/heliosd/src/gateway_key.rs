@@ -699,6 +699,39 @@ mod tests {
         outcome
     }
 
+    const ISOLATED_KEY_SCENARIO: &str = "HELIOSD_GATEWAY_KEY_SCENARIO";
+
+    /// The identity directory is process-wide, so filesystem scenarios run in
+    /// a child rather than relying on a lock invisible to other test modules.
+    fn run_isolated_identity_scenario(name: &str) -> bool {
+        if std::env::var(ISOLATED_KEY_SCENARIO).ok().as_deref() == Some(name) {
+            return false;
+        }
+        let directory = tempfile::tempdir().expect("temporary identity directory");
+        let test_name = format!("gateway_key::tests::{name}");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", test_name.as_str(), "--nocapture"])
+            .env(ISOLATED_KEY_SCENARIO, name)
+            .env(IDENTITY_DIR_ENV, directory.path())
+            .output()
+            .expect("isolated identity scenario starts");
+        assert!(
+            output.status.success(),
+            "isolated {name} failed:
+{}
+{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "isolated {name} must execute exactly one test:
+{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        true
+    }
+
     /// The escrow is the only recovery channel after a PCR change, and the
     /// gateway itself must be unable to open it — that is the whole design.
     /// This exercises the real write path, then opens the result as the
@@ -878,6 +911,85 @@ mod tests {
             std::fs::read(parent).expect("blocking file unchanged"),
             b"not a directory"
         );
+    }
+
+    #[test]
+    fn a_locked_vault_without_plaintext_fails_closed_and_is_preserved() {
+        if run_isolated_identity_scenario(
+            "a_locked_vault_without_plaintext_fails_closed_and_is_preserved",
+        ) {
+            return;
+        }
+        let path = PathBuf::from(keystore_path());
+        std::fs::write(&path, b"vault marker").expect("existing sealed vault");
+
+        let resolved = resolve(&NetworkConfig::default(), &BootDecision::Disabled);
+
+        assert_eq!(resolved.origin, KeyOrigin::Missing);
+        assert!(resolved.private_key.is_empty());
+        assert_eq!(std::fs::read(path).unwrap(), b"vault marker");
+    }
+
+    #[test]
+    fn a_locked_vault_uses_only_the_explicit_plaintext_fallback() {
+        if run_isolated_identity_scenario(
+            "a_locked_vault_uses_only_the_explicit_plaintext_fallback",
+        ) {
+            return;
+        }
+        let path = PathBuf::from(keystore_path());
+        std::fs::write(&path, b"vault marker").expect("existing sealed vault");
+        let network = NetworkConfig {
+            wg_private_key: VALID.into(),
+            ..NetworkConfig::default()
+        };
+
+        let resolved = resolve(&network, &BootDecision::Disabled);
+
+        assert_eq!(resolved.origin, KeyOrigin::PlaintextConfig);
+        assert_eq!(resolved.private_key.expose(), VALID);
+        assert_eq!(std::fs::read(path).unwrap(), b"vault marker");
+    }
+
+    #[test]
+    fn a_recovery_file_without_a_locked_vault_is_not_consumed_or_used() {
+        if run_isolated_identity_scenario(
+            "a_recovery_file_without_a_locked_vault_is_not_consumed_or_used",
+        ) {
+            return;
+        }
+        let path = PathBuf::from(recovery_path());
+        let recovery = format!(" {VALID}\n");
+        std::fs::write(&path, recovery.as_bytes()).expect("operator recovery file");
+
+        let resolved = resolve(&NetworkConfig::default(), &BootDecision::Disabled);
+
+        assert_eq!(resolved.origin, KeyOrigin::Missing);
+        assert!(resolved.private_key.is_empty());
+        assert_eq!(std::fs::read(path).unwrap(), recovery.as_bytes());
+    }
+
+    #[test]
+    fn initialization_preserves_an_existing_vault_without_rotation_or_secret() {
+        if run_isolated_identity_scenario(
+            "initialization_preserves_an_existing_vault_without_rotation_or_secret",
+        ) {
+            return;
+        }
+        let path = PathBuf::from(keystore_path());
+        std::fs::write(&path, b"existing sealed bytes").expect("existing vault");
+
+        let no_rotation = initialize(&NetworkConfig::default(), &BootDecision::Disabled, false)
+            .expect_err("initialize must require explicit rotation");
+        assert!(no_rotation.contains("Use --rotate"), "{no_rotation}");
+        let unavailable_rotation =
+            initialize(&NetworkConfig::default(), &BootDecision::Disabled, true)
+                .expect_err("rotation still requires a TPM secret");
+        assert!(
+            unavailable_rotation.contains("no TPM secret"),
+            "{unavailable_rotation}"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"existing sealed bytes");
     }
 
     #[test]
