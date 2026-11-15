@@ -653,6 +653,7 @@ describe('AstraView', () => {
       notAfter: Math.floor(Date.now() / 1000) + 33 * DAY,
       nextFingerprint: 'bb'.repeat(32),
       offline: false,
+      withoutCampaign: false,
       ...extra,
     })
 

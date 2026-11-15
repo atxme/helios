@@ -494,3 +494,20 @@ describe('the wording', () => {
     expect(text).not.toMatch(/\b(tu|te|ton|ta|tes|toi)\b/i)
   })
 })
+
+describe('the CA-PQ replacement without a campaign', () => {
+  const ROW = 'Remplacer la CA-PQ sans campagne'
+  const WARNING =
+    'Aucune autorité ne vérifie ce remplacement : le coffre avance sur votre seul geste. À réserver à un domaine sans Astra.'
+
+  it('warns above the start for its row, and not for the campaign replacement', async () => {
+    await show(overview({ relayNamesOrigin: false }))
+    choose(ROW)
+    expect(screen.getByText(WARNING)).toBeTruthy()
+    cleanup()
+
+    await show(overview({ relayNamesOrigin: true }))
+    choose('Remplacer la CA-PQ')
+    expect(screen.queryByText(WARNING)).toBeNull()
+  })
+})

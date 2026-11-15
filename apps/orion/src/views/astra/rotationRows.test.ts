@@ -131,6 +131,7 @@ describe('finish and resume', () => {
       notAfter: NOW + 30 * DAY,
       nextFingerprint: 'aa',
       offline: false,
+      withoutCampaign: false,
     }
     const found = row(overview({ resumable: true, journal }), 'resume')
     expect(found?.state).toMatch(/CA-PQ/)
@@ -153,6 +154,7 @@ describe('finish and resume', () => {
       notAfter: NOW + 30 * DAY,
       nextFingerprint: 'aa',
       offline: false,
+      withoutCampaign: false,
     }
     // Local data and the workstation clock: a Signed journal Astra never heard of, or an
     // Applied one already on the gateway, resume harmlessly. Not a dead end yet.
@@ -300,6 +302,7 @@ describe('prerequisites', () => {
       notAfter: NOW + 30 * DAY,
       nextFingerprint: 'aa',
       offline: false,
+      withoutCampaign: false,
     }
     for (const stage of ['applied', 'installed'] as const) {
       const o = overview({
@@ -501,6 +504,7 @@ describe('the stops', () => {
     notAfter: 1_802_000_000,
     nextFingerprint: 'aa',
     offline: true,
+    withoutCampaign: false,
   }
 
   it('an_install_deadline_shows_its_date', () => {
@@ -573,6 +577,7 @@ describe('the journal line', () => {
     notAfter: NOW + 33 * DAY,
     nextFingerprint: 'aa',
     offline: false,
+    withoutCampaign: false,
   }
 
   it('gives_the_deadline_of_a_rotation_still_to_install', () => {
@@ -615,6 +620,7 @@ describe('the wording', () => {
         notAfter: NOW + 2,
         nextFingerprint: 'aa',
         offline: false,
+        withoutCampaign: false,
       },
     })
     for (const variant of [o, overview({ caPqOverlap: true }), overview({ vault: null, vaultError: 'illisible', tunnel: false })]) {
@@ -685,5 +691,99 @@ describe('the CA-PQ finish row', () => {
     expect(row(o, 'replace_ca_pq')?.disabledReason).toBeNull()
     expect(allGreen(prerequisites(o, 'replace_ca_pq'))).toBe(true)
     expect(expiringWorkstationWarnings(overview({ workstations: { state: 'unreachable' } }), NOW)).toEqual([])
+  })
+})
+
+describe('the CA-PQ replacement without a campaign', () => {
+  const NO_CAMPAIGN = 'Remplacer la CA-PQ sans campagne'
+
+  it('stands in place of the campaign replacement when the relay names no origin', () => {
+    const o = overview({ relayNamesOrigin: false })
+    expect(row(o, 'replace_ca_pq')).toBeUndefined()
+    const titles = rotationRows(o, NOW).map((r) => r.title)
+    expect(titles).toContain(NO_CAMPAIGN)
+    expect(titles.indexOf(NO_CAMPAIGN)).toBe(
+      rotationRows(overview(), NOW).findIndex((r) => r.action === 'replace_ca_pq'),
+    )
+    expect(row(o, 'replace_ca_pq_without_campaign')?.button).toBe('Remplacer')
+  })
+
+  it('the campaign replacement stays when the relay names an origin or cannot be read', () => {
+    for (const relayNamesOrigin of [true, null]) {
+      const o = overview({ relayNamesOrigin })
+      expect(row(o, 'replace_ca_pq_without_campaign')).toBeUndefined()
+      expect(row(o, 'replace_ca_pq')?.title).toBe('Remplacer la CA-PQ')
+    }
+  })
+
+  it('an unread authority does not disable it', () => {
+    const o = overview({ relayNamesOrigin: false, caPqOverlap: null })
+    expect(row(o, 'replace_ca_pq_without_campaign')?.disabledReason).toBeNull()
+  })
+
+  it('a kept outgoing CA-PQ disables it with the finish-first sentence', () => {
+    const o = overview({ relayNamesOrigin: false, retainedCaPqNotAfter: NOW + 5 })
+    expect(row(o, 'replace_ca_pq_without_campaign')?.disabledReason).toBe(
+      "Terminer d'abord la rotation CA-PQ précédente.",
+    )
+  })
+
+  it('a CA-PQ overlap, a CA TLS overlap or a rotation to resume disables it', () => {
+    expect(
+      row(overview({ relayNamesOrigin: false, caPqOverlap: true }), 'replace_ca_pq_without_campaign')
+        ?.disabledReason,
+    ).toBe('Recouvrement CA-PQ en cours')
+    expect(
+      row(
+        overview({
+          relayNamesOrigin: false,
+          domain: { state: 'ok', value: domainRead({ client_tls_ca_transition_pending: true }) },
+          caTlsCloseAt: NOW + 10 * DAY,
+        }),
+        'replace_ca_pq_without_campaign',
+      )?.disabledReason,
+    ).toBe('Recouvrement CA TLS en cours')
+    expect(
+      row(overview({ relayNamesOrigin: false, resumable: true }), 'replace_ca_pq_without_campaign')
+        ?.disabledReason,
+    ).toBe('Rotation à reprendre')
+  })
+
+  it('its prerequisites ask the tunnel, the administrator, the vault, the keys and the domain, never Astra', () => {
+    const lines = prerequisites(overview({ relayNamesOrigin: false }), 'replace_ca_pq_without_campaign')
+    expect(lines.map((p) => p.label)).toEqual([
+      'Tunnel connecté',
+      'Administrateur du tunnel',
+      'Coffre présent',
+      'Deux clés enregistrées',
+      'Domaine concordant',
+    ])
+    expect(allGreen(lines)).toBe(true)
+  })
+
+  it('a resumption of a journal written without a campaign speaks to the gateway alone', () => {
+    const journal = {
+      kind: 'ca_pq' as const,
+      stage: 'signed' as const,
+      activationAt: NOW + DAY,
+      notAfter: NOW + 30 * DAY,
+      nextFingerprint: 'aa',
+      offline: false,
+      withoutCampaign: true,
+    }
+    const o = overview({
+      resumable: true,
+      journal,
+      pending: { state: 'astra_unavailable' },
+      authority: { state: 'astra_unavailable' },
+    })
+    expect(prerequisites(o, 'resume').map((p) => p.label)).toEqual([
+      'Tunnel connecté',
+      'Administrateur du tunnel',
+      'Coffre présent',
+    ])
+    // A journal from before the field reads as before: Astra is asked while it is signed.
+    const before = overview({ resumable: true, journal: { ...journal, withoutCampaign: false } })
+    expect(prerequisites(before, 'resume').map((p) => p.label)).toContain('Service Astra')
   })
 })

@@ -28,6 +28,7 @@ import {
   rowsOf,
 } from '../OperatorCeremony'
 import type { RotationStepContext } from './RotationsPanel'
+import { ArtifactDownloads } from './ArtifactDownloads'
 import {
   INSTALL_DEADLINE_TO_CHECK,
   PROPOSED_TERMS,
@@ -78,6 +79,7 @@ const isEnded = (status: OperatorStatus) =>
 
 const GESTURES = {
   replace_ca_pq: { gesture: 'replace_ca_pq' },
+  replace_ca_pq_without_campaign: { gesture: 'replace_ca_pq_without_campaign' },
   replace_ca_tls: { gesture: 'replace_ca_tls' },
   finish_ca_tls: { gesture: 'finish_ca_tls' },
   finish_ca_pq: { gesture: 'finish_ca_pq' },
@@ -86,6 +88,7 @@ const GESTURES = {
 
 const START_LABELS = {
   replace_ca_pq: 'Continuer',
+  replace_ca_pq_without_campaign: 'Continuer',
   replace_ca_tls: 'Continuer',
   finish_ca_tls: 'Terminer',
   finish_ca_pq: 'Terminer',
@@ -223,6 +226,8 @@ function datesOf(
     notAfter: manifest.not_after,
     nextFingerprint: manifest.next_anchor_fingerprint ?? '',
     offline: false,
+    // The manifest does not say whether a journal is written: the journal read is the answer.
+    withoutCampaign: false,
   }
 }
 
@@ -517,7 +522,11 @@ export function RotationCeremony({
   const manifest = caManifest(status)
   const ended = isEnded(status)
   const prepared = status.remote !== 'local' && status.remote !== 'awaiting_operator'
-  const finishing = purpose === 'promotion' || (manifest !== null && !manifest.campaign)
+  // A CA TLS finish shows a manifest without campaign; a CA-PQ one without campaign is the
+  // replacement that needs no campaign, and is not a finish.
+  const finishing =
+    purpose === 'promotion' ||
+    (manifest !== null && !manifest.campaign && operation === 'rotate_client_tls_ca')
 
   type Stage = 'ended' | 'follow' | 'touches' | 'keys' | 'wait'
   let stage: Stage
@@ -841,6 +850,7 @@ export function RotationCeremony({
             ))}
           </Box>
         )}
+        <ArtifactDownloads gesture={status.gesture} />
         {onDismiss && (
           <Button
             size="small"

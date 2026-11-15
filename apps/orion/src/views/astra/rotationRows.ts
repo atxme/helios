@@ -14,6 +14,7 @@ export type RotationAction =
   | 'resume'
   | 'renew_fleet'
   | 'replace_ca_pq'
+  | 'replace_ca_pq_without_campaign'
   | 'replace_ca_tls'
   | 'renew_delegation'
 
@@ -66,6 +67,7 @@ const TITLES: Record<RotationAction, string> = {
   resume: 'Reprendre une rotation',
   renew_fleet: 'Renouveler les postes',
   replace_ca_pq: 'Remplacer la CA-PQ',
+  replace_ca_pq_without_campaign: 'Remplacer la CA-PQ sans campagne',
   replace_ca_tls: 'Remplacer la CA TLS',
   renew_delegation: 'Renouveler la délégation',
 }
@@ -76,6 +78,7 @@ const BUTTONS: Record<RotationAction, string> = {
   resume: 'Reprendre',
   renew_fleet: 'Renouveler',
   replace_ca_pq: 'Remplacer',
+  replace_ca_pq_without_campaign: 'Remplacer',
   replace_ca_tls: 'Remplacer',
   renew_delegation: 'Renouveler',
 }
@@ -86,6 +89,8 @@ const SCOPES: Record<RotationAction, CampaignScope | null> = {
   resume: null,
   renew_fleet: 'fleet_leafs',
   replace_ca_pq: 'trust_authorities',
+  // No campaign: nothing is opened at the authority, so no operation to resume.
+  replace_ca_pq_without_campaign: null,
   replace_ca_tls: 'trust_authorities',
   renew_delegation: 'issuer_delegation',
 }
@@ -310,14 +315,18 @@ function caPqWindowOpen(o: RotationsOverview): boolean {
   )
 }
 
-/** One CA rotation at a time: the reason the other is not offered, if there is one. */
-function replaceBlock(o: RotationsOverview): string | null {
+/** One CA rotation at a time, read from the gateway and the vault alone. */
+function localReplaceBlock(o: RotationsOverview): string | null {
   if (caPqWindowOpen(o)) return OVERLAP_PQ
   if (o.retainedCaPqNotAfter !== null) return PQ_KEPT
   if (caTlsWindowOpen(o)) return OVERLAP_TLS
   if (o.resumable) return ROTATION_PENDING
-  if (o.caPqOverlap === null) return AUTHORITY_UNREAD
   return null
+}
+
+/** One CA rotation at a time: the reason the other is not offered, if there is one. */
+function replaceBlock(o: RotationsOverview): string | null {
+  return localReplaceBlock(o) ?? (o.caPqOverlap === null ? AUTHORITY_UNREAD : null)
 }
 
 function keysLabel(o: RotationsOverview): string {
@@ -349,6 +358,20 @@ function replacePqRow(o: RotationsOverview): RotationRow {
     button: BUTTONS.replace_ca_pq,
     // The journal that carried it is gone by the end: Astra and the gateway still name it.
     detail: incoming === null ? null : `Ancre entrante ${groupFingerprint(incoming)}`,
+  }
+}
+
+/**
+ * « Remplacer la CA-PQ sans campagne », in place of « Remplacer la CA-PQ » when the relay names
+ * no origin. Astra is never read for it, so an unread authority does not block it.
+ */
+function replacePqWithoutCampaignRow(o: RotationsOverview): RotationRow {
+  return {
+    ...replacePqRow(o),
+    action: 'replace_ca_pq_without_campaign',
+    title: TITLES.replace_ca_pq_without_campaign,
+    button: BUTTONS.replace_ca_pq_without_campaign,
+    disabledReason: localReplaceBlock(o),
   }
 }
 
@@ -445,7 +468,7 @@ export function rotationRows(o: RotationsOverview, local: number): RotationRow[]
     finishPqRow(o, now),
     resumeRow(o, now),
     fleetRow(o, now),
-    replacePqRow(o),
+    o.relayNamesOrigin === false ? replacePqWithoutCampaignRow(o) : replacePqRow(o),
     replaceTlsRow(o),
     delegationRow(o, now),
   ].filter((row): row is RotationRow => row !== null)
@@ -572,7 +595,11 @@ function domainPrerequisite(o: RotationsOverview): Prerequisite {
  * Astra there, and neither does the button.
  */
 function resumesOnTheGatewayAlone(o: RotationsOverview): boolean {
-  return o.journal?.stage === 'applied' || o.journal?.stage === 'installed'
+  return (
+    o.journal?.withoutCampaign === true ||
+    o.journal?.stage === 'applied' ||
+    o.journal?.stage === 'installed'
+  )
 }
 
 /** The checks before an action, one line each. A red line stops the next step. */
@@ -588,6 +615,10 @@ export function prerequisites(o: RotationsOverview, action: RotationAction): Pre
   // « Terminer » asks the key and moves the vault; its copy afterwards may fail.
   if (action === 'finish_ca_tls' || action === 'finish_ca_pq') {
     return [tunnel, vaultPrerequisite(o)]
+  }
+  // Two keys and the vault: nothing is asked of Astra, and no copy is sent to it.
+  if (action === 'replace_ca_pq_without_campaign') {
+    return [tunnel, admin, vaultPrerequisite(o), keysPrerequisite(o), domainPrerequisite(o)]
   }
   if (action === 'resume' && resumesOnTheGatewayAlone(o)) {
     return [tunnel, admin, vaultPrerequisite(o)]

@@ -7,6 +7,7 @@ const api = vi.hoisted(() => ({
   advanceOperatorCeremony: vi.fn(),
   approveRotationCeremony: vi.fn(),
   beginRotationCeremony: vi.fn(),
+  operatorArtifacts: vi.fn(),
 }))
 vi.mock('../../api', () => api)
 
@@ -63,6 +64,7 @@ const journal = (extra: Partial<RotationJournalView> = {}): RotationJournalView 
   notAfter: NOW + 37 * 86_400,
   nextFingerprint: 'bb'.repeat(32),
   offline: false,
+  withoutCampaign: false,
   ...extra,
 })
 
@@ -91,6 +93,7 @@ const button = (name: string) => screen.getByRole('button', { name }) as HTMLBut
 
 beforeEach(() => {
   vi.clearAllMocks()
+  api.operatorArtifacts.mockResolvedValue([])
 })
 afterEach(cleanup)
 
@@ -741,5 +744,49 @@ describe('the chain step taken at the approval', () => {
     api.approveRotationCeremony.mockRejectedValueOnce('le plan a avancé : relire')
     fireEvent.click(button('Approuver'))
     await waitFor(() => expect(screen.getByText(/le plan a avancé : relire/)).toBeTruthy())
+  })
+})
+
+describe('the CA-PQ replacement without a campaign', () => {
+  const START = 'replace_ca_pq_without_campaign'
+
+  it('starts with its own gesture, reads no pending first, and names the step Continuer', async () => {
+    const onCeremony = vi.fn()
+    const refresh = vi.fn()
+    api.beginRotationCeremony.mockResolvedValue(status())
+    render(
+      <RotationSteps
+        action={START}
+        overview={overview({ relayNamesOrigin: false })}
+        existingOperation={null}
+        operatorLabel="Clé 1"
+        onCeremony={onCeremony}
+        refresh={refresh}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Continuer' }))
+    await waitFor(() => expect(onCeremony).toHaveBeenCalled())
+    expect(api.beginRotationCeremony).toHaveBeenCalledWith({ gesture: START })
+    expect(refresh).not.toHaveBeenCalled()
+  })
+
+  it('a manifest without a campaign is a replacement, not a finish', () => {
+    shown(
+      status({
+        gesture: 'signing',
+        allowed: [],
+        manifest: manifest({ campaign: undefined }),
+      }),
+    )
+    expect(screen.getByRole('heading', { name: 'Remplacer la CA-PQ' })).toBeTruthy()
+    expect(screen.queryByText('Terminer la rotation CA-PQ')).toBeNull()
+  })
+
+  it('the ended ceremony offers the transition file to save', async () => {
+    api.operatorArtifacts.mockResolvedValue([
+      { file_name: 'ca-pq-transition.json', contents: '{}', encoding: 'text', fingerprint: null },
+    ])
+    shown(status({ gesture: 'done', remote: 'prepared', allowed: [], manifest: manifest({ campaign: undefined }) }))
+    expect(await screen.findByRole('button', { name: 'Enregistrer ca-pq-transition.json' })).toBeTruthy()
   })
 })

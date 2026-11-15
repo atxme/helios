@@ -85,6 +85,7 @@ describe('refusalSentence for the issuer delegation', () => {
       notAfter: 1_802_000_000,
       nextFingerprint: 'aa',
       offline: true,
+      withoutCampaign: false,
     }
     expect(refusalSentence({ refusal: 'domain_conflict' }, journal)).toMatch(
       /astra-signer rotate-ca-pq/,
@@ -150,6 +151,7 @@ describe('the words of a rotation', () => {
     notAfter: 1_802_000_000,
     nextFingerprint: 'aa',
     offline: false,
+    withoutCampaign: false,
   }
 
   it('a_gateway_that_cannot_be_reached_is_worded_for_a_rotation', () => {

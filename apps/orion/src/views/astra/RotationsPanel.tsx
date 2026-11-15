@@ -38,6 +38,10 @@ const POLL_MS = 15_000
 
 /** The amber of a row to do, as in the mockup the operator approved. */
 
+/** Said above the start of « Remplacer la CA-PQ sans campagne »: no authority checks it. */
+const NO_CAMPAIGN_WARNING =
+  'Aucune autorité ne vérifie ce remplacement : le coffre avance sur votre seul geste. À réserver à un domaine sans Astra.'
+
 const DEFAULT_REASON: Partial<Record<RotationAction, string>> = {
   renew_fleet: 'Renouvellement des postes',
   renew_delegation: 'Renouvellement de la délégation',
@@ -379,12 +383,18 @@ export function RotationsPanel({
             Vérifier
           </Button>
           {/* A warning, not a block: the workstations are named, the step stays open. */}
-          {chosen.action === 'replace_ca_pq' &&
+          {(chosen.action === 'replace_ca_pq' ||
+            chosen.action === 'replace_ca_pq_without_campaign') &&
             expiringWorkstationWarnings(overview, now).map((warning) => (
               <Typography key={warning} sx={{ mt: 0.75, fontSize: 11.5, color: DUE_BORDER }}>
                 {warning}
               </Typography>
             ))}
+          {chosen.action === 'replace_ca_pq_without_campaign' && (
+            <Alert severity="warning" variant="outlined" sx={{ mt: 0.75, fontSize: 11.5 }}>
+              {NO_CAMPAIGN_WARNING}
+            </Alert>
+          )}
 
           {(chosen.action === 'renew_fleet' || chosen.action === 'renew_delegation') && (
             <Box sx={{ mt: 1.25 }}>
