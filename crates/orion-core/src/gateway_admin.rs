@@ -15,7 +15,7 @@
 use std::time::Duration;
 
 use aether::certificates::encoding::DerCertificate;
-use aether::key_negotiation::{PqCertificate, ProtectionMode};
+use aether::key_negotiation::{EnrollmentExport, PqCertificate, ProtectionMode};
 use base64::Engine as _;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -349,6 +349,39 @@ pub async fn gateway_material(
             .map(str::to_string),
         heliosd_url: heliosd_url(&network.wg_address),
         trust,
+    };
+    Ok((material, admission))
+}
+
+/// The material and the admission an enrolment export carries, read as the
+/// online path reads them, so that no tunnel is needed.
+///
+/// The online check of [`negotiate`] is not repeated: an export has no network
+/// view to compare with. Orion checks the key against the invitation's pin
+/// instead.
+pub fn material_from_export(
+    export: &EnrollmentExport,
+) -> Result<(GatewayMaterial, Admission), GatewayAdminError> {
+    let trust = serde_json::from_value::<TrustMaterial>(export.trust.clone())
+        .map_err(|_| invalid("le bloc de confiance illisible"))?;
+    let material = GatewayMaterial {
+        server_name: export.server_name.clone(),
+        gateway_ca_der: export.gateway_ca_der.clone(),
+        gateway_pq_certificate: export.gateway_pq_certificate.clone(),
+        wireguard_public_key: export.wireguard_public_key.clone(),
+        pq_certificate_sha256: export.pq_certificate_sha256.clone(),
+        negotiation_port: export.negotiation_port,
+    };
+    let admission = Admission {
+        address: export.address.clone(),
+        address_v6: export
+            .address_v6
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        heliosd_url: heliosd_url(&export.gateway_wg_address),
+        trust: Some(trust),
     };
     Ok((material, admission))
 }

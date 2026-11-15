@@ -77,7 +77,7 @@ pub fn check_leaves(
 pub fn build_draft(draft: DraftInput<'_>) -> Result<EnrollmentDocument> {
     let Some(trust) = draft.admission.trust else {
         bail!(
-            "cette gateway n'a pas de domaine de confiance : `astra-signer init` puis \
+            "cette gateway n'a pas de domaine de confiance : créer le domaine dans Orion (Astra › Coffre et clés, « Créer le domaine »), puis \
              `heliosd init-trust-domain`. Un document v5 est signé sous la CA-PQ que ce domaine \
              épingle."
         );
