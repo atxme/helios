@@ -1071,6 +1071,94 @@ mod tests {
         assert_eq!(refusal, TrustUpdateRefusal::Conflict);
     }
 
+    #[test]
+    fn authority_statuses_map_to_their_coarse_refusal_classes() {
+        use axum::http::StatusCode;
+        use helios_api::certificates::TrustUpdateRefusal as Refusal;
+
+        for (status, expected) in [
+            (StatusCode::BAD_REQUEST, Refusal::Protocol),
+            (StatusCode::FORBIDDEN, Refusal::Rejected),
+            (StatusCode::CONFLICT, Refusal::Conflict),
+            (StatusCode::TOO_MANY_REQUESTS, Refusal::Throttled),
+            (StatusCode::NOT_IMPLEMENTED, Refusal::Unavailable),
+            (StatusCode::SERVICE_UNAVAILABLE, Refusal::Unavailable),
+            (StatusCode::UNAUTHORIZED, Refusal::Internal),
+            (StatusCode::PAYLOAD_TOO_LARGE, Refusal::Internal),
+            (StatusCode::INTERNAL_SERVER_ERROR, Refusal::Internal),
+        ] {
+            assert_eq!(
+                AstraRenewalRelay::refuse(
+                    "operator-test",
+                    ::astra_channel::ChannelError::Status(status),
+                ),
+                expected,
+                "authority status {status} must remain coarse"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_and_response_failures_are_unavailable_to_the_caller() {
+        use helios_api::certificates::TrustUpdateRefusal;
+
+        let errors = [
+            ::astra_channel::ChannelError::Tls("handshake failed".into()),
+            ::astra_channel::ChannelError::Pin("certificate mismatch".into()),
+            ::astra_channel::ChannelError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "authority offline",
+            )),
+            ::astra_channel::ChannelError::Body("invalid response body".into()),
+        ];
+        for error in errors {
+            assert_eq!(
+                AstraRenewalRelay::refuse("trust-update", error),
+                TrustUpdateRefusal::Unavailable
+            );
+        }
+    }
+
+    #[test]
+    fn chain_refusal_preserves_the_authority_plan_sentence_and_coarsens_other_errors() {
+        use helios_api::certificates::{ChainRefusal, TrustUpdateRefusal};
+
+        assert_eq!(
+            AstraRenewalRelay::chain_refusal(
+                "operator-chain-next",
+                ::astra_channel::ChannelError::Plan("step still has an open operation".into()),
+            ),
+            ChainRefusal::Reason("step still has an open operation".into())
+        );
+        assert_eq!(
+            AstraRenewalRelay::chain_refusal(
+                "operator-chain-next",
+                ::astra_channel::ChannelError::Status(axum::http::StatusCode::CONFLICT),
+            ),
+            ChainRefusal::Class(TrustUpdateRefusal::Conflict)
+        );
+        assert_eq!(
+            AstraRenewalRelay::chain_refusal(
+                "operator-chain-next",
+                ::astra_channel::ChannelError::Tls("offline".into()),
+            ),
+            ChainRefusal::Class(TrustUpdateRefusal::Unavailable)
+        );
+    }
+
+    #[test]
+    fn resolved_renewal_caller_is_parsed_once_and_invalid_identity_is_internal() {
+        use aether::certificates::encoding::WireGuardKey;
+        use helios_api::certificates::TrustUpdateRefusal;
+
+        let key = WireGuardKey::from_bytes([0x42; 32]);
+        assert_eq!(AstraRenewalRelay::caller(&key.to_base64()), Ok(key));
+        assert!(matches!(
+            AstraRenewalRelay::caller("not a WireGuard key"),
+            Err(TrustUpdateRefusal::Internal)
+        ));
+    }
+
     /// A gateway with no channel document is a gateway without an authority,
     /// which is a supported state — not an error.
     #[test]
@@ -1223,6 +1311,52 @@ mod tests {
             .authority_client()
             .expect("client TLS configuration")
             .is_some());
+    }
+
+    #[test]
+    fn changing_the_authority_address_requires_explicit_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        let _guard = isolated(directory.path());
+        let astra_client = astra_certificate(directory.path());
+        let astra_server = astra_authority_certificate(
+            directory.path(),
+            ::astra_channel::ASTRA_INTERNAL_SERVER_NAME,
+        );
+        let initial = initialize(
+            "10.88.0.1:8444".parse().unwrap(),
+            &astra_client,
+            Some("10.88.0.2:8444".parse().unwrap()),
+            Some(&astra_server),
+            false,
+        )
+        .expect("initial authority pairing");
+
+        let error = match initialize(
+            "10.88.0.1:8444".parse().unwrap(),
+            &astra_client,
+            Some("10.88.0.3:8444".parse().unwrap()),
+            Some(&astra_server),
+            false,
+        ) {
+            Ok(_) => panic!("changing the remote endpoint changes the pairing"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("pins something else"));
+
+        let rotated = initialize(
+            "10.88.0.1:8444".parse().unwrap(),
+            &astra_client,
+            Some("10.88.0.3:8444".parse().unwrap()),
+            Some(&astra_server),
+            true,
+        )
+        .expect("explicit rotation accepts a changed pairing");
+        assert_ne!(rotated.served.as_bytes(), initial.served.as_bytes());
+        let channel = AstraChannel::load().unwrap().expect("rotated channel");
+        assert_eq!(
+            channel.authority.as_ref().unwrap().address,
+            "10.88.0.3:8444".parse().unwrap()
+        );
     }
 
     #[test]
