@@ -563,6 +563,18 @@ async fn an_open_without_a_relay_is_503() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
+/// The pending read is how Orion tells an administrator of a gateway without Astra: the
+/// administrator reads 503 (« Astra unavailable »), anyone else 403, whatever the relay.
+#[tokio::test]
+async fn the_pending_read_without_a_relay_tells_an_administrator_from_a_peer() {
+    let state = state_with(None);
+    assert!(state.operator_campaign.is_none());
+    let admin = operator_pending(State(state.clone()), Extension(operator_caller_at(true))).await;
+    assert_eq!(admin.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let peer = operator_pending(State(state), Extension(operator_caller_at(false))).await;
+    assert_eq!(peer.status(), StatusCode::FORBIDDEN);
+}
+
 /// What the authority refused stays its class: no sentence, no inventory.
 #[tokio::test]
 async fn a_refused_open_answers_its_class_alone() {

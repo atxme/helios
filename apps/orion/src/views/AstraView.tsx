@@ -86,6 +86,8 @@ export function AstraView({
   const [existingOperation, setExistingOperation] = useState<string | null>(null)
   // The chain's step the approval takes, when the chain has no campaign open yet.
   const [chainStep, setChainStep] = useState<ChainStepAsk | null>(null)
+  // The CA-PQ replacement that opens no campaign: its terms ask for no reason.
+  const [withoutCampaign, setWithoutCampaign] = useState(false)
   // The finished session of an automatic resumption, said in its row.
   const [automaticStop, setAutomaticStop] = useState<OperatorStatus | null>(null)
   const [tab, setTab] = useState<AstraTab>('Enrôlement')
@@ -256,9 +258,11 @@ export function AstraView({
     next: OperatorStatus,
     existing: string | null = null,
     step: ChainStepAsk | null = null,
+    noCampaign = false,
   ) => {
     setExistingOperation(existing)
     setChainStep(step)
+    setWithoutCampaign(noCampaign)
     setJournalKnown(true)
     setAutomaticStop(null)
     setCeremony(next)
@@ -296,6 +300,7 @@ export function AstraView({
             existingOperation={chainStep ? null : (led?.operation_id ?? existingOperation)}
             existingExpiresAt={chainStep ? null : (led?.expires_at ?? null)}
             chainStep={chainStep ?? undefined}
+            withoutCampaign={withoutCampaign}
           />
         ) : (
           <OperatorCeremonyPanel

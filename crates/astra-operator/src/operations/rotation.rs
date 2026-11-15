@@ -62,7 +62,7 @@ use crate::signing::{
     self, CampaignApprovalSession, DomainIdentity, ANCHOR_ROTATION_CREDENTIALS,
     MAX_CA_TLS_LIFETIME_SECS,
 };
-use crate::tunnel::{Tunnel, TunnelRefusal, VaultCopySent};
+use crate::tunnel::{GatewayIdentityRead, Tunnel, TunnelRefusal, VaultCopySent};
 use crate::vault::{AuthorityVault, CaTlsAdvance};
 use crate::{credentials, prepared, store};
 
@@ -100,6 +100,14 @@ pub enum OpenRefusal {
     /// Astra and this vault do not name the same anchors.
     #[error("Astra et ce coffre ne nomment pas la même ancre. Rien n'a été signé.")]
     AnchorsDisagree,
+    /// The relay names an Astra origin: the replacement goes through a campaign.
+    #[error(
+        "le relais nomme une origine Astra : ce remplacement passe par une campagne. Rien n'a été signé."
+    )]
+    OriginRecorded,
+    /// The outgoing `CA-PQ` is still kept, until « Terminer la rotation CA-PQ ».
+    #[error("la rotation CA-PQ précédente reste à terminer. Rien n'a été signé.")]
+    CaPqToFinish,
 }
 
 /// What the operator chose on the approval screen.
@@ -156,6 +164,8 @@ pub trait RotationRemote {
     fn install_ca_transition(&self, transition: &CaTransition) -> Result<()>;
     fn install_client_tls_ca_transition(&self, transition: &ClientTlsCaTransition) -> Result<()>;
     fn gateway_next_anchor(&self, kind: RotationKind) -> Result<Option<Fingerprint>>;
+    /// The gateway's domain: the anchors it serves, and what is in transition.
+    fn gateway_identity(&self) -> Result<GatewayIdentityRead>;
 }
 
 impl RotationRemote for Tunnel {
@@ -195,6 +205,10 @@ impl RotationRemote for Tunnel {
     fn gateway_next_anchor(&self, kind: RotationKind) -> Result<Option<Fingerprint>> {
         Tunnel::gateway_next_anchor(self, kind)
     }
+
+    fn gateway_identity(&self) -> Result<GatewayIdentityRead> {
+        Tunnel::gateway_identity(self)
+    }
 }
 
 impl ValidatedKeys {
@@ -202,6 +216,12 @@ impl ValidatedKeys {
     /// is touched for nothing.
     pub fn ensure_domain_readable(&self, vault_path: &Path, kind: RotationKind) -> Result<()> {
         LocalDomain::read(vault_path, &self.vault, kind).map(|_| ())
+    }
+
+    /// What [`open_without_campaign`] would refuse of the files beside this vault, asked
+    /// before a key is touched for nothing.
+    pub fn ensure_domain_readable_without_campaign(&self, vault_path: &Path) -> Result<()> {
+        WithoutCampaignDomain::read(vault_path, &self.vault).map(|_| ())
     }
 }
 
@@ -235,13 +255,7 @@ impl LocalDomain {
         let current_ca = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim())?;
         let registry = credentials::load(&credentials::path_beside(vault_path))?
             .context("aucun document de credentials à côté du coffre")?;
-        registry.verify(
-            &current_ca,
-            &identity.trust_domain_id,
-            &identity.gateway_wg_public_key,
-            identity.ca_epoch,
-            registry.credential_registry_epoch,
-        )?;
+        verify_document(&registry, &current_ca, &identity)?;
         let active_certificate = match kind {
             RotationKind::CaPq => None,
             RotationKind::CaTls => Some(DerCertificate::parse(relay.require(
@@ -274,6 +288,55 @@ impl LocalDomain {
             Some(active) => signing::client_tls_probe(&self.identity, active, window)?,
         })
     }
+}
+
+/// The files beside a vault with no Astra origin, read with no key: what a rotation
+/// without a campaign signs over.
+struct WithoutCampaignDomain {
+    relay: DomainHandoff,
+    identity: DomainIdentity,
+    current_ca: MlDsa87PublicKey,
+    /// The credential document, when the domain has one. A domain that never issued one
+    /// has none to re-sign.
+    registry: Option<CredentialRegistry>,
+}
+
+impl WithoutCampaignDomain {
+    /// Refuses a relay that names an origin before anything else is read of it.
+    fn read(vault_path: &Path, vault: &AuthorityVault) -> Result<Self> {
+        let relay = DomainHandoff::beside(vault_path, vault)?;
+        if relay.astra_authority_url.is_some() {
+            return Err(OpenRefusal::OriginRecorded.into());
+        }
+        let identity = handoff::identity_of(&relay)?;
+        let current_ca = MlDsa87PublicKey::parse(vault.ca_pq_public_key.trim())?;
+        let registry = credentials::load(&credentials::path_beside(vault_path))?;
+        if let Some(registry) = &registry {
+            verify_document(registry, &current_ca, &identity)?;
+        }
+        Ok(Self {
+            relay,
+            identity,
+            current_ca,
+            registry,
+        })
+    }
+}
+
+/// The credential document is signed under the anchor the vault holds, for this domain.
+fn verify_document(
+    registry: &CredentialRegistry,
+    current_ca: &MlDsa87PublicKey,
+    identity: &DomainIdentity,
+) -> Result<()> {
+    registry.verify(
+        current_ca,
+        &identity.trust_domain_id,
+        &identity.gateway_wg_public_key,
+        identity.ca_epoch,
+        registry.credential_registry_epoch,
+    )?;
+    Ok(())
 }
 
 /// The dates the operator approves, and the ones signed.
@@ -354,12 +417,7 @@ pub fn open_with(
 ) -> Result<OpenedRotation> {
     ensure_nothing_outstanding(vault_path)?;
     ensure_same_vault(vault_path, &keys.vault)?;
-    if keys.count() != ANCHOR_ROTATION_CREDENTIALS {
-        bail!(
-            "une rotation de CA exige {ANCHOR_ROTATION_CREDENTIALS} clés validées, {} ici",
-            keys.count()
-        );
-    }
+    ensure_two_validated(&keys)?;
     let schedule = Schedule::of(kind, terms, now)?;
     let domain = LocalDomain::read(vault_path, &keys.vault, kind)?;
     ensure_keys_may_approve(&keys, &domain.registry)?;
@@ -419,6 +477,17 @@ pub fn open_with(
         manifest,
         approval,
     })
+}
+
+/// A rotation of either kind is proved by exactly two validated keys.
+fn ensure_two_validated(keys: &ValidatedKeys) -> Result<()> {
+    if keys.count() != ANCHOR_ROTATION_CREDENTIALS {
+        bail!(
+            "une rotation de CA exige {ANCHOR_ROTATION_CREDENTIALS} clés validées, {} ici",
+            keys.count()
+        );
+    }
+    Ok(())
 }
 
 /// What the touch does, with the whole campaign it signs: the authority replaced, and
@@ -724,10 +793,134 @@ impl OpenedRotation {
             activation_at: schedule.window.activation_at,
             not_after: schedule.window.not_after,
             signed_at: now,
+            without_campaign: false,
         };
         rotation_journal::save(&rotation_journal::path_beside(vault_path), &journal)?;
         Ok(journal)
     }
+}
+
+/// A `CA-PQ` rotation with no campaign, checked, and its manifest. It asks no key again:
+/// the two validated keys are its approval, and nothing is sent to Astra.
+pub struct OpenedWithoutCampaign {
+    keys: ValidatedKeys,
+    domain: WithoutCampaignDomain,
+    window: TransitionWindow,
+    manifest: AstraManifest,
+}
+
+impl OpenedWithoutCampaign {
+    /// What the operator approves. Shown before the signature.
+    pub fn manifest(&self) -> &AstraManifest {
+        &self.manifest
+    }
+
+    /// Signs on the vault in memory, and writes the journal at « Accepté »: the operator's
+    /// gesture stands for the acceptance Astra would give. Moves nothing else.
+    pub fn sign_and_journal(self, vault_path: &Path, now: u64) -> Result<RotationJournal> {
+        let Self {
+            keys,
+            domain,
+            window,
+            ..
+        } = self;
+        rotation_journal::ensure_none_in_flight(vault_path)?;
+        ensure_same_vault(vault_path, &keys.vault)?;
+
+        let ValidatedKeys {
+            mut vault,
+            openings,
+            ..
+        } = keys;
+        let WithoutCampaignDomain {
+            mut relay,
+            identity,
+            registry,
+            ..
+        } = domain;
+        let rotated = signing::rotate_ca_pq(
+            &mut vault,
+            &[&openings[0], &openings[1]],
+            &identity,
+            registry.as_ref(),
+            window,
+            now,
+        )?;
+        relay.ca_epoch = Some(rotated.transition.next_ca_epoch);
+        relay.adopt(&vault)?;
+
+        let transition = RotationTransition::CaPq(Box::new(rotated.transition));
+        let journal = RotationJournal {
+            format_version: rotation_journal::ROTATION_JOURNAL_VERSION,
+            kind: RotationKind::CaPq,
+            stage: JournalStage::Accepted,
+            deposit: None,
+            next_anchor_fingerprint: transition.next_anchor_fingerprint(),
+            transition,
+            next: Some(NextLocal {
+                vault,
+                credentials: registry.map(|_| rotated.bindings),
+                handoff: relay,
+            }),
+            campaign_expires_at: now,
+            activation_at: window.activation_at,
+            not_after: window.not_after,
+            signed_at: now,
+            without_campaign: true,
+        };
+        rotation_journal::save(&rotation_journal::path_beside(vault_path), &journal)?;
+        Ok(journal)
+    }
+}
+
+/// Opens a `CA-PQ` rotation with no campaign, from the two keys already validated.
+///
+/// Astra is read for the gateway's identity and never called to act. Everything it
+/// refuses is refused before the signature, and nothing is written.
+pub fn open_without_campaign(
+    remote: &dyn RotationRemote,
+    vault_path: &Path,
+    keys: ValidatedKeys,
+    terms: &RotationTerms,
+    now: u64,
+) -> Result<OpenedWithoutCampaign> {
+    ensure_nothing_outstanding(vault_path)?;
+    ensure_same_vault(vault_path, &keys.vault)?;
+    ensure_two_validated(&keys)?;
+    let schedule = Schedule::of(RotationKind::CaPq, terms, now)?;
+    let domain = WithoutCampaignDomain::read(vault_path, &keys.vault)?;
+    if let Some(registry) = &domain.registry {
+        ensure_keys_may_approve(&keys, registry)?;
+    }
+    ensure_no_window_open(&keys)?;
+    if keys.vault.retained_outgoing_ca_pq_public().is_some() {
+        return Err(OpenRefusal::CaPqToFinish.into());
+    }
+    let gateway = remote.gateway_identity()?;
+    if gateway.next_ca_fingerprint.is_some() || gateway.next_client_tls_ca_fingerprint.is_some() {
+        return Err(OpenRefusal::RotationInFlight.into());
+    }
+    if gateway.ca_pq_fingerprint != domain.current_ca.authority_fingerprint() {
+        return Err(OpenRefusal::AnchorsDisagree.into());
+    }
+
+    let manifest = AstraManifest::CaRotation(CaRotationManifest {
+        trust_domain_id: domain.identity.trust_domain_id,
+        affected_ca: AffectedCa::CaPq,
+        current_epoch: domain.identity.ca_epoch,
+        next_epoch: domain.identity.ca_epoch + 1,
+        activation_at: schedule.window.activation_at,
+        not_after: schedule.window.not_after,
+        outgoing_anchor_fingerprint: domain.current_ca.authority_fingerprint(),
+        next_anchor_fingerprint: None,
+        campaign: None,
+    });
+    Ok(OpenedWithoutCampaign {
+        keys,
+        domain,
+        window: schedule.window,
+        manifest,
+    })
 }
 
 /// The vault in place as Astra keeps it, with no credential document.
@@ -749,7 +942,8 @@ pub fn vault_copy(vault_path: &Path) -> Result<OperatorVaultCopy> {
 /// - [`ResumeStep::Finished`]: the copy was attempted and the journal is gone. A
 ///   copy that failed does not undo anything: the prerequisite reads it and the
 ///   screen offers to send it (spec §5.9). A client TLS rotation still has its
-///   prepared record, until « Terminer ».
+///   prepared record, until « Terminer ». A rotation without a campaign ends here
+///   with no copy at all, and Astra is not called.
 /// - [`ResumeStep::SendVaultCopy`]: Astra holds the copy back. The same copy passes
 ///   later, so the journal stays and the next look retries it.
 /// - [`ResumeStep::Discard`]: nothing was announced, and the journal is gone.
@@ -771,6 +965,15 @@ pub fn advance(
         authority: None,
         gateway_next: GatewayAnchor::NotRead,
     };
+    // A domain that gained an origin after its adoption never reaches the no-campaign
+    // path: nothing moves, and the gateway is not read. An unreadable relay goes up.
+    if journal.without_campaign
+        && handoff::load(&handoff::path_beside(vault_path))?
+            .astra_authority_url
+            .is_some()
+    {
+        return Ok(ResumeStep::DomainConflict);
+    }
     let mut install_sent = false;
     loop {
         match next_step(journal, &facts) {
@@ -798,6 +1001,11 @@ pub fn advance(
                 install(remote, journal)?;
                 install_sent = true;
                 facts.gateway_next = GatewayAnchor::NotRead;
+            }
+            // Without a campaign, Astra holds no copy to hold back: the journal ends here.
+            ResumeStep::SendVaultCopy if journal.without_campaign => {
+                rotation_journal::clear(&rotation_journal::path_beside(vault_path))?;
+                return Ok(ResumeStep::Finished);
             }
             ResumeStep::SendVaultCopy => return finish_with_the_copy(remote, vault_path, journal),
             ResumeStep::Discard => {

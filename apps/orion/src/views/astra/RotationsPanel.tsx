@@ -26,6 +26,7 @@ import {
   rotationRows,
 } from './rotationRows'
 import type { RotationAction, RotationRow } from './rotationRows'
+import { saveArtifact } from './ArtifactDownloads'
 import { GatewayIdentityBlock } from './GatewayIdentityBlock'
 import { RenewAllBlock } from './RenewAllBlock'
 import { PrerequisiteLine } from './PrerequisiteLine'
@@ -37,6 +38,10 @@ import { PrerequisiteLine } from './PrerequisiteLine'
 const POLL_MS = 15_000
 
 /** The amber of a row to do, as in the mockup the operator approved. */
+
+/** Said above the start of « Remplacer la CA-PQ sans campagne »: no authority checks it. */
+const NO_CAMPAIGN_WARNING =
+  'Aucune autorité ne vérifie ce remplacement : le coffre avance sur votre seul geste. À réserver à un domaine sans Astra.'
 
 const DEFAULT_REASON: Partial<Record<RotationAction, string>> = {
   renew_fleet: 'Renouvellement des postes',
@@ -52,6 +57,7 @@ export type CeremonyHandoff = (
   status: OperatorStatus,
   existingOperation?: string | null,
   chainStep?: ChainStepAsk,
+  withoutCampaign?: boolean,
 ) => void
 
 /** What a step is given to run once every prerequisite is green. */
@@ -101,6 +107,7 @@ export function RotationsPanel({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [transitionError, setTransitionError] = useState<string | null>(null)
   const [reason, setReason] = useState('')
   const onOverviewRef = useRef(onOverview)
   onOverviewRef.current = onOverview
@@ -164,6 +171,19 @@ export function RotationsPanel({
   const existing = overview && chosen ? liveOperation(overview, chosen.action, now) : null
   // The row can turn impossible after it was chosen: its step is then not offered.
   const open = green && chosen?.disabledReason === null
+
+  // The transition of a rotation without a campaign the gateway has not taken: read beside
+  // the vault, so it is there after a restart and with the tunnel down.
+  const downloadTransition = async () => {
+    setTransitionError(null)
+    try {
+      const file = await api.operatorRotationTransitionFile()
+      if (file) saveArtifact(file)
+      else setTransitionError('Aucune transition à télécharger')
+    } catch (cause) {
+      setTransitionError(`Transition illisible : ${String(cause)}`)
+    }
+  }
 
   const choose = (action: RotationAction) => {
     setError(null)
@@ -350,6 +370,27 @@ export function RotationsPanel({
             >
               {resumable ? 'Reprendre' : row.button}
             </Button>
+            {row.action === 'resume' &&
+              overview.journal?.withoutCampaign === true &&
+              overview.journal.stage === 'applied' &&
+              overview.relayNamesOrigin === false && (
+                <>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    color="inherit"
+                    onClick={() => void downloadTransition()}
+                    sx={{ mt: 0.75, ml: 1, minHeight: 28, fontSize: 12 }}
+                  >
+                    Télécharger la transition
+                  </Button>
+                  {transitionError && (
+                    <Typography sx={{ fontSize: 11.5, color: '#B91C1C', mt: 0.5 }}>
+                      {transitionError}
+                    </Typography>
+                  )}
+                </>
+              )}
           </Paper>
         )
       })}
@@ -379,12 +420,18 @@ export function RotationsPanel({
             Vérifier
           </Button>
           {/* A warning, not a block: the workstations are named, the step stays open. */}
-          {chosen.action === 'replace_ca_pq' &&
+          {(chosen.action === 'replace_ca_pq' ||
+            chosen.action === 'replace_ca_pq_without_campaign') &&
             expiringWorkstationWarnings(overview, now).map((warning) => (
               <Typography key={warning} sx={{ mt: 0.75, fontSize: 11.5, color: DUE_BORDER }}>
                 {warning}
               </Typography>
             ))}
+          {chosen.action === 'replace_ca_pq_without_campaign' && (
+            <Alert severity="warning" variant="outlined" sx={{ mt: 0.75, fontSize: 11.5 }}>
+              {NO_CAMPAIGN_WARNING}
+            </Alert>
+          )}
 
           {(chosen.action === 'renew_fleet' || chosen.action === 'renew_delegation') && (
             <Box sx={{ mt: 1.25 }}>

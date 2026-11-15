@@ -43,7 +43,9 @@ use astra_operator::operations::rotation::{
     DEFAULT_PREPARE_DAYS,
 };
 use astra_operator::origin::CampaignRequest;
-use astra_operator::rotation_journal::{self, JournalStage, RotationJournal, RotationKind};
+use astra_operator::rotation_journal::{
+    self, JournalStage, RotationJournal, RotationKind, RotationTransition,
+};
 use astra_operator::tunnel::{admin_refusal, Tunnel, VaultCopySent};
 use astra_operator::vault::{CaTlsAdvance, SlotRole, SlotSecret};
 use astra_operator::vault_gestures::{add_key_with, create_first_key, finalize_with};
@@ -53,9 +55,9 @@ use zeroize::Zeroizing;
 
 use super::*;
 use crate::operator::rotations::{
-    obtain_chain_step, ChainRemote, CHAIN_FINISHED, CHAIN_FINISHED_NEXT,
+    obtain_chain_step, ChainRemote, JournalView, CHAIN_FINISHED, CHAIN_FINISHED_NEXT,
 };
-use crate::operator::{OperatorCeremony, RotationGesture, Words};
+use crate::operator::{ArtifactEncoding, OperatorCeremony, RotationGesture, Words};
 
 const NOW: u64 = 1_800_000_000;
 const EXPIRES: u64 = NOW + 300;
@@ -416,6 +418,10 @@ impl RotationRemote for Remote {
             .expect("an authority"))
     }
 
+    fn gateway_identity(&self) -> anyhow::Result<astra_operator::tunnel::GatewayIdentityRead> {
+        panic!("the campaign path reads the authority, not the gateway identity")
+    }
+
     fn send_vault_copy(&self, copy: &OperatorVaultCopy) -> anyhow::Result<VaultCopySent> {
         self.note("send_vault_copy");
         self.sent_with_credentials
@@ -492,6 +498,16 @@ impl Drop for TempDirectory {
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
 fn bench() -> Arc<Bench> {
+    bench_with_origin(true)
+}
+
+/// A finished domain whose relay names no Astra origin: the CA-PQ can be replaced without a
+/// campaign.
+fn bench_without_origin() -> Arc<Bench> {
+    bench_with_origin(false)
+}
+
+fn bench_with_origin(origin: bool) -> Arc<Bench> {
     let directory = std::env::temp_dir().join(format!(
         "orion-rotation-{}-{}",
         std::process::id(),
@@ -527,6 +543,9 @@ fn bench() -> Arc<Bench> {
     let (service_key, service_public) = generate_ml_dsa_87_keypair().expect("service key");
     let relay_path = handoff::path_beside(&path);
     let mut relay = handoff::load(&relay_path).expect("relay");
+    if !origin {
+        relay.astra_authority_url = None;
+    }
     relay.gateway_wg_public_key = Some(gateway_key().to_base64());
     relay.server_name = Some(SERVER_NAME.into());
     relay.astra_service_public_key = Some(service_public.to_base64());
@@ -553,7 +572,9 @@ fn bench() -> Arc<Bench> {
         touch_ends_at: AtomicU64::new(0),
         chain_asked: Mutex::default(),
     };
-    bench.arm(EXPIRES);
+    if origin {
+        bench.arm(EXPIRES);
+    }
     *bench.remote.authority.lock().expect("lock") = Some(bench.nothing_in_flight());
     *bench.remote.gateway_anchor.lock().expect("lock") = Some(Fingerprint::of(b"ancre sortante"));
     Arc::new(bench)
@@ -567,6 +588,8 @@ struct Ran {
     still_held: bool,
     /// The sentence the failed ceremony stored for the page, if it stored one.
     words: Option<String>,
+    /// The files the run offered.
+    artifacts: Vec<OperatorArtifact>,
 }
 
 impl Ran {
@@ -861,6 +884,10 @@ impl Bench {
             chain: &chain,
         };
         let words = Words::default();
+        let deposited = Mutex::new(Vec::new());
+        let mut deposit = |artifact: OperatorArtifact| {
+            deposited.lock().expect("lock").push(artifact);
+        };
         let mut publish = |status: OperatorStatus| {
             match script(&status, self) {
                 Answer::Nothing => {}
@@ -895,6 +922,7 @@ impl Bench {
             &self.path,
             &words,
             &reach,
+            &mut deposit,
         );
         let outcome = run.run(gesture);
         let still_held = !matches!(run.openings.held, Held::Nothing);
@@ -908,6 +936,7 @@ impl Bench {
             published,
             still_held,
             words,
+            artifacts: deposited.into_inner().expect("lock"),
         }
     }
 
@@ -1107,6 +1136,7 @@ fn without_a_tunnel_no_gesture_reaches_a_key() {
             &bench.path,
             &Mutex::default(),
             &Words::default(),
+            &mut |_artifact| panic!("no tunnel, so no file is offered"),
         );
         drop(presses);
         outcome.expect_err("no tunnel");
@@ -2526,6 +2556,7 @@ async fn open_session(
                     &running.path,
                     &thread_words,
                     &reach,
+                    &mut |_artifact| {},
                 )
                 .run(gesture)
             },
@@ -2752,6 +2783,11 @@ fn the_gestures_name_no_value() {
             r#"{"gesture":"replace_ca_tls"}"#,
             RotationGesture::ReplaceCaTls,
             OperationKind::RotateClientTlsCa,
+        ),
+        (
+            r#"{"gesture":"replace_ca_pq_without_campaign"}"#,
+            RotationGesture::ReplaceCaPqWithoutCampaign,
+            OperationKind::RotateAnchor,
         ),
         (
             r#"{"gesture":"finish_ca_tls"}"#,
@@ -3047,6 +3083,31 @@ async fn a_resume_towards_another_domains_gateway_starts_nothing() {
         std::fs::read(rotation_journal::path_beside(&bench.path)).expect("journal"),
         before
     );
+}
+
+/// The no-campaign replacement reads the gateway and posts to it: a gateway the relay does not
+/// name is refused before any call and before any key.
+#[tokio::test(flavor = "multi_thread")]
+async fn replace_without_campaign_refuses_another_gateway() {
+    let bench = bench_without_origin();
+    let vault = bench.vault_bytes();
+    let ceremony = OperatorCeremony::default();
+
+    ceremony
+        .begin_rotation(
+            RotationGesture::ReplaceCaPqWithoutCampaign,
+            Some(towards_another_gateway()),
+            bench.path.clone(),
+            Arc::default(),
+        )
+        .await
+        .expect("a session");
+    let ended = until(&ceremony, |status| status.gesture.is_terminal()).await;
+
+    assert_eq!(ended.refusal, Some(Refusal::HandoffMismatch));
+    assert_eq!(bench.touches(), 0, "no key is touched");
+    assert!(bench.journal().is_none());
+    assert_eq!(bench.vault_bytes(), vault);
 }
 
 /// The gesture of the button says so, before any call, and moves nothing.
@@ -4091,4 +4152,346 @@ fn finish_ca_pq_says_a_stranger_key_is_not_enrolled() {
         "the stranger's key is named as not enrolled"
     );
     ran.done();
+}
+
+// Without a campaign: the gateway alone.
+
+/// The gateway of a domain with no Astra origin. Every call of Astra panics: a rotation
+/// without a campaign never makes one.
+struct GatewayOnly {
+    anchor: Fingerprint,
+    calls: Mutex<Vec<&'static str>>,
+    gateway_anchor: Mutex<Option<Fingerprint>>,
+    /// Whether the gateway cannot be reached for the installation.
+    unreachable_install: AtomicBool,
+}
+
+impl GatewayOnly {
+    fn of(bench: &Bench) -> Self {
+        let relay = bench.relay();
+        let anchor = MlDsa87PublicKey::parse(relay.ca_pq_public_key.trim())
+            .expect("anchor")
+            .authority_fingerprint();
+        Self {
+            anchor,
+            calls: Mutex::default(),
+            gateway_anchor: Mutex::new(Some(anchor)),
+            unreachable_install: AtomicBool::new(false),
+        }
+    }
+
+    fn calls_of(&self, name: &str) -> usize {
+        self.calls
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|called| **called == name)
+            .count()
+    }
+}
+
+impl RotationRemote for GatewayOnly {
+    fn open_campaign(&self, _request: &OperatorOpenRequest) -> anyhow::Result<OperatorOpened> {
+        panic!("Astra is called by a rotation with a campaign only")
+    }
+
+    fn fetch_campaign(&self, _operation_id: &Id16) -> anyhow::Result<CampaignRequest> {
+        panic!("Astra is called by a rotation with a campaign only")
+    }
+
+    fn submit_campaign(
+        &self,
+        _operation_id: &Id16,
+        _result_token: &str,
+        _result: &AstraSignerResult,
+    ) -> anyhow::Result<SigningOperationState> {
+        panic!("Astra is called by a rotation with a campaign only")
+    }
+
+    fn authority_status(&self) -> anyhow::Result<OperatorAuthorityStatus> {
+        panic!("Astra is called by a rotation with a campaign only")
+    }
+
+    fn send_vault_copy(&self, _copy: &OperatorVaultCopy) -> anyhow::Result<VaultCopySent> {
+        panic!("Astra is called by a rotation with a campaign only")
+    }
+
+    fn install_ca_transition(&self, transition: &CaTransition) -> anyhow::Result<()> {
+        self.calls
+            .lock()
+            .expect("lock")
+            .push("install_ca_transition");
+        if self.unreachable_install.load(Ordering::SeqCst) {
+            return Tunnel::new("http://127.0.0.1:1")
+                .expect("tunnel")
+                .install_ca_transition(transition);
+        }
+        *self.gateway_anchor.lock().expect("lock") = Some(transition.next_ca_fingerprint);
+        Ok(())
+    }
+
+    fn install_client_tls_ca_transition(
+        &self,
+        _transition: &ClientTlsCaTransition,
+    ) -> anyhow::Result<()> {
+        panic!("a CA-PQ rotation installs no client TLS CA")
+    }
+
+    fn gateway_next_anchor(&self, _kind: RotationKind) -> anyhow::Result<Option<Fingerprint>> {
+        self.calls.lock().expect("lock").push("gateway_next_anchor");
+        Ok(*self.gateway_anchor.lock().expect("lock"))
+    }
+
+    fn gateway_identity(&self) -> anyhow::Result<astra_operator::tunnel::GatewayIdentityRead> {
+        self.calls.lock().expect("lock").push("gateway_identity");
+        Ok(serde_json::from_value(serde_json::json!({
+            "ca_pq_fingerprint": self.anchor,
+        }))
+        .expect("the gateway identity"))
+    }
+}
+
+#[test]
+fn replace_without_campaign_runs_two_keys_and_poses_the_transition() {
+    let bench = bench_without_origin();
+    let anchor_before = bench.relay().ca_pq_public_key;
+    let gateway = GatewayOnly::of(&bench);
+
+    let ran = bench.drive_against(
+        &gateway,
+        RotationGesture::ReplaceCaPqWithoutCampaign,
+        Bench::all_the_way,
+    );
+
+    ran.done();
+    assert_eq!(bench.touches(), 2, "two validations, and no approval");
+    assert!(!ran.purpose_asked(KeyPurpose::ApproveCampaign));
+    assert!(bench.journal().is_none());
+    assert_ne!(
+        bench.relay().ca_pq_public_key,
+        anchor_before,
+        "the vault moved"
+    );
+    assert_eq!(gateway.calls_of("install_ca_transition"), 1);
+    assert!(ran.artifacts.is_empty(), "nothing to offer once posed");
+}
+
+#[test]
+fn replace_without_campaign_refuses_an_origin_before_any_key() {
+    let bench = bench();
+    let gateway = GatewayOnly::of(&bench);
+
+    let ran = bench.drive_against(
+        &gateway,
+        RotationGesture::ReplaceCaPqWithoutCampaign,
+        Bench::all_the_way,
+    );
+
+    ran.refused(Refusal::ManifestMismatch);
+    assert!(ran.asked_no_key());
+    assert_eq!(bench.touches(), 0);
+    assert!(bench.journal().is_none());
+}
+
+#[test]
+fn replace_without_campaign_offers_the_transition_when_the_gateway_fails() {
+    let bench = bench_without_origin();
+    let gateway = GatewayOnly::of(&bench);
+    gateway.unreachable_install.store(true, Ordering::SeqCst);
+
+    let ran = bench.drive_against(
+        &gateway,
+        RotationGesture::ReplaceCaPqWithoutCampaign,
+        Bench::all_the_way,
+    );
+
+    ran.refused(Refusal::GatewayUnavailable);
+    let journal = bench.journal().expect("the journal is kept");
+    assert_eq!(journal.stage, JournalStage::Applied);
+    assert!(journal.without_campaign);
+    let [artifact] = ran.artifacts.as_slice() else {
+        panic!("one transition offered, got {:?}", ran.artifacts);
+    };
+    assert_eq!(artifact.file_name, "ca-pq-transition.json");
+    assert_eq!(artifact.encoding, ArtifactEncoding::Text);
+    assert_eq!(artifact.fingerprint, None);
+    let RotationTransition::CaPq(transition) = &journal.transition else {
+        panic!("a CA-PQ transition");
+    };
+    let offered: CaTransition =
+        serde_json::from_str(&artifact.contents).expect("the offered transition reads back");
+    assert_eq!(offered, **transition);
+    assert!(artifact.contents.ends_with('\n'));
+}
+
+#[test]
+fn a_domain_conflict_on_a_rotation_without_campaign_offers_no_transition() {
+    let bench = bench_without_origin();
+    let gateway = GatewayOnly::of(&bench);
+    gateway.unreachable_install.store(true, Ordering::SeqCst);
+    bench.drive_against(
+        &gateway,
+        RotationGesture::ReplaceCaPqWithoutCampaign,
+        Bench::all_the_way,
+    );
+    assert_eq!(
+        bench.journal().expect("kept").stage,
+        JournalStage::Applied,
+        "the vault moved"
+    );
+    // The relay gains an origin: the transition is no longer the operator's to pose.
+    let relay_path = handoff::path_beside(&bench.path);
+    let mut relay = bench.relay();
+    relay.astra_authority_url = Some(AUTHORITY_URL.into());
+    handoff::save(&relay_path, &relay).expect("relay saved");
+
+    let ran = bench.drive_against(&gateway, RotationGesture::Resume, Bench::all_the_way);
+
+    ran.refused(Refusal::DomainConflict);
+    assert!(ran.artifacts.is_empty(), "{:?}", ran.artifacts);
+    assert!(bench.journal().is_some(), "the rotation is kept");
+}
+
+#[test]
+fn the_transition_file_is_read_beside_the_vault_while_the_applied_journal_lasts() {
+    let bench = bench_without_origin();
+    let vault = Ok(bench.path.clone());
+    assert_eq!(rotations::read_transition_file(&vault), None, "no journal");
+
+    let gateway = GatewayOnly::of(&bench);
+    gateway.unreachable_install.store(true, Ordering::SeqCst);
+    let ran = bench.drive_against(
+        &gateway,
+        RotationGesture::ReplaceCaPqWithoutCampaign,
+        Bench::all_the_way,
+    );
+    let [offered] = ran.artifacts.as_slice() else {
+        panic!("one transition offered");
+    };
+    // The same bytes as the session offered, with no tunnel and no session.
+    assert_eq!(
+        rotations::read_transition_file(&vault).as_ref(),
+        Some(offered)
+    );
+
+    // Accepted: the vault has not moved, so there is nothing to pose.
+    let mut accepted = bench.journal().expect("journal");
+    accepted.stage = JournalStage::Accepted;
+    rotation_journal::save(&rotation_journal::path_beside(&bench.path), &accepted).expect("saved");
+    assert_eq!(rotations::read_transition_file(&vault), None);
+
+    // Once the gateway has it, the journal goes and so does the file.
+    let _ = std::fs::remove_file(rotation_journal::path_beside(&bench.path));
+    assert_eq!(rotations::read_transition_file(&vault), None);
+    assert_eq!(rotations::read_transition_file(&Err("x".into())), None);
+}
+
+#[test]
+fn the_transition_file_is_withheld_once_the_relay_names_an_origin() {
+    let bench = bench_without_origin();
+    let vault = Ok(bench.path.clone());
+    let gateway = GatewayOnly::of(&bench);
+    gateway.unreachable_install.store(true, Ordering::SeqCst);
+    let ran = bench.drive_against(
+        &gateway,
+        RotationGesture::ReplaceCaPqWithoutCampaign,
+        Bench::all_the_way,
+    );
+    let [offered] = ran.artifacts.as_slice() else {
+        panic!("one transition offered");
+    };
+    assert_eq!(
+        rotations::read_transition_file(&vault).as_ref(),
+        Some(offered)
+    );
+
+    // The relay gains an origin: the transition is no longer the operator's to pose.
+    let relay_path = handoff::path_beside(&bench.path);
+    let mut relay = bench.relay();
+    relay.astra_authority_url = Some(AUTHORITY_URL.into());
+    handoff::save(&relay_path, &relay).expect("relay saved");
+    assert_eq!(
+        rotations::read_transition_file(&vault),
+        None,
+        "origin named"
+    );
+
+    // A relay that cannot be read is fail-closed as well.
+    std::fs::remove_file(&relay_path).expect("relay removed");
+    assert_eq!(
+        rotations::read_transition_file(&vault),
+        None,
+        "relay unreadable"
+    );
+}
+
+#[test]
+fn a_campaign_journal_offers_no_transition_file() {
+    let campaign = bench_with_origin(true);
+    campaign
+        .remote
+        .deposits
+        .lock()
+        .expect("lock")
+        .push_back(503);
+    campaign.drive(RotationGesture::ReplaceCaPq, Bench::all_the_way);
+    let journal = campaign.journal().expect("kept");
+    assert!(!journal.without_campaign);
+    assert_eq!(
+        rotations::read_transition_file(&Ok(campaign.path.clone())),
+        None
+    );
+}
+
+#[test]
+fn resume_without_campaign_never_reads_astra() {
+    let bench = bench_without_origin();
+    let gateway = GatewayOnly::of(&bench);
+    // The journal of an acceptance nothing has applied: the two keys are validated and the
+    // rotation signed, as the ceremony does before it carries the journal.
+    let mut keys = ValidatedKeys::new(&bench.path).expect("keys");
+    keys.validate(&*bench.keys[0]).expect("the first key");
+    keys.validate(&*bench.keys[1]).expect("the second key");
+    rotation::open_without_campaign(&gateway, &bench.path, keys, &terms(), NOW)
+        .expect("opened without a campaign")
+        .sign_and_journal(&bench.path, NOW)
+        .expect("signed");
+    assert_eq!(
+        bench.journal().expect("the journal").stage,
+        JournalStage::Accepted
+    );
+
+    let ran = bench.drive_against(&gateway, RotationGesture::Resume, Bench::all_the_way);
+
+    ran.done();
+    assert!(ran.asked_no_key());
+    assert!(bench.journal().is_none());
+    assert_eq!(gateway.calls_of("install_ca_transition"), 1);
+}
+
+#[test]
+fn the_journal_view_says_whether_a_campaign_leads_it() {
+    let bench = bench_without_origin();
+    let gateway = GatewayOnly::of(&bench);
+    gateway.unreachable_install.store(true, Ordering::SeqCst);
+    bench.drive_against(
+        &gateway,
+        RotationGesture::ReplaceCaPqWithoutCampaign,
+        Bench::all_the_way,
+    );
+    let shown =
+        serde_json::to_value(JournalView::of(&bench.journal().expect("kept"))).expect("json");
+    assert_eq!(shown["withoutCampaign"], true);
+
+    let campaign = bench_with_origin(true);
+    campaign
+        .remote
+        .deposits
+        .lock()
+        .expect("lock")
+        .push_back(503);
+    campaign.drive(RotationGesture::ReplaceCaPq, Bench::all_the_way);
+    let shown =
+        serde_json::to_value(JournalView::of(&campaign.journal().expect("kept"))).expect("json");
+    assert_eq!(shown["withoutCampaign"], false);
 }

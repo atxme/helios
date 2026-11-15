@@ -50,6 +50,7 @@ la décision » (§7.1, §8).
 | Reprendre une rotation | reprend une rotation signée qui n'est pas allée au bout ; automatique à la montée du tunnel | §3, §9 |
 | Renouveler les postes | ouvre la campagne de parc et enchaîne les touchers | §2 |
 | Remplacer la CA-PQ | ouvre `trust_authorities`, signe, dépose, installe sur la gateway | §3 |
+| Remplacer la CA-PQ sans campagne | domaine sans origine Astra seulement : deux clés, la transition posée par le tunnel, sans Astra (F14-e) | §3 |
 | Remplacer la CA TLS | idem pour la CA TLS | §9 |
 | Renouveler la délégation | délégation de l'émetteur, sans fichier ni redémarrage | §4 |
 | Révoquer un poste | onglet *Postes* : coupe le poste tout de suite, puis signe la révocation (lot 5c) | §7 |
@@ -222,6 +223,29 @@ attend un clic sur la fermeture de cet écran. La ligne montre la date de fin de
 rotation et, pendant le recouvrement, « Ancre entrante … » : **comparer cette
 empreinte à celle que l'on a créée**, car elle n'existe pas avant la signature
 et ne se montre donc qu'après. Les commandes suivantes sont le recours.
+
+**Sans origine Astra : « Remplacer la CA-PQ sans campagne »** (F14-e). Dans un domaine
+dont le relais ne nomme aucune origine Astra, la ligne « Remplacer la CA-PQ sans campagne »
+remplace « Remplacer la CA-PQ » ; avec une origine, même illisible, elle n'apparaît pas. Elle
+tient lieu, hors campagne, de `astra-signer rotate-ca-pq` et des commandes de cette section :
+rien à ouvrir ni à approuver chez Astra. Prérequis : tunnel monté, administrateur du tunnel,
+coffre, clés, domaine ; ni Astra ni copie du coffre n'interviennent. Un avertissement précède
+les clés : « Aucune autorité ne vérifie ce remplacement : le coffre avance sur votre seul
+geste. À réserver à un domaine sans Astra. » Deux clés sont validées, sans toucher
+d'approbation, puis les durées et la signature. Le coffre, les credentials (s'il en existe
+un ; il n'est pas requis) et le relais avancent sur ce geste, puis Orion pose la transition
+sur la gateway par le tunnel. Avant toute clé, la cérémonie refuse si le relais nomme une
+origine, si le tunnel atteint une gateway que le relais ne nomme pas, ou si une rotation est
+en cours. Les autres contrôles passent après les deux validations et les durées : un
+recouvrement ouvert, la CA-PQ sortante encore gardée (« Terminer la rotation CA-PQ »
+d'abord), une CA-PQ ou une CA TLS suivante déjà annoncée par la gateway, une CA-PQ courante de
+la gateway qui n'est pas celle du coffre.
+
+Si la pose n'aboutit pas, `ca-pq-transition.json` est offert en téléchargement : à installer
+à la main avec `heliosd install-ca-transition` ou depuis l'écran *Certificats* de la gateway.
+La ligne « Reprendre » le garde sous « Télécharger la transition » tant que le journal existe, tunnel coupé ou Orion relancé. « Reprendre » finit la rotation plus tard, sans Astra. Un journal de rotation hors campagne
+laissé par `astra-signer rotate-ca-pq` dans un domaine sans origine se reprend de la même
+façon ; dans un domaine avec origine, la reprise lit Astra d'abord, comme avant.
 
 **Sur la gateway** :
 
@@ -1453,8 +1477,11 @@ dans [ROADMAP.md](ROADMAP.md) (F14-a à F14-f).
   lot 7) : sa reprise déplace le coffre, les credentials et le relais sans parole
   d'Astra, par le geste voulu de l'opérateur ; c'est une exception à la règle
   d'Orion « le coffre ne bouge qu'après l'acceptation d'Astra ». Un journal
-  adopté d'un tel enregistrement se lit d'abord auprès d'Astra. Le successeur de
-  ce recours, quand F14 absorbe `astra-signer`, reste à nommer.
+  adopté d'un tel enregistrement se lit d'abord auprès d'Astra. Son successeur est
+  « Remplacer la CA-PQ sans campagne » dans Orion (F14-e), et l'exception ne vaut
+  que dans un domaine sans origine Astra. Avec une origine, la reprise lit Astra
+  d'abord, et affiche « Domaine en désaccord » si le relais en nomme une entre-temps.
+  Tant qu'une telle rotation est en cours, le relais refuse de recevoir une origine Astra.
 - **La copie du coffre sur la gateway** : un administrateur du tunnel peut la
   remplacer (Astra n'en lit que le domaine, et ne peut pas l'ouvrir) ; une
   génération précédente est gardée, pas davantage ; une sauvegarde hors de la

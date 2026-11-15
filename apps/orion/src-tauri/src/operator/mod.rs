@@ -416,6 +416,9 @@ pub enum RotationGesture {
     ReplaceCaPq,
     /// Replaces the client TLS CA, in the same four touches.
     ReplaceCaTls,
+    /// Replaces the CA-PQ of a domain whose relay names no Astra origin: two keys validated,
+    /// then the rotation carried to its end, with no campaign.
+    ReplaceCaPqWithoutCampaign,
     /// Ends a client TLS rotation past `not_after`, with one key.
     FinishCaTls,
     /// Ends a CA-PQ rotation: destroys the outgoing `CA-PQ` kept for the overlap, with one key.
@@ -428,7 +431,10 @@ impl RotationGesture {
     /// `Resume` names what it found once it has read the journal.
     fn operation(self) -> OperationKind {
         match self {
-            Self::ReplaceCaPq | Self::FinishCaPq | Self::Resume => OperationKind::RotateAnchor,
+            Self::ReplaceCaPq
+            | Self::ReplaceCaPqWithoutCampaign
+            | Self::FinishCaPq
+            | Self::Resume => OperationKind::RotateAnchor,
             Self::ReplaceCaTls | Self::FinishCaTls => OperationKind::RotateClientTlsCa,
         }
     }
@@ -969,7 +975,7 @@ impl OperatorCeremony {
             gesture.operation(),
             false,
             Some(words),
-            move |session_id, presses, publish, _artifacts| {
+            move |session_id, presses, publish, artifacts| {
                 ceremony::run_rotation(
                     session_id,
                     gesture,
@@ -979,6 +985,7 @@ impl OperatorCeremony {
                     &vault_path,
                     &chain_opened,
                     &thread_words,
+                    &mut |artifact| deposit(artifacts, artifact),
                 )
             },
         )
@@ -1179,7 +1186,7 @@ impl OperatorCeremony {
                 gesture.operation(),
                 true,
                 None,
-                move |session_id, presses, publish, _artifacts| {
+                move |session_id, presses, publish, artifacts| {
                     ceremony::run_rotation(
                         session_id,
                         gesture,
@@ -1189,6 +1196,7 @@ impl OperatorCeremony {
                         &vault_path,
                         &StdMutex::new(None),
                         &Words::default(),
+                        &mut |artifact| deposit(artifacts, artifact),
                     )
                 },
             )

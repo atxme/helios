@@ -215,6 +215,10 @@ impl RotationRemote for Remote {
         }
         Ok(*self.gateway_anchor.borrow())
     }
+
+    fn gateway_identity(&self) -> Result<GatewayIdentityRead> {
+        panic!("the campaign path reads the authority, not the gateway identity")
+    }
 }
 
 impl Domain {
@@ -1700,6 +1704,14 @@ fn a_dead_campaign_with_the_status_read_failing_keeps_the_journal() {
 /// What `astra-signer` leaves behind, adopted: it holds no deposit and does not
 /// say whether one went out.
 fn adopted_legacy_journal(domain: &Domain) -> RotationJournal {
+    write_legacy_ca_pq(domain);
+    rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal")
+}
+
+/// Writes the CA-PQ file `astra-signer` leaves beside the vault, and names it.
+fn write_legacy_ca_pq(domain: &Domain) -> PathBuf {
     let mut vault = store::load(&domain.path).expect("vault");
     let relay = domain.relay();
     let identity = handoff::identity_of(&relay).expect("identity");
@@ -1727,14 +1739,9 @@ fn adopted_legacy_journal(domain: &Domain) -> RotationJournal {
         transition: rotated.transition,
         handoff: next_handoff,
     };
-    documents::write(
-        &rotation_journal::legacy_ca_pq_path_beside(&domain.path),
-        &legacy,
-    )
-    .expect("written");
-    rotation_journal::adopt_legacy(&domain.path)
-        .expect("adopted")
-        .expect("a journal")
+    let legacy_path = rotation_journal::legacy_ca_pq_path_beside(&domain.path);
+    documents::write(&legacy_path, &legacy).expect("written");
+    legacy_path
 }
 
 /// The user's rule, and `next_step` is its only barrier: `apply_local` does not
@@ -2658,4 +2665,464 @@ fn resume_trigger_reads_a_record_it_cannot_parse_as_an_error() {
     let domain = domain();
     std::fs::write(prepared::path_beside(&domain.path), b"illisible").expect("written");
     assert!(rotation_journal::something_to_resume(&domain.path).is_err());
+}
+
+/// The domain's relay in place, with no Astra origin: no campaign exists for it.
+fn without_origin(domain: &Domain) {
+    let path = handoff::path_beside(&domain.path);
+    let mut relay = handoff::load(&path).expect("relay");
+    relay.astra_authority_url = None;
+    handoff::save(&path, &relay).expect("relay saved");
+}
+
+/// A rotation without a campaign: the gateway names the outgoing anchor until the
+/// transition is installed, then the next one. Astra is never called.
+struct WithoutCampaign {
+    outgoing: Fingerprint,
+    next: Fingerprint,
+    installs: Cell<u32>,
+    reads: Cell<u32>,
+    identity: GatewayIdentityRead,
+}
+
+impl RotationRemote for WithoutCampaign {
+    fn open_campaign(&self, _: &OperatorOpenRequest) -> Result<OperatorOpened> {
+        panic!("a rotation without a campaign opens none")
+    }
+
+    fn fetch_campaign(&self, _: &Id16) -> Result<CampaignRequest> {
+        panic!("a rotation without a campaign fetches none")
+    }
+
+    fn submit_campaign(
+        &self,
+        _: &Id16,
+        _: &str,
+        _: &AstraSignerResult,
+    ) -> Result<SigningOperationState> {
+        panic!("a rotation without a campaign deposits nothing")
+    }
+
+    fn authority_status(&self) -> Result<OperatorAuthorityStatus> {
+        panic!("a rotation without a campaign never reads Astra")
+    }
+
+    fn send_vault_copy(&self, _: &OperatorVaultCopy) -> Result<VaultCopySent> {
+        panic!("a rotation without a campaign sends no copy")
+    }
+
+    fn install_ca_transition(&self, _: &CaTransition) -> Result<()> {
+        self.installs.set(self.installs.get() + 1);
+        Ok(())
+    }
+
+    fn install_client_tls_ca_transition(&self, _: &ClientTlsCaTransition) -> Result<()> {
+        panic!("a CA-PQ rotation installs no client TLS transition")
+    }
+
+    fn gateway_next_anchor(&self, kind: RotationKind) -> Result<Option<Fingerprint>> {
+        assert_eq!(kind, RotationKind::CaPq);
+        self.reads.set(self.reads.get() + 1);
+        Ok(Some(if self.installs.get() == 0 {
+            self.outgoing
+        } else {
+            self.next
+        }))
+    }
+
+    fn gateway_identity(&self) -> Result<GatewayIdentityRead> {
+        Ok(self.identity.clone())
+    }
+}
+
+#[test]
+fn advance_without_campaign_finishes_without_the_copy() {
+    let domain = domain();
+    let signed = domain.signed(RotationKind::CaPq);
+    without_origin(&domain);
+    let mut journal = RotationJournal {
+        without_campaign: true,
+        deposit: None,
+        stage: JournalStage::Accepted,
+        ..signed
+    };
+    let next_vault = journal.next.as_ref().expect("next").vault.clone();
+    rotation_journal::save(&rotation_journal::path_beside(&domain.path), &journal).expect("saved");
+    let remote = WithoutCampaign {
+        outgoing: journal.transition.outgoing_anchor_fingerprint(),
+        next: journal.next_anchor_fingerprint,
+        installs: Cell::new(0),
+        reads: Cell::new(0),
+        identity: gateway_names(&domain.path),
+    };
+
+    let step = advance(&remote, &domain.path, &mut journal, NOW).expect("advanced");
+
+    assert_eq!(step, ResumeStep::Finished);
+    assert_eq!(remote.installs.get(), 1);
+    assert_eq!(domain.journal_on_disk(), None);
+    assert_eq!(store::load(&domain.path).expect("vault"), next_vault);
+}
+
+/// Without an origin, the file beside the vault is a rotation with no campaign.
+#[test]
+fn adopt_legacy_without_origin_marks_without_campaign() {
+    let domain = domain();
+    without_origin(&domain);
+    write_legacy_ca_pq(&domain);
+
+    let journal = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+
+    assert!(journal.without_campaign);
+    assert!(!journal.awaits_confirmation());
+}
+
+/// With an origin, the adoption is the one that waits for Astra, whatever its value.
+#[test]
+fn legacy_ca_pq_with_origin_still_awaits_confirmation() {
+    let domain = domain();
+    write_legacy_ca_pq(&domain);
+
+    let journal = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+
+    assert!(!journal.without_campaign);
+    assert!(journal.awaits_confirmation());
+}
+
+/// The older file is what a stop leaves behind: it goes only once the vault is
+/// applied, so a second adoption before that keeps it.
+#[test]
+fn legacy_file_stays_until_applied_without_campaign() {
+    let domain = domain();
+    without_origin(&domain);
+    let legacy_path = write_legacy_ca_pq(&domain);
+    let mut journal = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+
+    let again = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted again")
+        .expect("a journal");
+
+    assert_eq!(again, journal);
+    assert!(legacy_path.exists(), "it stays until the vault is applied");
+
+    rotation_journal::apply_local(&domain.path, &mut journal).expect("applied");
+
+    assert!(!legacy_path.exists());
+}
+
+/// A domain that gained an origin after its journal was adopted: it never reaches the
+/// no-campaign path. Stopped before any step, with the gateway and the vault untouched.
+#[test]
+fn advance_without_campaign_stops_when_the_relay_names_an_origin() {
+    let domain = domain();
+    let signed = domain.signed(RotationKind::CaPq);
+    let journal = RotationJournal {
+        without_campaign: true,
+        deposit: None,
+        stage: JournalStage::Accepted,
+        ..signed
+    };
+    rotation_journal::save(&rotation_journal::path_beside(&domain.path), &journal).expect("saved");
+    let before = domain.files();
+    let remote = WithoutCampaign {
+        outgoing: journal.transition.outgoing_anchor_fingerprint(),
+        next: journal.next_anchor_fingerprint,
+        installs: Cell::new(0),
+        reads: Cell::new(0),
+        identity: gateway_names(&domain.path),
+    };
+    let mut held = journal.clone();
+
+    let step = advance(&remote, &domain.path, &mut held, NOW).expect("stopped");
+
+    assert_eq!(step, ResumeStep::DomainConflict);
+    assert_eq!(remote.reads.get(), 0, "the gateway is not read");
+    assert_eq!(remote.installs.get(), 0, "nothing is installed");
+    assert_eq!(held, journal);
+    assert_eq!(domain.files(), before, "the vault and the journal stay");
+}
+
+// Opening a CA-PQ rotation without a campaign.
+
+/// What the gateway serves for the domain at `vault_path`: its own `CA-PQ` anchor, and
+/// nothing in transition.
+fn gateway_names(vault_path: &Path) -> GatewayIdentityRead {
+    let relay = handoff::load(&handoff::path_beside(vault_path)).expect("relay");
+    GatewayIdentityRead {
+        now_unix: None,
+        ca_pq_fingerprint: MlDsa87PublicKey::parse(relay.ca_pq_public_key.trim())
+            .expect("anchor")
+            .authority_fingerprint(),
+        next_ca_fingerprint: None,
+        client_tls_ca_fingerprint: None,
+        next_client_tls_ca_fingerprint: None,
+        ca_retire_active_at: None,
+        gateway_identity_epoch: 1,
+        gateway_tls_fingerprint: String::new(),
+        gateway_pq_fingerprint: String::new(),
+        gateway_tls_not_after: None,
+        gateway_pq_not_after: None,
+        gateway_transition_pending: false,
+        gateway_transition_published: false,
+        gateway_activation_at: None,
+        gateway_retire_active_at: None,
+        gateway_rollback_expires_at: None,
+        gateway_restart_due: None,
+        gateway_revoked: false,
+        gateway_awaited_replacement: None,
+    }
+}
+
+/// The remote of a domain with no Astra origin: it answers the gateway identity and
+/// panics on any Astra call.
+fn without_campaign_remote(identity: GatewayIdentityRead) -> WithoutCampaign {
+    WithoutCampaign {
+        outgoing: identity.ca_pq_fingerprint,
+        next: identity.ca_pq_fingerprint,
+        installs: Cell::new(0),
+        reads: Cell::new(0),
+        identity,
+    }
+}
+
+/// Rotates the `CA-PQ` in the vault on disk and nothing else: what « Terminer » waits for.
+fn rotate_ca_pq_in_place(domain: &Domain) {
+    let mut vault = store::load(&domain.path).expect("vault");
+    let identity = handoff::identity_of(&domain.relay()).expect("identity");
+    let first = gestures::open_with_authorized_key(&domain.keys[0], &vault, "").expect("first");
+    let second = gestures::open_with_authorized_key(&domain.keys[1], &vault, "").expect("second");
+    signing::rotate_ca_pq(
+        &mut vault,
+        &[&first, &second],
+        &identity,
+        None,
+        TransitionWindow::new(NOW, NOW + 7 * 86_400, NOW + 37 * 86_400).expect("window"),
+        NOW,
+    )
+    .expect("rotated");
+    store::save(&domain.path, &vault).expect("saved");
+}
+
+#[test]
+fn open_without_campaign_signs_and_journals_without_astra() {
+    let domain = domain();
+    without_origin(&domain);
+    let vault_before = store::load(&domain.path).expect("vault");
+    let remote = without_campaign_remote(gateway_names(&domain.path));
+
+    let opened = open_without_campaign(
+        &remote,
+        &domain.path,
+        domain.validated(&[0, 1]),
+        &terms(),
+        NOW,
+    )
+    .expect("opened");
+    assert!(matches!(
+        opened.manifest(),
+        AstraManifest::CaRotation(manifest)
+            if manifest.campaign.is_none() && manifest.next_anchor_fingerprint.is_none()
+    ));
+    let journal = opened.sign_and_journal(&domain.path, NOW).expect("signed");
+
+    assert_eq!(journal.stage, JournalStage::Accepted);
+    assert!(journal.without_campaign);
+    assert!(journal.deposit.is_none());
+    assert_eq!(
+        journal.next_anchor_fingerprint,
+        journal.transition.next_anchor_fingerprint()
+    );
+    assert_eq!(domain.journal_on_disk(), Some(journal.clone()));
+    assert_eq!(
+        store::load(&domain.path).expect("vault"),
+        vault_before,
+        "the vault in place does not move before the acceptance"
+    );
+    assert_eq!(remote.installs.get(), 0);
+}
+
+#[test]
+fn open_without_campaign_refuses_an_origin() {
+    let domain = domain();
+    let remote = without_campaign_remote(gateway_names(&domain.path));
+
+    let refused = open_without_campaign(
+        &remote,
+        &domain.path,
+        domain.validated(&[0, 1]),
+        &terms(),
+        NOW,
+    )
+    .err()
+    .expect("refused");
+    assert_eq!(
+        refused.downcast_ref::<OpenRefusal>(),
+        Some(&OpenRefusal::OriginRecorded)
+    );
+
+    let refused = domain
+        .validated(&[0, 1])
+        .ensure_domain_readable_without_campaign(&domain.path)
+        .expect_err("refused");
+    assert_eq!(
+        refused.downcast_ref::<OpenRefusal>(),
+        Some(&OpenRefusal::OriginRecorded)
+    );
+    assert_eq!(domain.journal_on_disk(), None);
+}
+
+#[test]
+fn open_without_campaign_refuses_a_gateway_in_transition() {
+    let domain = domain();
+    without_origin(&domain);
+    let mut next_ca = gateway_names(&domain.path);
+    next_ca.next_ca_fingerprint = Some(Fingerprint::of(b"suivante"));
+    let mut next_client_tls = gateway_names(&domain.path);
+    next_client_tls.next_client_tls_ca_fingerprint = Some(Fingerprint::of(b"suivante"));
+
+    for identity in [next_ca, next_client_tls] {
+        let remote = without_campaign_remote(identity);
+        let refused = open_without_campaign(
+            &remote,
+            &domain.path,
+            domain.validated(&[0, 1]),
+            &terms(),
+            NOW,
+        )
+        .err()
+        .expect("refused");
+        assert_eq!(
+            refused.downcast_ref::<OpenRefusal>(),
+            Some(&OpenRefusal::RotationInFlight)
+        );
+    }
+    assert_eq!(domain.journal_on_disk(), None);
+}
+
+#[test]
+fn open_without_campaign_refuses_another_anchor() {
+    let domain = domain();
+    without_origin(&domain);
+    let mut identity = gateway_names(&domain.path);
+    identity.ca_pq_fingerprint = Fingerprint::of(b"une autre ancre");
+    let remote = without_campaign_remote(identity);
+
+    let refused = open_without_campaign(
+        &remote,
+        &domain.path,
+        domain.validated(&[0, 1]),
+        &terms(),
+        NOW,
+    )
+    .err()
+    .expect("refused");
+    assert_eq!(
+        refused.downcast_ref::<OpenRefusal>(),
+        Some(&OpenRefusal::AnchorsDisagree)
+    );
+    assert_eq!(domain.journal_on_disk(), None);
+}
+
+/// The outgoing `CA-PQ` is kept until « Terminer »: a second rotation over it would
+/// name the wrong outgoing anchor. The document is dropped here, since it was signed
+/// under the anchor this rotation replaced.
+#[test]
+fn open_without_campaign_refuses_a_kept_outgoing_ca_pq() {
+    let domain = domain();
+    without_origin(&domain);
+    std::fs::remove_file(credentials::path_beside(&domain.path)).expect("removed");
+    rotate_ca_pq_in_place(&domain);
+    let remote = without_campaign_remote(gateway_names(&domain.path));
+
+    let refused = open_without_campaign(
+        &remote,
+        &domain.path,
+        domain.validated(&[0, 1]),
+        &terms(),
+        NOW,
+    )
+    .err()
+    .expect("refused");
+    assert_eq!(
+        refused.downcast_ref::<OpenRefusal>(),
+        Some(&OpenRefusal::CaPqToFinish)
+    );
+}
+
+#[test]
+fn open_without_campaign_without_credentials() {
+    let domain = domain();
+    without_origin(&domain);
+    std::fs::remove_file(credentials::path_beside(&domain.path)).expect("removed");
+    let remote = without_campaign_remote(gateway_names(&domain.path));
+
+    let journal = open_without_campaign(
+        &remote,
+        &domain.path,
+        domain.validated(&[0, 1]),
+        &terms(),
+        NOW,
+    )
+    .expect("opened")
+    .sign_and_journal(&domain.path, NOW)
+    .expect("signed");
+
+    assert!(journal.without_campaign);
+    assert!(journal.next.expect("next").credentials.is_none());
+}
+
+#[test]
+fn open_without_campaign_with_credentials_resigns_them() {
+    let domain = domain();
+    without_origin(&domain);
+    let remote = without_campaign_remote(gateway_names(&domain.path));
+
+    let journal = open_without_campaign(
+        &remote,
+        &domain.path,
+        domain.validated(&[0, 1]),
+        &terms(),
+        NOW,
+    )
+    .expect("opened")
+    .sign_and_journal(&domain.path, NOW)
+    .expect("signed");
+
+    let next = journal.next.expect("next");
+    let credentials = next.credentials.expect("re-signed");
+    let identity = handoff::identity_of(&domain.relay()).expect("identity");
+    let next_ca = MlDsa87PublicKey::parse(next.vault.ca_pq_public_key.trim()).expect("anchor");
+    credentials
+        .verify(
+            &next_ca,
+            &identity.trust_domain_id,
+            &identity.gateway_wg_public_key,
+            identity.ca_epoch + 1,
+            credentials.credential_registry_epoch,
+        )
+        .expect("verified under the incoming anchor");
+}
+
+#[test]
+fn open_without_campaign_refuses_a_key_the_document_marks_lost() {
+    let domain = domain();
+    without_origin(&domain);
+    let keys = domain.validated(&[0, 1]);
+    mark_second_key_lost(&domain);
+    let remote = without_campaign_remote(gateway_names(&domain.path));
+
+    let refused = open_without_campaign(&remote, &domain.path, keys, &terms(), NOW)
+        .err()
+        .expect("refused");
+    assert_eq!(
+        refused.downcast_ref::<OpenRefusal>(),
+        Some(&OpenRefusal::KeyNotApprovable)
+    );
+    assert_eq!(domain.journal_on_disk(), None);
 }

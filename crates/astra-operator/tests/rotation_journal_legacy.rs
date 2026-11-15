@@ -25,7 +25,9 @@ use astra_operator::rotation_journal::{
     RotationTransition, LEGACY_CA_PQ_JOURNAL_VERSION,
 };
 use astra_operator::vault::{AuthorityVault, SlotRole};
-use astra_operator::vault_gestures::{add_key_with, create_first_key, finalize_with};
+use astra_operator::vault_gestures::{
+    add_key_with, create_first_key, finalize_with, write_relay, RelayUpdate,
+};
 use astra_operator::{credentials, documents, handoff, signing, store};
 use support::{FakeKey, PIN, RP_ID};
 
@@ -514,6 +516,49 @@ fn adopting_again_after_a_stop_keeps_the_journal_further_along() {
     assert!(!legacy_path.exists());
 }
 
+/// A journal adopted by an Orion older than the mark, in a domain with no origin, would
+/// loop on the read of an Astra that is not there: the next adoption marks it.
+#[test]
+fn an_unmarked_adoption_of_a_domain_without_origin_is_marked_in_place() {
+    let domain = domain();
+    let legacy = legacy_ca_pq(&domain);
+    let relay_path = handoff::path_beside(&domain.path);
+    let mut relay = handoff::load(&relay_path).expect("relay");
+    // The state an older Orion left: adopted while the relay was read as "with origin".
+    relay.astra_authority_url = Some(AUTHORITY_URL.into());
+    handoff::save(&relay_path, &relay).expect("relay saved");
+    let legacy_path = write_legacy_ca_pq(&domain.path, &legacy);
+    let unmarked = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+    assert!(!unmarked.without_campaign);
+
+    // With the origin still named, nothing changes, however many times it is read.
+    let again = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+    assert_eq!(again, unmarked);
+    assert!(legacy_path.exists());
+
+    relay.astra_authority_url = None;
+    handoff::save(&relay_path, &relay).expect("relay saved");
+    let marked = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+
+    assert!(marked.without_campaign);
+    assert!(!marked.awaits_confirmation());
+    assert_eq!(
+        rotation_journal::load(&rotation_journal::path_beside(&domain.path)).expect("load"),
+        Some(marked),
+        "saved, not only returned"
+    );
+    assert!(
+        legacy_path.exists(),
+        "the older file waits for the apply, as before"
+    );
+}
+
 /// Two different rotations: not this code's to choose, and nothing is lost.
 #[test]
 fn a_legacy_ca_pq_journal_against_another_journal_is_refused_with_both_intact() {
@@ -855,4 +900,55 @@ fn a_record_the_old_orion_ceremony_left_is_still_adopted() {
     assert!(kept.adopted);
     assert_eq!(kept.manifest, record.manifest);
     assert!(kept.transition_path.is_empty());
+}
+
+/// The origin of a domain with a rotation without campaign waits for its end: the
+/// relay refuses it while the journal is there, and an unreadable journal refuses too.
+#[test]
+fn write_relay_refuses_an_origin_during_a_rotation_without_campaign() {
+    let domain = domain();
+    let relay_path = handoff::path_beside(&domain.path);
+    let mut relay = handoff::load(&relay_path).expect("relay");
+    relay.astra_authority_url = None;
+    handoff::save(&relay_path, &relay).expect("relay saved");
+    write_legacy_ca_pq(&domain.path, &legacy_ca_pq(&domain));
+    let journal = rotation_journal::adopt_legacy(&domain.path)
+        .expect("adopted")
+        .expect("a journal");
+    assert!(journal.without_campaign);
+    let origin = RelayUpdate {
+        astra_authority_url: Some(AUTHORITY_URL.into()),
+        ..RelayUpdate::default()
+    };
+    let before = std::fs::read(&relay_path).expect("relay bytes");
+
+    let refused = write_relay(&domain.path, &origin).expect_err("refused");
+
+    assert!(
+        format!("{refused:#}").contains("sans campagne"),
+        "{refused:#}"
+    );
+    assert_eq!(std::fs::read(&relay_path).expect("relay bytes"), before);
+    write_relay(
+        &domain.path,
+        &RelayUpdate {
+            astra_service_key_epoch: Some(3),
+            ..RelayUpdate::default()
+        },
+    )
+    .expect("another update is still accepted");
+    let before = std::fs::read(&relay_path).expect("relay bytes");
+
+    let journal_path = rotation_journal::path_beside(&domain.path);
+    std::fs::write(&journal_path, b"illisible").expect("write");
+    assert!(write_relay(&domain.path, &origin).is_err(), "fail closed");
+    assert_eq!(std::fs::read(&relay_path).expect("relay bytes"), before);
+
+    std::fs::remove_file(&journal_path).expect("remove");
+    let written = write_relay(&domain.path, &origin).expect("no rotation in progress");
+    assert_eq!(
+        written.astra_authority_url.as_deref(),
+        Some("https://astra.helios.test"),
+        "the origin is normalised"
+    );
 }

@@ -27,7 +27,7 @@ use aether::certificates::transport::OperatorOpened;
 use aether_fido::authenticator::Authenticator;
 use astra_operator::operations::rotation::{
     self, CaTlsFinish, ChainStepAsk, FinishRefusal, KeyStep, OpenRefusal, OpenedRotation,
-    OperationSource, RotationRemote, RotationTerms, ValidatedKeys,
+    OpenedWithoutCampaign, OperationSource, RotationRemote, RotationTerms, ValidatedKeys,
 };
 use astra_operator::rotation_journal::{
     self, JournalStage, ResumeStep, RotationJournal, RotationKind,
@@ -38,8 +38,8 @@ use astra_operator::vault::VaultError;
 use super::gateway::store_words;
 use super::wait::{answers_the_terms, Ended, Step, Waiting};
 use super::{connect_key, now_unix, Ceremony, Press};
-use crate::operator::rotations::ChainStepRefusal;
-use crate::operator::{relay_names_peer, GatewayTarget, RotationGesture, Words};
+use crate::operator::rotations::{self, ChainStepRefusal};
+use crate::operator::{relay_names_peer, GatewayTarget, OperatorArtifact, RotationGesture, Words};
 
 /// Said when the tunnel leads to a gateway the domain's relay does not name.
 const WRONG_GATEWAY: &str = "la gateway jointe n'est pas celle que le relais du domaine désigne";
@@ -50,7 +50,8 @@ const ROTATION_KEYS: u8 = 2;
 
 /// Runs one rotation gesture to its end against the vault at `vault_path`, publishing
 /// every state it reaches. What a chain step refuses is stored in `words`, as the gateway
-/// step stores its own, and the failed status carries the same sentence.
+/// step stores its own, and the failed status carries the same sentence. A file the run
+/// offers goes to `deposit`.
 ///
 /// Called from the ceremony's own thread, which is what lets the tunnel be used with
 /// a blocking wait: that thread is not a runtime worker.
@@ -64,6 +65,7 @@ pub fn run_rotation(
     vault_path: &Path,
     chain_opened: &Mutex<Option<OperatorOpened>>,
     words: &Words,
+    deposit: &mut dyn FnMut(OperatorArtifact),
 ) -> Result<(), String> {
     let mut ceremony = Ceremony::new(
         session_id,
@@ -81,12 +83,15 @@ pub fn run_rotation(
         .and_then(|target| {
             // Before any call: a resumption reads the status of whatever authority
             // answers, and sends the sealed vault to whatever gateway it reaches.
-            // « Terminer », of either kind: each sends the vault copy at its end.
+            // « Terminer », of either kind, sends the vault copy at its end. The
+            // no-campaign replacement reads the gateway's identity and posts a transition
+            // to it, so it names the gateway the relay names too.
             if matches!(
                 gesture,
                 RotationGesture::Resume
                     | RotationGesture::FinishCaTls
                     | RotationGesture::FinishCaPq
+                    | RotationGesture::ReplaceCaPqWithoutCampaign
             ) && !relay_names_peer(vault_path, &target.peer_key).unwrap_or(false)
             {
                 return Err(WRONG_GATEWAY.to_string());
@@ -126,7 +131,16 @@ pub fn run_rotation(
         gateway_now: &gateway_now,
         chain: &chain,
     };
-    RotationRun::new(&mut ceremony, &presses, publish, vault_path, words, &reach).run(gesture)
+    RotationRun::new(
+        &mut ceremony,
+        &presses,
+        publish,
+        vault_path,
+        words,
+        &reach,
+        deposit,
+    )
+    .run(gesture)
 }
 
 /// The gateway's clock, read from its certificate answer: the source Task 8's
@@ -155,6 +169,7 @@ enum Held {
     /// lives in this enum.
     Keys(Box<ValidatedKeys>),
     Campaign(Box<OpenedRotation>),
+    WithoutCampaign(Box<OpenedWithoutCampaign>),
 }
 
 /// The vault openings of the ceremony in progress.
@@ -193,6 +208,7 @@ struct RotationRun<'a> {
     /// The operation the chain gave this ceremony, so that a second opening reuses it and never
     /// takes another step.
     obtained: Cell<Option<Id16>>,
+    deposit: &'a mut dyn FnMut(OperatorArtifact),
 }
 
 impl<'a> Deref for RotationRun<'a> {
@@ -217,6 +233,7 @@ impl RotationRun<'_> {
         vault_path: &'a Path,
         words: &'a Words,
         reach: &'a Reach<'a>,
+        deposit: &'a mut dyn FnMut(OperatorArtifact),
     ) -> RotationRun<'a> {
         RotationRun {
             wait: Waiting::new(ceremony, presses, publish, reach.connect, reach.now),
@@ -225,6 +242,7 @@ impl RotationRun<'_> {
             reach,
             openings: Openings::none(),
             obtained: Cell::new(None),
+            deposit,
         }
     }
 
@@ -232,6 +250,7 @@ impl RotationRun<'_> {
         let stepped = match gesture {
             RotationGesture::ReplaceCaPq => self.replace(RotationKind::CaPq),
             RotationGesture::ReplaceCaTls => self.replace(RotationKind::CaTls),
+            RotationGesture::ReplaceCaPqWithoutCampaign => self.replace_without_campaign(),
             RotationGesture::FinishCaTls => self.finish_ca_tls(),
             RotationGesture::FinishCaPq => self.finish_ca_pq(),
             RotationGesture::Resume => self.resume(),
@@ -258,6 +277,31 @@ impl RotationRun<'_> {
         let terms = self.await_terms(kind)?;
         self.open_campaign(kind, &terms)?;
         self.approve_campaign()?;
+        let journal = self.sign()?;
+        self.carry(journal)
+    }
+
+    /// « Remplacer la CA-PQ sans campagne »: the two validated keys are the approval, and
+    /// nothing is asked of Astra. Refused before any key when the relay names an origin.
+    fn replace_without_campaign(&mut self) -> Step<()> {
+        let vault_path = self.vault_path;
+        rotation::ensure_nothing_outstanding(vault_path)
+            .map_err(|error| self.refuse(Refusal::RotationInFlight, format!("{error:#}")))?;
+        let keys = ValidatedKeys::new(vault_path)
+            .map_err(|error| self.refuse(Refusal::VaultUnavailable, format!("{error:#}")))?;
+        keys.ensure_domain_readable_without_campaign(vault_path)
+            .map_err(|error| {
+                let refusal = match error.downcast_ref::<OpenRefusal>() {
+                    Some(OpenRefusal::OriginRecorded) => Refusal::ManifestMismatch,
+                    _ => Refusal::HandoffMismatch,
+                };
+                self.refuse(refusal, format!("{error:#}"))
+            })?;
+        self.openings.held = Held::Keys(Box::new(keys));
+
+        self.validate_keys()?;
+        let terms = self.await_terms(RotationKind::CaPq)?;
+        self.open_without_campaign(&terms)?;
         let journal = self.sign()?;
         self.carry(journal)
     }
@@ -357,6 +401,25 @@ impl RotationRun<'_> {
         Ok(())
     }
 
+    /// Checks the rotation against the gateway and the vault, with no call of Astra, and shows
+    /// its manifest. The keys already validated stand for the approval.
+    fn open_without_campaign(&mut self, terms: &RotationTerms) -> Step<()> {
+        self.ceremony.gesture = GestureState::Verifying;
+        self.ceremony.idle_until = None;
+        self.show();
+        let now = self.now();
+        let Held::Keys(keys) = self.openings.take() else {
+            return Err(self.nothing_held());
+        };
+        let opened =
+            rotation::open_without_campaign(self.reach.remote, self.vault_path, *keys, terms, now)
+                .map_err(|error| self.refuse(refusal_of_open(&error), format!("{error:#}")))?;
+        self.ceremony.manifest = Some(opened.manifest().clone());
+        self.openings.held = Held::WithoutCampaign(Box::new(opened));
+        self.show();
+        Ok(())
+    }
+
     fn approve_campaign(&mut self) -> Step<()> {
         for index in 1..=ROTATION_KEYS {
             loop {
@@ -389,19 +452,19 @@ impl RotationRun<'_> {
         self.ceremony.gesture = GestureState::Signing;
         self.ceremony.idle_until = None;
         self.show();
-        let Held::Campaign(opened) = self.openings.take() else {
-            return Err(self.nothing_held());
-        };
         let now = self.now();
-        let journal = opened
-            .sign_and_journal(self.vault_path, now)
-            .map_err(|error| {
-                let refusal = match error.downcast_ref::<KeyStep>() {
-                    Some(KeyStep::Expired) => Refusal::WindowExpired,
-                    _ => Refusal::Internal,
-                };
-                self.refuse(refusal, format!("{error:#}"))
-            })?;
+        let signed = match self.openings.take() {
+            Held::Campaign(opened) => opened.sign_and_journal(self.vault_path, now),
+            Held::WithoutCampaign(opened) => opened.sign_and_journal(self.vault_path, now),
+            _ => return Err(self.nothing_held()),
+        };
+        let journal = signed.map_err(|error| {
+            let refusal = match error.downcast_ref::<KeyStep>() {
+                Some(KeyStep::Expired) => Refusal::WindowExpired,
+                _ => Refusal::Internal,
+            };
+            self.refuse(refusal, format!("{error:#}"))
+        })?;
         self.ceremony.remote = RemoteState::Prepared;
         // The incoming anchor did not exist at the touch, and the journal carrying it
         // disappears at the end: this is where the operator can read it.
@@ -485,6 +548,18 @@ impl RotationRun<'_> {
             self.ceremony.remote = RemoteState::Deposited;
             self.show();
         }
+        // Without a campaign, the transition is what the operator takes to the gateway
+        // by hand when it stops short of its end: only once the vault has moved, and
+        // never when the relay gained an origin, which makes it no longer theirs to pose.
+        if journal.without_campaign
+            && journal.stage == JournalStage::Applied
+            && !matches!(
+                advanced,
+                Ok(ResumeStep::Finished | ResumeStep::SendVaultCopy | ResumeStep::DomainConflict)
+            )
+        {
+            self.offer_transition(&journal);
+        }
         match advanced {
             // A copy held back is on its way: the rotation is on the gateway, the
             // journal stays, and the next look sends it again.
@@ -500,6 +575,13 @@ impl RotationRun<'_> {
                 refusal_of_carry(&error, journal.stage),
                 format!("{error:#}"),
             )),
+        }
+    }
+
+    /// Deposits `ca-pq-transition.json` (see [`rotations::transition_artifact`]).
+    fn offer_transition(&mut self, journal: &RotationJournal) {
+        if let Some(artifact) = rotations::transition_artifact(journal) {
+            (self.deposit)(artifact);
         }
     }
 
@@ -564,7 +646,9 @@ impl RotationRun<'_> {
 /// Whether the authority is known to hold the deposit: past `Signed`, except for an
 /// adoption that nothing has confirmed, and that may yet prove a conflict.
 fn is_deposited(journal: &RotationJournal) -> bool {
-    journal.stage != JournalStage::Signed && !journal.awaits_confirmation()
+    journal.stage != JournalStage::Signed
+        && !journal.awaits_confirmation()
+        && !journal.without_campaign
 }
 
 fn refusal_of_open(error: &anyhow::Error) -> Refusal {
@@ -574,8 +658,12 @@ fn refusal_of_open(error: &anyhow::Error) -> Refusal {
     if let Some(refused) = error.downcast_ref::<OpenRefusal>() {
         return match refused {
             OpenRefusal::KeyNotApprovable => Refusal::SignerRevoked,
-            OpenRefusal::RotationInFlight | OpenRefusal::CaTlsToFinish => Refusal::RotationInFlight,
+            OpenRefusal::RotationInFlight
+            | OpenRefusal::CaTlsToFinish
+            | OpenRefusal::CaPqToFinish => Refusal::RotationInFlight,
             OpenRefusal::AnchorsDisagree => Refusal::DomainConflict,
+            // The relay names an origin: the manifest of no campaign does not describe this domain.
+            OpenRefusal::OriginRecorded => Refusal::ManifestMismatch,
         };
     }
     match error.downcast_ref::<TunnelRefusal>() {

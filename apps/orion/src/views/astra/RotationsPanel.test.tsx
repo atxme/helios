@@ -12,6 +12,7 @@ const api = vi.hoisted(() => ({
   beginRotationCeremony: vi.fn(),
   operatorCeremonyStatus: vi.fn(),
   operatorChainHeld: vi.fn(),
+  operatorRotationTransitionFile: vi.fn(),
 }))
 vi.mock('../../api', () => api)
 
@@ -492,5 +493,107 @@ describe('the wording', () => {
     choose('Remplacer la CA-PQ')
     const text = document.body.textContent ?? ''
     expect(text).not.toMatch(/\b(tu|te|ton|ta|tes|toi)\b/i)
+  })
+})
+
+describe('the CA-PQ replacement without a campaign', () => {
+  const ROW = 'Remplacer la CA-PQ sans campagne'
+  const WARNING =
+    'Aucune autorité ne vérifie ce remplacement : le coffre avance sur votre seul geste. À réserver à un domaine sans Astra.'
+
+  it('warns above the start for its row, and not for the campaign replacement', async () => {
+    await show(overview({ relayNamesOrigin: false }))
+    choose(ROW)
+    expect(screen.getByText(WARNING)).toBeTruthy()
+    cleanup()
+
+    await show(overview({ relayNamesOrigin: true }))
+    choose('Remplacer la CA-PQ')
+    expect(screen.queryByText(WARNING)).toBeNull()
+  })
+
+  it('hands its ceremony over marked, and the campaign replacement unmarked', async () => {
+    api.beginRotationCeremony.mockResolvedValue(ceremony)
+    const onCeremony = vi.fn()
+    api.operatorRotationsOverview.mockResolvedValue(overview({ relayNamesOrigin: false }))
+    render(
+      <RotationsPanel
+        onCeremony={onCeremony}
+        renderStep={(context) => <RotationSteps {...context} />}
+      />,
+    )
+    await screen.findByRole('region', { name: 'Renouveler les postes' })
+    choose(ROW)
+    fireEvent.click(await screen.findByRole('button', { name: 'Continuer' }))
+    await waitFor(() => expect(onCeremony).toHaveBeenCalledWith(ceremony, null, undefined, true))
+  })
+})
+
+describe('the transition file of a rotation without a campaign', () => {
+  const journal = (extra: Partial<NonNullable<RotationsOverview['journal']>> = {}) => ({
+    kind: 'ca_pq' as const,
+    stage: 'applied' as const,
+    activationAt: NOW + 86_400,
+    notAfter: NOW + 30 * 86_400,
+    nextFingerprint: 'aa',
+    offline: false,
+    withoutCampaign: true,
+    ...extra,
+  })
+  const BUTTON = 'Télécharger la transition'
+
+  it('is offered by the resume row only for an applied journal without a campaign', async () => {
+    await show(overview({ resumable: true, relayNamesOrigin: false, journal: journal() }))
+    expect(screen.getByRole('button', { name: BUTTON })).toBeTruthy()
+    cleanup()
+    for (const other of [
+      journal({ stage: 'accepted' }),
+      journal({ stage: 'installed' }),
+      journal({ withoutCampaign: false }),
+    ]) {
+      await show(overview({ resumable: true, relayNamesOrigin: false, journal: other }))
+      expect(screen.queryByRole('button', { name: BUTTON })).toBeNull()
+      cleanup()
+    }
+    await show(overview({ resumable: true, relayNamesOrigin: false, journal: null }))
+    expect(screen.queryByRole('button', { name: BUTTON })).toBeNull()
+  })
+
+  it('stays shut unless the relay is known to name no origin', async () => {
+    for (const relayNamesOrigin of [true, null] as const) {
+      await show(overview({ resumable: true, relayNamesOrigin, journal: journal() }))
+      expect(screen.queryByRole('button', { name: BUTTON })).toBeNull()
+      cleanup()
+    }
+    await show(overview({ resumable: true, relayNamesOrigin: false, journal: journal() }))
+    expect(screen.getByRole('button', { name: BUTTON })).toBeTruthy()
+  })
+
+  it('saves what the backend reads beside the vault, with no ceremony', async () => {
+    const file = {
+      file_name: 'ca-pq-transition.json',
+      contents: '{}\n',
+      encoding: 'text' as const,
+    }
+    api.operatorRotationTransitionFile.mockResolvedValue(file)
+    const createObjectURL = vi.fn(() => 'blob:x')
+    const revokeObjectURL = vi.fn()
+    Object.assign(URL, { createObjectURL, revokeObjectURL })
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    await show(
+      overview({ resumable: true, relayNamesOrigin: false, journal: journal(), tunnel: false }),
+    )
+    fireEvent.click(screen.getByRole('button', { name: BUTTON }))
+    await waitFor(() => expect(click).toHaveBeenCalled())
+    expect(api.operatorRotationTransitionFile).toHaveBeenCalledTimes(1)
+    expect(createObjectURL).toHaveBeenCalled()
+    click.mockRestore()
+  })
+
+  it('says so when there is nothing to download', async () => {
+    api.operatorRotationTransitionFile.mockResolvedValue(null)
+    await show(overview({ resumable: true, relayNamesOrigin: false, journal: journal() }))
+    fireEvent.click(screen.getByRole('button', { name: BUTTON }))
+    expect(await screen.findByText('Aucune transition à télécharger')).toBeTruthy()
   })
 })

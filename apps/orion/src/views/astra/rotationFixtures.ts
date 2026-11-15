@@ -100,6 +100,7 @@ export const overview = (extra: Partial<RotationsOverview> = {}): RotationsOverv
   retainedCaPqNotAfter: null,
   workstations: { state: 'ok', value: [] },
   gatewayPending: null,
+  relayNamesOrigin: true,
   ...extra,
 })
 

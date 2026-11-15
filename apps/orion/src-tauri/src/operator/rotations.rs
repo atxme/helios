@@ -20,6 +20,9 @@
 
 use std::path::Path;
 
+/// The name the transition is saved under.
+pub const TRANSITION_FILE: &str = "ca-pq-transition.json";
+
 use anyhow::Context as _;
 use astra_operator::operations::rotation as operation;
 use astra_operator::overview::VaultOverview;
@@ -30,6 +33,8 @@ use orion_core::operator_rotations::{
     AuthorityStatusRead, GatewayDomainRead, PeerCertificatesRead, PendingOperationRead, Reach,
 };
 use serde::Serialize;
+
+use super::{ArtifactEncoding, OperatorArtifact};
 
 use aether::certificates::encoding::Id16;
 use aether::certificates::transport::{
@@ -364,6 +369,9 @@ pub struct JournalView {
     /// No deposit of Orion's own: signed offline, or adopted from the CA-PQ file. Only
     /// then is `astra-signer rotate-ca-pq` a recourse that cannot conflict with Orion.
     pub offline: bool,
+    /// No campaign at Astra: the operator's gesture stood for the acceptance. Read as `false`
+    /// from a journal written before the mark.
+    pub without_campaign: bool,
 }
 
 impl JournalView {
@@ -383,6 +391,7 @@ impl JournalView {
             not_after: journal.not_after,
             next_fingerprint: journal.next_anchor_fingerprint.to_hex(),
             offline: journal.deposit.is_none(),
+            without_campaign: journal.without_campaign,
         }
     }
 }
@@ -514,6 +523,9 @@ pub struct Local {
     pub retained_ca_pq_not_after: Option<u64>,
     /// The gateway's identity record waiting beside the vault, if one does.
     pub gateway_pending: Option<GatewayPendingView>,
+    /// Whether the relay beside the vault names an Astra origin. `None` when the relay cannot
+    /// be read: that is not « no origin », and « Remplacer la CA-PQ sans campagne » is not offered.
+    pub relay_names_origin: Option<bool>,
 }
 
 /// The journal and whether anything calls for a resumption, read from the files beside
@@ -539,6 +551,52 @@ pub fn read_journal(vault_path: &Result<std::path::PathBuf, String>) -> LocalJou
             .map(|journal| JournalView::of(&journal)),
         resumable: rotation_journal::something_to_resume(path).unwrap_or(false),
     }
+}
+
+/// The file a CA-PQ replacement without a campaign hands the operator when the gateway has
+/// not taken its transition: the journal's `CaTransition`, written as `documents::write`
+/// writes a document. Nothing for another kind of journal.
+pub fn transition_artifact(journal: &RotationJournal) -> Option<OperatorArtifact> {
+    let rotation_journal::RotationTransition::CaPq(transition) = &journal.transition else {
+        return None;
+    };
+    match serde_json::to_string_pretty(transition.as_ref()) {
+        Ok(mut contents) => {
+            contents.push('\n');
+            Some(OperatorArtifact {
+                file_name: TRANSITION_FILE.to_string(),
+                contents,
+                encoding: ArtifactEncoding::Text,
+                fingerprint: None,
+            })
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "the CA-PQ transition could not be serialized");
+            None
+        }
+    }
+}
+
+/// The transition file of a rotation without a campaign whose vault has moved and whose
+/// gateway has not taken it, read beside the vault: no tunnel, no key, no session. The
+/// file stays downloadable as long as that journal does, across restarts. Nothing for any
+/// other journal, and nothing for a journal that cannot be read. Nothing either once the
+/// relay names an Astra origin, or when the relay cannot be read: the operator poses the
+/// transition by hand only in a domain without Astra.
+pub fn read_transition_file(
+    vault_path: &Result<std::path::PathBuf, String>,
+) -> Option<OperatorArtifact> {
+    let path = vault_path.as_ref().ok()?;
+    if relay_names_origin(path) != Some(false) {
+        return None;
+    }
+    let journal = rotation_journal::load(&rotation_journal::path_beside(path))
+        .ok()
+        .flatten()?;
+    if !journal.without_campaign || journal.stage != JournalStage::Applied {
+        return None;
+    }
+    transition_artifact(&journal)
 }
 
 /// Reads the vault and what rotations left beside it, without a key.
@@ -577,7 +635,15 @@ pub fn read_local(vault_path: &Result<std::path::PathBuf, String>, now: u64) -> 
         credential_registry_epoch: local_credentials_epoch(path),
         retained_ca_pq_not_after: retained_ca_pq_not_after(path),
         gateway_pending: gateway_pending_of(path, now),
+        relay_names_origin: relay_names_origin(path),
     }
+}
+
+/// Whether the relay beside the vault names an Astra origin, read with no key.
+fn relay_names_origin(vault_path: &Path) -> Option<bool> {
+    astra_operator::handoff::load(&astra_operator::handoff::path_beside(vault_path))
+        .ok()
+        .map(|relay| relay.astra_authority_url.is_some())
 }
 
 /// The end of the outgoing CA-PQ the vault keeps, read without a key: the clear copy of
@@ -675,6 +741,8 @@ pub struct RotationsOverview {
     pub workstations: Reach<Vec<WorkstationExpiry>>,
     /// The gateway's identity record waiting beside the vault, if one does.
     pub gateway_pending: Option<GatewayPendingView>,
+    /// Whether the relay names an Astra origin: `None` when the relay cannot be read.
+    pub relay_names_origin: Option<bool>,
 }
 
 impl RotationsOverview {
@@ -697,6 +765,7 @@ impl RotationsOverview {
             credential_registry_epoch,
             retained_ca_pq_not_after,
             gateway_pending,
+            relay_names_origin,
         } = local;
         let ca_pq_overlap = authority
             .ok()
@@ -732,6 +801,7 @@ impl RotationsOverview {
             retained_ca_pq_not_after,
             workstations: workstations_of(certificates),
             gateway_pending,
+            relay_names_origin,
         }
     }
 }
@@ -895,6 +965,52 @@ mod overview_tests {
             certificates,
             local,
         )
+    }
+
+    /// The relay's origin is read as it is, and an unreadable relay is no answer.
+    #[test]
+    fn overview_says_whether_the_relay_names_an_origin() {
+        let dir =
+            std::env::temp_dir().join(format!("orion-overview-origin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let vault = dir.join("vault.json");
+        let relay = |origin: Option<&str>| astra_operator::handoff::DomainHandoff {
+            trust_domain_id: String::new(),
+            rp_id: String::new(),
+            ca_pq_public_key: String::new(),
+            vault_fingerprint: String::new(),
+            ca_epoch: None,
+            ca_tls_epoch: None,
+            ca_tls_certificate: None,
+            gateway_wg_public_key: None,
+            server_name: None,
+            astra_service_public_key: None,
+            astra_service_key_epoch: None,
+            astra_authority_url: origin.map(String::from),
+        };
+        let read = |vault: &Path| read_local(&Ok(vault.to_path_buf()), 0).relay_names_origin;
+        let path = astra_operator::handoff::path_beside(&vault);
+
+        astra_operator::handoff::save(&path, &relay(None)).expect("relay");
+        assert_eq!(read(&vault), Some(false));
+        let shown = serde_json::to_value(assembled(
+            Local {
+                relay_names_origin: read(&vault),
+                ..Local::default()
+            },
+            Reach::Unreachable,
+        ))
+        .expect("json");
+        assert_eq!(shown["relayNamesOrigin"], false);
+
+        astra_operator::handoff::save(&path, &relay(Some("https://astra.helios.test/")))
+            .expect("relay");
+        assert_eq!(read(&vault), Some(true));
+
+        std::fs::remove_file(&path).expect("removed");
+        assert_eq!(read(&vault), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The kept key's expiry reaches the page, and nothing of the key does.

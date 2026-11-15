@@ -995,6 +995,8 @@ export type RotationGesture =
   | { gesture: 'finish_ca_tls' }
   | { gesture: 'finish_ca_pq' }
   | { gesture: 'resume' }
+  /** Remplacer la CA-PQ d'un domaine sans Astra : aucune campagne, le geste de l'opérateur suffit. */
+  | { gesture: 'replace_ca_pq_without_campaign' }
 
 /** Ce que l'écran d'approbation fixe. Public, comme le manifeste qui en découle. */
 export interface RotationTerms {
@@ -1147,6 +1149,8 @@ export interface RotationJournalView {
   nextFingerprint: string
   /** Sans dépôt d'Orion : une rotation signée hors ligne, que `astra-signer` peut encore reprendre. */
   offline: boolean
+  /** Signée sans campagne : la reprise se fait sur la gateway seule. Absent des anciens journaux : `false`. */
+  withoutCampaign: boolean
 }
 
 /** Tout ce que montre l'écran des rotations ; des données d'affichage, ni jeton, ni clé, ni chemin. */
@@ -1189,6 +1193,11 @@ export interface RotationsOverview {
   workstations: Reach<WorkstationExpiry[]>
   /** Le dépôt d'identité de la gateway en attente à côté du coffre, `null` sans dépôt. */
   gatewayPending: GatewayPendingView | null
+  /**
+   * Le relais nomme une origine Astra : `false` seulement s'il n'en nomme aucune ; `null` si le
+   * relais est illisible.
+   */
+  relayNamesOrigin: boolean | null
 }
 
 /** Un poste non révoqué : son nom et la fin de son certificat. Ni clé ni jeton. */

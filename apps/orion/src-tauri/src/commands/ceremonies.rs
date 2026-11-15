@@ -389,6 +389,19 @@ pub(crate) async fn operator_rotation_journal(
     Ok(crate::operator::rotations::read_journal(&vault_path))
 }
 
+/// The transition file of a CA-PQ replacement without a campaign that the gateway has not
+/// taken, read beside the vault: no tunnel, no key, no running session. The operator can
+/// still take it to the gateway by hand after a restart; nothing once the journal is gone.
+#[tauri::command]
+pub(crate) async fn operator_rotation_transition_file(
+    state: State<'_, AppState>,
+) -> Result<Option<crate::operator::OperatorArtifact>, String> {
+    let vault_path = state.vault_location.path_to_look_at();
+    Ok(crate::operator::rotations::read_transition_file(
+        &vault_path,
+    ))
+}
+
 /// The operator vault and its trust domain, read without any key.
 ///
 /// Nothing is unwrapped: the slots come back as identifier, label and role, and
