@@ -504,6 +504,48 @@ mod tests {
     }
 
     #[test]
+    fn unrecognized_rule_parts_remain_visible_in_the_summary() {
+        let rules = "chain input {\n    tcp flags syn / fin,syn,rst,ack counter drop  # unusual TCP filter\n  }";
+        let text = render_firewall(
+            &Ui::plain(None),
+            &FirewallView {
+                rules: rules.into(),
+                default_verdict: "drop".into(),
+                dry_run: false,
+            },
+        );
+
+        assert!(
+            text.contains("drop   tcp flags syn / fin,syn,rst,ack\n"),
+            "unknown nftables match syntax must not disappear from the operator view: {text}"
+        );
+        assert!(text.contains("unusual TCP filter"), "{text}");
+    }
+
+    #[test]
+    fn rules_with_different_explanations_are_not_merged() {
+        let rules = "chain input {\n    type filter hook input priority filter; policy drop;\n    iifname \"enp3s0\" udp dport 51820 accept  # primary uplink\n    iifname \"wlo1\" udp dport 51820 accept  # backup uplink\n  }";
+        let text = render_firewall(
+            &Ui::plain(None),
+            &FirewallView {
+                rules: rules.into(),
+                default_verdict: "drop".into(),
+                dry_run: false,
+            },
+        );
+
+        assert!(text.contains("otherwise drop · 2 rules"), "{text}");
+        assert!(
+            text.contains("UDP 51820 on enp3s0\n           primary uplink"),
+            "{text}"
+        );
+        assert!(
+            text.contains("UDP 51820 on wlo1\n           backup uplink"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn narrow_terminals_cut_lines_instead_of_wrapping_them() {
         let text = render_firewall(&Ui::plain(Some(40)), &view());
         assert!(text.lines().all(|line| line.chars().count() < 40), "{text}");
