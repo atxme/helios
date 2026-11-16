@@ -110,7 +110,7 @@ fn gateway_revocation_open(state_dir: &Path, text: OpeningText) -> Result<()> {
         opening.opened.campaign_fingerprint
     );
     eprintln!(
-        "terminal : la gateway ne négociera plus. Signer dans Orion : Astra › Postes, \
+        "terminal : la gateway ne négociera plus. Signer dans Orion : Astra › Rotations, \
          opération {} (échéances PQ {pq_not_after}, TLS {tls_not_after})",
         operation_id.to_hex()
     );

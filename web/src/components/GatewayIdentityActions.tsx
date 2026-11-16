@@ -254,7 +254,7 @@ export function GatewayIdentityActions({ domain }: Props) {
                 <br />
                 <code>astra gateway-identity open --reason … --requested-by …</code>
                 <br />
-                <code>Orion, Astra › Gateways</code>
+                <code>Orion, Astra › Rotations</code>
               </Alert>
             </Box>
           )}
@@ -403,7 +403,7 @@ export function GatewayIdentityActions({ domain }: Props) {
                 À signer au poste opérateur&nbsp;:
                 <br />
                 <code>
-                  Orion, Astra › Gateways (rollback)
+                  Orion, Astra › Rotations (rollback)
                 </code>
                 <br />
                 Puis coller l’autorisation ci-dessus et <strong>redémarrer heliosd</strong> : la

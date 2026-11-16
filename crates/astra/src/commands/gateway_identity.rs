@@ -61,13 +61,9 @@ pub(super) fn print_gateway_identity(
         opening.opened.campaign_fingerprint
     );
     eprintln!("feuille en service exportée : {}", served_path.display());
+    eprintln!("renouveler dans Orion : Astra › Rotations (époque {next_epoch})");
     eprintln!(
-        "renouveler dans Orion : Astra › Gateways (époque {next_epoch}), avec la feuille active \
-         <{}>",
-        GATEWAY_ACTIVE_CERTIFICATE_FILE
-    );
-    eprintln!(
-        "ou annuler la transition déjà en attente : Astra › Gateways, opération {}",
+        "ou annuler la transition déjà en attente : Astra › Rotations, opération {}",
         operation_id.to_hex()
     );
     Ok(())

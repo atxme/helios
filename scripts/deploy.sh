@@ -488,7 +488,7 @@ deployer_astra() {
         echo "    demande publique rapatriée : $demande_gateway"
         echo "    deux credentials distincts doivent maintenant émettre la leaf :" >&2
         echo "      « Amorcer la gateway… » dans Orion (Astra › Domaine), avec '$demande_gateway'" >&2
-        echo "      certificat attendu : '$CERTIFICAT_AMORCAGE'" >&2
+        echo "      enregistrer le téléchargement ici : '$CERTIFICAT_AMORCAGE'" >&2
         echo "    puis reprendre : ./scripts/deploy.sh --astra" >&2
         return 1
     fi
