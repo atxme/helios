@@ -110,6 +110,10 @@ pub enum EnrollmentGesture {
         allowed_ips: Option<String>,
         #[serde(default)]
         ssh_target: Option<String>,
+        /// The contents of the `heliosd export-enrolment` file the operator
+        /// chose. Read only when no gateway is connected to read it from.
+        #[serde(default)]
+        enrolment_export: Option<String>,
     },
 }
 
@@ -1751,6 +1755,29 @@ mod tests {
         assert!(accept(r#","validity_days":1825"#).is_ok());
         assert!(accept(r#","validity_days":1826"#).is_err());
         assert!(accept(r#","validity_days":0"#).is_err());
+    }
+
+    /// A resumption may carry the export a gateway gave the operator; it is
+    /// optional, so a resumption without one still reads.
+    #[test]
+    fn a_resumption_may_carry_an_export() {
+        let resume = |extra: &str| {
+            gesture(&format!(
+                r#"{{"gesture":"resume","invitation_id":"fdcc7341b0cf98f1672eab37508db464","endpoint":"gw:51820"{extra}}}"#
+            ))
+        };
+        match resume("") {
+            Ok(EnrollmentGesture::Resume {
+                enrolment_export, ..
+            }) => assert_eq!(enrolment_export, None),
+            other => panic!("{other:?}"),
+        }
+        match resume(r#","enrolment_export":"{}""#) {
+            Ok(EnrollmentGesture::Resume {
+                enrolment_export, ..
+            }) => assert_eq!(enrolment_export.as_deref(), Some("{}")),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// The name becomes a file name: only the documented alphabet and length.

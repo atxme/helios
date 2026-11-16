@@ -18,20 +18,23 @@
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 
-use aether::certificates::encoding::{DerCertificate, Id16, MlDsa87PublicKey, WireGuardKey};
+use aether::certificates::encoding::{
+    DerCertificate, Id16, MlDsa87PublicKey, TrustDomainId, WireGuardKey,
+};
 use aether::certificates::operator_session::{
     AcceptanceManifest, AstraManifest, GestureState, InvitationManifest, KeyCheckManifest,
     KeyPurpose, KeySlotLabel, OperationKind, OperationLocator, OperatorAction, OperatorStatus,
     Refusal, RemoteState,
 };
 use aether::key_negotiation::{
-    decode_request_file, encode_invitation_file, EnrollmentRequest, PqCertificate,
-    PqCertificateRole, ProtectionMode,
+    decode_enrolment_export_file, decode_request_file, encode_invitation_file, EnrollmentRequest,
+    PqCertificate, PqCertificateRole, ProtectionMode,
 };
 use aether_fido::authenticator::Authenticator;
 use astra_operator::enrollment::{AcceptedEnrollment, InvitationRegistry};
 use astra_operator::operations::rotation::RotationTerms;
 use astra_operator::vault::AuthorityVault;
+use orion_core::enrollment_draft::{Admission, GatewayMaterial};
 
 use super::{dialog_owner, now_unix, ArtifactEncoding, EnrollmentGesture, OperatorArtifact};
 
@@ -222,6 +225,7 @@ fn run_enrollment_with(
             endpoint,
             allowed_ips,
             ssh_target,
+            enrolment_export,
         } => resume(
             &mut ceremony,
             &presses,
@@ -237,6 +241,7 @@ fn run_enrollment_with(
                     ssh_target: ssh_target.as_deref(),
                     gateway: gateway.as_deref(),
                 },
+                export: enrolment_export.as_deref(),
             },
             &read_negotiation,
             &read_admitted_keys,
@@ -439,6 +444,9 @@ struct Delivery<'a> {
 struct Resume<'a> {
     invitation_id: Id16,
     delivery: Delivery<'a>,
+    /// The `heliosd export-enrolment` file the operator chose. It stands in for
+    /// the gateway only when no gateway is connected, and is ignored otherwise.
+    export: Option<&'a str>,
 }
 
 const DAY_SECS: u64 = 86_400;
@@ -612,6 +620,7 @@ fn accept(
             delivery: &accept.delivery(),
             pin: &pin,
             admit: true,
+            offline: None,
         },
     )
 }
@@ -674,6 +683,8 @@ struct Delivering<'a> {
     pin: &'a GatewayPin,
     /// False when the gateway already lists the peer.
     admit: bool,
+    /// The material read from a verified export, in place of the gateway.
+    offline: Option<(GatewayMaterial, Admission)>,
 }
 
 /// Steps 4 to 6, from leaves that exist: check them, admit the peer unless it
@@ -695,6 +706,7 @@ fn deliver(
         delivery,
         pin,
         admit,
+        offline,
     } = delivering;
     if let Err(error) = orion_core::enrollment_draft::check_leaves(
         &accepted.request,
@@ -717,7 +729,7 @@ fn deliver(
         )?;
     }
 
-    match sign_delivery(registry, vault, opened, accepted, delivery, pin) {
+    match sign_delivery(registry, vault, opened, accepted, delivery, pin, offline) {
         Ok(artifact) => {
             deposit(artifact);
             ceremony.gesture = GestureState::Done;
@@ -755,14 +767,18 @@ struct Resuming {
     /// Why no gateway can be used: none is connected, or it did not answer.
     /// The resumption then stops before any key.
     gateway_error: Option<(Refusal, String)>,
+    /// The gateway's material and admission read from a verified export, when
+    /// no gateway is connected. The document is then drafted from these.
+    offline: Option<(GatewayMaterial, Admission)>,
 }
 
 /// Step 5 and 6 again, §15.2: finishes an acceptance whose invitation is
 /// consumed and whose leaves are kept, without issuing anything.
 ///
 /// Everything before the key is a refusal that changes nothing. Without a
-/// reachable gateway it stops before any key, handing over the leaves kept and
-/// the line that admits the peer by hand: the same files the acceptance would
+/// connected gateway, a verified export stands in for it; without either, the
+/// resumption stops before any key, handing over the leaves kept and the
+/// line that admits the peer by hand: the same files the acceptance would
 /// have handed over. Otherwise one key signs the document, and the peer is
 /// admitted first only when the gateway does not list it.
 #[allow(clippy::too_many_arguments)]
@@ -791,6 +807,7 @@ fn resume(
         pin,
         admitted,
         gateway_error,
+        offline,
     } = resuming;
 
     if let Some((refusal, message)) = gateway_error {
@@ -823,6 +840,7 @@ fn resume(
             delivery: &resume.delivery,
             pin: &pin,
             admit: !admitted,
+            offline,
         },
     )
 }
@@ -894,11 +912,21 @@ fn prepare_resumption(
     // The same pin as the acceptance, checked before a key is touched.
     let pin = GatewayPin::of(&record.invitation);
     let mut peer_admitted = false;
+    let mut offline = None;
     let gateway_error = match resume.delivery.gateway {
-        None => Some((
-            Refusal::GatewayUnavailable,
-            NO_GATEWAY_CONNECTED.to_string(),
-        )),
+        None => match resume.export {
+            Some(text) => {
+                offline = Some(read_export(text, &accepted, &vault, &pin)?);
+                // `heliosd export-enrolment` only writes a peer the gateway
+                // already admits, so the admission is not repeated.
+                peer_admitted = true;
+                None
+            }
+            None => Some((
+                Refusal::GatewayUnavailable,
+                NO_GATEWAY_CONNECTED.to_string(),
+            )),
+        },
         Some(base) => match read(base) {
             Ok(material) => {
                 pin.check(&material)?;
@@ -919,7 +947,68 @@ fn prepare_resumption(
         pin,
         admitted: peer_admitted,
         gateway_error,
+        offline,
     })
+}
+
+/// The message of a file that is not a `heliosd export-enrolment` export.
+const NOT_AN_EXPORT: &str =
+    "Ce fichier n'est pas un export d'enrôlement de `heliosd export-enrolment`.";
+
+/// Reads the export the operator chose, and checks it as the connected
+/// gateway's answer would be checked: the same pin, the same peer, the same
+/// domain and the same leaf. Every refusal is before any key.
+fn read_export(
+    text: &str,
+    accepted: &AcceptedEnrollment,
+    vault: &AuthorityVault,
+    pin: &GatewayPin,
+) -> Result<(GatewayMaterial, Admission), (Refusal, String)> {
+    let mismatch = |message: &str| (Refusal::HandoffMismatch, message.to_string());
+    let export = decode_enrolment_export_file(text).map_err(|_| mismatch(NOT_AN_EXPORT))?;
+    let (material, admission) = orion_core::gateway_admin::material_from_export(&export)
+        .map_err(|error| mismatch(&error.to_string()))?;
+    pin.check(&material)?;
+
+    let same_peer = WireGuardKey::parse(export.peer_public_key.trim())
+        .map(|key| key == accepted.request.client_wg_public_key)
+        .unwrap_or(false);
+    if !same_peer {
+        return Err(mismatch(
+            "cet export nomme un autre poste que la demande acceptée",
+        ));
+    }
+
+    let other_domain = "cet export vient d'un autre domaine que ce coffre";
+    let Some(trust) = admission.trust.as_ref() else {
+        return Err(mismatch(other_domain));
+    };
+    let same_domain = trust.ca_pq_public_key.trim() == vault.ca_pq_public_key.trim()
+        && TrustDomainId::parse_hex(trust.trust_domain_id.trim())
+            .is_ok_and(|id| id == vault.trust_domain_id);
+    if !same_domain {
+        return Err(mismatch(other_domain));
+    }
+
+    let leaf = orion_core::enrollment_draft::pinned_gateway_leaf(&material)
+        .map_err(|error| mismatch(&format!("{error:#}")))?;
+    let fingerprint_matches = leaf
+        .fingerprint()
+        .is_ok_and(|fingerprint| fingerprint == material.pq_certificate_sha256.trim());
+    if !fingerprint_matches {
+        return Err(mismatch(
+            "la feuille PQ de cet export ne correspond pas à son empreinte",
+        ));
+    }
+    orion_core::config::verify_pinned_gateway_certificate(
+        &leaf,
+        &material.server_name,
+        &material.wireguard_public_key,
+        Some(trust),
+        now_unix(),
+    )
+    .map_err(|error| mismatch(&format!("{error:#}")))?;
+    Ok((material, admission))
 }
 
 /// Hands over the kept leaves and the line that admits the peer by hand, then
@@ -1177,9 +1266,19 @@ fn hand_over_leaves(
         encoding: ArtifactEncoding::Text,
         fingerprint: None,
     });
+    // The export is taken on the gateway after the peer is added: the file
+    // then carries what the document needs, without a tunnel.
+    let export = format!(
+        "heliosd export-enrolment --public-key {} > {}.enrolment.json",
+        astra_operator::admission::shell_word(&accepted.request.client_wg_public_key.to_base64()),
+        astra_operator::admission::shell_word(&accepted.request.requested_name),
+    );
     deposit(OperatorArtifact {
         file_name: "admission.txt".to_string(),
-        contents: format!("{line}\n"),
+        contents: format!(
+            "{line}\n{export}\nAjouter --admin à la première ligne pour le premier administrateur, \
+             puis « Reprendre » avec ce fichier.\n"
+        ),
         encoding: ArtifactEncoding::Text,
         fingerprint: None,
     });
@@ -1197,9 +1296,15 @@ fn sign_delivery(
     accepted: &AcceptedEnrollment,
     delivery: &Delivery<'_>,
     pin: &GatewayPin,
+    offline: Option<(GatewayMaterial, Admission)>,
 ) -> Result<OperatorArtifact, (Refusal, String)> {
     let not_signed = |error: String| (Refusal::DocumentNotSigned, error);
-    let draft = draft_delivery(accepted, delivery, pin)?;
+    let draft = match offline {
+        Some((material, admission)) => {
+            draft_from_material(accepted, delivery, pin, material, admission, now_unix())
+        }
+        None => draft_delivery(accepted, delivery, pin),
+    }?;
     let request = &accepted.request;
     let signed = astra_operator::signing::sign_document(vault, opened, registry, draft)
         .map_err(|error| not_signed(format!("{error:#}")))?;
@@ -1221,7 +1326,6 @@ fn draft_delivery(
     delivery: &Delivery<'_>,
     pin: &GatewayPin,
 ) -> Result<aether::key_negotiation::EnrollmentDocument, (Refusal, String)> {
-    use orion_core::enrollment_draft::{build_draft, resolve_negotiation_endpoint, DraftInput};
     use orion_core::gateway_admin as admin;
 
     let not_signed = |error: String| (Refusal::DocumentNotSigned, error);
@@ -1236,6 +1340,24 @@ fn draft_delivery(
         &request.client_wg_public_key.to_base64(),
     ))
     .map_err(|error| not_signed(error.to_string()))?;
+    draft_from_material(accepted, delivery, pin, material, admission, now_unix())
+}
+
+/// The document's draft, from the gateway's material and admission however they
+/// were read: from the gateway, or from a verified export. Nothing here depends
+/// on the source, so both build the same document.
+fn draft_from_material(
+    accepted: &AcceptedEnrollment,
+    delivery: &Delivery<'_>,
+    pin: &GatewayPin,
+    material: GatewayMaterial,
+    admission: Admission,
+    now: u64,
+) -> Result<aether::key_negotiation::EnrollmentDocument, (Refusal, String)> {
+    use orion_core::enrollment_draft::{build_draft, resolve_negotiation_endpoint, DraftInput};
+
+    let not_signed = |error: String| (Refusal::DocumentNotSigned, error);
+    let request = &accepted.request;
     pin.check(&material)
         .map_err(|(_, message)| not_signed(message))?;
     let negotiation_endpoint =
@@ -1251,7 +1373,7 @@ fn draft_delivery(
         negotiation_endpoint,
         allowed_ips: delivery.allowed_ips,
         ssh_target: delivery.ssh_target,
-        now_unix: now_unix(),
+        now_unix: now,
     })
     .map_err(|error| not_signed(format!("{error:#}")))?;
     // Read as Orion will read it before anyone signs it: a document Orion

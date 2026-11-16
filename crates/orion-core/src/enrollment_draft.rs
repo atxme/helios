@@ -74,6 +74,16 @@ pub fn check_leaves(
     Ok(())
 }
 
+/// The gateway's pinned PQ leaf, decoded from the material's base64 JSON.
+pub fn pinned_gateway_leaf(material: &GatewayMaterial) -> Result<PqCertificate> {
+    serde_json::from_slice(
+        &base64::engine::general_purpose::STANDARD
+            .decode(&material.gateway_pq_certificate)
+            .context("the gateway PQ certificate is not valid base64")?,
+    )
+    .context("the gateway PQ certificate is not a readable JSON document")
+}
+
 pub fn build_draft(draft: DraftInput<'_>) -> Result<EnrollmentDocument> {
     let Some(trust) = draft.admission.trust else {
         bail!(
@@ -99,12 +109,7 @@ pub fn build_draft(draft: DraftInput<'_>) -> Result<EnrollmentDocument> {
 
     // The one place the pinned gateway leaf is verified, under the authority
     // that issued it — the trust block's `CA-PQ`.
-    let gateway_certificate: PqCertificate = serde_json::from_slice(
-        &base64::engine::general_purpose::STANDARD
-            .decode(&draft.material.gateway_pq_certificate)
-            .context("the gateway PQ certificate is not valid base64")?,
-    )
-    .context("the gateway PQ certificate is not a readable JSON document")?;
+    let gateway_certificate = pinned_gateway_leaf(draft.material)?;
     verify_pinned_gateway_certificate(
         &gateway_certificate,
         &draft.material.server_name,

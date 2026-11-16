@@ -1012,7 +1012,7 @@ fn the_admission_line_names_the_written_leaves() {
         .find(|artifact| artifact.file_name == "admission.txt")
         .expect("the line is handed over");
     assert_eq!(
-        line.contents.trim_end(),
+        line.contents.lines().next().expect("the line"),
         astra_operator::admission::admission_command_line(
             "laptop $(id)",
             &enrolment.request.client_wg_public_key.to_base64(),
@@ -1218,6 +1218,7 @@ fn the_acceptance_manifest_shows_the_signed_routes() {
                 ssh_target: Some("root@10.0.0.1"),
                 gateway: Some("http://gateway.invalid"),
             },
+            export: None,
         },
         &|_| answer(SERVER_NAME, &domain.gateway_key),
         &|_| Ok(vec![device.clone()]),
@@ -1309,6 +1310,7 @@ fn resume_of<'a>(id: Id16, gateway: Option<&'a str>) -> Resume<'a> {
             ssh_target: None,
             gateway,
         },
+        export: None,
     }
 }
 
@@ -1316,6 +1318,19 @@ fn run_resume(
     domain: &Domain,
     id: Id16,
     gateway: Option<&str>,
+    read: GatewayReader<'_>,
+    admitted: AdmittedReader<'_>,
+) -> (
+    Result<(), String>,
+    Vec<OperatorStatus>,
+    Vec<OperatorArtifact>,
+) {
+    run_resume_of(domain, resume_of(id, gateway), read, admitted)
+}
+
+fn run_resume_of(
+    domain: &Domain,
+    resume_with: Resume<'_>,
     read: GatewayReader<'_>,
     admitted: AdmittedReader<'_>,
 ) -> (
@@ -1341,7 +1356,7 @@ fn run_resume(
         &mut |artifact| artifacts.push(artifact),
         &domain.vault_path,
         &domain.registry,
-        resume_of(id, gateway),
+        resume_with,
         read,
         admitted,
     );
@@ -1377,6 +1392,7 @@ fn a_resumed_enrollment_never_reissues_leaves() {
                 endpoint: "198.51.100.7:51820".into(),
                 allowed_ips: None,
                 ssh_target: None,
+                enrolment_export: None,
             },
             None,
             received,
@@ -1579,4 +1595,375 @@ fn revoking_an_issued_invitation() {
     );
     // Nothing is left to revoke twice, and a consumed invitation is not revocable.
     assert!(crate::operator::invitations::revoke(&domain.registry, &id, now_unix()).is_err());
+}
+
+/// The trust domain of the fixture vault, as a trust block names it.
+const DOMAIN_ID_HEX: &str = "03030303030303030303030303030303";
+
+/// The gateway's leaf for `server_name` under `key`, as an export carries it:
+/// base64 of its JSON, and the fingerprint the export names it by.
+fn leaf_fields(domain: &Domain, server_name: &str, key: &str) -> (String, String) {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let json = domain.leaf(server_name, key);
+    let leaf: aether::key_negotiation::PqCertificate =
+        serde_json::from_str(&json).expect("the leaf is JSON");
+    (
+        STANDARD.encode(json.as_bytes()),
+        leaf.fingerprint().expect("fingerprint"),
+    )
+}
+
+/// The export `heliosd export-enrolment` writes for the fixture gateway and the
+/// peer `device`: the gateway's leaf, and the trust block of the fixture domain.
+fn export_of(domain: &Domain, device: &str) -> aether::key_negotiation::EnrollmentExport {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let (leaf, fingerprint) = leaf_fields(domain, SERVER_NAME, &domain.gateway_key);
+    let trust = orion_core::TrustMaterial {
+        trust_domain_id: DOMAIN_ID_HEX.into(),
+        ca_epoch: 1,
+        ca_pq_public_key: domain.ca_public_key.to_base64(),
+        ca_tls_epoch: 1,
+        client_tls_ca_der: STANDARD.encode(
+            aether::certificates::test_x509::certificate_authority("helios-client-ca-tls")
+                .as_bytes(),
+        ),
+        client_generation: 1,
+        active_gateway_identity_epoch: 1,
+        gateway_decision_epoch: 1,
+        astra_authority_url: "https://astra.example".into(),
+        webauthn_rp_id: "astra.example".into(),
+        astra_policy_fingerprint: "11".repeat(32),
+        credential_registry_epoch: 1,
+        astra_credential_bindings: Vec::new(),
+        astra_service_key_epoch: 1,
+        astra_service_public_key: domain.ca_public_key.to_base64(),
+    };
+    aether::key_negotiation::EnrollmentExport {
+        server_name: SERVER_NAME.into(),
+        gateway_ca_der: STANDARD.encode(
+            aether::certificates::test_x509::certificate_authority("helios-gateway-ca").as_bytes(),
+        ),
+        gateway_pq_certificate: leaf,
+        pq_certificate_sha256: fingerprint,
+        wireguard_public_key: domain.gateway_key.clone(),
+        negotiation_port: Some(51821),
+        gateway_wg_address: "100.64.0.1/24".into(),
+        peer_public_key: device.into(),
+        address: "100.64.1.2/32".into(),
+        address_v6: None,
+        trust: serde_json::to_value(&trust).expect("the trust block"),
+    }
+}
+
+/// The export text for `device`, with `edit` applied to it first.
+fn export_text(
+    domain: &Domain,
+    device: &str,
+    edit: impl FnOnce(&mut aether::key_negotiation::EnrollmentExport),
+) -> String {
+    let mut export = export_of(domain, device);
+    edit(&mut export);
+    aether::key_negotiation::encode_enrolment_export_file(&export)
+}
+
+/// A kept acceptance of `laptop`, and the device's key it was made for.
+fn offline_fixture(label: &str) -> (Domain, Id16, String) {
+    let domain = Domain::new(label).with_ca_tls();
+    let (enrolment, accepted) = kept_acceptance(&domain, "laptop");
+    let device = accepted.request.client_wg_public_key.to_base64();
+    (domain, enrolment.invitation.invitation_id, device)
+}
+
+/// A resumption with no gateway connected, reading `export`.
+fn resume_offline(id: Id16, export: &str) -> Resume<'_> {
+    Resume {
+        invitation_id: id,
+        delivery: Delivery {
+            endpoint: "198.51.100.7:51820",
+            allowed_ips: None,
+            ssh_target: None,
+            gateway: None,
+        },
+        export: Some(export),
+    }
+}
+
+/// Refuses `text` as an offline resumption: a HandoffMismatch, before any key,
+/// with the registry and the artifacts untouched. Returns the message.
+fn refused_offline(domain: &Domain, id: Id16, text: &str) -> String {
+    let before = registry_snapshot(domain, &id);
+    let (outcome, published, artifacts) = run_resume_of(
+        domain,
+        resume_offline(id, text),
+        &|_| unreachable_gateway(),
+        &nothing_admitted,
+    );
+    let error = outcome.expect_err("the export is refused");
+    assert_eq!(
+        published.last().expect("a status").refusal,
+        Some(Refusal::HandoffMismatch)
+    );
+    assert!(no_key_was_asked(&published));
+    assert!(artifacts.is_empty());
+    assert_eq!(registry_snapshot(domain, &id), before);
+    error
+}
+
+/// An export read with no gateway draws the same document as the gateway's own
+/// material: both go through one builder, and the draft is what gets signed.
+#[test]
+fn resume_offline_signs_the_same_document_as_online() {
+    let (domain, id, device) = offline_fixture("resume-offline-document");
+    let accepted = domain
+        .registry
+        .accepted(&id)
+        .expect("readable")
+        .expect("kept");
+    let pin = pin_of(&domain, &accepted);
+    // One export, built once: each call draws fresh CA certificates.
+    let export = export_of(&domain, &device);
+    let text = aether::key_negotiation::encode_enrolment_export_file(&export);
+    let resuming = prepare_resumption(
+        &domain.vault_path,
+        &domain.registry,
+        &resume_offline(id, &text),
+        &|_| unreachable_gateway(),
+        &nothing_admitted,
+    )
+    .map_err(|(refusal, _)| refusal)
+    .expect("prepared");
+    assert!(resuming.admitted);
+    assert!(resuming.gateway_error.is_none());
+    let (material, admission) = resuming.offline.expect("the export is read");
+
+    let delivery = Delivery {
+        endpoint: "198.51.100.7:51820",
+        allowed_ips: None,
+        ssh_target: None,
+        gateway: None,
+    };
+    let now = now_unix();
+    let from_export = draft_from_material(&accepted, &delivery, &pin, material, admission, now)
+        .expect("drafted from the export");
+
+    // The gateway's own values, as the online route serves them: the same ones
+    // the export was written from.
+    let online_material = GatewayMaterial {
+        server_name: export.server_name.clone(),
+        gateway_ca_der: export.gateway_ca_der.clone(),
+        gateway_pq_certificate: export.gateway_pq_certificate.clone(),
+        wireguard_public_key: export.wireguard_public_key.clone(),
+        pq_certificate_sha256: export.pq_certificate_sha256.clone(),
+        negotiation_port: export.negotiation_port,
+    };
+    let online_admission = Admission {
+        address: export.address.clone(),
+        address_v6: None,
+        heliosd_url: Some(format!("http://100.64.0.1:{}", aether::API_PORT)),
+        trust: Some(serde_json::from_value(export.trust.clone()).expect("the trust block")),
+    };
+    let from_gateway = draft_from_material(
+        &accepted,
+        &delivery,
+        &pin,
+        online_material,
+        online_admission,
+        now,
+    )
+    .expect("drafted from the gateway");
+    assert_eq!(
+        from_export.to_json().expect("json"),
+        from_gateway.to_json().expect("json")
+    );
+}
+
+/// With a verified export and no gateway, the ceremony reaches the key, and
+/// only then. A byte order mark, as Notepad saves it, is read like any other.
+#[test]
+fn resume_offline_asks_for_the_key_only_after_every_check() {
+    let (domain, id, device) = offline_fixture("resume-offline-key");
+    let text = format!("\u{feff}{}", export_text(&domain, &device, |_| {}));
+    let before = registry_snapshot(&domain, &id);
+    let (outcome, published, artifacts) = run_resume_of(
+        &domain,
+        resume_offline(id, &text),
+        &|_| unreachable_gateway(),
+        &nothing_admitted,
+    );
+    let asked = published
+        .iter()
+        .find(|status| matches!(status.gesture, GestureState::AwaitingKey { .. }))
+        .expect("the key is asked for");
+    assert!(matches!(
+        asked.manifest,
+        Some(AstraManifest::EnrollmentAcceptance(_))
+    ));
+    outcome.expect("an abandonment is not a failure");
+    assert_eq!(
+        published.last().expect("a status").gesture,
+        GestureState::Cancelled
+    );
+    assert!(artifacts.is_empty());
+    assert_eq!(registry_snapshot(&domain, &id), before);
+}
+
+/// An export taken on another gateway, or naming another one, is refused.
+#[test]
+fn resume_offline_refuses_an_export_of_another_gateway() {
+    let (domain, id, device) = offline_fixture("resume-offline-gateway");
+    let other = aether::wg::generate_keypair().expect("keys").public_key;
+    for text in [
+        export_text(&domain, &device, |export| {
+            export.wireguard_public_key = other.clone();
+        }),
+        export_text(&domain, &device, |export| {
+            export.server_name = "elsewhere.example".into();
+        }),
+    ] {
+        refused_offline(&domain, id, &text);
+    }
+}
+
+/// An export of the right gateway for another peer (the wrong key was
+/// exported) is refused before any key, by name.
+#[test]
+fn resume_offline_refuses_an_export_of_another_peer() {
+    let (domain, id, _) = offline_fixture("resume-offline-peer");
+    let other = aether::wg::generate_keypair().expect("keys").public_key;
+    let error = refused_offline(&domain, id, &export_text(&domain, &other, |_| {}));
+    assert!(error.contains("un autre poste"), "{error}");
+}
+
+/// A trust block naming another domain, or another CA-PQ, is refused before
+/// any key.
+#[test]
+fn resume_offline_refuses_an_export_of_another_domain() {
+    let (domain, id, device) = offline_fixture("resume-offline-domain");
+    let other_ca = aether::certificates::encoding::generate_ml_dsa_87_keypair()
+        .expect("CA-PQ")
+        .1
+        .to_base64();
+    for text in [
+        export_text(&domain, &device, |export| {
+            export.trust["trust_domain_id"] = "04".repeat(16).into();
+        }),
+        export_text(&domain, &device, |export| {
+            export.trust["ca_pq_public_key"] = other_ca.clone().into();
+        }),
+    ] {
+        let error = refused_offline(&domain, id, &text);
+        assert!(error.contains("un autre domaine"), "{error}");
+    }
+}
+
+/// The gateway's leaf is verified under the domain's CA-PQ, and its fingerprint
+/// must be the one the export names: anything else is refused before any key.
+#[test]
+fn resume_offline_refuses_a_gateway_leaf_that_does_not_verify() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let (domain, id, device) = offline_fixture("resume-offline-leaf");
+    let (other_leaf, other_fingerprint) =
+        leaf_fields(&domain, "elsewhere.example", &domain.gateway_key);
+    for text in [
+        export_text(&domain, &device, |export| {
+            export.gateway_pq_certificate = other_leaf.clone();
+            export.pq_certificate_sha256 = other_fingerprint.clone();
+        }),
+        export_text(&domain, &device, |export| {
+            export.pq_certificate_sha256 = "00".repeat(32);
+        }),
+        export_text(&domain, &device, |export| {
+            export.gateway_pq_certificate = STANDARD.encode("not a leaf");
+        }),
+    ] {
+        refused_offline(&domain, id, &text);
+    }
+}
+
+/// Whatever is not a `heliosd export-enrolment` export is refused with the
+/// window's sentence, verbatim, before any key.
+#[test]
+fn resume_offline_refuses_an_unreadable_export() {
+    let (domain, id, device) = offline_fixture("resume-offline-unreadable");
+    let good = export_text(&domain, &device, |_| {});
+    assert!(good.contains("helios-enrolment-export-v1"), "{good}");
+    let foreign = good.replace("helios-enrolment-export-v1", "helios-enrolment-export-v0");
+    for text in [
+        String::new(),
+        "{}".to_string(),
+        "not an export".to_string(),
+        foreign,
+    ] {
+        let error = refused_offline(&domain, id, &text);
+        assert_eq!(
+            error,
+            "Ce fichier n'est pas un export d'enrôlement de `heliosd export-enrolment`."
+        );
+    }
+}
+
+/// With a tunnel up, the gateway is read and the export is ignored, even when
+/// it is unreadable: the online path is unchanged.
+#[test]
+fn resume_online_ignores_the_export() {
+    let (domain, id, device) = offline_fixture("resume-online-export");
+    let reads = std::cell::Cell::new(0);
+    let read = |_: &str| {
+        reads.set(reads.get() + 1);
+        answer(SERVER_NAME, &domain.gateway_key)
+    };
+    let admitted_device = device.clone();
+    let (outcome, published, artifacts) = run_resume_of(
+        &domain,
+        Resume {
+            invitation_id: id,
+            delivery: Delivery {
+                endpoint: "198.51.100.7:51820",
+                allowed_ips: None,
+                ssh_target: None,
+                gateway: Some("http://gateway.invalid"),
+            },
+            export: Some("not an export"),
+        },
+        &read,
+        &|_| Ok(vec![admitted_device.clone()]),
+    );
+    assert_eq!(reads.get(), 1, "the gateway is read");
+    outcome.expect("an abandonment is not a failure");
+    assert!(published
+        .iter()
+        .any(|status| matches!(status.gesture, GestureState::AwaitingKey { .. })));
+    assert!(published
+        .iter()
+        .all(|status| status.refusal != Some(Refusal::HandoffMismatch)));
+    assert!(artifacts.is_empty());
+}
+
+/// The line to hand over names the export command after the admission, and the
+/// sentence that says what to do with its file.
+#[test]
+fn admission_artifact_names_the_export_command() {
+    let domain = Domain::new("admission-export").with_ca_tls();
+    let enrolment = domain.enrolment("laptop", true);
+    let accepted = issued_leaves(&domain, &enrolment);
+    let (_, _, artifacts) = keep_and_admit_on(&domain, &accepted, None);
+    let text = artifacts
+        .iter()
+        .find(|artifact| artifact.file_name == "admission.txt")
+        .expect("the line is handed over")
+        .contents
+        .clone();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 3, "{text}");
+    assert_eq!(
+        lines[1],
+        format!(
+            "heliosd export-enrolment --public-key {} > laptop.enrolment.json",
+            enrolment.request.client_wg_public_key.to_base64()
+        )
+    );
+    assert_eq!(
+        lines[2],
+        "Ajouter --admin à la première ligne pour le premier administrateur, puis « Reprendre » avec ce fichier."
+    );
 }
