@@ -1,4 +1,6 @@
 use super::*;
+use aether::certificates::encoding::Id16;
+use orion_core::certificate_recovery::RecoveryStep;
 use orion_core::{ClientProfile, ProfileKind};
 
 fn profile_with_secrets() -> (ClientProfile, String, String) {
@@ -104,4 +106,82 @@ fn renewal_progress_uses_stable_discriminants_and_keeps_operation_context() {
     assert_eq!(recovered["generation"], 9);
     assert_eq!(recovered["activation_at"], 1_900_000_000);
     assert!(recovered.get("operation_id").is_none());
+}
+
+#[test]
+fn renewal_steps_map_to_progress_without_losing_operation_or_generation() {
+    let operation_id = Id16::new([0x2a; 16]).expect("operation id");
+
+    assert_eq!(
+        RenewalProgress::of(&RenewalStep::AwaitingOperator { operation_id }),
+        RenewalProgress::AwaitingOperator {
+            operation_id: operation_id.to_hex()
+        }
+    );
+    assert_eq!(
+        RenewalProgress::of(&RenewalStep::Issuing { operation_id }),
+        RenewalProgress::Issuing {
+            operation_id: operation_id.to_hex()
+        }
+    );
+    assert_eq!(
+        RenewalProgress::of(&RenewalStep::Committed {
+            generation: u64::MAX
+        }),
+        RenewalProgress::Committed {
+            generation: u64::MAX
+        }
+    );
+}
+
+#[test]
+fn recovery_steps_keep_the_recovery_discriminant_and_all_context() {
+    let operation_id = Id16::new([0x51; 16]).expect("operation id");
+
+    assert_eq!(
+        RenewalProgress::of_recovery(&RecoveryStep::AwaitingOperator { operation_id }),
+        RenewalProgress::RecoveryAwaitingOperator {
+            operation_id: operation_id.to_hex()
+        }
+    );
+    assert_eq!(
+        RenewalProgress::of_recovery(&RecoveryStep::Issuing { operation_id }),
+        RenewalProgress::Issuing {
+            operation_id: operation_id.to_hex()
+        }
+    );
+    assert_eq!(
+        RenewalProgress::of_recovery(&RecoveryStep::Recovered {
+            generation: 17,
+            activation_at: u64::MAX,
+        }),
+        RenewalProgress::Recovered {
+            generation: 17,
+            activation_at: u64::MAX,
+        }
+    );
+}
+
+#[test]
+fn action_outcome_can_report_progress_and_refusals_for_different_profiles() {
+    let outcome = ActionOutcome {
+        progress: [(
+            "bureau".into(),
+            RenewalProgress::Committed { generation: 12 },
+        )]
+        .into_iter()
+        .collect(),
+        refused: [("secours".into(), "gateway unavailable".into())]
+            .into_iter()
+            .collect(),
+    };
+    let encoded = serde_json::to_value(&outcome).expect("outcome serializes");
+
+    assert_eq!(encoded["progress"]["bureau"]["step"], "committed");
+    assert_eq!(encoded["progress"]["bureau"]["generation"], 12);
+    assert_eq!(encoded["refused"]["secours"], "gateway unavailable");
+    assert_eq!(
+        serde_json::from_value::<ActionOutcome>(encoded).expect("outcome deserializes"),
+        outcome
+    );
 }
