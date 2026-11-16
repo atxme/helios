@@ -748,8 +748,8 @@ seconde pour le client (ou deux comptes). Le parcours est décrit dans
 - réutiliser l'invitation consommée pour une seconde demande : refus « déjà
   consommée » avant tout toucher, qui oriente vers « Reprendre » ;
 - une invitation expirée ou inconnue de ce poste : refus nommé, rien consommé ;
-- « Reprendre » sur une acceptation faite par la CLI (`astra-signer enroll
-  accept`, transitoire) : refus « acceptée hors d'Orion » ;
+- « Reprendre » sur une acceptation faite par l'ancien `astra-signer enroll
+  accept` (retiré au lot 7) : refus « acceptée hors d'Orion » ;
 - gateway connectée dont l'identité diffère de celle épinglée par l'invitation :
   refus avant tout toucher, invitation intacte ;
 - « Révoquer » une invitation émise : confirmation demandée, aucun toucher,
@@ -785,8 +785,7 @@ Prévoir deux YubiKey, et une troisième si possible.
     une anomalie à consigner. Le coffre est écrit et le relais public à côté
     (`astra-domain.json`) ; le panneau liste deux clés. L'écran de fin montre
     l'empreinte du coffre et celle de `CA-PQ`, groupées par quatre, le rappel
-    « Sauvegardez le coffre » et les étapes suivantes (déploiement, amorçage par
-    `astra-signer issue-gateway-bootstrap`, « Finaliser le domaine »).
+    « Sauvegardez le coffre » et les étapes suivantes (déploiement, amorçage par « Amorcer la gateway… » (*Domaine*), « Finaliser le domaine »).
 16. « Ajouter une clé » (libellé, rôle) avec la troisième YubiKey : **3 dialogues**
     attendus (une clé déjà enrôlée ouvre le coffre ; la nouvelle s'enregistre
     puis dérive son secret). Sans troisième clé, ajouter une seconde fois une
@@ -973,8 +972,8 @@ astra_exec='sudo docker compose -f deploy/astra/compose.yaml
 35. **Console, service en marche puis arrêté.** `$astra_exec campaign open
     --scope fleet-leafs --reason "recette 5a" --requested-by "prénom.nom"`.
     Attendu : l'identifiant d'opération sur la sortie standard, l'empreinte et
-    la ligne `astra-signer approve-campaign …` sur l'erreur standard, comme
-    avant le lot. La même commande une seconde fois, tant que la première
+    le bloc
+    « approuver dans Orion : Astra › Approbations », avec l'autorité et l'opération, sur l'erreur standard. La même commande une seconde fois, tant que la première
     attend : refus « une opération de la même famille attend déjà l'opérateur
     (…) », rien d'ouvert. Puis `sudo docker compose … stop astra` : le journal
     dit « Astra's door closed » et `operator.sock` disparaît du volume. Lancer
@@ -1007,9 +1006,8 @@ astra_exec='sudo docker compose -f deploy/astra/compose.yaml
     même requête avec `"action":"client_revocation","peer":"<clé WireGuard du
     client>"`. Attendu : `operation_id` et `revocation_expiries` dont
     `pq_not_after` et `tls_not_after` valent l'échéance de la génération
-    active du client. Sur le poste opérateur : `astra-signer revoke
-    --authority-url <origine d'Astra> --operation-id <operation_id> --not-after
-    <pq_not_after>`, sans rien retaper d'autre. Attendu : la révocation aboutit
+    active du client. Sur le poste opérateur, approuver la révocation dans
+    Orion (*Approbations* pour une campagne ouverte à la console), sans rien retaper. Attendu : la révocation aboutit
     et le client est révoqué (écran *Certificats* de la gateway). Une révocation du **même** client rouverte pendant que la
     première attend : refusée ; celle d'un **autre** client : acceptée.
     Variantes : `"action":"gateway_identity"` ou une `peer` sur
@@ -1158,9 +1156,10 @@ Chaque étape : action, puis état attendu. Onglet *Astra* › *Rotations*.
     par un autre coffre du même domaine. Attendu : acceptée, la copie précédente
     est gardée à côté, l'empreinte et l'opérateur sont au journal d'Astra ; elle
     ne peut ni ouvrir le coffre ni signer. `ROADMAP.md`, F14-f.
-61. **Ancien enregistrement `astra-signer`, adopté puis terminé.** Interrompre
-    `astra-signer rotate-ca-tls` (enregistrement `astra-prepared.json`) ou
-    `rotate-ca-pq` (journal historique) avant la fin, puis ouvrir Orion. Attendu :
+61. **Ancien enregistrement `astra-signer`, adopté puis terminé.** **[cible]** (fichier
+    laissé par l'ancien `astra-signer`, retiré au lot 7). Remettre en place un
+    `astra-prepared.json` (rotation CA TLS) ou un journal `rotate-ca-pq` (historique),
+    laissé avant la fin, puis ouvrir Orion. Attendu :
     la ligne « Reprendre » apparaît sans clé ; un journal CA-PQ ancien lit **d'abord
     Astra** : s'il tient l'ancre du journal, la rotation continue ; sinon conflit de
     domaine et rien ne bouge. Après adoption l'enregistrement n'est plus rejoué à
@@ -1171,11 +1170,10 @@ Chaque étape : action, puis état attendu. Onglet *Astra* › *Rotations*.
     deux `astra run` sur un même volume : le second refuse (`flock`). Une clé
     débranchée en plein dialogue : aucune limite de temps (limite connue, seul un
     redémarrage d'Orion y met fin, `ROADMAP.md` F14-d).
-63. **Recours en ligne de commande.** `astra-signer rotate-ca-pq` avec
-    `--authority-url` et `--operation-id` d'une campagne ouverte par `astra
-    campaign open` : la rotation se joue comme avant et son enregistrement est
-    ensuite repris par Orion (étape 61). Orion n'a lancé aucun `astra-signer`
-    pendant tout « G ».
+63. **Sans `astra-signer`.** Le recours en ligne de commande est retiré au lot 7 : la
+    rotation de « G » se joue entièrement dans Orion. Attendu : aucune commande
+    `astra-signer` n'est lancée pendant tout « G », et l'enregistrement de l'étape 61
+    est repris par Orion.
 64. **Marquer une clé perdue atteint Astra.** Hors recouvrement, tunnel monté,
     *Coffre et clés* : la ligne « Copie du coffre » du bloc *Astra* est verte ;
     noter le champ `credential_registry_epoch` de la route `operator/status`
@@ -1249,8 +1247,8 @@ attendu.
     sous la clé sortante ; Astra accepte, et la ligne passe « Révoqué ». « Reprendre »
     reste disponible pendant le recouvrement. **[cible]** (clés réelles).
 75. **Recours refusé pendant un recouvrement.** Sur le poste de l'opérateur,
-    `astra-signer revoke …` pendant le même recouvrement. Attendu : « Changement de
-    CA-PQ en cours : révoquer ce poste depuis Orion. Rien n'a été signé. ». **[cible]**
+    révoquer depuis Orion (*Postes*, « Révoquer ») pendant le même recouvrement.
+    Attendu : la signature passe sous la clé sortante, sans recours en ligne de commande. **[cible]**
     (coffre et clés réelles).
 76. **Marge d'une heure.** Avec une horloge d'essai, ouvrir une révocation à moins
     d'une heure de `not_after` de la clé sortante. Attendu : la coupure se fait, la
@@ -1540,7 +1538,7 @@ deux clés dans le coffre pour les étapes **[cible]**. Onglet *Astra* › *Rota
 **L. F14-e : « Remplacer la CA-PQ sans campagne » depuis Orion**
 
 Les étapes marquées **[cible]** demandent de vraies clés, une gateway cible ou un vrai
-journal `astra-signer`. Les autres se jouent sans clé, tunnel monté. Onglet *Astra* ›
+journal d'un ancien `astra-signer`. Les autres se jouent sans clé, tunnel monté. Onglet *Astra* ›
 *Rotations*, sur un domaine dont le relais nomme ou non une origine Astra. Chaque étape :
 action, puis état attendu.
 
@@ -1569,12 +1567,13 @@ action, puis état attendu.
     origine Astra, ouvrir *Rotations*. Attendu : « Remplacer la CA-PQ sans campagne »
     n'apparaît pas ; « Remplacer la CA-PQ » reste la seule ligne. Même résultat si le relais est
     illisible.
-129. **Journal `astra-signer` hors campagne, puis « Reprendre ».** **[cible]** (un journal réel).
-    Dans un domaine sans origine, lancer `astra-signer rotate-ca-pq` hors campagne (sans
-    identifiant d'opération) et l'interrompre après l'écriture de son journal, avant la pose.
+129. **Journal d'un ancien `astra-signer` hors campagne, puis « Reprendre ».** **[cible]**
+    (un journal réel, laissé par l'ancien `astra-signer rotate-ca-pq`, retiré au lot 7).
+    Dans un domaine sans origine, remettre en place ce journal, interrompu après l'écriture
+    de son journal et avant la pose.
     Attendu : « Reprendre » finit la rotation sans demander de clé ni passer par Astra, et
     installe la transition par le tunnel. Variante : donner une origine au relais avant la
-    reprise. Attendu : la ligne lit « Domaine en désaccord. Intervention manuelle requise », sans rien poser ; et
+    reprise. Attendu : la ligne lit « Domaine en désaccord. Intervention manuelle requise. », sans rien poser ; et
     avant cela, ajouter une origine pendant le journal est refusé.
 
 **M. F14-f : copie du coffre depuis Orion**
@@ -1643,6 +1642,39 @@ action, puis état attendu.
     s'affiche sous le geste, avec « Remplacer quand même » et l'avertissement « La copie
     d’Astra sera remplacée par ce coffre. À ne faire que si vous savez que la copie d’Astra
     est fausse. ». Ouvrir ensuite *Rotations* : le refus seul, sans bouton.
+
+**N. Lot 7 : retrait d'`astra-signer`, premier administrateur sans tunnel**
+
+Onglet *Astra* › *Enrôlement*, sauf mention contraire. Le premier administrateur
+n'a pas de tunnel avant son admission : la gateway est jouée en console, et le
+poste client est un vrai poste Windows. Chaque étape : action, puis état attendu.
+
+139. **[cible] Premier administrateur sans tunnel, de bout en bout.** Inviter le poste
+    administrateur (« Inviter un poste… »), puis, sur le poste client, « Importer une
+    invitation » et « Accepter une demande… » côté opérateur, sans gateway qui réponde. Attendu : les deux feuilles et
+    `admission.txt`, dont la première ligne est `heliosd peer add … --minimum-mode ml-kem`,
+    la deuxième `heliosd export-enrolment --public-key <clé> > <nom>.enrolment.json`, la
+    troisième « Ajouter --admin à la première ligne pour le premier administrateur, puis
+    « Reprendre » avec ce fichier. ». Sur la gateway, en console : la première ligne avec
+    `--admin`, puis la deuxième. Sur le poste, « Reprendre » avec le fichier d'export
+    (champ « Export d'enrôlement de la gateway », « Sans tunnel : le fichier de
+    `heliosd export-enrolment`. »). Attendu : un document signé, qu'on importe sur le poste
+    client ; le profil se connecte une fois le tunnel monté.
+140. **Export d'une autre gateway refusé avant toute clé.** Reprendre l'invitation avec le
+    fichier d'export d'une autre gateway. Attendu : refus nommé, avant tout toucher ; rien
+    n'est consommé, l'invitation reste « à reprendre ».
+141. **Export d'un autre pair refusé avant toute clé.** Sur la bonne gateway, exporter la
+    clé d'un autre poste (`heliosd export-enrolment --public-key <autre clé>`) et le
+    donner à « Reprendre ». Attendu : refus nommé, avant tout toucher.
+142. **`heliosd export-enrolment` avant `heliosd peer add` refusé.** Sur la gateway, exporter
+    pour une clé qui n'est pas dans `network.toml`. Attendu : refus « admit it first, with
+    `heliosd peer add` » ; aucun fichier produit, aucune admission vide.
+143. **Reprise en ligne inchangée, fichier choisi.** Tunnel monté, avec un fichier d'export
+    choisi dans « Reprendre ». Attendu : la gateway connectée fait foi, le fichier est
+    ignoré, et le document est produit comme avant le lot 7.
+144. **Fichier qui n'est pas un export.** Choisir un autre JSON, ou un fichier d'un autre
+    format, dans « Reprendre » sans tunnel. Attendu : « Ce fichier n'est pas un export
+    d'enrôlement de `heliosd export-enrolment`. », avant toute clé.
 
 ### Le chemin manuel
 

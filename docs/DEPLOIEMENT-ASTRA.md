@@ -9,10 +9,9 @@ qui le suit.
 
 Les gestes du coffre et du domaine se jouent **dans Orion**, onglet *Astra*
 (le lot 3 de F14, fusionné dans `main` le 31 octobre 2026, validation Windows
-à faire). `astra-signer` reste livré comme voie transitoire, jusqu'au
-lot 7. L'amorçage de la gateway se joue lui aussi dans Orion (le lot 6a de F14,
-fusionné dans `main` le 31 octobre 2026, validation Windows à faire) ; `astra-signer issue-gateway-bootstrap` en est la voie
-transitoire.
+à faire). `astra-signer` est retiré au lot 7 : Orion est le seul outil. L'amorçage
+de la gateway se joue lui aussi dans Orion (le lot 6a de F14, fusionné dans
+`main` le 31 octobre 2026, validation Windows à faire).
 
 1. Orion, « Coffre et clés » : « Créer un domaine ». Nom du domaine (RP ID) et
    origine, libellés des deux clés, « Créer le domaine » : deux YubiKey, branchées
@@ -59,21 +58,13 @@ vérifie sous le `CA-PQ` du relais et n'inscrit l'identité que si elle y vérif
 origine d'Astra. Ni l'un ni l'autre ne remplace une identité déjà inscrite, ni
 celle à laquelle le document de credentials est lié.
 
-Voie transitoire, équivalente aux étapes 1 à 5 tant que `astra-signer` est livré
-(jusqu'au lot 7 ; `astra-signer issue-gateway-bootstrap` y reste la voie en ligne
-de commande de l'étape 3) :
+Les étapes 1, 3 et 4 n'ont plus de voie en ligne de commande : `astra-signer` est
+retiré au lot 7, et Orion en porte chaque geste. Les commandes restantes sont
+celles de `deploy.sh` :
 
 ```sh
-astra-signer init --rp-id <gateway>.<tailnet>.ts.net --label "YubiKey du bureau"
-astra-signer enrol --label "YubiKey de récupération"
-./scripts/deploy.sh
-astra-signer issue-gateway-bootstrap \
-  --request ~/.helios/astra/gateway-bootstrap-request.json \
-  --out ~/.helios/astra/gateway-bootstrap-certificate.json
-# L'ancre TLS cliente, dans la foulée : elle se dépose dans le même relais et
-# c'est là que le déploiement va chercher l'empreinte qu'il épingle.
-astra-signer issue-ca-tls
-./scripts/deploy.sh --astra
+./scripts/deploy.sh          # premier passage, étape 2
+./scripts/deploy.sh --astra  # reprise, étape 5
 ```
 
 C'est tout. Chaque geste à clé exige les clés de sécurité et ne peut
@@ -92,7 +83,7 @@ cérémonie au lieu de l'adopter. Dans Orion, l'identité déjà enregistrée ne
 change pas (c'est une transition de gateway, lot 6), et « Reprendre la gateway
 connectée » refuse celle d'une autre gateway que le profil connecté.
 
-Aucune valeur n'est recopiée à la main. La création du domaine (Orion, ou `init`) écrit un **relais** public à côté
+Aucune valeur n'est recopiée à la main. La création du domaine (Orion) écrit un **relais** public à côté
 du coffre (`~/.helios/astra/astra-domain.json`, `%APPDATA%\astra\` sous Windows) :
 domaine, RP ID, ancre `CA-PQ`. Les cérémonies suivantes y ajoutent ce qu'elles
 apprennent — identité de la gateway, ancre `CA-TLS` et son époque.
@@ -265,11 +256,8 @@ l'origine de l'autorité, le RP ID et les durées viennent du relais de domaine
 **Si la clé est sur un autre poste**, Orion affiche l'identifiant d'opération
 et le chemin : sur le poste de l'opérateur, Astra › Approbations › « Approuver
 une récupération », avec cet identifiant. Ce second Orion approuve sans achever
-la récupération ; le poste expiré reprend de son côté. L'adaptateur
-`astra-signer recover --authority-url … --operation-id …` subsiste, à titre
-transitoire, sur le transport HTTPS (origine publique, sans tunnel) ; la
-récupération n'a pas de mode hors ligne. Il exécute la même
-cérémonie.
+la récupération ; le poste expiré reprend de son côté. La
+récupération n'a pas de mode hors ligne.
 
 Une seule clé suffit, et §7.5 dit pourquoi : elle n'est pas la seule preuve —
 la clé privée de la dernière génération admise signe aussi la demande, et une
@@ -296,10 +284,11 @@ astra campaign open --scope trust-authorities \
   --reason "rotation annuelle" --requested-by "prénom.nom"
 # → imprime un identifiant d'opération
 
-# sur le poste opérateur
-astra-signer rotate-ca-pq --out ca-pq-transition.json \
-  --authority-url https://astra.exemple --operation-id <identifiant>
 ```
+
+Sur le poste opérateur, dans Orion : Astra › Rotations, ligne « Remplacer la
+CA-PQ », qui ouvre elle-même la campagne. Si la campagne a été ouverte à la
+console, son approbation se fait dans Astra › Approbations.
 
 Dans un domaine sans origine Astra, la ligne « Remplacer la CA-PQ sans campagne » de
 *Rotations* remplace ces deux commandes hors campagne (`RENOUVELLEMENT-CERTIFICATS.md`, §3) :
@@ -309,22 +298,11 @@ ligne n'apparaît pas.
 
 ### Par le tunnel, quand il est monté
 
-Les quatre commandes de chaîne — `rotate-ca-tls`, `sign-gateway-transition`,
-`abort-gateway-transition` et `resume-rotation` — n'avaient que l'origine
-publique. Depuis l'amendement du 4 septembre 2026 elles passent par le tunnel
-dès qu'il existe, ce qui est le seul chemin praticable quand le nom de
-l'autorité n'est pas résoluble publiquement (spécification §8.5) :
-
-```sh
-astra-signer rotate-ca-tls --out ca-tls-transition.json \
-  --heliosd-url http://<VIP de la gateway>:8080 --operation-id <identifiant>
-```
-
-Le poste opérateur doit être un pair **administrateur** du tunnel : les routes
-sont derrière la barrière d'administration de la gateway, pas derrière la
-simple appartenance au réseau. `--heliosd-url` et `--authority-url` s'excluent,
-et un tunnel qui échoue est une erreur — jamais un repli silencieux vers
-l'origine publique.
+Les rotations de CA-TLS et les gestes de la gateway passent par le tunnel depuis
+Orion (Astra › Rotations) : le poste opérateur doit être un pair **administrateur**
+du tunnel, les routes étant derrière la barrière d'administration de la gateway,
+et pas seulement derrière l'appartenance au réseau. Un tunnel qui échoue est une
+erreur, jamais un repli silencieux vers l'origine publique.
 
 La campagne est résolue **sur l'ancre que le registre détient**, et le
 compagnon la compare à celle de son propre coffre : deux moitiés du domaine qui
@@ -349,7 +327,7 @@ parc dont une part n'est pas allumée tous les jours.
 Le **RP ID WebAuthn**, avant tout le reste.
 
 Un credential FIDO2 est créé *sous* un RP ID, et une assertion doit présenter
-le même. Le coffre le mémorise à `astra-signer init` ; en changer rend tous les
+le même. Le coffre le mémorise à la création du domaine ; en changer rend tous les
 key-slots inouvrables, définitivement, sans recours — la spécification refuse
 explicitement toute phrase de passe de secours.
 
@@ -399,31 +377,17 @@ n'oblige pas Orion à ouvrir une connexion HTTPS directe vers Astra.
   credentials actifs distincts, comme une réadmission sans continuité. Le
   coffre reste 1-sur-N : ce n'est pas un quorum humain, mais deux barrières
   matérielles appliquées par le compagnon honnête.
-- Le compagnon bâti sur la machine où la clé se branche :
-  `cargo build -p astra-signer`. En **debug** : le garde-fou ADR-002 refuse le
-  trousseau éditeur de développement dans toute compilation `--release`, et
-  rien ici n'y gagne — le déverrouillage d'un key-slot est un HKDF-SHA256.
-  Pour un binaire release, fournir `HELIOS_PUBLISHER_KEYRING_PATH`.
-- Sous Windows, **aucune élévation n'est nécessaire** : le compagnon passe par
-  l'API WebAuthn du système (`--transport platform`, le défaut), qui demande
-  elle-même le PIN et le contact — le PIN n'entre donc jamais dans ce
-  processus. Elle exige `WEBAUTHN_API_VERSION_4` pour les sels `hmac-secret` ;
-  sur un Windows antérieur, le compagnon le dit et renvoie vers
-  `--transport hid`, qui parle CTAP2 directement mais **exige une console
-  administrateur** — Windows y réserve l'ouverture d'un HID FIDO aux processus
-  élevés depuis la 1903. `astra-signer devices` liste ce que la pile HID
-  montre, et distingue « aucun HID » de « des HID, mais aucun FIDO ».
-  Un credential est celui de la clé, pas celui de l'API : un coffre créé par un
-  transport s'ouvre par l'autre, tant que le RP ID est le même — le chemin HID
-  applique la même conversion PRF que la plateforme, faute de quoi le même sel
-  dériverait deux secrets différents.
+- Sous Windows, **aucune élévation n'est nécessaire** : Orion passe par l'API
+  WebAuthn du système, qui demande elle-même le PIN et le contact. Cette API
+  exige `WEBAUTHN_API_VERSION_4` pour les sels `hmac-secret`. Le diagnostic HID
+  `astra-signer devices` est retiré au lot 7, sans équivalent dans Orion.
 
 ## Le détail, si quelque chose casse
 
-### Créer le domaine : « Créer un domaine » dans Orion, ou `astra-signer init`
+### Créer le domaine : « Créer un domaine » dans Orion
 
-Orion fait ce que fait `init`, voie transitoire jusqu'au lot 7. Génère `CA-PQ` (ML-DSA-87) et `CA-TLS`, les scelle sous un key-slot ouvert par
-la clé branchée, écrit le coffre et le relais.
+Orion génère `CA-PQ` (ML-DSA-87) et `CA-TLS`, les scelle sous un key-slot ouvert
+par la clé branchée, puis écrit le coffre et le relais.
 
 Le coffre est à `~/.helios/astra/authority-vault.json`, et sous Windows à
 `%APPDATA%\astra\authority-vault.json`. Orion peut le ranger ailleurs
@@ -439,43 +403,31 @@ comme une erreur, avec « Changer… » et « Emplacement par défaut » pour en
 il est déjà chiffré, donc une copie hors ligne ne coûte rien.
 
 Le relais, à côté, ne contient que du public. Orion (« Domaine », « Modifier »)
-ou `astra-signer domain` l'écrit sans clé de sécurité ; la clé WireGuard et le
-nom de service de la gateway ne se remplissent que s'ils sont vides.
+l'écrit sans clé de sécurité ; la clé WireGuard et le nom de service de la
+gateway ne se remplissent que s'ils sont vides.
 
 Une valeur à y enregistrer une fois pour toutes : l'origine que le domaine
-déclare.
+déclare (« Modifier », dans « Domaine »).
 
-```sh
-astra-signer domain --astra-authority-url https://astra.exemple
-```
-
-Toute demande de signature nomme cette origine, et le compagnon compare les
-deux au lieu de croire celle qu'on lui envoie. Sur le canal public, l'URL
-composée jouait ce rôle ; dans le tunnel aucune URL n'est composée, donc une
-campagne portée par le tunnel s'arrête tant que cette valeur manque — en
-nommant cette commande.
+Toute demande de signature nomme cette origine, et Orion compare les deux au
+lieu de croire celle qu'on lui envoie. Sur le canal public, l'URL composée
+jouait ce rôle ; dans le tunnel aucune URL n'est composée, donc une campagne
+portée par le tunnel s'arrête tant que cette valeur manque.
 
 Quand la seconde clé est en main, Orion propose « Ajouter une clé » (libellé,
-rôle), « Renommer », « Marquer perdue » / « Réactiver » et « Retirer ». Le
-retrait ouvre le coffre avec une autre clé que celle retirée : la clé retirée
-n'est pas demandée pour ce geste (en présenter une autre ; comportement de
-Windows non vérifié, à constater en recette), et le coffre garde au
-moins deux clés. Une clé que le document de credentials révoque déjà (retrait
-interrompu entre le document et le coffre) ne se marque plus : refaire le
-retrait. Équivalent en ligne de commande :
-
-```sh
-astra-signer enrol --label "YubiKey de récupération"
-astra-signer verify        # à faire avec chacune des deux, séparément
-```
-
-`enrol` demande d'abord la clé déjà enregistrée, puis la nouvelle : deux objets,
-branchés un à la fois. Une troisième ou une quatrième plus tard, c'est la même
-commande — rien ne distingue la seconde de la cinquième.
+rôle), « Renommer », « Marquer perdue » / « Réactiver » et « Retirer ». Ajouter
+une clé demande d'abord la clé déjà enregistrée, puis la nouvelle : deux objets,
+branchés un à la fois. Une troisième ou une quatrième plus tard, c'est le même
+geste — rien ne distingue la seconde de la cinquième. Le retrait ouvre le coffre
+avec une autre clé que celle retirée : la clé retirée n'est pas demandée pour ce
+geste (en présenter une autre ; comportement de Windows non vérifié, à constater
+en recette), et le coffre garde au moins deux clés. Une clé que le document de
+credentials révoque déjà (retrait interrompu entre le document et le coffre) ne
+se marque plus : refaire le retrait.
 
 L'ADR ne tient le bootstrap pour fini qu'« après enregistrement **et essai** des
-deux clés ». `verify` est cet essai : il ouvre les ancres, pas seulement le
-slot.
+deux clés ». « Vérifier une clé » (« Coffre et clés ») est cet essai, à faire avec
+chacune des deux, séparément : il ouvre les ancres, pas seulement le slot.
 
 ### Ce que `deploy.sh` fait à l'étape 7
 
@@ -491,8 +443,8 @@ slot.
    refuse la compilation `--release` de l'image. La construction tourne dans
    une unité systemd transitoire : une coupure SSH n'annule pas BuildKit, et le
    script se reconnecte pour lire son résultat et son journal ;
-5. à la reprise, la leaf publique issue de
-   `astra-signer issue-gateway-bootstrap` est copiée sur la gateway ; si le
+5. à la reprise, la leaf publique produite par « Amorcer la gateway… » (Orion,
+   « Domaine ») est copiée sur la gateway ; si le
    domaine n'est pas amorcé : `astra bootstrap`, capture de la clé de service
    et de la tête d'audit, écriture du `.env` distant, puis
    `heliosd init-trust-domain --gateway-certificate ...` — qui vérifie la
@@ -501,8 +453,9 @@ slot.
 6. l'ancre TLS cliente est épinglée par son empreinte, sans laquelle la
    rotation du §9.4 reste invérifiable ici et se refuse par son nom. Elle ne
    se retape pas : le relais porte déjà le certificat public
-   (`ca_tls_certificate`) dès qu'`astra-signer issue-ca-tls` a tourné, et le
-   script en calcule le SHA-256. Sur un domaine neuf, l'empreinte est passée à
+   (`ca_tls_certificate`) dès que la CA-TLS est émise (« Amorcer la gateway… »
+   sur un domaine neuf, « Finaliser le domaine » sinon), et le script en calcule
+   le SHA-256. Sur un domaine neuf, l'empreinte est passée à
    `astra bootstrap` ; sur un domaine déjà amorcé, elle passe par
    `astra pin-ca-tls`, qui l'enregistre une fois et refuse d'en remplacer une.
    Cet épinglage étend la chaîne d'audit, donc les deux témoins qui en portent
@@ -515,6 +468,17 @@ slot.
    distributions signées en attente, mais refuse tout registre qui a quitté
    l'époque et les générations initiales ;
 7. `compose up -d`.
+
+Sans `deploy.sh`, l'empreinte se calcule à la main, depuis le bloc de confiance
+de `heliosd export-enrolment` : c'est le SHA-256 du DER de `client_tls_ca_der`
+(base64 DER). Ni Orion ni `heliosd` ne l'impriment directement :
+
+```sh
+printf '%s' '<valeur de client_tls_ca_der>' | base64 -d | sha256sum
+```
+
+Elle se passe à `astra bootstrap --ca-tls-fingerprint` sur un domaine neuf, ou à
+`astra pin-ca-tls --fingerprint` sur un domaine déjà amorcé.
 
 Le contexte `~/astra-build` est jetable et remplacé à chaque déploiement. Le
 témoin durable passé à `--expected-audit-head` vit donc hors de ce contexte,
@@ -644,9 +608,9 @@ par-dessus une autorité existante. C'est la seule erreur irrattrapable de cette
 
 ### Le document de credentials
 
-Astra n'approuve rien sans liste d'autorisation. `astra-signer bindings` émet
-le document signé par `CA-PQ` — et le réémet tout seul à chaque geste qui
-déplace la table de key-slots. L'étape 7 le recopie dans le volume d'Astra,
+Astra n'approuve rien sans liste d'autorisation. Le document signé par `CA-PQ`
+est émis par Orion (« Coffre et clés ») et réémis à chaque geste qui déplace la
+table de key-slots. L'étape 7 le recopie dans le volume d'Astra,
 depuis `~/.helios/astra/astra-credentials.json`, à côté du coffre.
 
 Orion le réémet à chaque geste qui déplace la table de key-slots (ajout,
@@ -752,15 +716,15 @@ il ne détient aucune clé autorisée à émettre. `CA-PQ` ne quitte jamais le
 coffre, donc la délégation se signe sur le poste opérateur, à la clé de
 sécurité, et fait un aller-retour.
 
-**Depuis le lot 5b, Orion renouvelle la délégation** : ligne « Renouveler la
+**Orion renouvelle la délégation** : ligne « Renouveler la
 délégation » de l'onglet *Rotations*, qui ouvre la campagne par le tunnel,
 reçoit la demande dans la réponse (sans fichier), fait approuver par une clé,
 dépose la délégation, et **Astra l'adopte sans redémarrer** (un échec d'adoption
 n'est écrit qu'au journal d'Astra, l'émetteur précédent restant servi ; la ligne
 de délégation d'Orion montre alors une époque servie différente de l'inscrite).
-Les trois commandes ci-dessous sont le recours.
+Les trois étapes ci-dessous décrivent la chaîne ; Orion la conduit.
 
-Trois commandes, dans cet ordre :
+Trois étapes, dans cet ordre :
 
 ```sh
 # 1. sur la gateway : les deux clés privées naissent dans le volume d'Astra,
@@ -773,16 +737,12 @@ ssh <gateway> "cd ~/astra-build && sudo docker compose -f deploy/astra/compose.y
     --reason 'délégation trimestrielle' --requested-by 'prénom.nom'" \
     > delegation-request.json
 
-# 2. sur le poste opérateur, clé branchée : CA-TLS d'abord si le domaine n'en
-#    a pas encore, puis la délégation elle-même. Orion sait la signer (Astra >
-#    Approbations, campagne `issuer_delegation`) ; la commande ci-dessous reste
-#    livrée, à titre transitoire, jusqu'au lot 7. Le signataire récupère la
-#    campagne, compare la demande à la matière qu'elle épingle, et redépose la
-#    délégation signée.
-astra-signer issue-ca-tls
-astra-signer authorize-issuer --request delegation-request.json \
-    --authority-url https://astra.example --operation-id <identifiant> \
-    --days 30 --leaf-days 90
+# 2. sur le poste opérateur, clé branchée : Orion signe la délégation (Astra ›
+#    Approbations, campagne `issuer_delegation`, « Ouvrir la cérémonie » sur le
+#    fichier de demande ; hors campagne, « Signer une délégation sans campagne… »).
+#    CA-TLS d'abord si le domaine n'en a pas encore (« Finaliser le domaine »).
+#    Le signataire récupère la campagne, compare la demande à la matière qu'elle
+#    épingle, et redépose la délégation signée.
 
 # 3. Astra en marche a enregistré la délégation et l'adopte seul, sans
 #    redémarrage. Si l'adoption échoue, seul son journal le dit et l'émetteur
@@ -790,14 +750,14 @@ astra-signer authorize-issuer --request delegation-request.json \
 #    s'adopte au démarrage suivant.
 ```
 
-La demande sort sur la **sortie standard** — d'où le `>` de l'étape 1 — et
-tout le reste, l'identifiant d'opération compris, sur l'erreur standard. Sans
-`--reason` ni `--requested-by`, aucune campagne n'est ouverte : le compagnon
-écrit alors son autorisation avec `--out` et `astra issuer install` la relit
-sur l'entrée standard quand `--authorization` est absent. Cette forme de repli
-existe pour un domaine dont l'origine publique n'est pas joignable : une
-demande de délégation ne porte aucune signature, donc l'opérateur y signe le
-fichier qu'on lui présente.
+La demande sort sur la **sortie standard** — d'où le `>` de l'étape 1 — et tout
+le reste, l'identifiant d'opération compris, sur l'erreur standard. Sans
+`--reason` ni `--requested-by`, aucune campagne n'est ouverte : la demande ne
+porte alors aucune signature, et sa signature est le chemin « Signer une
+délégation sans campagne… » d'Approbations, réservé au domaine sans origine
+Astra (RENOUVELLEMENT-CERTIFICATS §4). Orion signe le fichier qu'on lui présente ;
+`astra issuer install --authorization <fichier>` le pose ensuite sur l'hôte
+d'Astra.
 
 `install` vérifie trois choses qui viennent de trois endroits différents :
 l'ancre que le registre épingle, la politique d'émission calculée à l'amorçage,
@@ -871,7 +831,7 @@ d'un fork, et `astra run --expected-audit-head` est ce qui refuse le second.
 
 ## Limite connue : retirer une clé ne rattrape pas les sauvegardes
 
-`astra-signer remove` rescelle le corps du coffre sous la table de slots qu'il
+Retirer une clé (« Coffre et clés », « Retirer ») rescelle le corps du coffre sous la table de slots qu'il
 laisse : le slot retiré, recollé depuis une sauvegarde, n'ouvre plus le fichier
 courant. Mais une sauvegarde **antérieure** au retrait reste ouvrable par la clé
 retirée, définitivement — c'est la situation de LUKS avec une phrase supprimée
@@ -893,15 +853,15 @@ slot, c'est une rotation de `CA-PQ`.
   `/internal/v1/certificates/peers`, que `heliosd` doit servir. Sans elle, Astra
   ne recopie aucun poste, et la révocation d'un poste qu'elle ne connaît pas est
   refusée sur le canal.
-- **Un coffre écrit par ce lot ne s'ouvre plus avec un Orion ou un `astra-signer`
-  plus ancien**, dès qu'il détient une clé `CA-PQ` sortante, c'est-à-dire entre la
+- **Un coffre écrit par ce lot ne s'ouvre plus avec un Orion plus ancien**, dès qu'il détient une clé `CA-PQ` sortante, c'est-à-dire entre la
   signature d'une rotation `CA-PQ` et « Terminer la rotation CA-PQ ». Les structures
   refusent les champs inconnus (`crates/astra-operator/src/vault.rs:270` et `:412`).
   Un coffre sans clé sortante se sérialise comme avant : les deux champs ne sont
   écrits que s'ils sont présents (`skip_serializing_if`, `vault.rs:290` et `:427`).
-  Mettre Orion et `astra-signer` à jour avant la prochaine rotation `CA-PQ`.
-- **Révocation pendant une rotation `CA-PQ`.** `astra-signer revoke` refuse dans
-  cet état et renvoie vers Orion ; c'est Orion qui signe.
+  Mettre Orion à jour avant la prochaine rotation `CA-PQ`. (`astra-signer`, qui
+  partageait ce format, est retiré au lot 7.)
+- **Révocation pendant une rotation `CA-PQ`.** L'ancien `astra-signer revoke`
+  refusait dans cet état et renvoyait vers Orion ; c'est Orion qui signe.
 
 ## Essais sur cible
 

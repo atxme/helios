@@ -28,17 +28,13 @@ Tout le reste ci-dessous est une action délibérée.
 Depuis le lot 5b, les rotations se font **depuis Orion**, sur un poste
 administrateur du tunnel : onglet *Astra* › *Rotations*, une liste d'actions
 avec leur état. Ce qui est à faire passe en premier. Les commandes de ce
-document (`astra campaign open`, `astra-signer rotate-ca-pq`, `heliosd
-install-*`, `promote-ca-tls`, `resume-rotation`) restent décrites comme
-**recours** : elles servent quand Orion ne peut pas, jamais par défaut. Orion ne
-lance plus `astra-signer`.
+document (`astra campaign open`, `heliosd install-*`, …) sont celles de la
+console Astra et des scripts ; `astra-signer`, qui portait les autres gestes,
+est retiré au lot 7 et n'a pas de recours en ligne de commande.
 
 Depuis le lot 6b, l'identité de la gateway se gère aussi depuis Orion, par le
-tunnel, sans fichier ni commande (§7.1, §8, §8.1). Les commandes gateway de ce
-document (`astra-signer sign-gateway-transition`, `sign-gateway-rollback`,
-`revoke --scope gateway`, `astra gateway-identity …`) restent le recours jusqu'au
-lot 7. « Tout renouveler » se joue aussi dans Orion, en tête de *Rotations* (§10) :
-la console reste le recours.
+tunnel, sans fichier ni commande (§7.1, §8, §8.1). « Tout renouveler » se joue
+aussi dans Orion, en tête de *Rotations* (§10).
 
 Depuis le lot 6c, les durées de l'identité gateway se règlent dans Orion, une gateway
 révoquée s'affiche comme telle, et les impasses de la gateway se jettent par « Abandonner
@@ -186,13 +182,8 @@ motif, le demandeur, les cibles et l'empreinte avant de demander les clés — u
 à la fois, parce que deux touchers d'un même jeton sont refusés et qu'il vaut
 mieux l'apprendre à la seconde invite qu'après les deux.
 
-Si la clé est ailleurs, l'adaptateur en ligne de commande exécute la même
-cérémonie :
-
-```sh
-astra-signer approve-campaign --authority-url https://astra.exemple \
-  --operation-id <identifiant>
-```
+Si la clé est ailleurs, l'approbation se fait sur le poste qui la porte, dans
+Orion (Astra › Approbations), par la même cérémonie.
 
 Ensuite, chaque poste couvert qui envoie sa demande dans la fenêtre est
 renouvelé sans qu'on lui redemande rien — la campagne surcharge aussi le seuil
@@ -227,7 +218,7 @@ et ne se montre donc qu'après. Les commandes suivantes sont le recours.
 **Sans origine Astra : « Remplacer la CA-PQ sans campagne »** (F14-e). Dans un domaine
 dont le relais ne nomme aucune origine Astra, la ligne « Remplacer la CA-PQ sans campagne »
 remplace « Remplacer la CA-PQ » ; avec une origine, même illisible, elle n'apparaît pas. Elle
-tient lieu, hors campagne, de `astra-signer rotate-ca-pq` et des commandes de cette section :
+tient lieu, hors campagne, des commandes de cette section (l'ancien `astra-signer rotate-ca-pq` est retiré au lot 7) :
 rien à ouvrir ni à approuver chez Astra. Prérequis : tunnel monté, administrateur du tunnel,
 coffre, clés, domaine ; ni Astra ni copie du coffre n'interviennent. Un avertissement précède
 les clés : « Aucune autorité ne vérifie ce remplacement : le coffre avance sur votre seul
@@ -244,7 +235,7 @@ la gateway qui n'est pas celle du coffre.
 Si la pose n'aboutit pas, `ca-pq-transition.json` est offert en téléchargement : à installer
 à la main avec `heliosd install-ca-transition` ou depuis l'écran *Certificats* de la gateway.
 La ligne « Reprendre » le garde sous « Télécharger la transition » tant que le journal existe, tunnel coupé ou Orion relancé. « Reprendre » finit la rotation plus tard, sans Astra. Un journal de rotation hors campagne
-laissé par `astra-signer rotate-ca-pq` dans un domaine sans origine se reprend de la même
+laissé par un ancien `astra-signer rotate-ca-pq` dans un domaine sans origine se reprend de la même
 façon ; dans un domaine avec origine, la reprise lit Astra d'abord, comme avant.
 
 **Sur la gateway** :
@@ -257,15 +248,11 @@ astra campaign open --scope trust-authorities \
 
 Ou par le tunnel, comme au §2, avec `"action":"trust_authorities"`.
 
-**Sur le poste de l'opérateur** :
+**Sur le poste de l'opérateur**, dans Orion : la ligne « Remplacer la CA-PQ » de
+*Rotations* (deux clés, puis « Approuver »), comme décrit plus haut. Une campagne
+ouverte à la console s'approuve dans *Approbations*.
 
-```sh
-astra-signer rotate-ca-pq --out ca-pq-transition.json \
-  --authority-url https://astra.exemple --operation-id <identifiant> \
-  --prepare-days 7 --overlap-days 30
-```
-
-Le compagnon compare la cible de la campagne à l'ancre de son propre coffre
+Orion compare la cible de la campagne à l'ancre de son propre coffre
 avant de demander quoi que ce soit : deux moitiés du domaine qui se
 contredisent sur ce qui est courant s'arrêtent, elles ne se réconcilient pas
 par une rotation. Les deux clés restent branchées pour leurs deux gestes
@@ -353,7 +340,7 @@ au plus, ramenée au plafond de la politique épinglée avant la clé ; une seul
 qui approuve la campagne puis ouvre le coffre. Avant de la demander, Orion refuse
 une CA-TLS expirée, trop proche de son expiration ou qui n'est pas une autorité
 (« la renouveler d'abord »), et une demande que la campagne ne nomme pas.
-`astra-signer authorize-issuer` reste livré à titre transitoire, jusqu'au lot 7.
+
 
 Orion vérifie la campagne sous la clé de service qu'il épingle déjà,
 compare la demande à ce que la campagne nomme — l'époque, la clé ML-DSA-87 et
@@ -445,17 +432,11 @@ Astra d'ici là, et « Envoyer » est à refaire après `not_after` (voir « Lim
 connues des rotations dans Orion »). Une clé perdue ne coupe pas le poste qui la
 porte : pour couper le poste, voir §7.
 
-Le recours, hors d'Orion :
-
-```sh
-# sur le poste de l'opérateur
-astra-signer bindings --lost <key-slot>     # 32 caractères hexadécimaux
-astra-signer bindings --active <key-slot>   # la remettre en service
-```
-
-Le document réémis est alors à copier dans le volume d'état d'Astra, puis Astra
-à redémarrer (il le lit au démarrage) : c'est lui qui décide quelles rangées
-peuvent répondre à une approbation.
+Le recours hors d'Orion (`astra-signer bindings`) est retiré au lot 7, sans
+équivalent dans Orion : le geste se joue dans « Coffre et clés », et le document
+de credentials réémis part avec la copie du coffre (DEPLOIEMENT-ASTRA, « Le
+document de credentials »). C'est lui qui décide quelles rangées peuvent répondre
+à une approbation.
 
 ## 7. Révoquer une identité compromise (§10)
 
@@ -514,10 +495,13 @@ signature est refusée à moins d'une heure de `not_after` (« Révocation possi
 après … »). Une rotation faite avant le lot 5c ne garde pas sa clé sortante : la
 signature y reste refusée jusqu'à `not_after`.
 
-**Recours en ligne de commande** (jusqu'au lot 7). `astra-signer revoke` refuse
-pendant un recouvrement `CA-PQ` : « Changement de CA-PQ en cours : révoquer ce
-poste depuis Orion. Rien n'a été signé. ». Les commandes suivantes restent le
-recours, dans le conteneur Astra :
+**Ouverture à la console, signature dans Orion.** `astra-signer revoke` refusait
+pendant un recouvrement `CA-PQ` (« Changement de CA-PQ en cours : révoquer ce
+poste depuis Orion. Rien n'a été signé. ») : c'est Orion qui signe. L'ouverture
+reste possible dans le conteneur Astra ; une campagne ouverte à la console
+s'approuve dans *Approbations*.
+
+Ouverture, dans le conteneur Astra :
 
 ```sh
 astra revocation open --scope client --peer <clé-wg-base64> \
@@ -534,16 +518,10 @@ la génération, les deux empreintes actives et le prochain compteur de
 révocation. Une autorité en ligne compromise ne peut donc pas substituer une
 autre leaf sous le toucher de l'opérateur.
 
-**Sur le poste de l'opérateur**, exécuter la ligne imprimée :
+**Sur le poste de l'opérateur**, dans Orion (onglet *Postes*, ou *Approbations*
+pour une campagne ouverte à la console) :
 
-```sh
-astra-signer revoke --authority-url https://astra.exemple \
-  --operation-id <identifiant> --not-after <échéance>
-# --halves tls|pq|both (défaut : both)
-# --reason key-compromise|suspected-compromise|cessation|superseded
-```
-
-Le compagnon vérifie la demande sous la clé de service épinglée, affiche
+Orion vérifie la demande sous la clé de service épinglée, affiche
 l'identité, les feuilles et le compteur avant le toucher, ouvre le coffre puis
 signe la décision sous `CA-PQ`. Le dépôt est unique : l'approbation WebAuthn et
 la révocation signée partent ensemble.
@@ -555,9 +533,8 @@ gateway sur le canal privé et la distribue aux clients qui reviennent jusqu'à
 la dernière échéance signée. Un dépôt identique est idempotent et peut rejouer
 le relais après une panne transitoire du canal privé.
 
-`--not-after` n'est plus retapé : la réponse d'ouverture porte l'échéance
-signée, et la console l'imprime dans la ligne à coller ; par le tunnel, elle
-est dans `revocation_expiries`. Elle voyage hors de la campagne signée, parce
+L'échéance n'est pas retapée : elle vient de la réponse d'ouverture (dans
+`revocation_expiries` par le tunnel). Elle voyage hors de la campagne signée, parce
 que le format partagé `CampaignTarget` ne porte pas l'échéance. Une valeur
 altérée en route ne révoque pas la mauvaise chose : Astra refuse le dépôt
 entier en la comparant à la génération active.
@@ -566,16 +543,17 @@ Deux révocations de deux postes différents peuvent attendre l'opérateur en
 même temps ; une seconde révocation du **même** poste est refusée tant que la
 première attend.
 
-**Révoquer la gateway elle-même** — recours en ligne de commande (jusqu'au lot 7) ;
-la voie d'Orion est au §7.1. Même cérémonie, une résolution en plus :
+**Révoquer la gateway elle-même** — voie d'Orion, §7.1. Même cérémonie, une
+résolution en plus :
 
 ```sh
 astra revocation open --scope gateway \
   --reason "clé de service compromise" --requested-by "prénom.nom"
-# → imprime les deux empreintes, leurs deux échéances, et la ligne à coller
-astra-signer revoke --scope gateway --authority-url https://astra.exemple \
-  --operation-id <identifiant> --pq-not-after <…> --tls-not-after <…>
+# → imprime les deux empreintes et leurs deux échéances
 ```
+
+La signature se fait dans Orion, onglet *Rotations*, bloc « Identité de la
+gateway » (§7.1).
 
 Le registre Astra n'a jamais détenu les feuilles de la gateway — il transcrit
 des admissions, il ne tient pas l'identité que tous les clients épinglent.
@@ -588,7 +566,7 @@ Ce canal est celui du service (`ASTRA_GATEWAY_CHANNEL` et
 `ASTRA_GATEWAY_CERTIFICATE` d'`astra run`, que `deploy.sh` renseigne) : la
 commande ne prend plus d'adresse, et sans canal privé dans le service elle est
 refusée par son nom. Depuis le lot 6b, Orion ouvre aussi cette révocation par
-le tunnel (§7.1) ; la commande ci-dessus reste le recours.
+le tunnel (§7.1) ; la signature ne passe plus par une commande.
 
 Les deux feuilles gateway n'expirent pas ensemble, contrairement à une
 génération cliente : leurs échéances se nomment séparément, et une moitié sans
@@ -744,8 +722,10 @@ l'installer. Rien n'a été jeté. » ; « cette décision peut encore aboutir :
 Rien n'a été jeté. » ; avant l'activation, « la transition s'annule encore : choisir
 « Annuler ». Rien n'a été jeté. ».
 
-**Recours en ligne de commande** (jusqu'au lot 7). Les quatre étapes suivantes
-sont celles de la machine à états, en commandes.
+**Les quatre étapes, dans l'ordre de la machine à états.** Orion les conduit par
+le tunnel (*Rotations*). `astra-signer` est retiré au lot 7 : il n'existe plus de
+recours en ligne de commande pour ces signatures. La préparation ci-dessous reste
+celle de `heliosd`.
 
 L'ordre est imposé, et par la machine à états plutôt que par la consigne.
 
@@ -760,25 +740,14 @@ Une identité révoquée ne signe pas pour sa suivante : la signature de
 continuité du §5 est exactement le droit qu'un retrait supprime. Sans
 `--key-recovery`, la commande refuse et le dit.
 
-**2. Signer la transition de remplacement** — campagne `gateway-identity` :
+**2. Signer la transition de remplacement** — campagne `gateway-identity`, dans
+Orion (*Rotations*, « Avec remplaçant », première série de touches).
 
-```sh
-astra-signer sign-gateway-transition --emergency-replacement \
-  --authority-url https://astra.exemple --operation-id <identifiant> \
-  --request gateway-certificate-request.json --out remplacement.json \
-  --key-recovery
-```
+**3. Signer la révocation, en la nommant** — campagne `emergency-revocation`, dans
+Orion (*Rotations*, deuxième série de touches).
 
-**3. Signer la révocation, en la nommant** — campagne `emergency-revocation` :
-
-```sh
-astra-signer revoke --scope gateway --authority-url https://astra.exemple \
-  --operation-id <identifiant> --pq-not-after <…> --tls-not-after <…> \
-  --replacement-transition remplacement.json
-```
-
-Le fichier est lu, pas l'empreinte saisie. Une valeur retapée de travers
-laisserait une gateway qui attend un document que plus personne ne peut
+Le fichier de remplacement est lu, pas l'empreinte saisie. Une valeur retapée de
+travers laisserait une gateway qui attend un document que plus personne ne peut
 produire.
 
 **4. Appliquer, dans cet ordre** : la révocation d'abord — c'est elle qui
@@ -901,7 +870,7 @@ gateway en « Détail technique : … ». Rien ne redémarre à sa place.
 à 7, 7 et 365 jours : c'est un geste d'urgence (§7.1). Une gateway révoquée sans
 remplaçant ne se répare pas dans Orion : le domaine se reconstruit.
 
-### Recours en ligne de commande (jusqu'au lot 7)
+### Recours en ligne de commande, démon arrêté
 
 **Sur la gateway**, depuis la console — *Sécurité → Certificats* — avec
 « Préparer la demande ». C'est le chemin normal : la console passe par le
@@ -991,17 +960,9 @@ que la gateway refuse — au moment précis où un renouvellement est en cours.
 La commande exporte aussi la feuille en service : le compagnon ne peut pas
 vérifier la signature de continuité du §5 sans la clé qui signe réellement.
 
-**Sur le poste de l'opérateur** :
+**Sur le poste de l'opérateur**, dans Orion (*Rotations*, bloc « Identité de la gateway ») :
 
-```sh
-astra-signer sign-gateway-transition --authority-url https://astra.exemple \
-  --operation-id <identifiant> --request demande.json \
-  --active-certificate gateway-active-certificate.json --out transition.json
-# --tls-certificate <der> si la feuille TLS change aussi
-# --prepare-days 7 --overlap-days 7 --validity-days 365
-```
-
-Le compagnon émet la feuille sous `CA-PQ` **et** signe la transition dans le
+Orion émet la feuille sous `CA-PQ` **et** signe la transition dans le
 même geste : la signature lie la feuille exacte, et une transition signée
 autour d'une feuille émise à part lierait celle qui traînait sur le disque.
 
@@ -1035,13 +996,9 @@ localement sous le verrou du volume et relaie par le canal que le service
 emploierait : elle lit alors `ASTRA_GATEWAY_CHANNEL` et
 `ASTRA_GATEWAY_CERTIFICATE` dans son environnement, et refuse sans eux.
 
-Pour annuler, tant que rien n'est publié : rouvrir une campagne
-(`astra gateway-identity open`), puis
-
-```sh
-astra-signer abort-gateway-transition --authority-url https://astra.exemple \
-  --operation-id <identifiant> --transition transition.json --out avortement.json
-```
+Pour annuler, tant que rien n'est publié : *Rotations*, bloc « Identité de la
+gateway », « Annuler » (avant activation), voir « Annuler avant publication »
+plus haut.
 
 **Limite connue** : un client qui n'a jamais reçu la transition reste à
 l'époque précédente et refusera correctement le saut vers la suivante (§6.3),
@@ -1086,16 +1043,9 @@ Après la pose, la ligne affiche « Retour arrière jusqu'au … » tant que la
 sélection tient. Si Orion affiche « Redémarrer heliosd sur la gateway. », le
 redémarrage reste à faire par l'opérateur (§11).
 
-**Recours en ligne de commande** (jusqu'au lot 7) :
-
-```sh
-astra-signer sign-gateway-rollback --transition transition.json \
-  --out rollback.json --hours 24 --reason … --requested-by …
-```
-
-Puis sur la gateway, depuis l'écran *Certificats* (ou
-`POST /api/certificates/gateway-transition/rollback`), coller l'autorisation,
-**et redémarrer `heliosd`**.
+Orion pose l'autorisation par le tunnel, sans fichier. Un redémarrage de
+`heliosd` reste à faire : Orion l'indique (« Redémarrer heliosd sur la gateway. »),
+et l'opérateur le fait (§11).
 
 Le redémarrage n'est pas un détail : la feuille en service est descellée au
 démarrage et tenue pour la vie du processus. Installer l'autorisation
@@ -1146,8 +1096,7 @@ tournent pas ensemble : pendant le recouvrement de l'une, les deux boutons
 « Remplacer » sont désactivés. **À `not_after`, la ligne « Terminer la rotation
 CA TLS » apparaît en tête** et remplace `promote-ca-tls` (une clé, sans nouvelle
 autorisation) ; Orion n'a pas d'ordonnanceur, donc elle attend l'ouverture de
-l'onglet, et la gateway a déjà avancé son époque pendant ce temps. Les commandes
-suivantes sont le recours.
+l'onglet, et la gateway a déjà avancé son époque pendant ce temps.
 
 **Une fois, si le domaine est antérieur à cet épinglage** — dans le conteneur
 Astra :
@@ -1170,13 +1119,11 @@ volume — c'est le chemin de `deploy.sh`.
 
 ```sh
 astra campaign open --scope trust-authorities --reason … --requested-by …
-astra-signer rotate-ca-tls --authority-url https://astra.exemple \
-  --operation-id <identifiant> --out ca-tls-transition.json
-# --prepare-days 7 --overlap-days 30 --validity-days 1825
+# Orion (Astra › Rotations, « Remplacer la CA TLS ») produit ca-tls-transition.json
+
 heliosd install-client-tls-ca ca-tls-transition.json
 
-# à not_after, une fois le recouvrement écoulé :
-astra-signer promote-ca-tls
+# à not_after : « Terminer la rotation CA TLS » (Astra › Rotations)
 ```
 
 L'ancre entrante est créée au compagnon, auto-signée pour prouver qu'elle
@@ -1217,15 +1164,10 @@ gestes de signature — avant que `promote-ca-tls` ne l'y déplace.
 successeur, puis écrit `astra-prepared.json` à côté du coffre — les octets
 exacts du dépôt, la fenêtre, et le fichier de transition —, et seulement
 ensuite dépose auprès d'Astra. Une machine qui s'arrête entre les deux se
-reprend par :
-
-```sh
-astra-signer resume-rotation --authority-url https://astra.exemple
-```
+reprend dans Orion, « Reprendre une rotation » (*Rotations*), sans clé.
 
 Astra traite un résultat identique comme le même (§8.2) : la reprise ne
-redemande aucune clé, parce qu'elle n'approuve rien de neuf. Tant que ce
-fichier existe, `rotate-ca-tls` refuse d'ouvrir une seconde fenêtre. Orion
+redemande aucune clé, parce qu'elle n'approuve rien de neuf. Tant que ce fichier existe, une seconde fenêtre de rotation CA TLS ne s'ouvre pas. Orion
 adopte un tel enregistrement une fois (marqueur posé après l'écriture de son
 journal) et le reprend comme sa propre rotation.
 
@@ -1352,9 +1294,8 @@ astra chain open --reason "renouvellement annuel" --requested-by "prénom.nom" \
 À la console, la première étape s'ouvre ainsi. Pour chacune des suivantes :
 
 ```sh
-# depuis le poste opérateur : approuver l'étape en cours, avec sa commande
-# propre (astra-signer authorize-issuer, rotate-ca-tls,
-# sign-gateway-transition, approve-campaign).
+# depuis le poste opérateur : approuver l'étape en cours dans Orion (Astra ›
+# Approbations, ou Astra › Rotations pour les étapes de rotation).
 
 # puis, sur la gateway :
 astra chain next
@@ -1473,15 +1414,13 @@ dans [ROADMAP.md](ROADMAP.md) (F14-a à F14-f).
   sur les ouvertures gardées en mémoire : seul un redémarrage d'Orion y met fin.
   Rien n'est écrit sur le disque avant la signature. Un GUID d'annulation
   fermerait le cas sous Windows.
-- **Le recours en ligne de commande** (`astra-signer rotate-ca-pq`, jusqu'au
-  lot 7) : sa reprise déplace le coffre, les credentials et le relais sans parole
-  d'Astra, par le geste voulu de l'opérateur ; c'est une exception à la règle
-  d'Orion « le coffre ne bouge qu'après l'acceptation d'Astra ». Un journal
-  adopté d'un tel enregistrement se lit d'abord auprès d'Astra. Son successeur est
-  « Remplacer la CA-PQ sans campagne » dans Orion (F14-e), et l'exception ne vaut
-  que dans un domaine sans origine Astra. Avec une origine, la reprise lit Astra
-  d'abord, et affiche « Domaine en désaccord » si le relais en nomme une entre-temps.
-  Tant qu'une telle rotation est en cours, le relais refuse de recevoir une origine Astra.
+- **Un journal CA-PQ d'un ancien `astra-signer`.** Son recours en ligne de commande
+  est retiré au lot 7, sans équivalent dans Orion. Orion reprend un tel journal
+  comme le sien (§3) ; dans un domaine avec origine, la reprise lit Astra d'abord.
+  Quand le journal est en désaccord avec le domaine (le relais nomme une origine
+  Astra entre-temps), la reprise s'arrête sur la phrase « Domaine en désaccord.
+  Intervention manuelle requise. ». Tant qu'une telle rotation est en cours, le
+  relais refuse de recevoir une origine Astra.
 - **La copie du coffre sur la gateway** : un administrateur du tunnel peut la
   remplacer, et gonfler le compteur de révision du coffre, puisque la copie
   n'est pas authentifiée ; « Remplacer quand même » est alors le recours. Une
@@ -1523,8 +1462,8 @@ dans [ROADMAP.md](ROADMAP.md) (F14-a à F14-f).
   le porte pas), puis « Changer… » sous « Coffre opérateur » pour choisir ce
   fichier. Le relais se reconstruit depuis le coffre et la gateway ; l'export ne
   porte que le coffre, pas le document de credentials, d'où cette copie à la main.
-- **Compatibilité du compteur.** Un Orion ou un `astra-signer` antérieur ne lit
-  plus un coffre qui porte la révision ; les deux sont livrés ensemble. Un
+- **Compatibilité du compteur.** Un Orion antérieur ne lit
+plus un coffre qui porte la révision ; `astra-signer`, qui partageait ce format, est retiré au lot 7. Un
   coffre qui n'a pas été réécrit depuis reste lisible par eux. Un Orion
   antérieur à ce lot ne lit plus non plus l'état d'Astra dans ses cérémonies
   (lecture stricte du champ `vault_copy_revision`), comme pour le champ `chain`
@@ -1537,7 +1476,7 @@ dans [ROADMAP.md](ROADMAP.md) (F14-a à F14-f).
 - **`write_domain_relay` attend comme les gestes sur les clés.** L'écriture du
   relais de domaine (« Modifier », « Enregistrer », « Confirmer ») est refusée
   tant qu'un coffre scellé attend d'écraser celui en place (enregistrement
-  `astra-signer` présent, journal illisible, ou journal avec coffre suivant),
+  d'un ancien `astra-signer` présent, journal illisible, ou journal avec coffre suivant),
   avec la phrase « une rotation porte un coffre qui remplacera celui-ci : la
   mener à son terme dans Orion avant de changer les clés ou leurs noms. Rien
   n'a été modifié. ».
@@ -1549,8 +1488,8 @@ dans [ROADMAP.md](ROADMAP.md) (F14-a à F14-f).
 
 ```sh
 astra status --expected-audit-head <empreinte notée à la dernière opération>
-heliosd show-trust-enrolment <clé-du-pair>
-astra-signer list          # les key-slots du coffre, sans clé de sécurité
+heliosd export-enrolment --public-key <clé-du-pair>   # export d'enrôlement d'un pair admis
+# les key-slots du coffre se lisent dans Orion (Astra › Coffre et clés)
 ```
 
 `astra status` refuse une chaîne d'audit qui bifurque : une sauvegarde qui se
