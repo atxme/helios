@@ -75,7 +75,7 @@ sudo apt-get install -y \
     libudev-dev \
     ca-certificates
 success "Outils de base OK"
-# libudev-dev : en-têtes exigées par `hidapi`, donc par astra-signer, qui porte
+# libudev-dev : en-têtes exigées par `hidapi`, que tire `aether-fido`, qui porte
 # la pile CTAP2 sans condition (ADR-008 §4). Sans ce paquet le workspace ne se
 # bâtit plus. Le paquet s'installe partout ; brancher une clé de sécurité, non
 # — WSL2 n'a aucun passthrough USB. Voir docs/testing/TESTING.md.

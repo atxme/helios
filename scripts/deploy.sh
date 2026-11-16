@@ -43,7 +43,7 @@ ASTRA=1
 ASTRA_ONLY=0
 FIREWALL_MODE=preserve
 SEQUENCE=""
-# Relais public écrit par `astra-signer init` : domaine, RP ID, ancre CA-PQ.
+# Relais public créé dans Orion (Astra › Coffre et clés) : domaine, RP ID, ancre CA-PQ.
 # Rien de secret — le coffre, lui, ne quitte jamais le poste opérateur.
 RELAIS="${ASTRA_HANDOFF:-$HOME/.helios/astra/astra-domain.json}"
 # Leaf publique rendue par la cérémonie hors ligne du §13.1. Le chemin par
@@ -87,7 +87,7 @@ Usage : ./scripts/deploy.sh [hôte-ssh] [options]
   --avec-firewall   Retire explicitement le mode maintenance au redémarrage
 
 Astra (ADR-008) se déploie tout seul dès qu'un relais de domaine existe —
-celui qu'écrit `astra-signer init` à côté du coffre. Sans relais, cette
+celui que crée Orion (Astra › Coffre et clés) à côté du coffre. Sans relais, cette
 partie est silencieusement sautée : une gateway sans autorité reste une
 gateway qui marche.
 
@@ -379,7 +379,7 @@ terminateur_tailscale() {
 # le RP ID et l'ancre ; la leaf PQ servie donne le nom de serveur et la clé
 # WireGuard ; le bootstrap Astra rend la clé de service et la tête d'audit, qui
 # repartent aussitôt vers `heliosd init-trust-domain`. Le seul geste manuel de
-# toute la chaîne est celui qui exige une clé physique — `astra-signer init` —
+# toute la chaîne est celui qui exige une clé physique — la création du coffre dans Orion —
 # et il a déjà eu lieu.
 deployer_astra() {
     local compose etat wg_pub nom_serveur url rp domaine ancre sortie
@@ -436,8 +436,8 @@ deployer_astra() {
     # refuse par son nom jusqu'à un `pin-ca-tls`.
     #
     # Elle se calcule ici plutôt que de se retaper : le relais porte déjà le
-    # certificat public (`ca_tls_certificate`, DER en base64) dès qu'`astra-signer
-    # issue-ca-tls` a tourné, et l'empreinte en est le SHA-256 en hexadécimal
+    # certificat public (`ca_tls_certificate`, DER en base64) dès que la CA-TLS est
+    # émise dans Orion (Astra › Coffre et clés), et l'empreinte en est le SHA-256 en hexadécimal
     # minuscule — exactement ce que `Fingerprint::of` calcule sur ces octets.
     ca_tls_der="$(sed -n \
         's/.*"ca_tls_certificate"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$RELAIS")"
@@ -447,7 +447,7 @@ deployer_astra() {
     else
         empreinte_ca_tls=""
         echo "    aucune CA TLS cliente dans le relais : la rotation du §9.4 restera" >&2
-        echo "    refusée ici. L'émettre par « astra-signer issue-ca-tls », puis" >&2
+        echo "    refusée ici. L'émettre dans Orion (Astra › Coffre et clés), puis" >&2
         echo "    relancer ./scripts/deploy.sh --astra." >&2
     fi
 
@@ -487,8 +487,8 @@ deployer_astra() {
         }
         echo "    demande publique rapatriée : $demande_gateway"
         echo "    deux credentials distincts doivent maintenant émettre la leaf :" >&2
-        echo "      astra-signer issue-gateway-bootstrap --request '$demande_gateway' \\" >&2
-        echo "        --out '$CERTIFICAT_AMORCAGE'" >&2
+        echo "      « Amorcer la gateway… » dans Orion (Astra › Domaine), avec '$demande_gateway'" >&2
+        echo "      certificat attendu : '$CERTIFICAT_AMORCAGE'" >&2
         echo "    puis reprendre : ./scripts/deploy.sh --astra" >&2
         return 1
     fi
@@ -1010,7 +1010,7 @@ deployer_astra() {
         else
             echo "    relais sans ca_tls_certificate : le registre gateway va retenir la CA" >&2
             echo "    opérateur comme ancre du domaine, et aucun renouvellement ne pourra" >&2
-            echo "    se stager. Émettre la CA-TLS par astra-signer issue-ca-tls." >&2
+            echo "    se stager. Émettre la CA-TLS dans Orion (Astra › Coffre et clés)." >&2
         fi
         helios_ssh_sudo "$CIBLE" "$HELIOSD init-trust-domain \
             --trust-domain-id '$domaine' --ca-public-key '$ancre' \
@@ -1152,8 +1152,8 @@ deployer_astra() {
     # rien de secret — c'est le consommateur qui le vérifie sous son ancre, pas
     # ce script, pas la gateway et pas Astra.
     #
-    # Il vit à côté du coffre, sur le poste opérateur, et `astra-signer` le
-    # réémet à chaque geste qui déplace la table de key-slots. Le recopier ici
+    # Il vit à côté du coffre, sur le poste opérateur, et Orion le
+    # réécrit à chaque geste qui déplace la table de key-slots. Le recopier ici
     # est donc idempotent, et l'oublier est la panne qu'on ne comprend qu'au
     # premier renouvellement.
     #
@@ -1220,7 +1220,7 @@ deployer_astra() {
     else
         echo "    aucun document de credentials à côté du coffre :" >&2
         echo "      $credentials_local" >&2
-        echo "    l'émettre par « astra-signer bindings », sinon aucun opérateur ne" >&2
+        echo "    l'émettre dans Orion (Astra › Coffre et clés), sinon aucun opérateur ne" >&2
         echo "    peut approuver un renouvellement." >&2
     fi
 
@@ -1243,7 +1243,7 @@ if [ "$ASTRA" = "0" ]; then
 elif [ ! -f "$RELAIS" ]; then
     echo "==> 7/7  Astra sauté : aucun relais de domaine"
     echo "    en créer un, sur le poste où la clé de sécurité est branchée :"
-    echo "      astra-signer init --rp-id <nom> --label \"YubiKey ...\""
+    echo "      créer le domaine dans Orion : Astra › Coffre et clés"
 else
     echo "==> 7/7  Astra et domaine de confiance"
     # Non fatal : la gateway est déjà installée à ce point, et l'écraser d'un

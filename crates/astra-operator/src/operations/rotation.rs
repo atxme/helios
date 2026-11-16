@@ -535,7 +535,7 @@ pub fn ensure_nothing_outstanding(vault_path: &Path) -> Result<()> {
     rotation_journal::ensure_none_in_flight(vault_path)?;
     if rotation_journal::legacy_ca_pq_path_beside(vault_path).exists() {
         bail!(
-            "une rotation CA-PQ préparée par astra-signer reste à reprendre. Rien n'a été signé."
+            "une rotation CA-PQ préparée par l'ancien outil de signature reste à reprendre dans Orion, Astra › Rotations. Rien n'a été signé."
         );
     }
     if prepared::load(&prepared::path_beside(vault_path))?.is_some() {

@@ -160,8 +160,8 @@ pub enum VaultError {
     )]
     CredentialKeyMissing,
     #[error(
-        "une fenêtre de rotation CA-TLS est déjà ouverte : la mener à son terme par \
-         `astra-signer promote-ca-tls` avant d'en ouvrir une seconde"
+        "une fenêtre de rotation CA-TLS est déjà ouverte : la mener à son terme dans Orion, Astra › Rotations, \
+         avant d'en ouvrir une seconde"
     )]
     CaTlsWindowOpen,
     #[error(

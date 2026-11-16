@@ -114,7 +114,7 @@ pub enum KeyNegoCmd {
     ///
     /// A laboratory tool, tied to the file CA: it holds the client's private
     /// keys on the operator's disk. A real client is enrolled with an
-    /// enrollment v5 invitation (`astra-signer enroll invite`), whose keys
+    /// enrollment v5 invitation (Orion's Astra › Enrôlement), whose keys
     /// never leave the client.
     IssueClient {
         #[arg(long)]

@@ -673,8 +673,6 @@ mod ctap {
             );
         }
         diagnosis
-            .push_str("\n\n`astra-signer devices` liste chaque périphérique et son usage page.");
-        diagnosis
     }
 
     pub struct Ctap2Authenticator {

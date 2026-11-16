@@ -166,14 +166,14 @@ impl CertificateActionBlock {
             Self::CompanionTransportMissing => {
                 "Ce profil peut demander son renouvellement : la requête part, l'autorité ouvre \
                  l'opération et attend la clé matérielle de l'opérateur. C'est là que la chaîne \
-                 s'arrête — le compagnon « astra-signer » ne sait pas encore lire sa demande à \
+                 s'arrête — le compagnon de signature ne sait pas encore lire sa demande à \
                  travers le tunnel, et ses routes publiques répondent 501. Le renouvellement \
                  reste donc en attente d'opérateur jusqu'à ce que ce transport existe."
                     .into()
             }
             Self::OperatorCredentialRequired => {
                 "Cette opération exige une clé matérielle d'opérateur et le compagnon \
-                 « astra-signer », qu'Astra refuse explicitement dans cette version."
+                 de signature, qu'Astra refuse explicitement dans cette version."
                     .into()
             }
         }

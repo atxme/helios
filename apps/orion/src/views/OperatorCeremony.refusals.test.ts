@@ -87,8 +87,8 @@ describe('refusalSentence for the issuer delegation', () => {
       offline: true,
       withoutCampaign: false,
     }
-    expect(refusalSentence({ refusal: 'domain_conflict' }, journal)).toMatch(
-      /astra-signer rotate-ca-pq/,
+    expect(refusalSentence({ refusal: 'domain_conflict' }, journal)).toBe(
+      'Domaine en désaccord. Intervention manuelle requise.',
     )
     expect(refusalSentence({ refusal: 'domain_conflict' }, { ...journal, offline: false })).not.toMatch(
       /astra-signer/,

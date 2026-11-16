@@ -117,7 +117,7 @@ pub fn check_creation(vault_path: &Path) -> std::result::Result<(), SetupRefusal
 }
 
 /// Creates the vault around fresh anchors, registers the first key, and
-/// writes the relay beside it — `astra-signer init`, plus the authority
+/// writes the relay beside it — what the retired `astra-signer init` did, plus the authority
 /// origin.
 ///
 /// One assertion on `key`. Its opening is returned so the ceremony registers

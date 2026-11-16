@@ -409,7 +409,7 @@ export function CertificateDomainPanel() {
       {domain.issuer !== null && !domain.issuer.usable && (
         <KnownLimit register="danger" title="L’émetteur délégué ne peut plus signer">
           Aucun renouvellement client n’aboutira tant qu’il n’est pas réautorisé —{' '}
-          <code>astra issuer request</code>, <code>astra-signer authorize-issuer</code>,{' '}
+          <code>astra issuer request</code>, <code>Orion, Astra › Approbations</code>,{' '}
           <code>astra issuer install</code>.
         </KnownLimit>
       )}
@@ -486,7 +486,7 @@ export function CertificateDomainPanel() {
               <DataRow
                 label="Émetteur délégué"
                 value="absent"
-                hint="Aucun renouvellement ordinaire ne peut être émis : l’installer par astra issuer request, astra-signer authorize-issuer puis astra issuer install."
+                hint="Aucun renouvellement ordinaire ne peut être émis : l’installer par astra issuer request, approuver dans Orion (Astra › Approbations), puis astra issuer install."
               />
             )}
           </Box>

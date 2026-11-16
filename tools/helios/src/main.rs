@@ -284,7 +284,7 @@ enum ProfileCmd {
     },
     /// Re-emits the invitation profile of an admitted client, readable by
     /// Orion's import. Admits nobody: a new client is enrolled from an
-    /// `astra-signer enroll invite` invitation.
+    /// invitation in Orion's Astra › Enrôlement.
     Emit {
         /// Profile name, also used as the peer name on the gateway.
         #[arg(long)]

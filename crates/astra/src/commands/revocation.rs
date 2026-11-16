@@ -64,9 +64,7 @@ pub(crate) fn revocation_open(
         opening.opened.campaign_fingerprint
     );
     eprintln!(
-        "signer depuis le poste opérateur :\n  astra-signer revoke --authority-url {} \
-         --operation-id {} --not-after {not_after}",
-        opening.authority_url,
+        "signer dans Orion : Astra › Postes, opération {} (échéance {not_after})",
         operation_id.to_hex()
     );
     Ok(())
@@ -112,10 +110,8 @@ fn gateway_revocation_open(state_dir: &Path, text: OpeningText) -> Result<()> {
         opening.opened.campaign_fingerprint
     );
     eprintln!(
-        "terminal : la gateway ne négociera plus. Signer depuis le poste opérateur :\n  \
-         astra-signer revoke --scope gateway --authority-url {} --operation-id {} \
-         --pq-not-after {pq_not_after} --tls-not-after {tls_not_after}",
-        opening.authority_url,
+        "terminal : la gateway ne négociera plus. Signer dans Orion : Astra › Postes, \
+         opération {} (échéances PQ {pq_not_after}, TLS {tls_not_after})",
         operation_id.to_hex()
     );
     Ok(())

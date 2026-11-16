@@ -1151,7 +1151,7 @@ export interface RotationJournalView {
   activationAt: number
   notAfter: number
   nextFingerprint: string
-  /** Sans dépôt d'Orion : une rotation signée hors ligne, que `astra-signer` peut encore reprendre. */
+  /** Sans dépôt d'Orion : une rotation signée hors ligne, que l'ancien `astra-signer` pouvait reprendre. */
   offline: boolean
   /** Signée sans campagne : la reprise se fait sur la gateway seule. Absent des anciens journaux : `false`. */
   withoutCampaign: boolean

@@ -266,7 +266,7 @@ fn resolve_public_key(options: &EmitOptions) -> Result<String> {
         bail!(
             "provide --public-key <public key of an admitted client>: `profile emit` re-emits \
              the invitation of a peer the gateway already holds. To enroll a new client, start \
-             from `astra-signer enroll invite`"
+             from Orion's Astra › Enrôlement"
         );
     };
     let public_key = public_key.trim().to_string();
@@ -288,7 +288,7 @@ fn reuse_admission(peers: &[NetworkPeerView], name: &str, public_key: &str) -> R
              `helios peer add --name {name} --public-key <key> \
              --key-negotiation-certificate-sha256 <sha256> \
              --key-negotiation-pq-certificate-sha256 <sha256>`, then re-run this command; \
-             or enroll it from `astra-signer enroll invite`"
+             or enroll it from Orion's Astra › Enrôlement"
         );
     };
     if existing.public_key.trim() != public_key {
@@ -457,10 +457,7 @@ mod tests {
             error.contains("--key-negotiation-pq-certificate-sha256"),
             "message: {error}"
         );
-        assert!(
-            error.contains("astra-signer enroll invite"),
-            "message: {error}"
-        );
+        assert!(error.contains("Astra › Enrôlement"), "message: {error}");
     }
 
     #[test]
@@ -490,10 +487,7 @@ mod tests {
     fn without_a_public_key_the_tool_refuses_and_points_to_enroll() {
         let error = resolve_public_key(&options()).unwrap_err().to_string();
         assert!(error.contains("--public-key"), "message: {error}");
-        assert!(
-            error.contains("astra-signer enroll invite"),
-            "message: {error}"
-        );
+        assert!(error.contains("Astra › Enrôlement"), "message: {error}");
     }
 
     #[test]

@@ -543,6 +543,6 @@ Operational bootstrap complete.
 
 Enroll the first Orion administrator with an enrollment v5 invitation
 (docs/security/OPERATOR-TOOLING.md §6), adding --admin to the
-\`heliosd peer add\` line \`astra-signer enroll accept\` prints.
+\`heliosd peer add\` line that Orion's Astra › Enrôlement prints on acceptance.
 Keep $CERTS_ROOT backed up and off the gateway.
 EOF

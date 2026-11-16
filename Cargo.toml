@@ -132,9 +132,6 @@ blake3 = "1"
 zeroize = "1"
 base64 = "0.23"
 hex = "0.4"
-# Saisie du PIN FIDO2 sans écho. Un PIN d'authentificateur affiché dans un
-# terminal se retrouve dans un scrollback, une capture d'écran ou un partage.
-rpassword = "7"
 # `static_secrets` expose `StaticSecret` : une clé privée persistée (celle du
 # profil WireGuard), par opposition aux clés éphémères par défaut.
 x25519-dalek = { version = "3", features = ["static_secrets"] }

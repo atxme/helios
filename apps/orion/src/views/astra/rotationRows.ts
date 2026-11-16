@@ -714,9 +714,8 @@ export function expiringWorkstationWarnings(o: RotationsOverview, local: number)
 }
 
 /**
- * The sentence of a stop that gives its cause and its recourse. `astra-signer rotate-ca-pq`
- * is named only for a rotation signed offline: for one Orion carries, the command could
- * conflict with it.
+ * The sentence of a stop that gives its cause and its recourse. It names no command: the
+ * retired `astra-signer rotate-ca-pq` was once named for a rotation signed offline only.
  */
 export function stopSentence(
   refusal: 'domain_conflict' | 'install_deadline_passed' | 'gateway_names_no_anchor',
@@ -740,9 +739,7 @@ export function stopSentence(
   if (journal?.withoutCampaign) {
     return 'Le relais nomme désormais une origine Astra : rotation conservée.'
   }
-  return journal?.kind === 'ca_pq' && journal.offline
-    ? 'Domaine en désaccord. Intervention manuelle requise : astra-signer rotate-ca-pq.'
-    : 'Domaine en désaccord. Intervention manuelle requise.'
+  return 'Domaine en désaccord. Intervention manuelle requise.'
 }
 
 /**
