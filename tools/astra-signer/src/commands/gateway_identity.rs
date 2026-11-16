@@ -55,14 +55,14 @@ pub(crate) fn issue_gateway_bootstrap(
             }
         }
     }
-    handoff.gateway_wg_public_key = Some(gateway_key);
-    handoff.server_name = Some(request.server_name.clone());
-    handoff::save(&handoff::path_beside(path), &handoff)?;
     let now = now_unix();
     let validity = validity_days
         .checked_mul(DAY_SECS)
         .and_then(|seconds| now.checked_add(seconds))
         .context("durée de validité hors bornes")?;
+    handoff.gateway_wg_public_key = Some(gateway_key);
+    handoff.server_name = Some(request.server_name.clone());
+    handoff::save(&handoff::path_beside(path), &handoff)?;
 
     let scope = CampaignScope::GatewayBootstrap;
     println!("amorçage gateway : émission de l'époque 1 sous CA-PQ");
@@ -1025,6 +1025,47 @@ mod tests {
             Some(expected_gateway_key.as_str())
         );
         assert_eq!(handoff.server_name.as_deref(), Some("gateway.example"));
+    }
+
+    #[test]
+    fn bootstrap_refuses_unrepresentable_validity_before_recording_gateway_identity() {
+        let fixture = Fixture::new();
+        let request = fixture.bootstrap_request(fixture.gateway_key, "gateway.example");
+        let request_path = fixture._directory.path().join("bootstrap-request.json");
+        let out = fixture._directory.path().join("gateway-certificate.json");
+        std::fs::write(
+            &request_path,
+            serde_json::to_vec(&request).expect("serialize bootstrap request"),
+        )
+        .expect("write bootstrap request");
+
+        let mut handoff = handoff::DomainHandoff::beside(
+            &fixture.vault_path,
+            &store::load(&fixture.vault_path).expect("load vault"),
+        )
+        .expect("load handoff");
+        handoff.gateway_wg_public_key = None;
+        handoff.server_name = None;
+        let handoff_path = handoff::path_beside(&fixture.vault_path);
+        handoff::save(&handoff_path, &handoff).expect("save unbound handoff");
+        let before = std::fs::read(&handoff_path).expect("read handoff");
+
+        let error = issue_gateway_bootstrap(
+            &fixture.vault_path,
+            &request_path,
+            &out,
+            u64::MAX,
+            Transport::Hid,
+        )
+        .expect_err("unrepresentable validity must fail before the ceremony");
+
+        assert!(format!("{error:#}").contains("durée de validité hors bornes"));
+        assert_eq!(
+            std::fs::read(&handoff_path).expect("handoff remains readable"),
+            before
+        );
+        assert!(!out.exists());
+        assert!(!format!("{error:#}").contains("terminal"));
     }
 
     #[test]
