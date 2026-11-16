@@ -405,9 +405,9 @@ Valider avec accès console :
 - coffre d'autorité Astra ([ADR-008](../adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md) §4),
   sur le poste où la clé de sécurité est branchée — Windows en administrateur,
   ou un Linux avec accès au périphérique HID :
-  `astra-signer init` crée le coffre et enregistre la première clé, puis
-  `astra-signer verify` la rouvre après avoir débranché et rebranché ;
-  `astra-signer enrol` enregistre la seconde en la branchant à la place de la
+  dans Orion, onglet *Astra › Coffre et clés*, la création du coffre enregistre la première clé, puis
+  « Vérifier une clé » la rouvre après avoir débranché et rebranché ;
+  l'ajout d'une clé enregistre la seconde en la branchant à la place de la
   première, et **chacune** des deux rouvre ensuite les ancres seule. Vérifier
   aussi qu'une troisième clé s'enrôle exactement de la même façon, qu'une clé
   jamais enrôlée est refusée sans ambiguïté, que rebrancher une clé déjà
@@ -416,7 +416,7 @@ Valider avec accès console :
   jamais moins de deux slots. Un mauvais PIN doit refuser, pas ouvrir.
 
   Ce qui **n'est pas** exerçable ailleurs : rien d'autre. La séquence complète
-  est éprouvée en dur par `tools/astra-signer/tests/enrolment.rs` contre des
+  est éprouvée en dur par les tests du coffre contre des
   clés simulées ; ce que seule la cible établit, c'est que la clé produit bien
   une sortie `hmac-secret` stable pour un couple (credential, sel) à travers
   débranchements et redémarrages. Si elle ne l'était pas, le coffre ne se
@@ -428,7 +428,7 @@ Valider avec accès console :
   console administrateur et échouer sans, en nommant l'élévation. Vérifier
   qu'un coffre créé par l'un s'ouvre par l'autre — le credential appartient à
   la clé, pas à l'API. WSL2 n'a aucun passthrough USB. CTAP n'est **pas** une feature de
-  compilation — tout binaire `astra-signer` porte la pile, et il n'existe aucun
+  compilation — tout binaire qui touche le coffre, Orion compris, porte la pile, et il n'existe aucun
   chemin qui ouvre le coffre sans clé. Le prix est une dépendance de
   compilation : `libudev` sous Linux, posée par `scripts/setup-dev.sh`, sans
   laquelle le workspace entier ne se bâtit plus.
@@ -437,7 +437,7 @@ Valider avec accès console :
   ([ADR-008](../adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md), guide :
   [DEPLOIEMENT-ASTRA](../DEPLOIEMENT-ASTRA.md)) : `astra bootstrap` dans le
   conteneur puis `heliosd init-trust-domain` sur la gateway, avec les valeurs
-  du même `astra-signer init`. Vérifier qu'un second appel de chacune est
+  de la création du coffre dans Orion (« Astra › Coffre et clés »). Vérifier qu'un second appel de chacune est
   refusé — une seconde histoire pour un domaine repartirait aux époques 1 face
   à des clients qui en tiennent de plus hautes, et chacun la refuserait ; que
   `heliosd init-trust-domain` réussit **TPM indisponible**, puisqu'il ne
@@ -1093,7 +1093,7 @@ dernier effet exige la gateway réelle.
   échoue en construisant `aws-lc-sys`, faute de compilateur C ciblant MSVC. Une
   erreur de nom ou de type dans `vault/windows/` ou dans le transport WebAuthn
   n’apparaît donc que sous Windows. Le job Windows applique Clippy strict et
-  les tests d'`astra-signer`, sans exiger de clé physique. Deux atténuations
+  les tests du coffre, sans exiger de clé physique (l'ancien `astra-signer` a été retiré au lot 7 de F14). Deux atténuations
   locales, aucune n’étant un substitut :
   - les modules `#[cfg(windows)] mod imp` importent le parent par `use super::*`,
     pour qu’un élément ajouté au-dessus ne manque jamais à l’appel ;
@@ -1119,8 +1119,8 @@ dernier effet exige la gateway réelle.
   une recette cible : Orion sous Windows, tunnel monté, gateway avec Astra
   déployé, et l'approbation jouée dans Orion lui-même (« Approuver avec la clé »,
   F14 lot 4, MANUAL-TESTING « E. Lot 4 ») sur la même machine avec la clé
-  branchée. Le transport de `astra-signer`, lui, s’éprouve hors matériel contre une gateway factice
-  (`tools/astra-signer/tests/tunnel.rs`). **Ce que cette recette doit vérifier
+  branchée. Le transport de l'ancien `astra-signer`, lui, s’éprouvait hors matériel contre une gateway factice
+  (`tools/astra-signer/tests/tunnel.rs`, retiré au lot 7 de F14). **Ce que cette recette doit vérifier
   en dernier**, et qui est l’acceptation réelle du renouvellement : que le
   client **rouvre le tunnel après l’activation**. Tout le reste peut réussir et
   laisser un poste enfermé dehors à la fin du chevauchement — c’est précisément
@@ -1174,7 +1174,7 @@ dernier effet exige la gateway réelle.
   tardif, couples TLS/PQ mixtes, transaction chunkée invisible avant son
   dernier fragment. Ce qui **n’est pas** exercé, et ne peut pas l’être en
   WSL2 : l’extension CTAP2 `hmac-secret` d’une YubiKey réelle, l’ouverture du
-  coffre HVLT par le compagnon `astra-signer`, le veth privé Astra–Helios et
+  coffre HVLT par le compagnon `astra-signer` (retiré au lot 7 de F14, remplacé par Orion), le veth privé Astra–Helios et
   ses garanties TLS 1.3, le redémarrage de `heliosd` sur une nouvelle identité
   gateway, et la bascule coordonnée d’un parc existant. Les routes qui
   dépendent d’un credential matériel répondent `501` par une variante d’erreur

@@ -39,8 +39,9 @@ heliosd ── aether-key-negotiation ── helios-provisioning
 - `helios-update` traite les mises à jour signées et le rollback.
 - `orion-core` porte la logique cliente portable ; `apps/orion` fournit le shell
   React/Tauri et les intégrations de plateforme.
-- `helios`, `astra-signer`, `helios-publisher`, `helios-installer` et
-  `xtask` sont les outils opérateur, éditeur, installation et build.
+- `helios` est l'outil opérateur ; `helios-publisher`, `helios-installer` et
+  `xtask` servent à l'édition, à l'installation et au build. Orion est le seul
+  outil côté poste (`astra-signer` a été retiré au lot 7 de F14).
 
 ## Dépendances et flux principaux
 

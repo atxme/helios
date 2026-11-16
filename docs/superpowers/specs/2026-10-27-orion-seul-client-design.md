@@ -234,6 +234,14 @@ reste celle d'`InvitationRegistry`.
 7. **Retrait** : `tools/astra-signer`, `helios enroll document`, empaquetage,
    xtask, docs (ADR-008, OPERATOR-TOOLING, MANUAL-TESTING, ROADMAP, README).
 
+**Amendement du 15 novembre 2026 (lot 7).** Le premier administrateur, qui n'a pas de
+tunnel, ne pouvait pas « Reprendre » : la reprise exigeait une gateway joignable. Le
+lot 7 ajoute `heliosd export-enrolment --public-key <clé>`, qui remplace
+`heliosd show-trust-enrolment` et imprime un fichier public unique (matière de la
+gateway, admission du pair, bloc de confiance) ; « Reprendre » accepte ce fichier
+quand aucun tunnel n'est monté. `tools/astra-signer` et `helios enroll document` sont
+retirés au même lot. Conception : `docs/superpowers/specs/2026-11-15-f14-lot7-retrait-astra-signer-design.md`.
+
 ## 8. Erreurs et sécurité
 
 - Tout message d'erreur montré à la personne est en français et nomme la cause ;

@@ -1662,7 +1662,7 @@ action, puis état attendu. Les écrans sont nommés à chaque étape.
        rien n'est généré tant qu'elle ne correspond pas. Renseigner « Nom du poste », puis
        « Créer la demande ». Attendu : « Demande créée. » et « Enregistrer la demande »
        écrit `<nom>.helios-request`.
-3. Transporter `<nom>.helios-request` à l'opérateur (fichier public).
+    3. Transporter `<nom>.helios-request` à l'opérateur (fichier public).
     4. Opérateur, *Astra* › *Enrôlement*, « Accepter une demande… » : champ « Fichier de
        demande » = ce fichier, « Adresse publique de la gateway », « Vérifier et
        accepter ». Attendu : les deux feuilles et `admission.txt` (trois lignes) ; la

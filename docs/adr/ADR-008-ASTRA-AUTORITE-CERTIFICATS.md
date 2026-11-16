@@ -156,7 +156,7 @@ pour toute signature de `CA-PQ`.
 
 Le canal WireGuard est obligatoire dès qu'il existe. Une opération ordinaire
 initiée par Orion passe par des routes typées de l'API interne du tunnel, sans
-appel à `astra-signer` ni assertion WebAuthn. `heliosd` résout d'abord la VIP
+appel à un outil séparé (`astra-signer`, retiré au lot 7 de F14) ni assertion WebAuthn. `heliosd` résout d'abord la VIP
 source vers l'unique pair
 admis, compare la clé WireGuard portée par l'objet, puis relaie l'objet
 canonique vers Astra par le veth. Il n'est jamais un reverse proxy générique et
@@ -296,8 +296,8 @@ Le PIN seul, une assertion WebAuthn non liée au coffre ou un mot de passe de
 secours ne déverrouillent pas l'autorité.
 
 Le coffre chiffré peut résider dans l'état Astra et ses sauvegardes, mais il
-n'est jamais ouvert dans le conteneur. Une application portable
-`astra-signer`, exécutée sur le poste où la YubiKey est branchée, récupère le
+n'est jamais ouvert dans le conteneur. Une application portable,
+exécutée sur le poste où la YubiKey est branchée (`astra-signer`, jusqu'à son retrait au lot 7 de F14, puis Orion), récupère le
 coffre chiffré et une requête de signature Astra. Elle vérifie la clé de
 service épinglée, l'empreinte du coffre, l'échéance et le manifeste canonique,
 affiche l'opération exacte, puis utilise CTAP directement pour ouvrir un
@@ -305,7 +305,7 @@ key-slot. Elle signe localement, zéroïse le matériel maître et ne renvoie qu
 les objets signés. Ni la clé de déverrouillage ni une clé privée de CA ne
 transitent par Astra, Helios ou le navigateur.
 
-Le renouvellement ordinaire n'emploie ni `astra-signer`, ni assertion FIDO2,
+Le renouvellement ordinaire n'emploie ni outil séparé, ni assertion FIDO2,
 ni ouverture du coffre. La demande signée par l'identité active et par la clé
 candidate, son empreinte, le seuil de 80 %, l'admission non révoquée et la
 délégation bornée forment son autorisation. Astra, Helios et Orion vérifient
@@ -333,8 +333,7 @@ le domaine et la clé de service depuis le hand-off épinglé au coffre, puis
 publie des états et un manifeste typés (`operator_session`). Aucun secret ni PIN
 ne traverse vers la WebView. Le comportement sous Windows réel de cette
 cérémonie dans l'IHM est **à valider en recette** (MANUAL-TESTING, point 10 de
-« Séparation des privilèges (F11) »). `astra-signer` reste l'adaptateur portable des flux hors ligne
-et des cérémonies qui n'ont pas encore atteint cette parité dans Orion.
+« Séparation des privilèges (F11) »). `astra-signer`, adaptateur portable des flux hors ligne et des cérémonies, a été retiré au lot 7 de F14 : Orion les mène désormais.
 
 Règles de gestion :
 
@@ -475,7 +474,7 @@ chemin ; une politique plus stricte peut en exiger deux, jamais zéro.
 ### 7. Commandes manuelles et rollback borné
 
 Orion et la console Helios exposent une surface « Certificats ». Les deux IHM
-créent une campagne Astra, lancent le compagnon `astra-signer` et vérifient
+créent une campagne Astra, lancent le compagnon `astra-signer` (remplacé par Orion au lot 4 de F14, retiré au lot 7) et vérifient
 ensuite les objets signés ; elles ne manipulent pas elles-mêmes une YubiKey et
 ne font pas confiance à un simple callback de navigateur. (Pour Orion, l'amendement
 du 31 octobre 2026 ci-dessous remplace le compagnon par une cérémonie dans
@@ -571,12 +570,12 @@ passe de la WebView à Rust.
 Ce que la gateway accorde au pair opérateur ne se vérifie pas dans le dépôt : à
 valider en recette (MANUAL-TESTING).
 
-`astra-signer` et `helios enroll document` restent livrés, à titre transitoire,
-jusqu'au lot 7 de F14. L'amorçage de la gateway se joue dans Orion (lot 6a) :
+`astra-signer` et `helios enroll document` ont été retirés au lot 7 de F14
+(15 novembre 2026). L'amorçage de la gateway se joue dans Orion (lot 6a) :
 par fichiers (la demande de la gateway en entrée, la feuille PQ en sortie), avec
 deux clés distinctes, sans route nouvelle sur la gateway. Les mentions de
-`astra-signer` plus haut dans cet ADR décrivent l'outil tel qu'il reste
-jusque-là.
+`astra-signer` plus haut dans cet ADR décrivent l'outil avant son retrait
+au lot 7.
 
 #### Amendement du 31 octobre 2026 : les approbations se jouent dans Orion (F14, lot 4)
 
@@ -657,10 +656,10 @@ manifeste ait été montré, ni sur un autre objet que celui montré.
   lit un fichier `CampaignApproval` (ni `astra`, ni `heliosd`, ni Orion) ; le
   porter produirait un fichier que rien n'installe. La récupération n'a pas de
   mode hors ligne : elle exige un aller-retour avec l'autorité.
-- **Reste sur `astra-signer`** : la rotation CA-TLS jusqu'au lot 5 ; les campagnes
+- **Restait sur `astra-signer`** : la rotation CA-TLS jusqu'au lot 5 ; les campagnes
   d'ancre, de révocation, d'identité de gateway et d'amorçage (lots 5 et 6b) sont
   listées dans *Approbations* comme « pas encore disponibles ». `astra-signer`
-  disparaît au lot 7.
+  a disparu au lot 7.
 
 Ce que le dialogue WebAuthn rattaché à la fenêtre produit sous Windows, une
 récupération approuvée depuis un second poste et une délégation suivie du
@@ -722,7 +721,7 @@ Ce que cet amendement ne fait **pas** : il n'ajoute aucun écran — ceux d'Orio
 qui ouvriront une rotation ou une révocation sont les lots 5b et 5c — et ne
 touche ni aux capacités bearer, ni aux fenêtres, ni à la vérification par
 Orion du manifeste sous la clé de service épinglée, ni au refus de dépôt par
-Astra. `SigningOperationView` est inchangé, pour que les `astra-signer` et
+Astra. `SigningOperationView` est inchangé, pour que l'ancien `astra-signer` et
 Orion déjà livrés continuent de le lire. La forme normative est au §0.9 de la
 spécification.
 
@@ -822,11 +821,11 @@ Renvoi à la spécification du lot 6b (§5.1) ; la recette est dans MANUAL-TESTI
   pair administrateur (`crates/helios-api/src/lib.rs`).
 - **Gestes.** Orion renouvelle, annule, revient à l'ancienne identité, révoque la
   gateway et reprend ou jette une décision en attente, par le tunnel, sans
-  `astra-signer`. Jeter est refusé tant qu'il reste un travail à finir sur la
+  outil séparé. Jeter est refusé tant qu'il reste un travail à finir sur la
   gateway (une décision installée et non publiée, une révocation non terminée) :
   la phrase de refus finit par « Rien n'a été jeté. ». Une révocation refusée
   définitivement au dépôt garde son remplaçant et redevient à signer. Les commandes
-  restent le recours jusqu'au lot 7.
+  `astra-signer` étaient le recours avant le retrait du lot 7 de F14.
 - **Hors lot.** « Tout renouveler » n'est pas dans Orion : le plan reste sur la
   console d'Astra. Les routes des pas du plan sont en place, sans écran qui les appelle.
 
