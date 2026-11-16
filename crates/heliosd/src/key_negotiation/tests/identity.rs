@@ -230,6 +230,43 @@ fn a_restart_selects_only_a_published_candidate_inside_the_overlap() {
     );
 }
 
+#[test]
+fn a_restart_rejects_revocation_and_publication_after_the_activation_boundary() {
+    let revoked = select_served_identity_slot(true, None, None, None, false, false, 100)
+        .expect_err("revocation closes the listener even without a staged identity");
+    assert!(format!("{revoked:#}").contains("identity is revoked"));
+
+    let unpublished =
+        select_served_identity_slot(false, Some(7), Some(200), Some(300), false, false, 200)
+            .expect_err("the candidate cannot be served before Astra publishes it");
+    assert!(format!("{unpublished:#}").contains("before publication"));
+
+    // At the retirement boundary the overlap is over, even when the
+    // candidate was never published or a service rollback is active.
+    let retired =
+        select_served_identity_slot(false, Some(7), Some(200), Some(300), false, true, 300)
+            .expect_err("rollback cannot extend the overlap");
+    assert!(format!("{retired:#}").contains("reached not_after"));
+}
+
+#[test]
+fn restart_reason_surfaces_invalid_fresh_start_and_candidate_epoch_changes() {
+    let invalid = restart_reason(
+        ServedIdentitySlot::Active,
+        select_served_identity_slot(true, None, None, None, false, false, 10),
+    )
+    .expect("the operator needs the refusal reason before restarting");
+    assert!(invalid.contains("would refuse to serve"));
+    assert!(invalid.contains("identity is revoked"));
+
+    let changed_epoch = restart_reason(
+        ServedIdentitySlot::Candidate { epoch: 2 },
+        select_served_identity_slot(false, Some(3), Some(10), Some(20), true, false, 10),
+    )
+    .expect("a new candidate requires a restart to select its leaf");
+    assert!(changed_epoch.contains("epoch 3 is due"));
+}
+
 /// A rollback puts the overlap back on the outgoing leaf without moving
 /// the end of the decision it lives in (spec §4.4, §11.1 step 8).
 #[test]
