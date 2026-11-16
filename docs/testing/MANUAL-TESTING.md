@@ -1655,10 +1655,14 @@ action, puis état attendu. Les écrans sont nommés à chaque étape.
        reçoit `/var/lib/helios/key-negotiation-pq-cert.json`, copié depuis la gateway
        (le chemin de la feuille PQ). « Signer l’invitation » : le fichier
        `<nom>.helios-invite` est enregistré, avec l'empreinte `CA-PQ`.
-    2. Poste client, *Profils* › « Importer une invitation » : l'empreinte affichée
-       est lue à l'opérateur par un autre canal, puis « Enregistrer la demande »
+    2. Poste client, *Profils* › « Importer une invitation » : choisir `<nom>.helios-invite`.
+       La boîte affiche la gateway, l'échéance et l'empreinte CA-PQ de l'invitation. Le
+       client se fait lire cette empreinte par l'opérateur, par un autre canal que celui
+       qui a apporté le fichier, et la recopie dans « Empreinte lue par l’opérateur » ;
+       rien n'est généré tant qu'elle ne correspond pas. Renseigner « Nom du poste », puis
+       « Créer la demande ». Attendu : « Demande créée. » et « Enregistrer la demande »
        écrit `<nom>.helios-request`.
-    3. Transporter `<nom>.helios-request` à l'opérateur (fichier public).
+3. Transporter `<nom>.helios-request` à l'opérateur (fichier public).
     4. Opérateur, *Astra* › *Enrôlement*, « Accepter une demande… » : champ « Fichier de
        demande » = ce fichier, « Adresse publique de la gateway », « Vérifier et
        accepter ». Attendu : les deux feuilles et `admission.txt` (trois lignes) ; la
