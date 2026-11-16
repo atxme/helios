@@ -26,6 +26,127 @@ fn transition() -> ClientTlsCaTransition {
     }
 }
 
+fn domain_vault(path: &Path) {
+    use aether::certificates::encoding::generate_ml_dsa_87_keypair;
+    use astra_operator::vault::{draw_salt, AuthoritySecrets, SlotEnrolment, SlotSecret};
+    use base64::Engine as _;
+
+    let (private, public) = generate_ml_dsa_87_keypair().expect("ML-DSA keypair");
+    let encoder = base64::engine::general_purpose::STANDARD;
+    let secrets = AuthoritySecrets {
+        ca_pq_private_key: encoder.encode(&*private),
+        ca_pq_public_key: public.to_base64(),
+        ca_tls_private_key: encoder.encode(b"test TLS private key"),
+        retained_ca_tls: None,
+        retained_outgoing_ca_pq: None,
+    };
+    let enrolment = SlotEnrolment {
+        role: SlotRole::Primary,
+        label: "primary".into(),
+        credential_id: vec![1; 64],
+        credential_public_key: [
+            &[0xA4, 0x01, 0x01, 0x03, 0x27, 0x20, 0x06, 0x21, 0x58, 0x20][..],
+            &[9; 32],
+        ]
+        .concat(),
+        aaguid: [1; 16],
+        enrolled_at: 1_000,
+    };
+    let vault = AuthorityVault::create(
+        TrustDomainId::new([1; 16]).expect("domain"),
+        "astra.helios.test",
+        draw_salt().expect("salt"),
+        &secrets,
+        enrolment,
+        &SlotSecret::new(vec![1; 32]),
+        1_000,
+    )
+    .expect("vault");
+    store::save(path, &vault).expect("save vault");
+}
+
+#[test]
+fn domain_updates_preserve_existing_pins_and_normalize_new_values() {
+    use aether::certificates::encoding::WireGuardKey;
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let vault = directory.path().join("authority-vault.json");
+    domain_vault(&vault);
+    let relay_path = handoff::path_beside(&vault);
+    let original =
+        handoff::DomainHandoff::beside(&vault, &store::load(&vault).expect("load vault"))
+            .expect("initial handoff");
+    let old_gateway = WireGuardKey::from_bytes([3; 32]).to_base64();
+    let mut handoff = original.clone();
+    handoff.gateway_wg_public_key = Some(old_gateway);
+    handoff.server_name = Some("old.example.test".into());
+    handoff.astra_authority_url = Some("https://astra.old.example".into());
+    handoff::save(&relay_path, &handoff).expect("write initial handoff");
+
+    let new_gateway = WireGuardKey::from_bytes([4; 32]).to_base64();
+    commands::domain(
+        &vault,
+        Some(&format!("  {new_gateway}  ")),
+        Some(" gateway.example.test "),
+        None,
+        None,
+        None,
+    )
+    .expect("partial domain update");
+
+    let updated: handoff::DomainHandoff =
+        serde_json::from_slice(&std::fs::read(relay_path).expect("read handoff"))
+            .expect("decode handoff");
+    assert_eq!(
+        updated.gateway_wg_public_key.as_deref(),
+        Some(new_gateway.as_str())
+    );
+    assert_eq!(updated.server_name.as_deref(), Some("gateway.example.test"));
+    assert_eq!(
+        updated.astra_authority_url.as_deref(),
+        Some("https://astra.old.example")
+    );
+    assert_eq!(updated.ca_pq_public_key, original.ca_pq_public_key);
+    assert_eq!(updated.vault_fingerprint, original.vault_fingerprint);
+}
+
+#[test]
+fn domain_rejects_invalid_values_before_replacing_the_handoff() {
+    use aether::certificates::encoding::WireGuardKey;
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let vault = directory.path().join("authority-vault.json");
+    domain_vault(&vault);
+    let relay_path = handoff::path_beside(&vault);
+    let initial = handoff::DomainHandoff::beside(&vault, &store::load(&vault).expect("load vault"))
+        .expect("initial handoff");
+    let mut existing = initial;
+    existing.gateway_wg_public_key = Some(WireGuardKey::from_bytes([5; 32]).to_base64());
+    existing.server_name = Some("gateway.example.test".into());
+    handoff::save(&relay_path, &existing).expect("write initial handoff");
+    let before = std::fs::read(&relay_path).expect("read initial bytes");
+
+    for (gateway, server_name, service_key, epoch, origin) in [
+        (Some("not-a-key"), None, None, None, None),
+        (None, Some("bad/name"), None, None, None),
+        (None, None, None, Some(0), None),
+        (
+            None,
+            None,
+            None,
+            None,
+            Some("http://user:pass@example.test"),
+        ),
+    ] {
+        let result = commands::domain(&vault, gateway, server_name, service_key, epoch, origin);
+        assert!(result.is_err(), "invalid domain input should fail closed");
+        assert_eq!(
+            std::fs::read(&relay_path).expect("handoff remains readable"),
+            before
+        );
+    }
+}
+
 /// The operator's copy is what `heliosd install-*` reads, so it carries no
 /// routing envelope.
 ///
