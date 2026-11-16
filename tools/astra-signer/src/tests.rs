@@ -147,6 +147,62 @@ fn domain_rejects_invalid_values_before_replacing_the_handoff() {
     }
 }
 
+/// A key-slot mutation must stop at the terminal check when no operator can
+/// answer the prompt. In particular, it must not rewrite the encrypted vault
+/// or publish a credential document after a failed hardware interaction.
+#[test]
+fn enrol_without_a_terminal_preserves_the_vault_and_writes_no_bindings() {
+    const CHILD: &str = "ASTRA_SIGNER_NON_TTY_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("test executable path"))
+                .args([
+                    "--exact",
+                    "tests::enrol_without_a_terminal_preserves_the_vault_and_writes_no_bindings",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("run the isolated non-terminal test");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the isolated child test did not run: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let vault = directory.path().join("authority-vault.json");
+    domain_vault(&vault);
+    let vault_before = std::fs::read(&vault).expect("vault before");
+    let bindings = credentials::path_beside(&vault);
+
+    use std::io::IsTerminal as _;
+    assert!(
+        !std::io::stdin().is_terminal(),
+        "child stdin must be non-terminal"
+    );
+    let error = commands::enrol(&vault, "recovery", SlotRole::Recovery, Transport::Hid)
+        .expect_err("enrollment needs an interactive operator");
+
+    assert!(
+        error.to_string().contains("ne s'exécute pas sans terminal"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read(&vault).expect("vault after"), vault_before);
+    assert!(
+        !bindings.exists(),
+        "failed enrollment must not publish bindings"
+    );
+}
+
 /// The operator's copy is what `heliosd install-*` reads, so it carries no
 /// routing envelope.
 ///
