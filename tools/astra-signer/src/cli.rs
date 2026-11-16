@@ -124,6 +124,72 @@ impl From<RevocationReasonArg> for aether::certificates::revocation::RevocationR
     }
 }
 
+#[cfg(test)]
+mod conversion_tests {
+    use super::*;
+
+    #[test]
+    fn transport_and_role_arguments_map_to_their_domain_values() {
+        assert!(matches!(
+            Transport::from(TransportArg::Platform),
+            Transport::Platform
+        ));
+        assert!(matches!(Transport::from(TransportArg::Hid), Transport::Hid));
+        assert!(matches!(
+            SlotRole::from(RoleArg::Principale),
+            SlotRole::Primary
+        ));
+        assert!(matches!(
+            SlotRole::from(RoleArg::Recuperation),
+            SlotRole::Recovery
+        ));
+    }
+
+    #[test]
+    fn revocation_scope_and_reason_arguments_map_to_domain_values() {
+        use aether::certificates::revocation::{RevocationReason, RevocationScope};
+
+        assert!(matches!(
+            RevocationScope::from(RevocationScopeArg::Client),
+            RevocationScope::Client
+        ));
+        assert!(matches!(
+            RevocationScope::from(RevocationScopeArg::Gateway),
+            RevocationScope::Gateway
+        ));
+        assert!(matches!(
+            RevocationReason::from(RevocationReasonArg::KeyCompromise),
+            RevocationReason::KeyCompromise
+        ));
+        assert!(matches!(
+            RevocationReason::from(RevocationReasonArg::SuspectedCompromise),
+            RevocationReason::SuspectedCompromise
+        ));
+        assert!(matches!(
+            RevocationReason::from(RevocationReasonArg::Cessation),
+            RevocationReason::Cessation
+        ));
+        assert!(matches!(
+            RevocationReason::from(RevocationReasonArg::Superseded),
+            RevocationReason::Superseded
+        ));
+    }
+
+    #[test]
+    fn abort_reason_arguments_map_to_domain_values() {
+        use aether::certificates::gateway::AbortReason;
+
+        assert!(matches!(
+            AbortReason::from(AbortReasonArg::OperatorCancelled),
+            AbortReason::OperatorCancelled
+        ));
+        assert!(matches!(
+            AbortReason::from(AbortReasonArg::SupersededBeforeActivation),
+            AbortReason::SupersededBeforeActivation
+        ));
+    }
+}
+
 #[derive(Subcommand)]
 pub(crate) enum Command {
     /// Creates the vault around fresh anchors and registers the first key.
