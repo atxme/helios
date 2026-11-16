@@ -380,21 +380,33 @@ encore de tunnel vers la gateway, donc aucune admission ne passe par l'API
 d'administration. Le parcours se fait en trois temps :
 
 1. Accepter la demande du poste (étape 3) : Orion écrit les feuilles et
-   `admission.txt`, puis s'arrête.
-2. Sur la gateway, en console, lancer les deux premières lignes de
-   `admission.txt`, la première avec `--admin` :
+   `admission.txt`, puis s'arrête. La réponse est une invitation « consommée »
+   avec « Reprendre ».
+2. Copier sur la gateway les deux feuilles écrites à côté d'`admission.txt`,
+   `<id>-client-cert.der` et `<id>-client-pq-cert.json` (`<id>` est l'identifiant
+   hexadécimal de la demande), dans le répertoire où l'on lance la commande :
+   la ligne les nomme par chemin relatif. Puis, en console sur la gateway, lancer
+   la **première ligne** d'`admission.txt`, avec `--admin` ajouté à la fin, puis la
+   deuxième. La première ligne d'`admission.txt` est, pour un poste nommé
+   `poste-admin` :
 
    ```sh
    sudo heliosd peer add --name poste-admin --public-key <clé> \
+     --certificate <id>-client-cert.der --pq-certificate <id>-client-pq-cert.json \
      --minimum-mode ml-kem --admin
    sudo heliosd export-enrolment --public-key <clé> > poste-admin.enrolment.json
    ```
+
+   Sans les deux feuilles, `peer add` refuse sur une gateway qui a un domaine de
+   confiance, et `export-enrolment` échoue faute de feuilles.
 
    `export-enrolment` imprime un JSON de format `helios-enrolment-export-v1`, sans
    démon ni réseau. Il refuse un pair absent de `network.toml` (« admit it first,
    with `heliosd peer add` ») et une gateway sans domaine de confiance. Le fichier
    est public : il ne contient aucun secret.
-3. Sur le poste, « Reprendre » (étape 4) avec `poste-admin.enrolment.json`.
+3. Sur le poste, « Reprendre » (étape 4) avec `poste-admin.enrolment.json`. Le
+   champ « Adresse publique de la gateway » est obligatoire : sans lui le bouton
+   « Reprendre l’enrôlement » reste inactif.
 
 Avant toute clé, Orion contrôle que ce fichier désigne la même gateway que
 l'invitation (clé WireGuard et nom de service, par l'épingle de l'invitation),

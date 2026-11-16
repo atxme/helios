@@ -1645,36 +1645,53 @@ action, puis état attendu.
 
 **N. Lot 7 : retrait d'`astra-signer`, premier administrateur sans tunnel**
 
-Onglet *Astra* › *Enrôlement*, sauf mention contraire. Le premier administrateur
-n'a pas de tunnel avant son admission : la gateway est jouée en console, et le
-poste client est un vrai poste Windows. Chaque étape : action, puis état attendu.
+Le premier administrateur n'a pas de tunnel avant son admission : la gateway est
+jouée en console, et le poste client est un vrai poste Windows. Chaque étape :
+action, puis état attendu. Les écrans sont nommés à chaque étape.
 
-139. **[cible] Premier administrateur sans tunnel, de bout en bout.** Inviter le poste
-    administrateur (« Inviter un poste… »), puis, sur le poste client, « Importer une
-    invitation » et « Accepter une demande… » côté opérateur, sans gateway qui réponde. Attendu : les deux feuilles et
-    `admission.txt`, dont la première ligne est `heliosd peer add … --minimum-mode ml-kem`,
-    la deuxième `heliosd export-enrolment --public-key <clé> > <nom>.enrolment.json`, la
-    troisième « Ajouter --admin à la première ligne pour le premier administrateur, puis
-    « Reprendre » avec ce fichier. ». Sur la gateway, en console : la première ligne avec
-    `--admin`, puis la deuxième. Sur le poste, « Reprendre » avec le fichier d'export
-    (champ « Export d'enrôlement de la gateway », « Sans tunnel : le fichier de
-    `heliosd export-enrolment`. »). Attendu : un document signé, qu'on importe sur le poste
-    client ; le profil se connecte une fois le tunnel monté.
-140. **Export d'une autre gateway refusé avant toute clé.** Reprendre l'invitation avec le
-    fichier d'export d'une autre gateway. Attendu : refus nommé, avant tout toucher ; rien
-    n'est consommé, l'invitation reste « à reprendre ».
+139. **[cible] Premier administrateur sans tunnel, de bout en bout.** Dans l'ordre :
+    1. Opérateur, *Astra* › *Enrôlement*, « Inviter un poste… » : nom du poste, durée,
+       puis le champ « Feuille PQ de la gateway ». Sans gateway qui réponde, ce champ
+       reçoit `/var/lib/helios/key-negotiation-pq-cert.json`, copié depuis la gateway
+       (le chemin de la feuille PQ). « Signer l’invitation » : le fichier
+       `<nom>.helios-invite` est enregistré, avec l'empreinte `CA-PQ`.
+    2. Poste client, *Profils* › « Importer une invitation » : l'empreinte affichée
+       est lue à l'opérateur par un autre canal, puis « Enregistrer la demande »
+       écrit `<nom>.helios-request`.
+    3. Transporter `<nom>.helios-request` à l'opérateur (fichier public).
+    4. Opérateur, *Astra* › *Enrôlement*, « Accepter une demande… » : champ « Fichier de
+       demande » = ce fichier, « Adresse publique de la gateway », « Vérifier et
+       accepter ». Attendu : les deux feuilles et `admission.txt` (trois lignes) ; la
+       demande passe « consommée », avec « Reprendre ».
+    5. Gateway, en console : copier les deux feuilles nommées par `admission.txt` dans le
+       répertoire de la commande ; lancer la première ligne avec `--admin` ajouté, puis la
+       deuxième (`heliosd export-enrolment …`). Attendu : `heliosd` affiche le JSON ou écrit
+       le fichier, sans erreur.
+    6. Opérateur, « Reprendre » sur la ligne : « Adresse publique de la gateway » (obligatoire),
+       champ « Export d'enrôlement de la gateway » = le fichier d'export, « Reprendre
+       l’enrôlement ». Sans tunnel, la phrase du champ est « Sans tunnel : le fichier de
+       `heliosd export-enrolment`. ». Attendu : une clé signe le document, qui se
+       télécharge.
+    7. Poste client, *Profils* : importer le document signé. Attendu : profil importé.
+    8. Monter le tunnel. Attendu : le poste se connecte.
+140. **Export d'une autre gateway refusé avant toute clé.** Dans « Reprendre », donner le
+    fichier d'export d'une autre gateway (adresse et endpoint renseignés). Attendu : refus
+    nommé, avant tout toucher ; la demande reste « consommée » avec « Reprendre » disponible,
+    aucune clé n'est touchée.
 141. **Export d'un autre pair refusé avant toute clé.** Sur la bonne gateway, exporter la
     clé d'un autre poste (`heliosd export-enrolment --public-key <autre clé>`) et le
-    donner à « Reprendre ». Attendu : refus nommé, avant tout toucher.
+    donner à « Reprendre ». Attendu : refus nommé, avant tout toucher ; la demande reste
+    « consommée » avec « Reprendre », aucune clé n'est touchée.
 142. **`heliosd export-enrolment` avant `heliosd peer add` refusé.** Sur la gateway, exporter
     pour une clé qui n'est pas dans `network.toml`. Attendu : refus « admit it first, with
     `heliosd peer add` » ; aucun fichier produit, aucune admission vide.
 143. **Reprise en ligne inchangée, fichier choisi.** Tunnel monté, avec un fichier d'export
     choisi dans « Reprendre ». Attendu : la gateway connectée fait foi, le fichier est
     ignoré, et le document est produit comme avant le lot 7.
-144. **Fichier qui n'est pas un export.** Choisir un autre JSON, ou un fichier d'un autre
-    format, dans « Reprendre » sans tunnel. Attendu : « Ce fichier n'est pas un export
-    d'enrôlement de `heliosd export-enrolment`. », avant toute clé.
+144. **Fichier qui n'est pas un export.** Dans « Reprendre » sans tunnel, choisir : (a) un
+    fichier UTF-16 enregistré par le Bloc-notes Windows (lu par `readFileText`), (b) un JSON
+    d'un autre `format` que `helios-enrolment-export-v1`. Attendu : « Ce fichier n'est pas un
+    export d'enrôlement de `heliosd export-enrolment`. », avant toute clé.
 
 ### Le chemin manuel
 

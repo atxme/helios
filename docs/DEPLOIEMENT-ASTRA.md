@@ -304,8 +304,7 @@ du tunnel, les routes étant derrière la barrière d'administration de la gatew
 et pas seulement derrière l'appartenance au réseau. Un tunnel qui échoue est une
 erreur, jamais un repli silencieux vers l'origine publique.
 
-La campagne est résolue **sur l'ancre que le registre détient**, et le
-compagnon la compare à celle de son propre coffre : deux moitiés du domaine qui
+la campagne est résolue **sur l'ancre que le registre détient**, et Orion la compare à celle de son propre coffre : deux moitiés du domaine qui
 se contredisent sur ce qui est courant s'arrêtent, elles ne se réconcilient pas
 par une rotation. Les deux clés autorisées restent branchées le temps de leurs
 deux gestes — l'assertion de campagne et l'ouverture du key-slot — plutôt que
@@ -376,7 +375,7 @@ n'oblige pas Orion à ouvrir une connexion HTTPS directe vers Astra.
   continuité sortante ; `CampaignScope::GatewayBootstrap` exige donc deux
   credentials actifs distincts, comme une réadmission sans continuité. Le
   coffre reste 1-sur-N : ce n'est pas un quorum humain, mais deux barrières
-  matérielles appliquées par le compagnon honnête.
+  matérielles appliquées par Orion, honnête.
 - Sous Windows, **aucune élévation n'est nécessaire** : Orion passe par l'API
   WebAuthn du système, qui demande elle-même le PIN et le contact. Cette API
   exige `WEBAUTHN_API_VERSION_4` pour les sels `hmac-secret`. Le diagnostic HID
@@ -640,8 +639,7 @@ ancien ») et propose « Envoyer ». Une clé marquée perdue pendant un recouvr
 reste donc admise par Astra jusqu'à cet envoi, fait après `not_after`.
 
 Il ne porte rien de secret : ce sont les liaisons publiques des credentials,
-et c'est le **consommateur** qui les vérifie sous son ancre — Orion sous le
-`CA-PQ` de son profil, le compagnon sous celui de son coffre. Ni ce script, ni
+et c'est le **consommateur** qui les vérifie sous son ancre — Orion sous le `CA-PQ` de son profil, et Orion sous celui de son coffre. Ni ce script, ni
 la gateway, ni Astra ne les authentifient.
 
 Il est lu **au démarrage**. Copié dans un conteneur déjà en marche, il n'aurait
@@ -663,9 +661,10 @@ incomplète doit ressembler.
 ### Le coffre chiffré, et pourquoi il ne se copie pas tout seul
 
 Une campagne qui fait signer une ancre — la portée `trust_authorities` — exige
-que le compagnon **ouvre** le coffre. Il le télécharge par
-`GET /v1/vaults/<empreinte>`, sous un jeton de capacité, et Astra ne peut le
-servir que s'il en détient une copie : `/var/lib/astra/authority-vault.json`.
+que le poste qui approuve **ouvre** le coffre : c'est Orion, sur ce poste, qui
+l'ouvre avec ses clés. La route `GET /v1/vaults/<empreinte>`, sous un jeton de
+capacité, reste servie, et Astra ne peut la servir que s'il détient une copie :
+`/var/lib/astra/authority-vault.json`.
 
 **Depuis le lot 5b de F14, Orion l'envoie à votre place** : sur un poste
 administrateur du tunnel, le prérequis « Copie du coffre » de l'onglet
@@ -704,7 +703,7 @@ interprète. Un coffre copié ainsi dans un service déjà en marche n'existe po
 porte qu'après le redémarrage, ce qui est précisément ce que la route d'Orion
 évite : elle remplace la valeur en mémoire en même temps que le fichier.
 Son empreinte apparaît au journal de démarrage — c'est elle que la demande
-signée nomme, et que le compagnon compare avant d'ouvrir quoi que ce soit.
+signée nomme, et qu'Orion compare avant d'ouvrir quoi que ce soit.
 
 Sans lui, seules les campagnes qui font signer une ancre sont refusées, en le
 disant. Toutes les autres portées sont inchangées.

@@ -280,7 +280,7 @@ accepterait une chaîne que le domaine a retirée, ou refuserait une chaîne sou
 laquelle il émet encore ; laquelle des deux dépendrait de l'endroit où la
 panne est tombée.
 
-**Comparer l'empreinte entrante** avec celle qu'affiche le compagnon. Le §9.1
+**Comparer l'empreinte entrante** avec celle qu'affiche Orion. Le §9.1
 en fait le contrôle : la double signature prouve la continuité, pas que
 l'ancre affichée est celle que l'opérateur a créée. La console la montre à
 côté de l'époque.
@@ -947,18 +947,24 @@ choisir entre deux décisions portant le même numéro.
 
 ```sh
 astra gateway-identity open --reason "rotation annuelle" --requested-by "prénom.nom"
-# → imprime l'identifiant, les deux empreintes en service, et les deux
-#   lignes de commande à coller
+# → imprime sur la sortie standard l'identifiant d'opération ; sur l'erreur
+#   standard, les deux empreintes en service, la feuille exportée, et les deux
+#   lignes qui renvoient à Orion (Astra › Rotations) : renouveler, ou annuler
 ```
+
+Ces lignes ne sont plus des commandes à coller : le geste se joue dans Orion,
+onglet *Astra* › *Rotations*, bloc « Identité de la gateway », bouton
+« Renouveler l'identité de la gateway ». Une campagne ouverte à la console
+s'approuve dans *Approbations*.
 
 La campagne lit l'identité **en direct sur le canal privé** du service
 (`ASTRA_GATEWAY_CHANNEL`, comme au §7), auprès du démon qui la sert. Astra
 enregistre la génération de chaque client ; elle n'a jamais détenu les feuilles
-de la gateway, et le §11.1 étape 3 en exige les empreintes exactes. Une valeur retapée produirait une campagne que le compagnon signe et
+de la gateway, et le §11.1 étape 3 en exige les empreintes exactes. Une valeur retapée produirait une campagne que Orion signe et
 que la gateway refuse — au moment précis où un renouvellement est en cours.
 
-La commande exporte aussi la feuille en service : le compagnon ne peut pas
-vérifier la signature de continuité du §5 sans la clé qui signe réellement.
+La commande exporte aussi la feuille en service : la signature de continuité du
+§5 se vérifie contre cette feuille, celle que la clé signe réellement.
 
 **Sur le poste de l'opérateur**, dans Orion (*Rotations*, bloc « Identité de la gateway ») :
 
@@ -1126,7 +1132,7 @@ heliosd install-client-tls-ca ca-tls-transition.json
 # à not_after : « Terminer la rotation CA TLS » (Astra › Rotations)
 ```
 
-L'ancre entrante est créée au compagnon, auto-signée pour prouver qu'elle
+L'ancre entrante est créée par Orion, auto-signée pour prouver qu'elle
 détient sa clé — cette auto-signature ne remplace jamais la signature `CA-PQ`
 comme autorisation. `CA-PQ`, elle, ne bouge pas.
 
