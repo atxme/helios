@@ -452,7 +452,7 @@ pub struct JournalView {
     /// The incoming anchor, hexadecimal.
     pub next_fingerprint: String,
     /// No deposit of Orion's own: signed offline, or adopted from the CA-PQ file. Only
-    /// then was `astra-signer rotate-ca-pq` a recourse that could not conflict with Orion.
+    /// then was the former `astra-signer rotate-ca-pq` a recourse that could not conflict with Orion.
     pub offline: bool,
     /// No campaign at Astra: the operator's gesture stood for the acceptance. Read as `false`
     /// from a journal written before the mark.

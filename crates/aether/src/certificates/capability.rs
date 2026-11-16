@@ -2,7 +2,7 @@
 //!
 //! # What these are for
 //!
-//! Three public routes exist only so `astra-signer` can fetch what it needs
+//! Three public routes existed only so the former `astra-signer` could fetch what it needed
 //! for one operation: the signer request, the encrypted vault, and the slot to
 //! post the result back into. None of them may be reachable by knowing an
 //! identifier. So each carries a bearer token that names exactly one scope,

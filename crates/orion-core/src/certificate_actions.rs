@@ -118,7 +118,7 @@ pub enum CertificateActionBlock {
     /// variant survives so that an earlier serialized state still reads back,
     /// and `renewal_block` no longer returns it.
     CompanionTransportMissing,
-    /// Needs a hardware credential and the `astra-signer` companion (not the
+    /// Needed a hardware credential and the former `astra-signer` companion (not the
     /// ordinary renewal, which Orion approves itself).
     OperatorCredentialRequired,
 }
@@ -271,8 +271,8 @@ fn recovery_block(
         return Some(CertificateActionBlock::NothingExpired);
     }
     // Nothing blocks it any more. `certificate_recovery` signs the historical
-    // request against Astra's public origin, `astra-signer recover` opens the
-    // vault once, and the commit comes back through the private channel — the
+    // request against Astra's public origin, the former `astra-signer recover` opened the
+    // vault once, and the commit came back through the private channel — the
     // client has no tunnel, which is the whole premise.
     None
 }

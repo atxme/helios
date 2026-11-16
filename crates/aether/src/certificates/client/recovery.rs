@@ -177,8 +177,8 @@ impl ExpiredCertificateRecoveryRequest {
     /// The exact operation an operator confirms for this request.
     ///
     /// Not something the token signs: a YubiKey signs no ML-DSA, and nothing
-    /// here verifies a WebAuthn assertion. This is the value `astra-signer`
-    /// displays before the touch that unwraps the vault, and the value the
+    /// here verifies a WebAuthn assertion. This is the value the approval ceremony
+    /// in Orion (formerly `astra-signer`) displays before the touch that unwraps the vault, and the value the
     /// resulting `CA-PQ` signature is bound to.
     pub fn approval_challenge(&self) -> Fingerprint {
         expired_recovery_approval_challenge(

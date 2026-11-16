@@ -3,8 +3,8 @@
 //! # Why this exists at all
 //!
 //! Windows reserves opening a FIDO HID device to elevated processes, and has
-//! done since Windows 10 1903. Talking CTAP directly therefore means running
-//! `astra-signer` as Administrator — a program that holds `CA-PQ` in the clear
+//! done since Windows 10 1903. Talking CTAP directly therefore meant running
+//! `astra-signer` as Administrator — a program that held `CA-PQ` in the clear
 //! for the length of an operation, run with the widest privileges the machine
 //! has. That is the exact opposite of what ADR-008 §4 asks for.
 //!

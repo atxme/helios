@@ -12,7 +12,7 @@
 //! secret only on physical presence and user verification. That derivation
 //! unwraps a key-slot; the slot yields the vault's master key; the master key
 //! opens the payload. The private anchors exist in the clear only inside
-//! `astra-signer`, on the operator's machine, for the length of one signature
+//! the former `astra-signer`, on the operator's machine, for the length of one signature
 //! (ADR-008 §4).
 //!
 //! # Slots, and why adding one requires opening one
@@ -265,7 +265,7 @@ impl KeySlot {
     }
 }
 
-/// The private anchors of the domain. Never leaves `astra-signer`.
+/// The private anchors of the domain. Never leaves the former `astra-signer`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize)]
 #[serde(deny_unknown_fields)]
 #[zeroize(drop)]

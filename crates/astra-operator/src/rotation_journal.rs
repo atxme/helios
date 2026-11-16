@@ -20,7 +20,7 @@
 //!
 //! # The older records
 //!
-//! `astra-signer` left two others, and an operator may hold one from an
+//! The former `astra-signer` left two others, and an operator may hold one from an
 //! interrupted rotation: its CA-PQ journal, with the next vault still to apply,
 //! and the prepared CA-TLS record, written after the vault moved. [`adopt_legacy`]
 //! turns either into this one. Neither may be discarded when Astra knows nothing
@@ -53,7 +53,7 @@ pub const ROTATION_JOURNAL_FILE: &str = "astra-rotation-journal.json";
 /// The only journal format this build reads.
 pub const ROTATION_JOURNAL_VERSION: u16 = 1;
 
-/// Name of the CA-PQ journal `astra-signer` writes, beside the vault.
+/// Name of the CA-PQ journal the former `astra-signer` wrote, beside the vault.
 pub const LEGACY_CA_PQ_JOURNAL_FILE: &str = "ca-pq-rotation.pending.json";
 
 /// The only format of that journal there has been.
@@ -372,7 +372,7 @@ pub fn ensure_none_in_flight(vault_path: &Path) -> Result<()> {
 }
 
 /// Whether anything beside the vault calls for a resumption: a rotation journal, a
-/// prepared record no journal has adopted, or `astra-signer`'s CA-PQ journal file.
+/// prepared record no journal has adopted, or the CA-PQ journal file the former `astra-signer` left.
 ///
 /// What [`adopt_legacy`] would take up, read without taking it. An adopted record
 /// with no journal is a finished rotation waiting for its promotion and counts for
@@ -399,7 +399,7 @@ pub fn something_to_resume(vault_path: &Path) -> Result<bool> {
 ///
 /// [`apply_local`] saves that vault whole, so a key added, removed, marked or
 /// renamed meanwhile would be undone, a removed key regaining access. It waits in
-/// the CA-PQ file `astra-signer` left, in a journal that carries `next`, and in a
+/// the CA-PQ file the former `astra-signer` left, in a journal that carries `next`, and in a
 /// journal too damaged to say. A journal past `Applied` has no `next` and cannot
 /// overwrite anything: it must not hold a stolen key in the vault, which is the
 /// reason [`ensure_none_in_flight`], by presence, is not this check.
@@ -580,8 +580,8 @@ fn remove_legacy_ca_pq(vault_path: &Path) -> Result<()> {
     }
 }
 
-/// The CA-PQ journal `astra-signer` writes before replacing the four files of a
-/// rotation, and resumes from.
+/// The CA-PQ journal the former `astra-signer` wrote before replacing the four files of a
+/// rotation, and resumed from.
 ///
 /// Its format, which this module also reads: an operator may hold one whose
 /// vault was never applied, and that vault cannot be signed again.
@@ -636,7 +636,7 @@ impl LegacyCaPqJournal {
     /// checks the file against itself, and applying it would replace the vault
     /// in place with a stranger.
     ///
-    /// The next key is as good as the current one: a stop inside `astra-signer`
+    /// The next key is as good as the current one: a stop inside the former `astra-signer`
     /// may have moved the vault before it removed this file.
     fn ensure_describes_vault_at(&self, vault_path: &Path) -> Result<()> {
         let vault = store::load(vault_path)?;
@@ -689,7 +689,7 @@ impl LegacyCaPqJournal {
     }
 }
 
-/// Where `astra-signer` leaves its CA-PQ journal: beside the vault.
+/// Where the former `astra-signer` left its CA-PQ journal: beside the vault.
 pub fn legacy_ca_pq_path_beside(vault_path: &Path) -> PathBuf {
     vault_path
         .parent()
@@ -753,7 +753,7 @@ fn adopted_prepared(record: prepared::PreparedRotation) -> Result<RotationJourna
     })
 }
 
-/// Turns what `astra-signer` left behind into the journal, and returns the
+/// Turns what the former `astra-signer` left behind into the journal, and returns the
 /// journal to resume: the adopted one, or the one already in place.
 ///
 /// The CA-PQ journal goes first, because its vault is the one not yet applied. It
@@ -1184,7 +1184,7 @@ mod tests {
         }
     }
 
-    /// A CA-PQ journal adopted from `astra-signer`, which nothing has confirmed.
+    /// A CA-PQ journal adopted from the former `astra-signer`, which nothing has confirmed.
     fn unconfirmed() -> RotationJournal {
         RotationJournal {
             deposit: None,

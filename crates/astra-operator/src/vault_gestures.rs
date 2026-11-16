@@ -9,7 +9,7 @@
 //! itself requires. A gesture that quietly asked for another assertion would
 //! be a press nobody announced.
 //!
-//! The sequences are those of `astra-signer` (`init`, `enrol`, `remove`,
+//! The sequences are those of the former `astra-signer` (`init`, `enrol`, `remove`,
 //! `bindings`, `rename`, `domain`, `issue-ca-tls`), without the terminal.
 //!
 //! # Checks, then gestures
@@ -155,7 +155,7 @@ pub fn check_addition(vault: &AuthorityVault) -> std::result::Result<(), SetupRe
     Ok(())
 }
 
-/// Registers `key` with the master key `opening` released — `astra-signer
+/// Registers `key` with the master key `opening` released — the former `astra-signer
 /// enrol`.
 ///
 /// One assertion on `key`, none on the key behind `opening`: the vault is
@@ -241,7 +241,7 @@ pub fn open_for_removal(
     Ok(opened)
 }
 
-/// Withdraws a key — `astra-signer remove`.
+/// Withdraws a key — the former `astra-signer remove`.
 ///
 /// The key behind `opening` cannot be the one withdrawn: it would sign the
 /// document that revokes itself, with nothing left to prove another key still
@@ -260,7 +260,7 @@ pub fn remove_key_with(
         return Err(SetupRefusal::KeyBeingRemoved.into());
     }
     gestures::remove_key(&mut vault, opening, slot_id)?;
-    // The document first, as `astra-signer remove` does: a crash between the
+    // The document first, as the former `astra-signer remove` did: a crash between the
     // two writes then leaves a credential revoked that the old vault still
     // holds (fail closed), never an absent slot still marked active.
     if let Some(document) = pending_document(vault_path, &vault)? {
@@ -300,7 +300,7 @@ pub fn check_marking<'v>(
     Ok(slot)
 }
 
-/// Signs a key as lost, or as active again — `astra-signer bindings --lost` /
+/// Signs a key as lost, or as active again — the former `astra-signer bindings --lost` /
 /// `--active`.
 ///
 /// Returns the epoch of the document written.
@@ -338,7 +338,7 @@ pub fn rename_key(vault_path: &Path, slot_id: &[u8; 16], label: &str) -> Result<
 
 // --- Domain -----------------------------------------------------------------
 
-/// Values an operator records on the relay — `astra-signer domain`'s flags.
+/// Values an operator records on the relay — the former `astra-signer domain`'s flags.
 ///
 /// Each absent field leaves what the relay already records.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
@@ -351,7 +351,7 @@ pub struct RelayUpdate {
     pub astra_authority_url: Option<String>,
 }
 
-/// Records values on the relay beside the vault — `astra-signer domain`.
+/// Records values on the relay beside the vault — the former `astra-signer domain`.
 ///
 /// The relay is read first and refreshed from the vault, so what was recorded
 /// earlier stays. Every value is checked before anything is written: a key
@@ -546,7 +546,7 @@ pub struct Finalized {
 }
 
 /// Issues what [`finalization`] found missing, with the opening the ceremony
-/// already holds — `astra-signer issue-ca-tls`, then the credential document.
+/// already holds — the former `astra-signer issue-ca-tls`, then the credential document.
 ///
 /// `CA-TLS` is never issued twice: a relay that carries one keeps it, and
 /// replacing it is the §9.4 transition. The document is settled before
@@ -571,7 +571,7 @@ pub fn finalize_with(vault_path: &Path, opening: &Opened, now_unix: u64) -> Resu
             .context("durée hors bornes")?;
         let certificate = signing::issue_ca_tls(&vault, opening, &identity, now_unix, not_after)?;
         // The epoch moves with the certificate, in the same write, as
-        // `astra-signer issue-ca-tls` does: a relay naming one epoch and
+        // the former `astra-signer issue-ca-tls` did: a relay naming one epoch and
         // carrying another would have every later delegation refused.
         relay.ca_tls_epoch = Some(identity.ca_tls_epoch);
         relay.ca_tls_certificate = Some(certificate.to_base64());
@@ -662,7 +662,7 @@ pub(crate) fn describes_every_slot(
 
 // --- Shared -----------------------------------------------------------------
 
-/// The PEM form of a certificate, as `astra-signer` writes one.
+/// The PEM form of a certificate, as the former `astra-signer` wrote one.
 fn pem_of(certificate: &DerCertificate) -> String {
     let body = certificate.to_base64();
     let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");

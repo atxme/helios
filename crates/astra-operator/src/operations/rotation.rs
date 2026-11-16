@@ -1128,7 +1128,7 @@ impl CaTlsFinish {
     ///
     /// The record is the same one whichever wrote it, and it names the certificate
     /// because the journal is gone by now. It must have been through a journal, which
-    /// is what proves the gateway named the anchor. A record `astra-signer` left is
+    /// is what proves the gateway named the anchor. A record the former `astra-signer` left is
     /// adopted by the resumption first, and comes back here marked so.
     pub fn begin(vault_path: &Path, now: u64) -> Result<Self> {
         rotation_journal::ensure_none_in_flight(vault_path).context(FinishRefusal::InFlight)?;

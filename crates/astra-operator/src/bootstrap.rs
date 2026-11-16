@@ -1,6 +1,6 @@
 //! The gateway bootstrap of Orion's operator ceremony, by path and by opening.
 //!
-//! `astra-signer issue-gateway-bootstrap` without the terminal: the gateway's
+//! Orion's « Amorcer la gateway… » (formerly `astra-signer issue-gateway-bootstrap`) without the terminal: the gateway's
 //! public request, two keys, and epoch 1 of its leaf under `CA-PQ`, followed
 //! by whatever the domain still lacks to be finished (`CA-TLS`, the credential
 //! document) — so a fresh domain is served by one gesture rather than three.
@@ -36,7 +36,7 @@ use crate::vault_gestures::{
 };
 use crate::{credentials, gestures, handoff, signing, store};
 
-/// Lifetime of the leaf a bootstrap issues, in days — `astra-signer`'s.
+/// Lifetime of the leaf a bootstrap issues, in days, as the former `astra-signer` used it.
 pub const BOOTSTRAP_LEAF_DAYS: u64 = 365;
 
 /// The leaf's file, beside the vault: the name `scripts/deploy.sh` reads.
@@ -117,7 +117,7 @@ pub fn bootstrap_plan(
 }
 
 /// Issues the gateway's leaf with the two openings the ceremony holds, then
-/// finishes the domain — `astra-signer issue-gateway-bootstrap`, then
+/// finishes the domain — Orion's « Amorcer la gateway… » (formerly `astra-signer issue-gateway-bootstrap`), then
 /// « Finaliser le domaine ».
 ///
 /// `first` signs the leaf and the finalization; `second` is the second

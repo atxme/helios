@@ -2,8 +2,8 @@
 //!
 //! # Why this is a crate of its own
 //!
-//! `astra-signer` is the only program in this repository that ever holds
-//! `CA-PQ` in the clear, and ADR-008 §4 keeps it away from every other one.
+//! The former `astra-signer` was the only program in this repository that ever held
+//! `CA-PQ` in the clear, and ADR-008 §4 kept it away from every other one.
 //! An **ordinary client renewal**, however, opens no vault at all: the
 //! approval receives no salt, so no `hmac-secret` output exists for it and no
 //! key-slot can be unwrapped. §14.1 says exactly that.
@@ -26,7 +26,7 @@
 //!
 //! Voir [`authenticator`]. Aucun passthrough USB, et le module `webauthn` ne
 //! s'y compile même pas ; la séquence au-dessus du matériel, elle, est
-//! éprouvée par les essais d'`astra-signer`.
+//! éprouvée par les essais de l'ancien `astra-signer`.
 
 pub mod authenticator;
 

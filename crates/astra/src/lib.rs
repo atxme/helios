@@ -11,7 +11,7 @@
 //!
 //! It holds the registry, the audit chain, the delegated issuer and the
 //! encrypted master vault. It never holds `CA-PQ` in the clear: the vault is
-//! opened on the operator's machine by the `astra-signer` companion against a
+//! opened on the operator's machine by the former `astra-signer` companion, now run by Orion, against a
 //! hardware credential, which signs and zeroizes. The only key usable here
 //! without a human is [`issuer::DelegatedIssuer`], and every consumer checks
 //! its scope before its signature.

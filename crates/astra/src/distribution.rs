@@ -38,8 +38,8 @@
 //! one second later — installing something that should already be in force as
 //! if it were still ahead is exactly what that rule exists to stop. The
 //! preparation delay of the rotation is therefore the window every peer has to
-//! come back in, and `astra-signer rotate-ca-pq --prepare-days` is where it is
-//! chosen. A peer that stays away longer is repaired by an operator, not by a
+//! come back in, and the Astra › Rotations tab of Orion is where it is
+//! chosen (formerly `astra-signer rotate-ca-pq --prepare-days`). A peer that stays away longer is repaired by an operator, not by a
 //! late delivery.
 //!
 //! # Trust objects are distributed only under their pinned conditions

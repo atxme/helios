@@ -17,7 +17,7 @@
 //! # Why the companion runs on the client's machine
 //!
 //! Because the routes are authenticated by the **peer's** VIP. §12.2 has the
-//! Orion interface launch `astra-signer` with `heliosd_url` and
+//! Orion interface used to launch the former `astra-signer` with `heliosd_url` and
 //! `operation_id`; the companion inherits the tunnel that is already up, and
 //! nothing else about the client. An operator working from another machine
 //! has no VIP the gateway would resolve, and belongs on the public channel

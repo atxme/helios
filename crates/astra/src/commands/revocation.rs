@@ -5,7 +5,7 @@
 //! gateway's reads the leaves — and above all the signed expiries — from the
 //! daemon that serves them, over the running service's own channel. Both are
 //! resolved by the door; this command sends the request and prints the
-//! `astra-signer revoke` line the answer names.
+//! revocation line the answer names (formerly `astra-signer revoke`).
 
 use std::path::Path;
 
