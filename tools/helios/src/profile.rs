@@ -12,12 +12,12 @@
 //!
 //! `emit` admits nobody. Admission requires the client's TLS and PQ
 //! key-negotiation certificates (floor `ml_kem`), which this command neither
-//! issues nor carries: a new Helios client is enrolled from an
-//! `astra-signer enroll invite` invitation (NEGOCIATION-DE-CLE-V5 §15), whose
-//! signed document `helios enroll document` drafts. A profile emitted for a
-//! key the gateway does not know would bring up no tunnel, so such a key is
-//! refused. The assisted mode, where the operator generated the pair, is
-//! gone: the pair it generated could never be admitted.
+//! issues nor carries: a new Helios client is enrolled in Orion, under
+//! Astra › Enrôlement (NEGOCIATION-DE-CLE-V5 §15), which signs the v5
+//! document. A profile emitted for a key the gateway does not know would bring
+//! up no tunnel, so such a key is refused. The assisted mode, where the
+//! operator generated the pair, is gone: the pair it generated could never be
+//! admitted.
 
 use std::path::{Path, PathBuf};
 
@@ -73,8 +73,7 @@ struct Document<'a> {
 pub fn render(profile: Profile<'_>) -> Result<zeroize::Zeroizing<String>> {
     if profile.key_negotiation.is_some() {
         bail!(
-            "a Helios profile travels as a signed v5 document: `helios enroll document`, then \
-             `astra-signer enroll sign-document`"
+            "a Helios profile travels as a signed v5 document, signed in Orion's Astra › Enrôlement"
         );
     }
     let public = serde_json::to_vec(&Document {
@@ -245,8 +244,7 @@ pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<(
         allowed_ips: options.allowed_ips.as_deref(),
         ssh_target: options.ssh_target.as_deref(),
         heliosd_url: heliosd_url(&view.wg_address),
-        // A Helios profile is a signed v5 document, which `enroll document`
-        // drafts and `astra-signer` signs.
+        // A Helios profile is a signed v5 document, signed in Orion's Astra › Enrôlement.
         key_negotiation: None,
     })?;
 

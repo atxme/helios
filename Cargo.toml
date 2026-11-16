@@ -31,7 +31,6 @@ default-members = [
     "crates/orion-core",
     "crates/orion-engine",
     "crates/heliosd",
-    "tools/astra-signer",
     "tools/helios",
     "tools/helios-installer",
     "tools/xtask",

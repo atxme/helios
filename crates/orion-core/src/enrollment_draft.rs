@@ -2,7 +2,7 @@
 //! operator has: the client's request and leaves, and the gateway's public
 //! material.
 //!
-//! Shared by Orion and `helios enroll document` so both build the very same
+//! Built by the enrolment flow in Orion, so every caller builds the very same
 //! draft. The draft carries no secret and no signature: it is signed
 //! afterwards under `CA-PQ`.
 

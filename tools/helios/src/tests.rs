@@ -214,75 +214,6 @@ fn command_line_covers_offline_and_diagnostic_commands() {
         Cli::try_parse_from(arguments).unwrap();
     }
 
-    let online = [
-        "helios",
-        "enroll",
-        "document",
-        "--request",
-        "client.helios-request",
-        "--tls-certificate",
-        "client-cert.der",
-        "--pq-certificate",
-        "client-pq-cert.json",
-        "--endpoint",
-        "vpn.example:51820",
-        "--out",
-        "client.json",
-    ];
-    Cli::try_parse_from(online).unwrap();
-    assert!(
-        Cli::try_parse_from(
-            online
-                .iter()
-                .copied()
-                .chain(["--gateway-certificate", "gateway.der"])
-        )
-        .is_err(),
-        "partial offline enrollment material must be refused"
-    );
-    let offline: Vec<&str> = online
-        .iter()
-        .copied()
-        .chain([
-            "--gateway-certificate",
-            "gateway.der",
-            "--gateway-pq-certificate",
-            "gateway.json",
-            "--address",
-            "100.64.1.2/32",
-            "--trust-material",
-            "trust.json",
-        ])
-        .collect();
-    Cli::try_parse_from(&offline).unwrap();
-    Cli::try_parse_from(
-        offline
-            .iter()
-            .copied()
-            .chain(["--address-v6", "fd3c::2/128"]),
-    )
-    .unwrap();
-    assert!(
-        Cli::try_parse_from(
-            offline
-                .iter()
-                .copied()
-                .filter(|argument| !argument.starts_with("trust"))
-                .filter(|argument| *argument != "--trust-material")
-        )
-        .is_err(),
-        "offline, the trust block is what the document is signed under"
-    );
-    assert!(
-        Cli::try_parse_from(
-            online
-                .iter()
-                .copied()
-                .chain(["--address-v6", "fd3c::2/128"])
-        )
-        .is_err(),
-        "an IPv6 VIP alone is not offline enrollment material"
-    );
     assert!(Cli::try_parse_from([
         "helios",
         "app-update",
@@ -520,21 +451,6 @@ fn a_gateway_refusal_fails_the_command() {
         error: None
     })
     .is_ok());
-}
-
-/// An operator-typed IPv6 VIP is judged by Orion's rule before anything is
-/// written, and a blank one is no value at all.
-#[test]
-fn an_offline_ipv6_address_is_checked_with_orions_rule() {
-    assert_eq!(check_address_v6(None).unwrap(), None);
-    assert_eq!(check_address_v6(Some("  ".into())).unwrap(), None);
-    assert_eq!(
-        check_address_v6(Some(" fd3c:91a2:7e04::2/128 ".into())).unwrap(),
-        Some("fd3c:91a2:7e04::2/128".into())
-    );
-    let error = check_address_v6(Some("fd3c:91a2:7e04::/64".into())).unwrap_err();
-    assert!(format!("{error:#}").contains("--address-v6"), "{error:#}");
-    assert!(format!("{error:#}").contains("/128"), "{error:#}");
 }
 
 /// `profile emit` re-emits the invitation of an admitted peer and nothing

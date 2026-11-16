@@ -65,7 +65,7 @@ Read only the documents relevant to the touched area:
 * `orion-core` / `orion-engine` / `apps/orion`: portable client logic, elevated engine/state, and unprivileged Tauri/React desktop shell.
 * `heliosd`: gateway CLI and orchestration.
 * `web`: React/MUI gateway administration console.
-* `astra-signer`, `helios`, `helios-publisher`, `helios-installer`, `xtask`: operator, publisher, installer and build tooling.
+* `helios`, `helios-publisher`, `helios-installer`, `xtask`: operator, publisher, installer and build tooling.
 * `fuzz`: libFuzzer targets, **outside the workspace** (nightly only). The harnesses themselves live in `aether::fuzzing` and run with the ordinary test suite.
 
 Do not duplicate logic already owned by one of these components.
