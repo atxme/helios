@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
@@ -546,13 +546,29 @@ function ResumeDialog({
   const [sshTarget, setSshTarget] = useState('')
   const [exportText, setExportText] = useState<string | null>(null)
   const [fileError, setFileError] = useState<string | null>(null)
+  // Bumped on every reset, so a read that finishes after the dialog moved on is dropped.
+  const generation = useRef(0)
+
+  // A file chosen for one invitation never travels with another, nor with a reopened dialog.
+  const invitationId = entry?.invitation_id ?? null
+  useEffect(() => {
+    generation.current += 1
+    setExportText(null)
+    setFileError(null)
+  }, [invitationId])
 
   const pick = async (file: File | undefined) => {
+    const current = ++generation.current
     setFileError(null)
-    if (!file) return
+    if (!file) {
+      setExportText(null)
+      return
+    }
     try {
-      setExportText(await readFileText(file))
+      const text = await readFileText(file)
+      if (current === generation.current) setExportText(text)
     } catch (cause) {
+      if (current !== generation.current) return
       setExportText(null)
       setFileError(String(cause instanceof Error ? cause.message : cause))
     }

@@ -196,6 +196,81 @@ describe('EnrollmentOperatorPanel', () => {
     expect(Object.keys(gesture)).not.toContain('enrolment_export')
   })
 
+  it('a_chosen_export_is_forgotten_when_the_dialog_is_reopened', async () => {
+    api.getState.mockResolvedValue('down')
+    api.operatorInvitations.mockResolvedValue([invitation('a', { resumable: true })])
+    render(<EnrollmentOperatorPanel onCeremony={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Reprendre' }))
+    fireEvent.change(await screen.findByLabelText('Adresse publique de la gateway'), {
+      target: { value: '198.51.100.7:51820' },
+    })
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Export d'enrôlement de la gateway"), {
+        target: { files: [new File(['EXPORT-TEXT'], 'pc.json')] },
+      })
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Annuler' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    fireEvent.click(screen.getByRole('button', { name: 'Reprendre' }))
+    await screen.findByRole('dialog')
+    fireEvent.click(screen.getByRole('button', { name: 'Reprendre l’enrôlement' }))
+    await waitFor(() => expect(api.beginEnrollmentCeremony).toHaveBeenCalledTimes(1))
+    const [gesture] = api.beginEnrollmentCeremony.mock.calls[0]
+    expect(Object.keys(gesture)).not.toContain('enrolment_export')
+  })
+
+  it('a_chosen_export_is_not_sent_with_another_invitation', async () => {
+    api.getState.mockResolvedValue('down')
+    api.operatorInvitations.mockResolvedValue([
+      invitation('a', { resumable: true, requested_name: 'pc-salon' }),
+      invitation('b', { resumable: true, requested_name: 'tablette' }),
+    ])
+    render(<EnrollmentOperatorPanel onCeremony={vi.fn()} />)
+    await screen.findByText('pc-salon')
+    fireEvent.click(screen.getAllByRole('button', { name: 'Reprendre' })[0])
+    fireEvent.change(await screen.findByLabelText('Adresse publique de la gateway'), {
+      target: { value: '198.51.100.7:51820' },
+    })
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Export d'enrôlement de la gateway"), {
+        target: { files: [new File(['EXPORT-TEXT'], 'pc.json')] },
+      })
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Annuler' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    fireEvent.click(screen.getAllByRole('button', { name: 'Reprendre' })[1])
+    await screen.findByRole('dialog')
+    fireEvent.click(screen.getByRole('button', { name: 'Reprendre l’enrôlement' }))
+    await waitFor(() => expect(api.beginEnrollmentCeremony).toHaveBeenCalledTimes(1))
+    const [gesture] = api.beginEnrollmentCeremony.mock.calls[0]
+    expect(gesture.invitation_id).toBe('b'.repeat(32))
+    expect(Object.keys(gesture)).not.toContain('enrolment_export')
+  })
+
+  it('clearing_the_file_selection_forgets_the_chosen_export', async () => {
+    api.getState.mockResolvedValue('down')
+    api.operatorInvitations.mockResolvedValue([invitation('a', { resumable: true })])
+    render(<EnrollmentOperatorPanel onCeremony={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Reprendre' }))
+    fireEvent.change(await screen.findByLabelText('Adresse publique de la gateway'), {
+      target: { value: '198.51.100.7:51820' },
+    })
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Export d'enrôlement de la gateway"), {
+        target: { files: [new File(['EXPORT-TEXT'], 'pc.json')] },
+      })
+    })
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Export d'enrôlement de la gateway"), {
+        target: { files: [] },
+      })
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Reprendre l’enrôlement' }))
+    await waitFor(() => expect(api.beginEnrollmentCeremony).toHaveBeenCalledTimes(1))
+    const [gesture] = api.beginEnrollmentCeremony.mock.calls[0]
+    expect(Object.keys(gesture)).not.toContain('enrolment_export')
+  })
+
   it('resume_with_a_tunnel_up_only_hints_that_the_export_is_optional', async () => {
     api.operatorInvitations.mockResolvedValue([invitation('a', { resumable: true })])
     render(<EnrollmentOperatorPanel onCeremony={vi.fn()} />)
