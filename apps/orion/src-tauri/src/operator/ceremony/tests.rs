@@ -799,6 +799,75 @@ fn acceptance_rejects_an_undecodable_request_without_consuming_the_invitation() 
     );
 }
 
+/// Even a correctly signed request cannot turn an overflowing delivery
+/// lifetime into a certificate window. The invitation remains available and
+/// the gateway is not consulted after the arithmetic failure.
+#[test]
+fn acceptance_rejects_a_delivery_window_that_overflows_unix_time() {
+    let domain = Domain::new("accept-validity-overflow").with_ca_tls();
+    let enrolment = domain.enrolment("laptop", true);
+    let request = aether::key_negotiation::encode_request_file(&enrolment.request);
+    let accept = Accept {
+        request: &request,
+        validity_days: u16::MAX,
+        endpoint: "198.51.100.7:51820",
+        allowed_ips: None,
+        ssh_target: None,
+        gateway: Some("https://gateway.invalid"),
+    };
+
+    let (refusal, message) = prepare_acceptance(
+        &domain.vault_path,
+        &domain.registry,
+        &accept,
+        u64::MAX,
+        &|_| panic!("gateway must not be read for an overflowing validity window"),
+    )
+    .err()
+    .expect("an overflowing certificate window is refused");
+
+    assert_eq!(refusal, Refusal::HandoffMismatch);
+    assert!(message.contains("hors bornes"));
+    assert_eq!(
+        domain
+            .registry
+            .load(&enrolment.invitation.invitation_id)
+            .expect("invitation remains readable")
+            .state,
+        astra_operator::enrollment::InvitationState::Issued
+    );
+}
+
+/// A temporary read failure from the connected gateway is handled after the
+/// local request and invitation have been validated. It does not misidentify
+/// the gateway or consume the invitation before an operator key is presented.
+#[test]
+fn acceptance_keeps_a_valid_request_when_gateway_material_cannot_be_read() {
+    let domain = Domain::new("accept-gateway-read-error").with_ca_tls();
+    let enrolment = domain.enrolment("laptop", true);
+    let accept = accept_of(&enrolment.request, Some("https://gateway.invalid"));
+
+    let accepting = prepare_acceptance(
+        &domain.vault_path,
+        &domain.registry,
+        &accept,
+        now_unix(),
+        &|_| Err(orion_core::gateway_admin::GatewayAdminError::Unreachable),
+    )
+    .expect("a temporarily unavailable gateway does not block local acceptance");
+
+    assert_eq!(accepting.request.request_id, enrolment.request.request_id);
+    assert_eq!(accepting.pin.server_name, SERVER_NAME);
+    assert_eq!(
+        domain
+            .registry
+            .load(&enrolment.invitation.invitation_id)
+            .expect("invitation remains readable")
+            .state,
+        astra_operator::enrollment::InvitationState::Issued
+    );
+}
+
 /// The registry state is checked before a key is requested, even if the
 /// request itself remains valid and the ceremony is otherwise ready.
 #[test]

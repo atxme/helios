@@ -453,6 +453,55 @@ fn a_gateway_refusal_fails_the_command() {
     .is_ok());
 }
 
+/// `profile emit` validates operator traffic selectors before admission and
+/// stores the same canonical spelling Orion will show on import.
+#[test]
+fn allowed_ips_are_validated_before_emission_and_normalized() {
+    assert_eq!(check_allowed_ips(None).unwrap(), None);
+    assert_eq!(
+        check_allowed_ips(Some(" 100.64.0.0/10,192.168.1.0/24 ".into())).unwrap(),
+        Some("100.64.0.0/10, 192.168.1.0/24".into())
+    );
+
+    for invalid in [
+        "",
+        "   ",
+        "100.64.0.0/10,not-a-prefix",
+        "100.64.0.0/10, 100.64.0.0/10",
+        "100.64.0.0/33",
+    ] {
+        let error = check_allowed_ips(Some(invalid.into())).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("trafic capté invalide"), "{message}");
+        assert!(message.contains("--allowed-ips"), "{message}");
+    }
+}
+
+/// The SSH destination is trimmed and checked before it can be persisted in
+/// an emitted profile or passed to a spawned SSH process.
+#[test]
+fn ssh_targets_are_trimmed_and_reject_argument_or_shell_injection() {
+    assert_eq!(check_ssh_target(None).unwrap(), None);
+    assert_eq!(
+        check_ssh_target(Some("  operator@gateway.example:2222  ".into())).unwrap(),
+        Some("operator@gateway.example:2222".into())
+    );
+
+    for invalid in [
+        "",
+        "   ",
+        "-oProxyCommand=evil",
+        "operator@gateway.example;id",
+        "operator@host:0",
+        "operator@host:not-a-port",
+        "user@@host",
+    ] {
+        let error = check_ssh_target(Some(invalid.into())).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("--ssh-target"), "{message}");
+    }
+}
+
 /// `profile emit` re-emits the invitation of an admitted peer and nothing
 /// else: the assisted mode and the admission role are gone from the command
 /// line, not merely refused at run time (ADR-004 §6, 18 October 2026).
