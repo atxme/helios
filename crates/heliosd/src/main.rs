@@ -28,9 +28,9 @@ use crate::commands::ipv6_prefix::init_ipv6_prefix;
 use crate::commands::peer::peer_command;
 use crate::commands::tpm::{provision_tpm, tpm_command};
 use crate::commands::trust::{
-    abort_gateway_transition, init_trust_domain, install_astra_credentials, install_astra_issuer,
-    install_ca_transition, install_client_tls_ca, install_gateway_transition,
-    prepare_gateway_certificate, repair_client_tls_ca_bootstrap, show_trust_enrolment,
+    abort_gateway_transition, export_enrolment, init_trust_domain, install_astra_credentials,
+    install_astra_issuer, install_ca_transition, install_client_tls_ca, install_gateway_transition,
+    prepare_gateway_certificate, repair_client_tls_ca_bootstrap,
 };
 use crate::commands::wan::{resolve_uplink, show_uplink};
 use crate::daemon::run;
@@ -137,16 +137,17 @@ enum Command {
     /// the anchors it is told to trust. It therefore runs on a gateway whose
     /// TPM is unavailable, which is exactly when one wants to inspect it.
     InitTrustDomain {
-        /// Trust domain identifier, 32 hex characters — printed by
-        /// `astra-signer init`.
+        /// Trust domain identifier, 32 hex characters — shown by Orion when
+        /// the domain is created (Astra › Coffre et clés).
         #[arg(long)]
         trust_domain_id: String,
-        /// Public `CA-PQ` key, base64 — printed by `astra-signer init`. The
-        /// anchor of the domain, and the only one this gateway ever trusts.
+        /// Public `CA-PQ` key, base64 — shown by Orion when the domain is
+        /// created (Astra › Coffre et clés). The anchor of the domain, and the
+        /// only one this gateway ever trusts.
         #[arg(long)]
         ca_public_key: String,
-        /// Gateway PQ leaf returned by the offline `astra-signer
-        /// issue-gateway-bootstrap` ceremony.
+        /// Gateway PQ leaf returned by the gateway bootstrap in Orion
+        /// (Astra › Coffre et clés, « Amorcer la gateway… »).
         #[arg(long)]
         gateway_certificate: std::path::PathBuf,
         /// Astra's service public key, base64 — printed by `astra bootstrap`.
@@ -157,12 +158,13 @@ enum Command {
         #[arg(long)]
         authority_url: String,
         /// WebAuthn RP ID of the domain. The same value given to
-        /// `astra-signer init --rp-id` and to `astra bootstrap`.
+        /// Orion's domain creation (Astra › Coffre et clés) and to
+        /// `astra bootstrap`.
         #[arg(long)]
         webauthn_rp_id: String,
-        /// DER of the client `CA-TLS` **the domain** serves, self-signed from
-        /// the authority vault by `astra-signer issue-ca-tls` and carried by
-        /// the domain hand-off as `ca_tls_certificate`.
+        /// DER of the client `CA-TLS` **the domain** serves, created with the
+        /// domain in Orion (Astra › Coffre et clés) and carried by the domain
+        /// hand-off as `ca_tls_certificate`.
         ///
         /// This is not the operator CA that admits clients. That one lives on
         /// this gateway as a file and decides who may open an mTLS session;
@@ -318,11 +320,11 @@ enum Command {
     /// Records the domain's operator credentials, so an enrolment can carry
     /// them (spec §19, §7.5).
     ///
-    /// The document is the one `astra-signer bindings` emits beside the vault,
-    /// and `deploy.sh` already copies it to Astra. This installs the same
-    /// bytes here, because the enrolment block is the only thing a client
-    /// reads before it has a tunnel — and recovering an expired identity
-    /// begins by naming the credential that will approve it.
+    /// The document is the one Orion keeps beside the vault (Astra › Coffre et
+    /// clés). This installs the same bytes here, because the enrolment block
+    /// is the only thing a client reads before it has a tunnel — and
+    /// recovering an expired identity begins by naming the credential that
+    /// will approve it.
     ///
     /// Nothing secret crosses: the rows are public and each carries its own
     /// `CA-PQ` signature, which this registry checks under the anchor it
@@ -336,19 +338,18 @@ enum Command {
         /// `CA-PQ`-signed credential registry, as JSON.
         credentials: PathBuf,
     },
-    /// Prints the trust block a client's profile must carry (spec §19).
+    /// Prints the public file an Orion enrolment is signed from, for a first
+    /// administrator whose workstation has no tunnel yet.
     ///
-    /// Read from the certificate registry in one pass, and printed as the
-    /// JSON an Orion profile embeds verbatim. Eleven public values: anchors,
-    /// epochs, the Astra origin and the generation this peer is at. None is
-    /// secret, and none is meant to be retyped — a value pasted wrong here
-    /// fails months later, at 80 % of a leaf's life, on a client with no
-    /// fallback.
+    /// The same values the online routes serve — the negotiation certificates,
+    /// the network's public values and the trust block of one admitted peer —
+    /// printed as one JSON file on stdout. Orion reads it to sign the
+    /// enrolment (Astra › Coffre et clés). Public material only: no key and no
+    /// secret is in it.
     ///
-    /// Exists beside the API route because an enrolment happens **before** the
-    /// client has a tunnel, and the offline `helios enroll document` reads
-    /// this gateway over SSH rather than over the admin API.
-    ShowTrustEnrolment {
+    /// The peer must already be admitted (`heliosd peer add`), and the
+    /// negotiation material must exist (`heliosd init-key-negotiation`).
+    ExportEnrolment {
         /// The peer's WireGuard public key, base64, as it was admitted.
         #[arg(long)]
         public_key: String,
@@ -628,7 +629,7 @@ async fn main() -> anyhow::Result<()> {
             let network = NetworkConfig::load().context("loading the network config")?;
             init_key_negotiation(&network, &server_name, &client_ca, &client_pq_ca, rotate)
         }
-        Command::ShowTrustEnrolment { public_key } => show_trust_enrolment(&public_key),
+        Command::ExportEnrolment { public_key } => export_enrolment(&public_key),
         Command::PrepareGatewayCertificate {
             rotate_tls,
             new_key,
