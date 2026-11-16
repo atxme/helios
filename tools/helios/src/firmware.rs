@@ -1028,6 +1028,87 @@ mod tests {
         }
     }
     #[test]
+    fn fwupd_exit_code_two_means_no_updates_only_when_the_result_is_empty() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let no_updates = Output {
+            status: std::process::ExitStatus::from_raw(2 << 8),
+            stdout: Vec::new(),
+            stderr: b"No updates available".to_vec(),
+        };
+        assert!(parse_fwupd_output(no_updates, true).unwrap().is_empty());
+
+        let failure = Output {
+            status: std::process::ExitStatus::from_raw(2 << 8),
+            stdout: b"{incomplete".to_vec(),
+            stderr: b"metadata unavailable".to_vec(),
+        };
+        assert!(parse_fwupd_output(failure, true).is_err());
+
+        let reported_inventory = Output {
+            status: std::process::ExitStatus::from_raw(2 << 8),
+            stdout: format!(
+                r#"{{"Devices":[{{"DeviceId":"{ID}","Name":"UEFI","Version":"2022","Releases":[{{"Version":"2023"}}]}}]}}"#
+            )
+            .into_bytes(),
+            stderr: b"updates available".to_vec(),
+        };
+        assert_eq!(
+            parse_fwupd_output(reported_inventory, true).unwrap().len(),
+            1
+        );
+
+        let inventory_failure = Output {
+            status: std::process::ExitStatus::from_raw(2 << 8),
+            stdout: Vec::new(),
+            stderr: b"enumeration failed".to_vec(),
+        };
+        assert!(parse_fwupd_output(inventory_failure, false).is_err());
+
+        let unexpected_failure = Output {
+            status: std::process::ExitStatus::from_raw(3 << 8),
+            stdout: Vec::new(),
+            stderr: b"command failed".to_vec(),
+        };
+        assert!(parse_fwupd_output(unexpected_failure, true).is_err());
+    }
+
+    #[test]
+    fn firmware_versions_are_bounded_and_shell_safe_without_rejecting_fwupd_versions() {
+        for version in ["2023", "1.2.3-rc1", "1.2+vendor_build"] {
+            valid_version(version).unwrap();
+        }
+        for version in [
+            "x".repeat(129),
+            " version".into(),
+            "version ".into(),
+            "version/1".into(),
+        ] {
+            assert!(valid_version(&version).is_err(), "accepted {version:?}");
+        }
+    }
+
+    #[test]
+    fn persisted_plan_rejects_unknown_fields_oversize_and_backup_context_mismatch() {
+        let (dir, path, plan, _) = transaction(true);
+        let mut value = serde_json::to_value(&plan).unwrap();
+        value["unexpected"] = serde_json::json!(true);
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(load_plan(&path).is_err());
+
+        std::fs::write(&path, vec![b' '; 64 * 1024 + 1]).unwrap();
+        assert!(load_plan(&path).is_err());
+
+        let mut mismatched = plan;
+        mismatched.backup.as_mut().unwrap().request.target_version = "2024".into();
+        std::fs::write(&path, serde_json::to_vec(&mismatched).unwrap()).unwrap();
+        assert!(load_plan(&path).is_err());
+
+        // The fixture directory remains owned for the complete set of checks.
+        assert!(dir.path().exists());
+    }
+
+    #[test]
     fn installer_version_requires_a_known_device_version_pinning_contract() {
         for version in ["2.0.20", "2.1.1", "3.0.0"] {
             let bytes = serde_json::to_vec(&serde_json::json!({"Versions": [
