@@ -41,6 +41,31 @@ const API_BIND_DELAY: std::time::Duration = std::time::Duration::from_millis(500
 /// finished reading why it was gone.
 const RAW_SPEEDTEST_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Keeps API startup bounded while allowing the WireGuard address to appear.
+/// The final failure is returned to the caller so it can be logged once.
+async fn serve_api_with_retry<F, Fut>(
+    attempts: u32,
+    delay: std::time::Duration,
+    mut serve: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    anyhow::ensure!(attempts > 0, "API startup requires at least one attempt");
+    for attempt in 1..=attempts {
+        match serve().await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < attempts => {
+                warn!("API server unavailable (attempt {attempt}/{attempts}), retrying: {error:#}");
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    anyhow::bail!("API startup retry loop ended unexpectedly")
+}
+
 pub(crate) async fn run(
     mut network: NetworkConfig,
     dry_run: bool,
@@ -332,22 +357,12 @@ pub(crate) async fn run(
         // assign requested address", and without a retry the gateway would
         // run for good without an API: no provisioning, no telemetry, for a
         // race lost by a few dozen milliseconds.
-        for attempt in 1..=API_BIND_ATTEMPTS {
-            match helios_api::serve(api_state.clone(), api_bind).await {
-                Ok(()) => return,
-                Err(e) if attempt < API_BIND_ATTEMPTS => {
-                    warn!(
-                        "API server unavailable (attempt {attempt}/{API_BIND_ATTEMPTS}), \
-                         retrying: {e:#}"
-                    );
-                    tokio::time::sleep(API_BIND_DELAY).await;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "API server given up after {API_BIND_ATTEMPTS} attempts: {e:#}"
-                    );
-                }
-            }
+        if let Err(error) = serve_api_with_retry(API_BIND_ATTEMPTS, API_BIND_DELAY, || {
+            helios_api::serve(api_state.clone(), api_bind)
+        })
+        .await
+        {
+            tracing::error!("API server given up after {API_BIND_ATTEMPTS} attempts: {error:#}");
         }
     });
 
@@ -447,4 +462,70 @@ pub(crate) async fn run(
     .await;
     raw_speedtest_shutdown.store(true, Ordering::Release);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::serve_api_with_retry;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn api_retries_transient_bind_failure_and_returns_after_success() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+
+        let result = serve_api_with_retry(3, Duration::from_millis(250), move || {
+            let attempt = observed.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    anyhow::bail!("address is not assigned yet");
+                }
+                Ok(())
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn api_retry_exhaustion_returns_last_error_without_an_extra_delay() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let started = tokio::time::Instant::now();
+
+        let error = serve_api_with_retry(3, Duration::from_millis(250), move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { anyhow::bail!("address remains unavailable") }
+        })
+        .await
+        .expect_err("a persistent bind failure must remain visible");
+
+        assert!(format!("{error:#}").contains("address remains unavailable"));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_millis(500)
+        );
+    }
+
+    #[tokio::test]
+    async fn api_retry_rejects_a_zero_attempt_budget_without_calling_server() {
+        let calls = AtomicUsize::new(0);
+
+        let error = serve_api_with_retry(0, Duration::ZERO, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .await
+        .expect_err("zero attempts cannot represent a successful startup");
+
+        assert!(format!("{error:#}").contains("at least one attempt"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 }

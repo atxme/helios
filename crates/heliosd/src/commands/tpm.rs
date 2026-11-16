@@ -84,11 +84,20 @@ pub(crate) fn tpm_command(command: TpmCommand) -> anyhow::Result<()> {
 }
 
 fn read_firmware_input() -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+    read_firmware_input_from(std::io::stdin())
+}
+
+/// Reads one bounded firmware frame, keeping the allocation zeroizing even
+/// when the input is rejected after crossing the limit.
+fn read_firmware_input_from<R: std::io::Read>(
+    reader: R,
+) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
     use std::io::Read as _;
+
     // Reserve the entire bounded frame before reading any secret; reallocating
     // a populated Vec could leave an unwiped copy in the old allocation.
     let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(MAX_RESTORE_FRAME + 2));
-    std::io::stdin()
+    reader
         .take((MAX_RESTORE_FRAME + 1) as u64)
         .read_to_end(&mut bytes)?;
     anyhow::ensure!(
@@ -250,6 +259,36 @@ pub(crate) fn unlock_tpm_for_offline_command(tpm: &TpmSettings) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{self, Cursor, Read};
+
+    #[test]
+    fn firmware_input_reader_accepts_the_exact_bound_and_rejects_one_byte_over() {
+        let exact = vec![0x5a; MAX_RESTORE_FRAME];
+        let read = read_firmware_input_from(Cursor::new(exact.clone())).expect("exact bound");
+        assert_eq!(read.as_slice(), exact.as_slice());
+
+        let oversized = vec![0xa5; MAX_RESTORE_FRAME + 1];
+        let error = read_firmware_input_from(Cursor::new(oversized))
+            .expect_err("one extra byte is rejected");
+        assert!(error.to_string().contains("exceeds 64 KiB"));
+    }
+
+    #[test]
+    fn firmware_input_reader_preserves_io_errors() {
+        struct BrokenReader;
+
+        impl Read for BrokenReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected read failure",
+                ))
+            }
+        }
+
+        let error = read_firmware_input_from(BrokenReader).expect_err("read failure is fatal");
+        assert!(error.to_string().contains("injected read failure"));
+    }
 
     #[test]
     fn firmware_stdin_frame_rejects_truncation_extra_bytes_and_oversized_lengths() {
@@ -307,5 +346,19 @@ mod tests {
             .contains("refusing to overwrite"));
 
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn provisioning_accepts_an_enabled_tpm_without_an_existing_vault() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let absent_blob = directory.path().join("sealed.key");
+        let enabled = TpmSettings {
+            enabled: true,
+            sealed_blob_path: absent_blob.to_string_lossy().into_owned(),
+            ..TpmSettings::default()
+        };
+
+        assert!(validate_provisioning_request(&enabled).is_ok());
+        assert!(!absent_blob.exists());
     }
 }

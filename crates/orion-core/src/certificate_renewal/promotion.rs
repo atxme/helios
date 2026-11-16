@@ -269,3 +269,75 @@ pub fn rollback_to_previous(
         available_until: retire_at,
     })
 }
+
+#[cfg(all(test, feature = "certificate-signing"))]
+mod bundle_tests {
+    use super::*;
+    use crate::test_domain::{bundle, domain, store};
+    use aether::certificates::encoding::Fingerprint;
+
+    #[test]
+    fn rollback_accepts_only_the_matching_tls_and_pq_generation() {
+        let directory = tempfile::tempdir().expect("temporary trust directory");
+        let domain = domain();
+        let identity = bundle(&domain);
+        let mut generation = store(directory.path(), &domain)
+            .state()
+            .certificates
+            .active
+            .clone();
+        generation.tls_certificate_fingerprint = domain.active_client_tls.fingerprint();
+        generation.pq_certificate_fingerprint =
+            pq_certificate_fingerprint(&domain.active_client_leaf).expect("client PQ fingerprint");
+        bundle_matches_generation(&identity, &generation).expect("matching generation");
+
+        generation.tls_certificate_fingerprint = Fingerprint::of(b"different TLS certificate");
+        assert!(matches!(
+            bundle_matches_generation(&identity, &generation),
+            Err(RenewalError::Certificate(
+                CertificateError::FingerprintMismatch("client TLS identity")
+            ))
+        ));
+        generation.tls_certificate_fingerprint = domain.active_client_tls.fingerprint();
+        generation.pq_certificate_fingerprint = Fingerprint::of(b"different PQ certificate");
+        assert!(matches!(
+            bundle_matches_generation(&identity, &generation),
+            Err(RenewalError::Certificate(
+                CertificateError::FingerprintMismatch("client PQ identity")
+            ))
+        ));
+    }
+
+    #[test]
+    fn rollback_refuses_missing_or_malformed_certificates() {
+        let directory = tempfile::tempdir().expect("temporary trust directory");
+        let domain = domain();
+        let generation = store(directory.path(), &domain)
+            .state()
+            .certificates
+            .active
+            .clone();
+        let mut identity = bundle(&domain);
+        identity.certificate_chain.clear();
+        assert!(matches!(
+            bundle_matches_generation(&identity, &generation),
+            Err(RenewalError::Identity(_))
+        ));
+        identity.certificate_chain.push("not base64!".into());
+        assert!(matches!(
+            bundle_matches_generation(&identity, &generation),
+            Err(RenewalError::Identity(_))
+        ));
+        identity = bundle(&domain);
+        identity.pq_certificate = "not base64!".into();
+        assert!(matches!(
+            bundle_matches_generation(&identity, &generation),
+            Err(RenewalError::Identity(_))
+        ));
+        identity.pq_certificate = "e30=".into();
+        assert!(matches!(
+            bundle_matches_generation(&identity, &generation),
+            Err(RenewalError::Identity(_))
+        ));
+    }
+}
