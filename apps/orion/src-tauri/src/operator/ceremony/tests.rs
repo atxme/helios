@@ -726,6 +726,199 @@ fn a_request_for_an_unknown_invitation_is_refused_before_the_key() {
     assert!(domain.registry_is_empty());
 }
 
+/// Acceptance rejects a missing delivery endpoint before decoding a request
+/// or consulting the gateway, so no key prompt or registry mutation can follow.
+#[test]
+fn acceptance_rejects_a_blank_endpoint_before_gateway_io() {
+    let domain = Domain::new("accept-blank-endpoint").with_ca_tls();
+    let enrolment = domain.enrolment("laptop", true);
+    let request = aether::key_negotiation::encode_request_file(&enrolment.request);
+    let accept = Accept {
+        request: &request,
+        validity_days: 365,
+        endpoint: " \t ",
+        allowed_ips: None,
+        ssh_target: None,
+        gateway: Some("http://must-not-be-read.invalid"),
+    };
+
+    let result = prepare_acceptance(
+        &domain.vault_path,
+        &domain.registry,
+        &accept,
+        now_unix(),
+        &|_| panic!("gateway must not be read for a blank endpoint"),
+    );
+
+    let (refusal, message) = result.err().expect("blank endpoint is refused");
+    assert_eq!(refusal, Refusal::ManifestMismatch);
+    assert!(message.contains("adresse publique"));
+    assert_eq!(
+        domain
+            .registry
+            .load(&enrolment.invitation.invitation_id)
+            .expect("invitation remains readable")
+            .state,
+        astra_operator::enrollment::InvitationState::Issued
+    );
+}
+
+/// Malformed request contents are rejected as a handoff mismatch without
+/// consuming the otherwise valid invitation.
+#[test]
+fn acceptance_rejects_an_undecodable_request_without_consuming_the_invitation() {
+    let domain = Domain::new("accept-malformed-request").with_ca_tls();
+    let enrolment = domain.enrolment("laptop", true);
+    let accept = Accept {
+        request: "not an enrollment request",
+        validity_days: 365,
+        endpoint: "198.51.100.7:51820",
+        allowed_ips: None,
+        ssh_target: None,
+        gateway: None,
+    };
+
+    let result = prepare_acceptance(
+        &domain.vault_path,
+        &domain.registry,
+        &accept,
+        now_unix(),
+        &|_| Err(orion_core::gateway_admin::GatewayAdminError::Unreachable),
+    );
+
+    let (refusal, message) = result.err().expect("malformed request is refused");
+    assert_eq!(refusal, Refusal::HandoffMismatch);
+    assert!(message.contains("demande d'enrôlement"));
+    assert_eq!(
+        domain
+            .registry
+            .load(&enrolment.invitation.invitation_id)
+            .expect("invitation remains readable")
+            .state,
+        astra_operator::enrollment::InvitationState::Issued
+    );
+}
+
+/// The registry state is checked before a key is requested, even if the
+/// request itself remains valid and the ceremony is otherwise ready.
+#[test]
+fn acceptance_refuses_a_revoked_invitation_before_gateway_io() {
+    let domain = Domain::new("accept-revoked").with_ca_tls();
+    let enrolment = domain.enrolment("laptop", true);
+    domain
+        .registry
+        .revoke(&enrolment.invitation.invitation_id, now_unix())
+        .expect("issued invitation can be revoked");
+    let request = aether::key_negotiation::encode_request_file(&enrolment.request);
+    let accept = Accept {
+        request: &request,
+        validity_days: 365,
+        endpoint: "198.51.100.7:51820",
+        allowed_ips: None,
+        ssh_target: None,
+        gateway: None,
+    };
+
+    let (refusal, message) = prepare_acceptance(
+        &domain.vault_path,
+        &domain.registry,
+        &accept,
+        now_unix(),
+        &|_| panic!("gateway must not be read for a revoked invitation"),
+    )
+    .err()
+    .expect("revoked invitation is refused");
+
+    assert_eq!(refusal, Refusal::InvitationExpired);
+    assert!(message.contains("révoquée"));
+    assert!(matches!(
+        domain
+            .registry
+            .load(&enrolment.invitation.invitation_id)
+            .expect("invitation remains readable")
+            .state,
+        astra_operator::enrollment::InvitationState::Revoked { .. }
+    ));
+}
+
+/// An issued record whose signed validity window has elapsed is refused even
+/// when the registry has not yet purged or rewritten it.
+#[test]
+fn acceptance_refuses_an_issued_invitation_past_its_signed_expiry() {
+    let domain = Domain::new("accept-expired-window").with_ca_tls();
+    let enrolment = domain.enrolment("laptop", true);
+    let request = aether::key_negotiation::encode_request_file(&enrolment.request);
+    let accept = Accept {
+        request: &request,
+        validity_days: 365,
+        endpoint: "198.51.100.7:51820",
+        allowed_ips: None,
+        ssh_target: None,
+        gateway: None,
+    };
+
+    let (refusal, message) = prepare_acceptance(
+        &domain.vault_path,
+        &domain.registry,
+        &accept,
+        enrolment.invitation.not_after_unix + 1,
+        &|_| panic!("gateway must not be read for an expired invitation"),
+    )
+    .err()
+    .expect("expired invitation is refused");
+
+    assert_eq!(refusal, Refusal::InvitationExpired);
+    assert!(message.contains("expiré"));
+    assert_eq!(
+        domain
+            .registry
+            .load(&enrolment.invitation.invitation_id)
+            .expect("invitation remains readable")
+            .state,
+        astra_operator::enrollment::InvitationState::Issued
+    );
+}
+
+/// Altering the requested identity in an initially signed request invalidates
+/// its signature and cannot consume the associated invitation.
+#[test]
+fn acceptance_refuses_a_request_that_does_not_match_its_invitation() {
+    let domain = Domain::new("accept-request-mismatch").with_ca_tls();
+    let enrolment = domain.enrolment("laptop", true);
+    let mut request = enrolment.request;
+    request.requested_name = "another-device".into();
+    let request_file = aether::key_negotiation::encode_request_file(&request);
+    let accept = Accept {
+        request: &request_file,
+        validity_days: 365,
+        endpoint: "198.51.100.7:51820",
+        allowed_ips: None,
+        ssh_target: None,
+        gateway: None,
+    };
+
+    let (refusal, message) = prepare_acceptance(
+        &domain.vault_path,
+        &domain.registry,
+        &accept,
+        now_unix(),
+        &|_| panic!("gateway must not be read for an invalid request"),
+    )
+    .err()
+    .expect("mismatched request is refused");
+
+    assert_eq!(refusal, Refusal::HandoffMismatch);
+    assert!(message.contains("ne correspond pas"));
+    assert_eq!(
+        domain
+            .registry
+            .load(&enrolment.invitation.invitation_id)
+            .expect("invitation remains readable")
+            .state,
+        astra_operator::enrollment::InvitationState::Issued
+    );
+}
+
 /// A relay with no CA-TLS cannot issue a client leaf: refused before a key,
 /// naming what is missing.
 #[test]
