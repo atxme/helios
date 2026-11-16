@@ -207,6 +207,7 @@ export function EnrollmentOperatorPanel({
       <ResumeDialog
         entry={resuming}
         endpoint={gateway.endpoint}
+        connected={gateway.connected}
         busy={busy}
         onClose={() => setResuming(null)}
         onSubmit={async (gesture) => {
@@ -528,12 +529,14 @@ function AcceptForm({
 function ResumeDialog({
   entry,
   endpoint: prefill,
+  connected,
   busy,
   onClose,
   onSubmit,
 }: {
   entry: InvitationView | null
   endpoint: string
+  connected: boolean
   busy: boolean
   onClose: () => void
   onSubmit: (gesture: EnrollmentGesture) => Promise<void>
@@ -541,6 +544,20 @@ function ResumeDialog({
   const [endpoint, setEndpoint] = useEndpoint(prefill)
   const [allowedIps, setAllowedIps] = useState('')
   const [sshTarget, setSshTarget] = useState('')
+  const [exportText, setExportText] = useState<string | null>(null)
+  const [fileError, setFileError] = useState<string | null>(null)
+
+  const pick = async (file: File | undefined) => {
+    setFileError(null)
+    if (!file) return
+    try {
+      setExportText(await readFileText(file))
+    } catch (cause) {
+      setExportText(null)
+      setFileError(String(cause instanceof Error ? cause.message : cause))
+    }
+  }
+
   return (
     <Dialog open={entry !== null} onClose={onClose} fullWidth maxWidth="xs">
       <DialogTitle sx={{ fontSize: 14 }}>Reprendre l’enrôlement</DialogTitle>
@@ -558,6 +575,26 @@ function ResumeDialog({
             sshTarget={sshTarget}
             setSshTarget={setSshTarget}
           />
+          <Box>
+            <TextField
+              size="small"
+              type="file"
+              label="Export d'enrôlement de la gateway"
+              slotProps={{ inputLabel: { shrink: true } }}
+              onChange={(event) => void pick((event.target as HTMLInputElement).files?.[0])}
+              fullWidth
+            />
+            <Typography color="text.secondary" sx={{ fontSize: 10.5, mt: 0.5 }}>
+              {connected
+                ? 'Facultatif : la gateway connectée est lue.'
+                : 'Sans tunnel : le fichier de heliosd export-enrolment.'}
+            </Typography>
+            {fileError && (
+              <Alert severity="error" variant="outlined" sx={{ mt: 0.75, fontSize: 11.5 }}>
+                {fileError}
+              </Alert>
+            )}
+          </Box>
         </Stack>
       </DialogContent>
       <DialogActions>
@@ -574,6 +611,7 @@ function ResumeDialog({
               endpoint: endpoint.trim(),
               ...(optional(allowedIps) ? { allowed_ips: optional(allowedIps) } : {}),
               ...(optional(sshTarget) ? { ssh_target: optional(sshTarget) } : {}),
+              ...(exportText !== null ? { enrolment_export: exportText } : {}),
             })
           }
         >

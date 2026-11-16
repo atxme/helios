@@ -978,6 +978,8 @@ export type EnrollmentGesture =
       endpoint: string
       allowed_ips?: string
       ssh_target?: string
+      /** Contenu du fichier `heliosd export-enrolment`, lu seulement sans tunnel. */
+      enrolment_export?: string
     }
 
 /**
