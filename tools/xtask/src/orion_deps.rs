@@ -153,3 +153,128 @@ fn hex(bytes: &[u8]) -> String {
     }
     output
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            loop {
+                let path = std::env::temp_dir().join(format!(
+                    "helios-xtask-orion-deps-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create test directory {}: {error}", path.display()),
+                }
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn archive(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = File::create(path).expect("create archive fixture");
+        let mut zip = zip::ZipWriter::new(file);
+        for (name, contents) in entries {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .expect("start archive entry");
+            zip.write_all(contents).expect("write archive entry");
+        }
+        zip.finish().expect("finish archive fixture");
+    }
+
+    fn required_entries() -> [(&'static str, &'static [u8]); 3] {
+        [
+            (WIREGUARD_FILES[0].0, b"amd64 dll"),
+            (WIREGUARD_FILES[1].0, b"arm64 dll"),
+            (WIREGUARD_FILES[2].0, b"license"),
+        ]
+    }
+
+    #[test]
+    fn extraction_writes_all_required_files_to_their_runtime_names() {
+        let directory = TestDirectory::new();
+        let archive_path = directory.path().join("wireguard.zip");
+        archive(&archive_path, &required_entries());
+        let destination = directory.path().join("resources-windows");
+
+        extract_wireguard_files(&archive_path, &destination).expect("extract required files");
+
+        for (index, (_, output)) in WIREGUARD_FILES.iter().enumerate() {
+            assert_eq!(
+                std::fs::read(destination.join(output)).expect("read extracted file"),
+                required_entries()[index].1
+            );
+            assert!(!destination.join(output).with_extension("part").exists());
+        }
+    }
+
+    #[test]
+    fn extraction_replaces_existing_outputs() {
+        let directory = TestDirectory::new();
+        let archive_path = directory.path().join("wireguard.zip");
+        archive(&archive_path, &required_entries());
+        let destination = directory.path().join("resources-windows");
+        let existing = destination.join(WIREGUARD_FILES[0].1);
+        std::fs::create_dir_all(existing.parent().expect("output parent"))
+            .expect("create output parent");
+        std::fs::write(&existing, b"stale dll").expect("write old output");
+
+        extract_wireguard_files(&archive_path, &destination).expect("replace old files");
+
+        assert_eq!(
+            std::fs::read(existing).expect("read replaced file"),
+            b"amd64 dll"
+        );
+    }
+
+    #[test]
+    fn extraction_rejects_invalid_zip_and_missing_required_entry() {
+        let directory = TestDirectory::new();
+        let invalid = directory.path().join("invalid.zip");
+        std::fs::write(&invalid, b"not a zip").expect("write invalid archive");
+        let error = extract_wireguard_files(&invalid, &directory.path().join("invalid-out"))
+            .expect_err("invalid archive rejected");
+        assert!(format!("{error:#}").contains("reading archive"));
+
+        let missing = directory.path().join("missing.zip");
+        archive(&missing, &required_entries()[..2]);
+        let error = extract_wireguard_files(&missing, &directory.path().join("missing-out"))
+            .expect_err("missing license rejected");
+        assert!(format!("{error:#}").contains(WIREGUARD_FILES[2].0));
+    }
+
+    #[test]
+    fn digest_helpers_use_lowercase_hex_and_reject_missing_files() {
+        assert_eq!(hex(&[0x00, 0x0a, 0xff]), "000aff");
+        let directory = TestDirectory::new();
+        let file = directory.path().join("payload");
+        std::fs::write(&file, b"payload").expect("write payload");
+        assert!(sha256_matches(
+            &file,
+            "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+        )
+        .expect("hash payload"));
+        assert!(!sha256_matches(&file, &"0".repeat(64)).expect("compare wrong hash"));
+        assert!(sha256_matches(&directory.path().join("missing"), &"0".repeat(64)).is_err());
+    }
+}
