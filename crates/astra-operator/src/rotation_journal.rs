@@ -607,7 +607,6 @@ impl LegacyCaPqJournal {
         let gateway = WireGuardKey::parse(self.handoff.require(
             self.handoff.gateway_wg_public_key.as_ref(),
             "la clé publique de la gateway",
-            "--gateway-wg-public-key",
         )?)?;
         self.transition.verify(
             &self.current_ca_public_key,

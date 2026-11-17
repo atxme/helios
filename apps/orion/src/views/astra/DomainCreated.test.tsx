@@ -50,7 +50,7 @@ describe('DomainCreated', () => {
     const steps = screen.getAllByRole('listitem').map((step) => step.textContent)
     expect(steps).toHaveLength(3)
     expect(steps[0]).toContain('./scripts/deploy.sh')
-    expect(steps[1]).toContain('« Amorcer la gateway… »')
+    expect(steps[1]).toContain('« Domaine » → « Amorcer la gateway… »')
     expect(steps[1]).not.toContain('astra-signer')
     expect(steps[2]).toContain('« Finaliser le domaine »')
     expect(steps[2]).toContain('./scripts/deploy.sh --astra')

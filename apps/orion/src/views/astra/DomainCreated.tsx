@@ -56,7 +56,7 @@ export function DomainCreated() {
           Déployer la gateway : <Box component="code" sx={code}>./scripts/deploy.sh</Box>.
         </li>
         <li>
-          Amorcer la gateway : le bouton « Amorcer la gateway… » de ce panneau.
+          Amorcer la gateway : « Domaine » → « Amorcer la gateway… ».
         </li>
         <li>
           « Domaine » → « Finaliser le domaine », puis{' '}

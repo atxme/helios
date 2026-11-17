@@ -437,7 +437,7 @@ deployer_astra() {
     #
     # Elle se calcule ici plutôt que de se retaper : le relais porte déjà le
     # certificat public (`ca_tls_certificate`, DER en base64) dès que la CA-TLS est
-    # émise dans Orion (Astra › Coffre et clés), et l'empreinte en est le SHA-256 en hexadécimal
+    # émise dans Orion (Domaine, « Finaliser le domaine »), et l'empreinte en est le SHA-256 en hexadécimal
     # minuscule — exactement ce que `Fingerprint::of` calcule sur ces octets.
     ca_tls_der="$(sed -n \
         's/.*"ca_tls_certificate"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$RELAIS")"
@@ -447,7 +447,7 @@ deployer_astra() {
     else
         empreinte_ca_tls=""
         echo "    aucune CA TLS cliente dans le relais : la rotation du §9.4 restera" >&2
-        echo "    refusée ici. L'émettre dans Orion (Astra › Coffre et clés), puis" >&2
+        echo "    refusée ici. L'émettre dans Orion (Domaine, « Finaliser le domaine »), puis" >&2
         echo "    relancer ./scripts/deploy.sh --astra." >&2
     fi
 
@@ -1010,7 +1010,7 @@ deployer_astra() {
         else
             echo "    relais sans ca_tls_certificate : le registre gateway va retenir la CA" >&2
             echo "    opérateur comme ancre du domaine, et aucun renouvellement ne pourra" >&2
-            echo "    se stager. Émettre la CA-TLS dans Orion (Astra › Coffre et clés)." >&2
+            echo "    se stager. Émettre la CA-TLS dans Orion (Domaine, « Finaliser le domaine »)." >&2
         fi
         helios_ssh_sudo "$CIBLE" "$HELIOSD init-trust-domain \
             --trust-domain-id '$domaine' --ca-public-key '$ancre' \
@@ -1220,7 +1220,7 @@ deployer_astra() {
     else
         echo "    aucun document de credentials à côté du coffre :" >&2
         echo "      $credentials_local" >&2
-        echo "    l'émettre dans Orion (Astra › Coffre et clés), sinon aucun opérateur ne" >&2
+        echo "    l'émettre dans Orion (Domaine, « Finaliser le domaine »), sinon aucun opérateur ne" >&2
         echo "    peut approuver un renouvellement." >&2
     fi
 

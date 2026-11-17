@@ -261,14 +261,12 @@ impl LocalDomain {
             RotationKind::CaTls => Some(DerCertificate::parse(relay.require(
                 relay.ca_tls_certificate.as_ref(),
                 "le certificat CA-TLS en service",
-                "--ca-tls-certificate",
             )?)?),
         };
         let authority_url = relay
             .require(
                 relay.astra_authority_url.as_ref(),
                 "l'origine déclarée par l'autorité",
-                "--astra-authority-url",
             )?
             .clone();
         Ok(Self {
@@ -1244,7 +1242,6 @@ fn finish_manifest(
     let outgoing = DerCertificate::parse(relay.require(
         relay.ca_tls_certificate.as_ref(),
         "le certificat CA-TLS en service",
-        "--ca-tls-certificate",
     )?)?;
     Ok(AstraManifest::CaRotation(CaRotationManifest {
         trust_domain_id: vault.trust_domain_id,

@@ -1494,7 +1494,7 @@ pub(super) fn credential_document(vault_path: &Path) -> Result<CredentialRegistr
         .map_err(internal)?
         .ok_or_else(|| {
             GatewayRefusal::Guidance(
-                "aucun document de credentials : l'émettre dans Orion, Astra › Coffre et clés. Rien n'a été signé."
+                "aucun document de credentials : l'émettre dans Orion, Domaine, « Finaliser le domaine ». Rien n'a été signé."
                     .into(),
             )
         })

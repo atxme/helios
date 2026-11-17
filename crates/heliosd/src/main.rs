@@ -147,7 +147,7 @@ enum Command {
         #[arg(long)]
         ca_public_key: String,
         /// Gateway PQ leaf returned by the gateway bootstrap in Orion
-        /// (Astra › Coffre et clés, « Amorcer la gateway… »).
+        /// (Domaine, « Amorcer la gateway… »).
         #[arg(long)]
         gateway_certificate: std::path::PathBuf,
         /// Astra's service public key, base64 — printed by `astra bootstrap`.
@@ -162,9 +162,10 @@ enum Command {
         /// `astra bootstrap`.
         #[arg(long)]
         webauthn_rp_id: String,
-        /// DER of the client `CA-TLS` **the domain** serves, created with the
-        /// domain in Orion (Astra › Coffre et clés) and carried by the domain
-        /// hand-off as `ca_tls_certificate`.
+        /// DER of the client `CA-TLS` **the domain** serves, issued in Orion
+        /// (Domaine, « Amorcer la gateway… » on a new domain, otherwise
+        /// « Finaliser le domaine ») and carried by the domain hand-off as
+        /// `ca_tls_certificate`.
         ///
         /// This is not the operator CA that admits clients. That one lives on
         /// this gateway as a file and decides who may open an mTLS session;
@@ -320,11 +321,11 @@ enum Command {
     /// Records the domain's operator credentials, so an enrolment can carry
     /// them (spec §19, §7.5).
     ///
-    /// The document is the one Orion keeps beside the vault (Astra › Coffre et
-    /// clés). This installs the same bytes here, because the enrolment block
-    /// is the only thing a client reads before it has a tunnel — and
-    /// recovering an expired identity begins by naming the credential that
-    /// will approve it.
+    /// The document is the one Orion keeps beside the vault (Domaine, first
+    /// issued by « Finaliser le domaine »). This installs the same bytes here,
+    /// because the enrolment block is the only thing a client reads before it
+    /// has a tunnel — and recovering an expired identity begins by naming the
+    /// credential that will approve it.
     ///
     /// Nothing secret crosses: the rows are public and each carries its own
     /// `CA-PQ` signature, which this registry checks under the anchor it
@@ -344,7 +345,7 @@ enum Command {
     /// The same values the online routes serve — the negotiation certificates,
     /// the network's public values and the trust block of one admitted peer —
     /// printed as one JSON file on stdout. Orion reads it to sign the
-    /// enrolment (Astra › Coffre et clés). Public material only: no key and no
+    /// enrolment (Astra › Enrôlement, « Reprendre »). Public material only: no key and no
     /// secret is in it.
     ///
     /// The peer must already be admitted (`heliosd peer add`), and the
