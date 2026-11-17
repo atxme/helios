@@ -2285,11 +2285,13 @@ fn resume_offline_refuses_an_export_that_cannot_draft_a_document() {
     assert_eq!(error, INCOMPLETE_EXPORT);
 }
 
+/// An edit of the relay, as one case of the relay checks.
+type RelayEdit = Box<dyn Fn(&mut astra_operator::handoff::DomainHandoff)>;
+
 /// The export is checked against the relay beside the vault, family by family:
 /// each value the relay holds is compared, and a missing one is a mismatch.
 #[test]
 fn resume_offline_refuses_what_the_relay_does_not_hold() {
-    use astra_operator::handoff::DomainHandoff;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let (domain, id, device) = offline_fixture("resume-offline-relay");
     let text = export_text(&domain, &device, |_| {});
@@ -2301,7 +2303,7 @@ fn resume_offline_refuses_what_the_relay_does_not_hold() {
         .expect("service key")
         .1
         .to_base64();
-    let cases: Vec<(Box<dyn Fn(&mut DomainHandoff)>, Refusal)> = vec![
+    let cases: Vec<(RelayEdit, Refusal)> = vec![
         (
             Box::new(|relay| relay.rp_id = "elsewhere.example".into()),
             Refusal::ExportRelayRpId,

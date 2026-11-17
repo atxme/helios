@@ -1024,22 +1024,15 @@ fn check_export_against_relay(
     relay: &DomainHandoff,
     trust: &orion_core::TrustMaterial,
 ) -> Result<(), Refusal> {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-
     if relay.rp_id.trim() != trust.webauthn_rp_id.trim() {
         return Err(Refusal::ExportRelayRpId);
     }
-    let decode = |value: &str| {
-        STANDARD
-            .decode(value.trim())
-            .ok()
-            .filter(|bytes| !bytes.is_empty())
-    };
+    // Both sides are base64 DER certificates: parsed, then compared as bytes.
     let same_ca_tls = relay
         .ca_tls_certificate
         .as_deref()
-        .and_then(decode)
-        .zip(decode(&trust.client_tls_ca_der))
+        .and_then(|value| DerCertificate::parse(value.trim()).ok())
+        .zip(DerCertificate::parse(trust.client_tls_ca_der.trim()).ok())
         .is_some_and(|(relay, export)| relay == export);
     if !same_ca_tls {
         return Err(Refusal::ExportRelayCaTls);
