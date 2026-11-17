@@ -810,6 +810,25 @@ mod tests {
         report_installers(&bundle).expect("both installer formats are reported");
     }
 
+    #[test]
+    fn report_installers_skips_missing_format_directories_and_rejects_unreadable_artifacts() {
+        let directory = TestDirectory::new("installer-report-errors");
+        let bundle = directory.path().join("bundle");
+        std::fs::create_dir_all(bundle.join("msi")).expect("create MSI directory");
+
+        // A missing NSIS directory is an optional format, not a report failure.
+        std::fs::write(bundle.join("msi/notes.MSI.txt"), b"not an installer")
+            .expect("write unrelated file");
+        let error = report_installers(&bundle).expect_err("unreadable MSI artifact is an error");
+        assert!(format!("{error:#}").contains("no installer found"));
+
+        // A directory with an installer suffix reaches fingerprinting, where
+        // the file reader must surface the malformed artifact with context.
+        std::fs::create_dir(bundle.join("msi/broken.msi")).expect("create malformed MSI");
+        let error = report_installers(&bundle).expect_err("directory cannot be fingerprinted");
+        assert!(format!("{error:#}").contains("fingerprint of"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn file_copy_helpers_set_manifest_stable_permissions() {
@@ -890,6 +909,23 @@ mod tests {
         )
         .expect_err("non-zero subprocess is an error");
         assert!(format!("{error:#}").contains("failed (exit status: 7)"));
+
+        let output_failure = executable_script(directory.path(), "output-failure", "exit 9");
+        let error = output_of(output_failure.to_str().expect("script path"), &[])
+            .expect_err("non-zero output command is an error");
+        assert!(format!("{error:#}").contains("failed (exit status: 9)"));
+
+        let missing = directory.path().join("does-not-exist");
+        let error = run(
+            directory.path(),
+            missing.to_str().expect("missing path"),
+            &[],
+        )
+        .expect_err("missing command cannot run");
+        assert!(format!("{error:#}").contains("running "));
+        let error = output_of(missing.to_str().expect("missing path"), &[])
+            .expect_err("missing output command cannot run");
+        assert!(format!("{error:#}").contains("running "));
     }
 
     /// The bundle must carry everything a gateway needs. An omission would
