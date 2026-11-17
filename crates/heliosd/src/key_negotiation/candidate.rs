@@ -440,9 +440,9 @@ mod tests {
 
     #[test]
     fn generating_tls_rejects_a_server_name_that_cannot_be_encoded_in_x509() {
-        let error = generate_candidate_tls("gâtéway.example")
-            .err()
-            .expect("the certificate requires an ASCII DNS name");
+        let Err(error) = generate_candidate_tls("gâtéway.example") else {
+            panic!("the certificate requires an ASCII DNS name");
+        };
         assert_eq!(
             error.to_string(),
             "server name is not valid for an X.509 certificate"
@@ -669,7 +669,9 @@ mod sealed_slot_tests {
         std::fs::remove_file(&slot.keystore).expect("remove test vault");
         std::fs::create_dir(&slot.keystore).expect("block writes at the vault path");
 
-        let error = slot.seal(true).err().expect("sealing must fail");
+        let Err(error) = slot.seal(true) else {
+            panic!("sealing must fail");
+        };
 
         assert_eq!(error.to_string(), "sealing the candidate gateway keys");
         assert_eq!(
@@ -683,7 +685,9 @@ mod sealed_slot_tests {
         let slot = Slot::new();
         std::fs::create_dir(&slot.certificate).expect("block publication");
 
-        let error = slot.seal(true).err().expect("publication must fail");
+        let Err(error) = slot.seal(true) else {
+            panic!("publication must fail");
+        };
 
         assert_eq!(
             error.to_string(),
