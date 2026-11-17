@@ -468,16 +468,21 @@ chacune des deux, séparément : il ouvre les ancres, pas seulement le slot.
    l'époque et les générations initiales ;
 7. `compose up -d`.
 
-Sans `deploy.sh`, l'empreinte se calcule à la main, depuis le bloc de confiance
-de `heliosd export-enrolment` : c'est le SHA-256 du DER de `client_tls_ca_der`
-(base64 DER). Ni Orion ni `heliosd` ne l'impriment directement :
+Sans `deploy.sh`, l'empreinte se calcule à la main, depuis le relais de domaine
+à côté du coffre (`astra-domain.json`) : c'est le SHA-256 du DER de
+`ca_tls_certificate` (base64 DER), comme `deploy.sh` le fait. Ni Orion ni
+`heliosd` ne l'impriment directement :
 
 ```sh
-printf '%s' '<valeur de client_tls_ca_der>' | base64 -d | sha256sum
+sed -n 's/.*"ca_tls_certificate"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' ~/.helios/astra/astra-domain.json | base64 -d | sha256sum
 ```
 
 Elle se passe à `astra bootstrap --ca-tls-fingerprint` sur un domaine neuf, ou à
-`astra pin-ca-tls --fingerprint` sur un domaine déjà amorcé.
+`astra pin-ca-tls --fingerprint` sur un domaine déjà amorcé. Sur un domaine neuf,
+`heliosd export-enrolment` n'est pas encore utilisable (il exige un registre et
+un pair admis) : son bloc de confiance ne sert qu'à recouper une empreinte sur
+un domaine déjà amorcé. Le `client_tls_ca_der` d'un registre amorcé avec la CA
+admission n'est pas la CA-TLS du domaine.
 
 Le contexte `~/astra-build` est jetable et remplacé à chaque déploiement. Le
 témoin durable passé à `--expected-audit-head` vit donc hors de ce contexte,
