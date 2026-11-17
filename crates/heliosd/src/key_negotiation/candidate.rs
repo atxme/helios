@@ -2,6 +2,7 @@
 //! discard.
 
 use super::*;
+use aether::certificates::encoding::DerCertificate;
 
 /// Public half of the candidate identity a renewal has sealed.
 ///
@@ -66,30 +67,33 @@ pub(crate) fn seal_candidate_identity(
     gateway_identity_epoch: u64,
     rotate_tls: bool,
 ) -> Result<SealedCandidate> {
-    use aether::certificates::encoding::{DerCertificate, MlDsa87PublicKey};
-    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
+    seal_candidate_identity_at(
+        secret,
+        gateway_wg_public_key,
+        server_name,
+        gateway_identity_epoch,
+        rotate_tls,
+        &next_private_keystore_path(),
+        &next_certificate_path(),
+    )
+}
+
+fn seal_candidate_identity_at(
+    secret: &SecretKey,
+    gateway_wg_public_key: &str,
+    server_name: &str,
+    gateway_identity_epoch: u64,
+    rotate_tls: bool,
+    keystore_path: &Path,
+    certificate_path: &Path,
+) -> Result<SealedCandidate> {
+    use aether::certificates::encoding::MlDsa87PublicKey;
 
     let (pq_private_key, pq_public_key) =
         generate_ml_dsa_87_keypair().context("generating the candidate gateway PQ identity")?;
 
     let tls = if rotate_tls {
-        // Self-issued, self-signed and pinned, exactly like the active leaf:
-        // §15 keeps this asymmetry deliberate, and `GatewayIdentityTransition`
-        // refuses a leaf that chains to the client CA-TLS instead.
-        let mut params = CertificateParams::new(vec![server_name.trim().to_string()])
-            .context("server name is not valid for an X.509 certificate")?;
-        params.is_ca = IsCa::NoCa;
-        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
-        params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(825);
-        let key_pair = KeyPair::generate().context("generating the candidate gateway TLS key")?;
-        let certificate = params
-            .self_signed(&key_pair)
-            .context("creating the candidate gateway TLS certificate")?;
-        let der = DerCertificate::new(certificate.der().as_ref().to_vec())
-            .context("encoding the candidate gateway TLS certificate")?;
-        Some((Zeroizing::new(key_pair.serialize_der()), der))
+        Some(generate_candidate_tls(server_name)?)
     } else {
         None
     };
@@ -104,16 +108,13 @@ pub(crate) fn seal_candidate_identity(
         })
         .context("encoding the candidate gateway identity")?,
     );
-    SealedKeystore::new(
-        next_private_keystore_path(),
-        helios_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
-    )
-    .store(
-        secret,
-        &candidate_identity_context(gateway_wg_public_key, gateway_identity_epoch),
-        stored.as_slice(),
-    )
-    .context("sealing the candidate gateway keys")?;
+    SealedKeystore::new(keystore_path, helios_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY)
+        .store(
+            secret,
+            &candidate_identity_context(gateway_wg_public_key, gateway_identity_epoch),
+            stored.as_slice(),
+        )
+        .context("sealing the candidate gateway keys")?;
 
     // The public leaf is written only once its private half is sealed. The
     // reverse order would leave a certificate on disk whose key the gateway
@@ -121,13 +122,13 @@ pub(crate) fn seal_candidate_identity(
     // a candidate that does not exist.
     let tls_certificate = match tls {
         Some((_, der)) => {
-            write_public_atomic(&next_certificate_path(), der.as_bytes())
+            write_public_atomic(certificate_path, der.as_bytes())
                 .context("installing the candidate gateway TLS certificate")?;
             Some(der)
         }
         None => {
             // A previous attempt may have rotated TLS where this one does not.
-            remove_if_present(&next_certificate_path())?;
+            remove_if_present(certificate_path)?;
             None
         }
     };
@@ -137,6 +138,28 @@ pub(crate) fn seal_candidate_identity(
             .context("encoding the candidate gateway PQ public key")?,
         tls_certificate,
     })
+}
+
+fn generate_candidate_tls(server_name: &str) -> Result<(Zeroizing<Vec<u8>>, DerCertificate)> {
+    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
+
+    // Self-issued, self-signed and pinned, exactly like the active leaf:
+    // §15 keeps this asymmetry deliberate, and `GatewayIdentityTransition`
+    // refuses a leaf that chains to the client CA-TLS instead.
+    let mut params = CertificateParams::new(vec![server_name.trim().to_string()])
+        .context("server name is not valid for an X.509 certificate")?;
+    params.is_ca = IsCa::NoCa;
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    params.not_before = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+    params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(825);
+    let key_pair = KeyPair::generate().context("generating the candidate gateway TLS key")?;
+    let certificate = params
+        .self_signed(&key_pair)
+        .context("creating the candidate gateway TLS certificate")?;
+    let der = DerCertificate::new(certificate.der().as_ref().to_vec())
+        .context("encoding the candidate gateway TLS certificate")?;
+    Ok((Zeroizing::new(key_pair.serialize_der()), der))
 }
 
 /// Signs a gateway certificate request under the keys this module holds
@@ -152,17 +175,34 @@ pub(crate) fn sign_certificate_request(
     gateway_identity_epoch: u64,
     continuity: RequestContinuity,
 ) -> Result<aether::certificates::gateway::GatewayCertificateRequest> {
+    sign_certificate_request_at(
+        request,
+        secret,
+        dry_run,
+        gateway_wg_public_key,
+        gateway_identity_epoch,
+        continuity,
+        &next_private_keystore_path(),
+    )
+}
+
+fn sign_certificate_request_at(
+    request: aether::certificates::gateway::GatewayCertificateRequest,
+    secret: Option<&SecretKey>,
+    dry_run: bool,
+    gateway_wg_public_key: &str,
+    gateway_identity_epoch: u64,
+    continuity: RequestContinuity,
+    keystore_path: &Path,
+) -> Result<aether::certificates::gateway::GatewayCertificateRequest> {
     let unsealing =
         secret.context("TPM secret unavailable: the candidate gateway identity stays sealed")?;
-    let sealed = SealedKeystore::new(
-        next_private_keystore_path(),
-        helios_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
-    )
-    .load(
-        unsealing,
-        &candidate_identity_context(gateway_wg_public_key, gateway_identity_epoch),
-    )
-    .context("unsealing the candidate gateway identity")?;
+    let sealed = SealedKeystore::new(keystore_path, helios_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY)
+        .load(
+            unsealing,
+            &candidate_identity_context(gateway_wg_public_key, gateway_identity_epoch),
+        )
+        .context("unsealing the candidate gateway identity")?;
     let stored: StoredCandidateIdentity =
         serde_json::from_slice(&sealed).context("decoding the candidate gateway identity")?;
     let candidate_pq = Zeroizing::new(
@@ -204,8 +244,6 @@ pub(crate) fn candidate_tls_certificate(
 pub(crate) fn read_candidate_tls_certificate(
     path: &std::path::Path,
 ) -> Result<Option<aether::certificates::encoding::DerCertificate>> {
-    use aether::certificates::encoding::DerCertificate;
-
     match std::fs::read(path) {
         Ok(der) => Ok(Some(
             DerCertificate::new(der).with_context(|| format!("reading {}", path.display()))?,
@@ -332,8 +370,12 @@ pub(crate) fn promote_candidate_identity(
 /// registry has persisted the abort — a candidate destroyed ahead of that
 /// write would be destroyed for a cancellation that was refused.
 pub(crate) fn discard_candidate_identity() -> Result<()> {
-    remove_if_present(&next_private_keystore_path())?;
-    remove_if_present(&next_certificate_path())
+    discard_candidate_identity_at(&next_private_keystore_path(), &next_certificate_path())
+}
+
+fn discard_candidate_identity_at(keystore_path: &Path, certificate_path: &Path) -> Result<()> {
+    remove_if_present(keystore_path)?;
+    remove_if_present(certificate_path)
 }
 
 #[cfg(test)]
@@ -389,6 +431,115 @@ mod tests {
     }
 
     #[test]
+    fn generated_tls_leaf_matches_its_pkcs8_key() {
+        let (private, leaf) =
+            generate_candidate_tls(" gateway.example ").expect("generate candidate TLS identity");
+
+        assert_tls_key_matches(&leaf, private.to_vec());
+    }
+
+    #[test]
+    fn generating_tls_rejects_a_server_name_that_cannot_be_encoded_in_x509() {
+        let error = generate_candidate_tls("gâtéway.example")
+            .err()
+            .expect("the certificate requires an ASCII DNS name");
+        assert_eq!(
+            error.to_string(),
+            "server name is not valid for an X.509 certificate"
+        );
+    }
+
+    pub(super) fn assert_tls_key_matches(leaf: &DerCertificate, tls_key: Vec<u8>) {
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let provider = rustls::crypto::ring::default_provider();
+        rustls::sign::CertifiedKey::from_der(
+            vec![leaf.as_bytes().to_vec().into()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(tls_key)),
+            &provider,
+        )
+        .expect("the public leaf matches the private key")
+        .keys_match()
+        .expect("verify the leaf's public key");
+    }
+
+    #[test]
+    fn reading_candidate_tls_distinguishes_absence_from_invalid_or_unreadable_files() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let certificate = directory.path().join("candidate.der");
+
+        assert!(read_candidate_tls_certificate(&certificate)
+            .expect("missing file")
+            .is_none());
+        std::fs::write(&certificate, []).expect("write empty file");
+        let error = read_candidate_tls_certificate(&certificate).expect_err("empty certificate");
+        assert!(error
+            .downcast_ref::<aether::certificates::CertificateError>()
+            .is_some());
+        assert!(read_candidate_tls_certificate(directory.path())
+            .expect_err("directory instead of a certificate")
+            .downcast_ref::<std::io::Error>()
+            .is_some());
+    }
+
+    #[test]
+    fn discarding_clears_the_candidate_and_is_idempotent() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let keystore = directory.path().join("candidate.sealed");
+        let certificate = directory.path().join("candidate.der");
+        std::fs::write(&keystore, b"sealed fixture").expect("create test vault");
+        std::fs::write(&certificate, b"certificate fixture").expect("create test certificate");
+
+        discard_candidate_identity_at(&keystore, &certificate).expect("remove candidate files");
+        assert!(!keystore.exists());
+        assert!(!certificate.exists());
+        discard_candidate_identity_at(&keystore, &certificate).expect("discard again");
+    }
+
+    #[test]
+    fn discarding_preserves_the_leaf_if_the_private_slot_cannot_be_removed() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let keystore = directory.path().join("candidate.sealed");
+        let certificate = directory.path().join("candidate.der");
+        let leaf = b"candidate certificate fixture";
+        std::fs::create_dir(&keystore).expect("block private file removal");
+        std::fs::write(&certificate, leaf).expect("create test certificate");
+
+        let error = discard_candidate_identity_at(&keystore, &certificate)
+            .expect_err("cannot remove the private file");
+        assert_eq!(
+            error.to_string(),
+            format!("removing {}", keystore.display())
+        );
+        assert_eq!(
+            std::fs::read(&certificate).expect("read retained certificate"),
+            leaf
+        );
+    }
+
+    #[test]
+    fn discarding_can_retry_after_the_private_slot_is_removed() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let keystore = directory.path().join("candidate.sealed");
+        let certificate = directory.path().join("candidate.der");
+        std::fs::write(&keystore, b"sealed fixture").expect("create test vault");
+        std::fs::create_dir(&certificate).expect("block public file removal");
+
+        let error = discard_candidate_identity_at(&keystore, &certificate)
+            .expect_err("cannot remove the public file");
+        assert_eq!(
+            error.to_string(),
+            format!("removing {}", certificate.display())
+        );
+        assert!(!keystore.exists());
+
+        std::fs::remove_dir(&certificate).expect("unblock certificate removal");
+        std::fs::write(&certificate, b"certificate fixture").expect("create test certificate");
+        discard_candidate_identity_at(&keystore, &certificate).expect("retry candidate removal");
+        assert!(!certificate.exists());
+    }
+
+    #[test]
     fn stored_candidate_rejects_unknown_fields_and_missing_pq_material() {
         for malformed in [
             br#"{"pq_private_key":"pq","tls_private_key":null,"extra":true}"#.as_slice(),
@@ -398,6 +549,246 @@ mod tests {
                 serde_json::from_slice::<StoredCandidateIdentity>(malformed).is_err(),
                 "malformed candidate record should be refused"
             );
+        }
+    }
+}
+
+#[cfg(all(test, not(feature = "tpm")))]
+mod sealed_slot_tests {
+    use super::*;
+    use aether::certificates::{
+        encoding::{Id16, MlDsa87PublicKey, MlDsa87Signature, TrustDomainId, WireGuardKey},
+        gateway::{Continuity, GatewayCertificateRequest},
+        CERTIFICATE_FORMAT_VERSION,
+    };
+    use std::path::PathBuf;
+
+    const SERVER_NAME: &str = "gateway.example";
+    const EPOCH: u64 = 17;
+    const NOW: u64 = 1_700_000_000;
+
+    struct Slot {
+        _directory: tempfile::TempDir,
+        secret: SecretKey,
+        gateway_key: WireGuardKey,
+        keystore: PathBuf,
+        certificate: PathBuf,
+    }
+
+    impl Slot {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().expect("temporary candidate directory");
+            let path = |name| directory.path().join(name);
+            let settings = helios_tpm::TpmSettings {
+                enabled: true,
+                allow_provisioning: true,
+                device: path("no-tpm-device").to_string_lossy().into_owned(),
+                sealed_blob_path: path("simulated-root").to_string_lossy().into_owned(),
+                ticket_path: path("ticket").to_string_lossy().into_owned(),
+                state_path: path("state").to_string_lossy().into_owned(),
+                update_window_marker_path: path("window").to_string_lossy().into_owned(),
+                ..helios_tpm::TpmSettings::default()
+            };
+            let decision = helios_tpm::BootController::unlock(&settings)
+                .expect("provision secret with the simulated TPM");
+            Self {
+                secret: decision.secret().expect("simulated secret").clone(),
+                gateway_key: WireGuardKey::from_bytes([9; 32]),
+                keystore: path("candidate.sealed"),
+                certificate: path("candidate.der"),
+                _directory: directory,
+            }
+        }
+
+        fn seal(&self, rotate_tls: bool) -> Result<SealedCandidate> {
+            seal_candidate_identity_at(
+                &self.secret,
+                &self.gateway_key.to_base64(),
+                SERVER_NAME,
+                EPOCH,
+                rotate_tls,
+                &self.keystore,
+                &self.certificate,
+            )
+        }
+
+        fn store(&self) -> SealedKeystore {
+            SealedKeystore::new(&self.keystore, helios_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY)
+        }
+
+        fn read_private(&self) -> StoredCandidateIdentity {
+            let context = candidate_identity_context(&self.gateway_key.to_base64(), EPOCH);
+            let encoded = self.store().load(&self.secret, &context).expect("unseal");
+            serde_json::from_slice(&encoded).expect("decode private candidate")
+        }
+
+        fn request(&self, pq_public_key: MlDsa87PublicKey) -> GatewayCertificateRequest {
+            GatewayCertificateRequest {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                trust_domain_id: TrustDomainId::new([1; 16]).expect("domain"),
+                gateway_identity_epoch: EPOCH,
+                gateway_wg_public_key: self.gateway_key,
+                server_name: SERVER_NAME.into(),
+                new_ml_dsa_87_public_key: pq_public_key,
+                request_id: Id16::new([7; 16]).expect("id"),
+                created_at: NOW,
+                expires_at: NOW + 3_600,
+                new_key_proof: MlDsa87Signature::placeholder(),
+                current_key_authorization: None,
+            }
+        }
+    }
+
+    #[test]
+    fn sealing_tls_writes_a_leaf_matching_the_private_key_then_pq_only_replaces_the_candidate() {
+        let slot = Slot::new();
+        let sealed = slot.seal(true).expect("seal TLS and PQ keys");
+        let leaf = sealed.tls_certificate.expect("candidate TLS certificate");
+        assert_eq!(
+            read_candidate_tls_certificate(&slot.certificate).expect("read public leaf"),
+            Some(leaf.clone())
+        );
+
+        let private = slot.read_private();
+        let tls_key = base64::engine::general_purpose::STANDARD
+            .decode(private.tls_private_key.as_deref().expect("TLS private key"))
+            .expect("decode TLS key");
+        tests::assert_tls_key_matches(&leaf, tls_key);
+
+        let replacement = slot.seal(false).expect("seal replacement PQ key only");
+        assert_ne!(replacement.pq_public_key, sealed.pq_public_key);
+        assert!(replacement.tls_certificate.is_none());
+        assert!(slot.read_private().tls_private_key.is_none());
+        assert!(!slot.certificate.exists());
+    }
+
+    #[test]
+    fn sealing_failure_cannot_replace_the_public_leaf() {
+        let slot = Slot::new();
+        let leaf = slot.seal(true).expect("first preparation").tls_certificate;
+        std::fs::remove_file(&slot.keystore).expect("remove test vault");
+        std::fs::create_dir(&slot.keystore).expect("block writes at the vault path");
+
+        let error = slot.seal(true).err().expect("sealing must fail");
+
+        assert_eq!(error.to_string(), "sealing the candidate gateway keys");
+        assert_eq!(
+            read_candidate_tls_certificate(&slot.certificate).expect("read previous leaf"),
+            leaf
+        );
+    }
+
+    #[test]
+    fn a_failed_public_install_leaves_the_private_candidate_sealed() {
+        let slot = Slot::new();
+        std::fs::create_dir(&slot.certificate).expect("block publication");
+
+        let error = slot.seal(true).err().expect("publication must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "installing the candidate gateway TLS certificate"
+        );
+        assert!(slot.read_private().tls_private_key.is_some());
+    }
+
+    #[test]
+    fn recovery_proves_possession_without_faking_active_key_continuity() {
+        let slot = Slot::new();
+        let sealed = slot.seal(false).expect("seal PQ key");
+        let request = slot.request(sealed.pq_public_key);
+        let signed = sign_certificate_request_at(
+            request,
+            Some(&slot.secret),
+            false,
+            &slot.gateway_key.to_base64(),
+            EPOCH,
+            RequestContinuity::KeyRecovery,
+            &slot.keystore,
+        )
+        .expect("sign using the sealed candidate only");
+
+        assert!(signed.current_key_authorization.is_none());
+        signed
+            .verify(
+                Continuity::WaivedForKeyRecovery,
+                &signed.trust_domain_id,
+                EPOCH - 1,
+                &slot.gateway_key,
+                SERVER_NAME,
+                NOW,
+            )
+            .expect("the candidate proof verifies against the public key");
+    }
+
+    #[test]
+    fn signing_refuses_to_open_the_slot_for_another_gateway_or_epoch() {
+        let slot = Slot::new();
+        let sealed = slot.seal(false).expect("seal PQ key");
+        let request = slot.request(sealed.pq_public_key);
+
+        for (gateway_key, epoch) in [
+            (WireGuardKey::from_bytes([8; 32]), EPOCH),
+            (slot.gateway_key, EPOCH + 1),
+        ] {
+            let error = sign_certificate_request_at(
+                request.clone(),
+                Some(&slot.secret),
+                false,
+                &gateway_key.to_base64(),
+                epoch,
+                RequestContinuity::KeyRecovery,
+                &slot.keystore,
+            )
+            .expect_err("the slot belongs to the original gateway and epoch");
+            assert_eq!(
+                error.to_string(),
+                "unsealing the candidate gateway identity"
+            );
+        }
+    }
+
+    #[test]
+    fn signing_distinguishes_malformed_candidate_records_from_missing_unlock_secret() {
+        let slot = Slot::new();
+        let sealed = slot.seal(false).expect("seal PQ key");
+        let request = slot.request(sealed.pq_public_key);
+        let gateway_key = slot.gateway_key.to_base64();
+        let context = candidate_identity_context(&gateway_key, EPOCH);
+        let sign = |secret| {
+            sign_certificate_request_at(
+                request.clone(),
+                secret,
+                true,
+                &gateway_key,
+                EPOCH,
+                RequestContinuity::KeyRecovery,
+                &slot.keystore,
+            )
+            .expect_err("refuse to sign")
+        };
+        assert_eq!(
+            sign(None).to_string(),
+            "TPM secret unavailable: the candidate gateway identity stays sealed"
+        );
+        for (record, error) in [
+            (
+                br#"{"pq_private_key":42}"#.as_slice(),
+                "decoding the candidate gateway identity",
+            ),
+            (
+                br#"{"pq_private_key":"!"}"#.as_slice(),
+                "decoding the candidate gateway PQ private key",
+            ),
+            (
+                br#"{"pq_private_key":"AA=="}"#.as_slice(),
+                "signing the gateway certificate request",
+            ),
+        ] {
+            slot.store()
+                .store(&slot.secret, &context, record)
+                .expect("install malformed candidate");
+            assert_eq!(sign(Some(&slot.secret)).to_string(), error);
         }
     }
 }
