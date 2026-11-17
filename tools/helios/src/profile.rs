@@ -421,6 +421,147 @@ mod tests {
         }
     }
 
+    async fn emit_from_view(
+        gateway: Option<&str>,
+        peers: serde_json::Value,
+        options: EmitOptions,
+    ) -> Result<()> {
+        let mut body = network_json(peers);
+        body["wg_public_key"] = serde_json::json!(gateway);
+        let (base, server) = crate::tests::one_response_server("200 OK", body.to_string()).await;
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .expect("loopback HTTP client");
+        let outcome = emit(&client, &base, options).await;
+        let request = server.await.expect("mock gateway served one request");
+        assert!(request.starts_with("GET /api/network "), "{request}");
+        outcome
+    }
+
+    #[tokio::test]
+    async fn emit_writes_an_importable_profile_using_the_admitted_dual_stack_addresses() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("portable.orion");
+        let gateway = aether::wg::generate_keypair().expect("gateway keys");
+        let client = aether::wg::generate_keypair().expect("client keys");
+        let ipv6 = "fd3c:91a2:7e04::2/128";
+        let mut admitted = peer(ipv6.into());
+        admitted["public_key"] = serde_json::json!(client.public_key);
+        emit_from_view(
+            Some(&gateway.public_key),
+            serde_json::json!([admitted]),
+            EmitOptions {
+                public_key: Some(client.public_key),
+                allowed_ips: Some("10.0.0.0/8".into()),
+                output: Some(path.clone()),
+                ..options()
+            },
+        )
+        .await
+        .expect("emit profile");
+
+        let profile = orion_core::read_profile_import_path(&path)
+            .expect("import the emitted document")
+            .profile;
+        assert_eq!(profile.address.as_deref(), Some("100.64.1.2/32"));
+        assert_eq!(profile.address_v6.as_deref(), Some(ipv6));
+        assert_eq!(profile.allowed_ips, "10.0.0.0/8");
+        assert_eq!(profile.peer_public_key, gateway.public_key);
+        assert!(profile.private_key.is_empty());
+        check(&path).expect("check command reads the emitted file");
+    }
+
+    #[tokio::test]
+    async fn emit_refuses_a_missing_gateway_identity_or_mismatched_admission() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("portable.orion");
+        let gateway = aether::wg::generate_keypair().expect("gateway keys");
+        let client = aether::wg::generate_keypair().expect("client keys");
+
+        for (gateway, peers, expected) in [
+            (
+                None,
+                serde_json::json!([]),
+                "does not have a WireGuard identity",
+            ),
+            (
+                Some(""),
+                serde_json::json!([]),
+                "does not have a WireGuard identity",
+            ),
+            (
+                Some(gateway.public_key.as_str()),
+                serde_json::json!([]),
+                "no peer named",
+            ),
+            (
+                Some(gateway.public_key.as_str()),
+                serde_json::json!([peer(serde_json::Value::Null)]),
+                "different public key",
+            ),
+        ] {
+            let error = emit_from_view(
+                gateway,
+                peers,
+                EmitOptions {
+                    public_key: Some(client.public_key.clone()),
+                    output: Some(path.clone()),
+                    ..options()
+                },
+            )
+            .await
+            .expect_err("cannot issue a profile from the gateway view");
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(!path.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_refuses_to_overwrite_an_existing_document() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("portable.orion");
+        std::fs::write(&path, b"existing profile").expect("existing document");
+        let gateway = aether::wg::generate_keypair().expect("gateway keys");
+        let client = aether::wg::generate_keypair().expect("client keys");
+        let mut admitted = peer(serde_json::Value::Null);
+        admitted["public_key"] = serde_json::json!(client.public_key);
+        let error = emit_from_view(
+            Some(&gateway.public_key),
+            serde_json::json!([admitted]),
+            EmitOptions {
+                public_key: Some(client.public_key),
+                output: Some(path.clone()),
+                ..options()
+            },
+        )
+        .await
+        .expect_err("the existing profile must be preserved");
+        assert!(
+            error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
+            }),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(path).expect("read existing document"),
+            b"existing profile"
+        );
+    }
+
+    #[test]
+    fn checking_a_profile_reports_its_path_when_import_fails() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("unreadable.orion");
+        std::fs::write(&path, b"not a profile").expect("malformed document");
+        let error = check(&path).expect_err("Orion refuses the file");
+
+        assert_eq!(error.to_string(), format!("reading {}", path.display()));
+    }
+
     #[test]
     fn invitation_mode_produces_no_private_key() {
         let pair = aether::wg::generate_keypair().unwrap();
@@ -640,8 +781,8 @@ mod tests {
         );
     }
 
-    fn view(peers: serde_json::Value) -> api::NetworkConfigView {
-        serde_json::from_value(serde_json::json!({
+    fn network_json(peers: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
             "wan_ifaces": ["eth0"],
             "lan_ifaces": [],
             "allow_ssh_from": [],
@@ -653,8 +794,11 @@ mod tests {
             "wg_listen_port": 51820,
             "key_negotiation_port": 51821,
             "peers": peers,
-        }))
-        .unwrap()
+        })
+    }
+
+    fn view(peers: serde_json::Value) -> api::NetworkConfigView {
+        serde_json::from_value(network_json(peers)).unwrap()
     }
 
     fn peer(address_v6: serde_json::Value) -> serde_json::Value {

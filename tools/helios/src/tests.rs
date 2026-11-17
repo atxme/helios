@@ -35,9 +35,9 @@ async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
     String::from_utf8_lossy(&request).into_owned()
 }
 
-async fn one_response_server(
+pub(super) async fn one_response_server(
     status: &'static str,
-    body: &'static str,
+    body: impl Into<String>,
 ) -> (String, tokio::task::JoinHandle<String>) {
     use tokio::io::AsyncWriteExt as _;
 
@@ -45,6 +45,7 @@ async fn one_response_server(
         .await
         .expect("local HTTP listener");
     let address = listener.local_addr().expect("listener address");
+    let body = body.into();
     let task = tokio::spawn(async move {
         let (mut stream, _) =
             tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
