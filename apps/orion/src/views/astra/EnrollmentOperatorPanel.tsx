@@ -602,7 +602,7 @@ function ResumeDialog({
             />
             <Typography color="text.secondary" sx={{ fontSize: 10.5, mt: 0.5 }}>
               {connected
-                ? 'Facultatif : la gateway connectée est lue.'
+                ? 'Ignoré tunnel monté : la gateway connectée fait foi.'
                 : 'Sans tunnel : le fichier de heliosd export-enrolment.'}
             </Typography>
             {fileError && (

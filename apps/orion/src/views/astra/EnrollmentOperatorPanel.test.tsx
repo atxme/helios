@@ -271,12 +271,12 @@ describe('EnrollmentOperatorPanel', () => {
     expect(Object.keys(gesture)).not.toContain('enrolment_export')
   })
 
-  it('resume_with_a_tunnel_up_only_hints_that_the_export_is_optional', async () => {
+  it('resume_with_a_tunnel_up_says_the_export_is_ignored', async () => {
     api.operatorInvitations.mockResolvedValue([invitation('a', { resumable: true })])
     render(<EnrollmentOperatorPanel onCeremony={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Reprendre' }))
     expect(
-      await screen.findByText('Facultatif : la gateway connectée est lue.'),
+      await screen.findByText('Ignoré tunnel monté : la gateway connectée fait foi.'),
     ).toBeTruthy()
     expect(screen.queryByText(/Sans tunnel/)).toBeNull()
   })

@@ -409,7 +409,7 @@ export function CertificateDomainPanel() {
       {domain.issuer !== null && !domain.issuer.usable && (
         <KnownLimit register="danger" title="L’émetteur délégué ne peut plus signer">
           Aucun renouvellement client n’aboutira tant qu’il n’est pas réautorisé —{' '}
-          <code>astra issuer request</code>, <code>Orion, Astra › Approbations</code>,{' '}
+          <code>astra issuer request</code>, Orion, Astra › Approbations,{' '}
           <code>astra issuer install</code>.
         </KnownLimit>
       )}
