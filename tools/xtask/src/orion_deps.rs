@@ -35,13 +35,23 @@ pub const WIREGUARD_FILES: &[(&str, &str)] = &[
 
 /// Downloads, verifies and extracts the WireGuardNT resources below `root`.
 pub fn prepare(root: &Path) -> Result<()> {
+    prepare_with(root, WIREGUARD_NT_SHA256, |part| {
+        download_bounded(WIREGUARD_NT_URL, part, MAX_WIREGUARD_ARCHIVE_BYTES)
+    })
+}
+
+fn prepare_with(
+    root: &Path,
+    expected_sha256: &str,
+    download: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     let cache_dir = root.join("target").join("orion-deps");
     let archive = cache_dir.join(format!("wireguard-nt-{WIREGUARD_NT_VERSION}.zip"));
     let part = archive.with_extension("zip.part");
     std::fs::create_dir_all(&cache_dir)
         .with_context(|| format!("creating {}", cache_dir.display()))?;
 
-    let archive_is_valid = archive.is_file() && sha256_matches(&archive, WIREGUARD_NT_SHA256)?;
+    let archive_is_valid = archive.is_file() && sha256_matches(&archive, expected_sha256)?;
     if archive_is_valid {
         println!("==> WireGuardNT {WIREGUARD_NT_VERSION}: cached archive verified");
     } else {
@@ -54,12 +64,12 @@ pub fn prepare(root: &Path) -> Result<()> {
                 .with_context(|| format!("removing incomplete download {}", part.display()))?;
         }
         println!("==> WireGuardNT {WIREGUARD_NT_VERSION}: official download");
-        download_bounded(WIREGUARD_NT_URL, &part, MAX_WIREGUARD_ARCHIVE_BYTES)?;
-        if !sha256_matches(&part, WIREGUARD_NT_SHA256)? {
+        download(&part)?;
+        if !sha256_matches(&part, expected_sha256)? {
             let actual = hex(&helios_update::sha256_file(&part)
                 .map_err(|e| anyhow::anyhow!("fingerprint of {}: {e}", part.display()))?);
             std::fs::remove_file(&part).ok();
-            bail!("WireGuardNT archive rejected: SHA-256 {actual}, expected {WIREGUARD_NT_SHA256}");
+            bail!("WireGuardNT archive rejected: SHA-256 {actual}, expected {expected_sha256}");
         }
         std::fs::rename(&part, &archive)
             .with_context(|| format!("validating {}", archive.display()))?;
@@ -210,6 +220,137 @@ mod tests {
         ]
     }
 
+    fn cached_archive(root: &Path) -> PathBuf {
+        root.join("target/orion-deps")
+            .join(format!("wireguard-nt-{WIREGUARD_NT_VERSION}.zip"))
+    }
+
+    #[test]
+    fn prepare_reuses_verified_archive_without_downloading() {
+        let directory = TestDirectory::new();
+        let root = directory.path();
+        let cached = cached_archive(root);
+        std::fs::create_dir_all(cached.parent().expect("cache parent")).expect("create cache");
+        archive(&cached, &required_entries());
+        let digest = hex(&helios_update::sha256_file(&cached).expect("hash fixture"));
+
+        prepare_with(root, &digest, |_| panic!("verified cache should be reused"))
+            .expect("install verified archive");
+
+        assert!(sha256_matches(&cached, &digest).expect("check cached archive"));
+        assert_eq!(
+            std::fs::read(root.join("resources-windows/LICENSE-WireGuardNT.txt"))
+                .expect("read extracted license"),
+            b"license"
+        );
+    }
+
+    #[test]
+    fn prepare_replaces_invalid_cache_and_discards_previous_partial_download() {
+        let directory = TestDirectory::new();
+        let root = directory.path();
+        let cached = cached_archive(root);
+        let partial = cached.with_extension("zip.part");
+        std::fs::create_dir_all(cached.parent().expect("cache parent")).expect("create cache");
+        std::fs::write(&cached, b"invalid cache").expect("write invalid cache");
+        std::fs::write(&partial, b"incomplete earlier download").expect("write partial archive");
+        let fixture = root.join("fixture.zip");
+        archive(&fixture, &required_entries());
+        let digest = hex(&helios_update::sha256_file(&fixture).expect("hash fixture"));
+
+        prepare_with(root, &digest, |destination| {
+            assert_eq!(destination, partial);
+            assert!(!cached.exists());
+            assert!(!partial.exists());
+            std::fs::copy(&fixture, destination)?;
+            Ok(())
+        })
+        .expect("refresh invalid cache");
+
+        assert!(sha256_matches(&cached, &digest).expect("check verified cache"));
+        assert!(!partial.exists());
+        assert_eq!(
+            std::fs::read(root.join("resources-windows/binaries/wireguard-arm64.dll"))
+                .expect("read extracted binary"),
+            b"arm64 dll"
+        );
+    }
+
+    #[test]
+    fn prepare_rejects_a_download_before_replacing_installed_files() {
+        let directory = TestDirectory::new();
+        let root = directory.path();
+        let cached = cached_archive(root);
+        let installed = root.join("resources-windows/binaries/wireguard-amd64.dll");
+        std::fs::create_dir_all(installed.parent().expect("output parent")).expect("create output");
+        std::fs::write(&installed, b"already installed").expect("write installed binary");
+
+        let error = prepare_with(root, WIREGUARD_NT_SHA256, |destination| {
+            archive(destination, &required_entries());
+            Ok(())
+        })
+        .expect_err("reject archive with the wrong digest");
+
+        let message = error.to_string();
+        assert!(message.contains("WireGuardNT archive rejected: SHA-256"));
+        assert!(message.contains(WIREGUARD_NT_SHA256));
+        assert!(!cached.exists());
+        assert!(!cached.with_extension("zip.part").exists());
+        assert_eq!(
+            std::fs::read(installed).expect("read previous binary"),
+            b"already installed"
+        );
+    }
+
+    #[test]
+    fn prepare_propagates_download_failure_without_installing_a_partial_archive() {
+        let directory = TestDirectory::new();
+        let root = directory.path();
+        let cached = cached_archive(root);
+
+        let error = prepare_with(root, WIREGUARD_NT_SHA256, |destination| {
+            std::fs::write(destination, b"incomplete response")?;
+            bail!("download interrupted")
+        })
+        .expect_err("interrupted download fails");
+
+        assert_eq!(error.to_string(), "download interrupted");
+        assert!(!cached.exists());
+        assert!(!root.join("resources-windows").exists());
+    }
+
+    #[test]
+    fn prepare_reports_paths_that_block_cache_setup_before_downloading() {
+        let directory = TestDirectory::new();
+        let root = directory.path();
+        let cached = cached_archive(root);
+        let partial = cached.with_extension("zip.part");
+        let cache_dir = cached.parent().expect("cache parent");
+        std::fs::create_dir_all(cache_dir.parent().expect("target parent")).expect("create target");
+        std::fs::write(cache_dir, b"not a directory").expect("block cache creation");
+        let error = prepare_with(root, WIREGUARD_NT_SHA256, |_| {
+            panic!("cache creation should fail before downloading")
+        })
+        .expect_err("reject file blocking the cache directory");
+        assert!(error.to_string().contains("creating"));
+        std::fs::remove_file(cache_dir).expect("unblock cache creation");
+
+        std::fs::create_dir_all(&cached).expect("block cached archive with a directory");
+        let error = prepare_with(root, WIREGUARD_NT_SHA256, |_| {
+            panic!("invalid archive removal should fail before downloading")
+        })
+        .expect_err("reject directory blocking the archive");
+        assert!(error.to_string().contains("removing invalid archive"));
+        std::fs::remove_dir(&cached).expect("unblock cached archive");
+
+        std::fs::create_dir(&partial).expect("block partial archive with a directory");
+        let error = prepare_with(root, WIREGUARD_NT_SHA256, |_| {
+            panic!("incomplete archive removal should fail before downloading")
+        })
+        .expect_err("reject directory blocking the partial archive");
+        assert!(error.to_string().contains("removing incomplete download"));
+    }
+
     #[test]
     fn extraction_writes_all_required_files_to_their_runtime_names() {
         let directory = TestDirectory::new();
@@ -256,11 +397,79 @@ mod tests {
             .expect_err("invalid archive rejected");
         assert!(format!("{error:#}").contains("reading archive"));
 
-        let missing = directory.path().join("missing.zip");
-        archive(&missing, &required_entries()[..2]);
-        let error = extract_wireguard_files(&missing, &directory.path().join("missing-out"))
-            .expect_err("missing license rejected");
-        assert!(format!("{error:#}").contains(WIREGUARD_FILES[2].0));
+        for (missing_index, (missing_name, _)) in WIREGUARD_FILES.iter().enumerate() {
+            let missing = directory
+                .path()
+                .join(format!("missing-{missing_index}.zip"));
+            let entries: Vec<_> = required_entries()
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, entry)| (index != missing_index).then_some(entry))
+                .collect();
+            archive(&missing, &entries);
+            let error = extract_wireguard_files(
+                &missing,
+                &directory
+                    .path()
+                    .join(format!("missing-out-{missing_index}")),
+            )
+            .expect_err("missing required entry rejected");
+            assert!(format!("{error:#}").contains(missing_name));
+        }
+    }
+
+    #[test]
+    fn extraction_rejects_a_file_blocking_the_output_directory() {
+        let directory = TestDirectory::new();
+        let archive_path = directory.path().join("wireguard.zip");
+        archive(&archive_path, &required_entries());
+        let destination = directory.path().join("resources-windows");
+        let blocked_parent = destination.join("binaries");
+        std::fs::create_dir_all(&destination).expect("create destination");
+        std::fs::write(&blocked_parent, b"not a directory").expect("block output directory");
+
+        let error = extract_wireguard_files(&archive_path, &destination)
+            .expect_err("file blocking the output directory rejected");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("creating"));
+        assert!(message.contains(&blocked_parent.display().to_string()));
+    }
+
+    #[test]
+    fn extraction_rejects_a_directory_blocking_the_temporary_file() {
+        let directory = TestDirectory::new();
+        let archive_path = directory.path().join("wireguard.zip");
+        archive(&archive_path, &required_entries());
+        let destination = directory.path().join("resources-windows");
+        let temporary = destination
+            .join(WIREGUARD_FILES[0].1)
+            .with_extension("part");
+        std::fs::create_dir_all(&temporary).expect("block temporary file");
+
+        let error = extract_wireguard_files(&archive_path, &destination)
+            .expect_err("directory blocking the temporary file rejected");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("creating"));
+        assert!(message.contains(&temporary.display().to_string()));
+    }
+
+    #[test]
+    fn extraction_rejects_a_directory_at_an_existing_output_path() {
+        let directory = TestDirectory::new();
+        let archive_path = directory.path().join("wireguard.zip");
+        archive(&archive_path, &required_entries());
+        let destination = directory.path().join("resources-windows");
+        let existing = destination.join(WIREGUARD_FILES[0].1);
+        std::fs::create_dir_all(&existing).expect("block output with a directory");
+
+        let error = extract_wireguard_files(&archive_path, &destination)
+            .expect_err("directory at output path rejected");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("replacing"));
+        assert!(message.contains(&existing.display().to_string()));
     }
 
     #[test]
