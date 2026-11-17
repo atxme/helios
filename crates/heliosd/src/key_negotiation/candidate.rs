@@ -289,36 +289,7 @@ pub(crate) fn promote_candidate_identity(
     gateway: &aether::certificates::state::GatewayCertificateState,
     transition: &aether::certificates::gateway::GatewayIdentityTransition,
 ) -> Result<()> {
-    use aether::certificates::gateway::pq_certificate_fingerprint;
-
-    anyhow::ensure!(
-        gateway.active_gateway_identity_epoch == transition.gateway_identity_epoch,
-        "the promoted registry is at gateway epoch {}, but the retained transition is for epoch {}",
-        gateway.active_gateway_identity_epoch,
-        transition.gateway_identity_epoch
-    );
-    anyhow::ensure!(
-        gateway.gateway_wg_public_key == transition.gateway_wg_public_key,
-        "the retained transition belongs to another gateway identity"
-    );
-
-    let expected_tls = transition.next_gateway_tls_certificate.as_ref().map_or(
-        transition.active_gateway_tls_certificate_fingerprint,
-        |certificate| certificate.fingerprint(),
-    );
-    anyhow::ensure!(
-        gateway.active_tls_fingerprint().matches(&expected_tls),
-        "the promoted TLS leaf does not match the retained transition"
-    );
-    let expected_pq = match &transition.next_gateway_certificate {
-        Some(certificate) => pq_certificate_fingerprint(certificate)
-            .context("fingerprinting the retained candidate PQ leaf")?,
-        None => transition.active_gateway_certificate_fingerprint,
-    };
-    anyhow::ensure!(
-        gateway.active_pq_fingerprint()?.matches(&expected_pq),
-        "the promoted PQ leaf does not match the retained transition"
-    );
+    validate_promoted_gateway_identity(gateway, transition)?;
 
     let gateway_wg_public_key = gateway.gateway_wg_public_key.to_base64();
     let active = load_active_private_identity_with_secret(secret, &gateway_wg_public_key)?;
@@ -360,6 +331,46 @@ pub(crate) fn promote_candidate_identity(
             .context("encoding the promoted gateway PQ certificate")?,
     )
     .context("installing the promoted gateway PQ certificate")
+}
+
+/// Checks the promoted epoch, gateway key and active leaf fingerprints
+/// against the retained transition before opening either private slot.
+pub(crate) fn validate_promoted_gateway_identity(
+    gateway: &aether::certificates::state::GatewayCertificateState,
+    transition: &aether::certificates::gateway::GatewayIdentityTransition,
+) -> Result<()> {
+    use aether::certificates::gateway::pq_certificate_fingerprint;
+
+    anyhow::ensure!(
+        gateway.active_gateway_identity_epoch == transition.gateway_identity_epoch,
+        "the promoted registry is at gateway epoch {}, but the retained transition is for epoch {}",
+        gateway.active_gateway_identity_epoch,
+        transition.gateway_identity_epoch
+    );
+    anyhow::ensure!(
+        gateway.gateway_wg_public_key == transition.gateway_wg_public_key,
+        "the retained transition belongs to another gateway identity"
+    );
+
+    let expected_tls = transition.next_gateway_tls_certificate.as_ref().map_or(
+        transition.active_gateway_tls_certificate_fingerprint,
+        |certificate| certificate.fingerprint(),
+    );
+    anyhow::ensure!(
+        gateway.active_tls_fingerprint().matches(&expected_tls),
+        "the promoted TLS leaf does not match the retained transition"
+    );
+    let expected_pq = match &transition.next_gateway_certificate {
+        Some(certificate) => pq_certificate_fingerprint(certificate)
+            .context("fingerprinting the retained candidate PQ leaf")?,
+        None => transition.active_gateway_certificate_fingerprint,
+    };
+    anyhow::ensure!(
+        gateway.active_pq_fingerprint()?.matches(&expected_pq),
+        "the promoted PQ leaf does not match the retained transition"
+    );
+
+    Ok(())
 }
 
 /// Destroys the candidate identity, private half first (spec §6.3, `aborted`).

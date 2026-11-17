@@ -457,6 +457,114 @@ fn staged_transition(epoch: u64) -> GatewayIdentityTransition {
     }
 }
 
+fn promoted_registry_and_transition(
+    mut gateway: GatewayCertificateState,
+    rotate_tls: bool,
+    rotate_pq: bool,
+) -> (GatewayCertificateState, GatewayIdentityTransition) {
+    let mut transition = staged_transition(gateway.active_gateway_identity_epoch + 1);
+    transition.active_gateway_tls_certificate_fingerprint = gateway.active_tls_fingerprint();
+    transition.active_gateway_certificate_fingerprint = gateway
+        .active_pq_fingerprint()
+        .expect("outgoing PQ fingerprint");
+
+    if rotate_tls {
+        let new_leaf = aether::certificates::encoding::DerCertificate::new(vec![2; 64])
+            .expect("candidate TLS leaf");
+        transition.next_gateway_tls_certificate = Some(new_leaf.clone());
+        gateway.active_gateway_tls_certificate = new_leaf;
+    }
+    if rotate_pq {
+        let new_leaf = gateway_leaf();
+        transition.next_gateway_certificate = Some(new_leaf.clone());
+        gateway.active_gateway_certificate = new_leaf;
+    }
+    gateway.active_gateway_identity_epoch = transition.gateway_identity_epoch;
+    gateway.gateway_decision_epoch = transition.gateway_identity_epoch;
+    (gateway, transition)
+}
+
+#[test]
+fn promotion_guard_accepts_partial_and_full_leaf_rotations() {
+    for (rotate_tls, rotate_pq) in [(true, false), (false, true), (true, true)] {
+        let (gateway, transition) =
+            promoted_registry_and_transition(gateway(), rotate_tls, rotate_pq);
+        crate::key_negotiation::validate_promoted_gateway_identity(&gateway, &transition)
+            .expect("the registry agrees with the promoted transition");
+    }
+}
+
+#[test]
+fn promotion_guard_rejects_a_registry_still_at_the_outgoing_epoch() {
+    let (mut gateway, transition) = promoted_registry_and_transition(gateway(), true, true);
+    gateway.active_gateway_identity_epoch -= 1;
+
+    let error = crate::key_negotiation::validate_promoted_gateway_identity(&gateway, &transition)
+        .expect_err("wrong active epoch");
+    assert!(error.to_string().contains("registry is at gateway epoch 3"));
+}
+
+#[test]
+fn promotion_guard_rejects_a_transition_for_another_gateway() {
+    let (gateway, mut transition) = promoted_registry_and_transition(gateway(), true, true);
+    transition.gateway_wg_public_key = WireGuardKey::from_bytes([10; 32]);
+
+    let error = crate::key_negotiation::validate_promoted_gateway_identity(&gateway, &transition)
+        .expect_err("wrong gateway");
+    assert_eq!(
+        error.to_string(),
+        "the retained transition belongs to another gateway identity"
+    );
+}
+
+#[test]
+fn promotion_guard_rejects_the_outgoing_tls_leaf_when_tls_was_rotated() {
+    let outgoing = gateway();
+    let outgoing_tls = outgoing.active_gateway_tls_certificate.clone();
+    let (mut gateway, transition) = promoted_registry_and_transition(outgoing, true, false);
+    gateway.active_gateway_tls_certificate = outgoing_tls;
+
+    let error = crate::key_negotiation::validate_promoted_gateway_identity(&gateway, &transition)
+        .expect_err("the outgoing TLS leaf is still active");
+    assert_eq!(
+        error.to_string(),
+        "the promoted TLS leaf does not match the retained transition"
+    );
+}
+
+#[test]
+fn promotion_guard_rejects_the_outgoing_pq_leaf_when_pq_was_rotated() {
+    let outgoing = gateway();
+    let outgoing_pq = outgoing.active_gateway_certificate.clone();
+    let (mut gateway, transition) = promoted_registry_and_transition(outgoing, false, true);
+    gateway.active_gateway_certificate = outgoing_pq;
+
+    let error = crate::key_negotiation::validate_promoted_gateway_identity(&gateway, &transition)
+        .expect_err("the outgoing PQ leaf is still active");
+    assert_eq!(
+        error.to_string(),
+        "the promoted PQ leaf does not match the retained transition"
+    );
+}
+
+#[test]
+fn promotion_guard_rejects_a_candidate_pq_leaf_with_no_canonical_fingerprint() {
+    let (gateway, mut transition) = promoted_registry_and_transition(gateway(), false, true);
+    transition
+        .next_gateway_certificate
+        .as_mut()
+        .expect("candidate PQ certificate")
+        .ml_dsa_87_signature
+        .clear();
+
+    let error = crate::key_negotiation::validate_promoted_gateway_identity(&gateway, &transition)
+        .expect_err("the candidate no longer contains a well-formed signature");
+    assert_eq!(
+        error.to_string(),
+        "fingerprinting the retained candidate PQ leaf"
+    );
+}
+
 #[test]
 fn a_gateway_with_nothing_in_flight_is_left_alone() {
     let directory = tempfile::tempdir().expect("temp dir");

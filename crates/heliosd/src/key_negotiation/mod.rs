@@ -90,13 +90,13 @@ mod server;
 mod transaction;
 
 // The paths the rest of the daemon already names, unchanged by the split.
-#[cfg(test)]
-pub(crate) use candidate::read_candidate_tls_certificate;
 pub(crate) use candidate::{
     assert_candidate_identity_promotable, candidate_tls_certificate, discard_candidate_identity,
     promote_candidate_identity, seal_candidate_identity, sign_certificate_request,
     RequestContinuity, SealedCandidate,
 };
+#[cfg(test)]
+pub(crate) use candidate::{read_candidate_tls_certificate, validate_promoted_gateway_identity};
 pub use identity::{
     gateway_bootstrap_request, initialize, install_gateway_bootstrap_certificate, public_material,
     restart_due, served_identity,
