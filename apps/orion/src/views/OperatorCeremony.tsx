@@ -574,6 +574,33 @@ export function refusalSentence(
       return 'Le domaine est déjà finalisé : CA-TLS et document de credentials sont en place.'
     case 'handoff_mismatch':
       return 'La proposition ne correspond pas à ce que ce coffre épingle.'
+    case 'export_unreadable':
+      return "Ce fichier n'est pas un export d'enrôlement de `heliosd export-enrolment`."
+    case 'export_other_gateway':
+      return "Cet export vient d'une autre gateway que celle de l'invitation."
+    case 'export_other_peer':
+      return "Cet export nomme un autre poste que la demande acceptée."
+    case 'export_other_domain':
+      return "Cet export vient d'un autre domaine que ce coffre."
+    case 'export_leaf_invalid':
+      return "La feuille PQ de cet export ne se vérifie pas sous le CA-PQ de ce domaine."
+    case 'export_incomplete':
+      return (
+        "Cet export ne suffit pas à construire le document : refaire `heliosd export-enrolment` " +
+        'sur la gateway, le pair étant admis.'
+      )
+    case 'export_relay_unavailable':
+      return "Le relais du domaine est absent ou illisible : l'export ne peut pas être vérifié contre lui."
+    case 'export_relay_rp_id':
+      return "L'export ne correspond pas au relais du domaine (RP ID WebAuthn)."
+    case 'export_relay_ca_tls':
+      return "L'export ne correspond pas au relais du domaine (CA-TLS client)."
+    case 'export_relay_epochs':
+      return "L'export ne correspond pas au relais du domaine (époques de CA-PQ et de CA-TLS)."
+    case 'export_relay_service_key':
+      return "L'export ne correspond pas au relais du domaine (clé de service Astra)."
+    case 'export_relay_authority':
+      return "L'export ne correspond pas au relais du domaine (origine Astra)."
     case 'bootstrap_request_invalid':
       return (
         'Ce fichier n’est pas une demande d’amorçage de gateway valide, ou sa signature ne se ' +

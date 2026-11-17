@@ -27,11 +27,12 @@ use aether::certificates::operator_session::{
     Refusal, RemoteState,
 };
 use aether::key_negotiation::{
-    decode_enrolment_export_file, decode_request_file, encode_invitation_file, EnrollmentRequest,
-    PqCertificate, PqCertificateRole, ProtectionMode,
+    decode_enrolment_export_file, decode_request_file, encode_invitation_file,
+    EnrollmentInvitation, EnrollmentRequest, PqCertificate, PqCertificateRole, ProtectionMode,
 };
 use aether_fido::authenticator::Authenticator;
 use astra_operator::enrollment::{AcceptedEnrollment, InvitationRegistry};
+use astra_operator::handoff::DomainHandoff;
 use astra_operator::operations::rotation::RotationTerms;
 use astra_operator::vault::AuthorityVault;
 use orion_core::enrollment_draft::{Admission, GatewayMaterial};
@@ -683,8 +684,8 @@ struct Delivering<'a> {
     pin: &'a GatewayPin,
     /// False when the gateway already lists the peer.
     admit: bool,
-    /// The material read from a verified export, in place of the gateway.
-    offline: Option<(GatewayMaterial, Admission)>,
+    /// The document drafted from a verified export, in place of the gateway.
+    offline: Option<aether::key_negotiation::EnrollmentDocument>,
 }
 
 /// Steps 4 to 6, from leaves that exist: check them, admit the peer unless it
@@ -767,9 +768,9 @@ struct Resuming {
     /// Why no gateway can be used: none is connected, or it did not answer.
     /// The resumption then stops before any key.
     gateway_error: Option<(Refusal, String)>,
-    /// The gateway's material and admission read from a verified export, when
-    /// no gateway is connected. The document is then drafted from these.
-    offline: Option<(GatewayMaterial, Admission)>,
+    /// The document drafted from a verified export, when no gateway is connected:
+    /// drafted before any key, and signed as it is.
+    offline: Option<aether::key_negotiation::EnrollmentDocument>,
 }
 
 /// Step 5 and 6 again, §15.2: finishes an acceptance whose invitation is
@@ -916,7 +917,15 @@ fn prepare_resumption(
     let gateway_error = match resume.delivery.gateway {
         None => match resume.export {
             Some(text) => {
-                offline = Some(read_export(text, &accepted, &vault, &pin)?);
+                offline = Some(draft_from_export(
+                    text,
+                    &accepted,
+                    &vault,
+                    vault_path,
+                    &record.invitation,
+                    &pin,
+                    &resume.delivery,
+                )?);
                 // `heliosd export-enrolment` only writes a peer the gateway
                 // already admits, so the admission is not repeated.
                 peer_admitted = true;
@@ -955,51 +964,160 @@ fn prepare_resumption(
 const NOT_AN_EXPORT: &str =
     "Ce fichier n'est pas un export d'enrôlement de `heliosd export-enrolment`.";
 
+/// The message of an export taken on another gateway than the invitation pins.
+const OTHER_GATEWAY_EXPORT: &str =
+    "Cet export vient d'une autre gateway que celle de l'invitation.";
+
+/// The message of an export naming another peer than the accepted request.
+const OTHER_PEER_EXPORT: &str = "Cet export nomme un autre poste que la demande acceptée.";
+
+/// The message of an export whose trust block names another domain.
+const OTHER_DOMAIN_EXPORT: &str = "Cet export vient d'un autre domaine que ce coffre.";
+
+/// The message of an export whose gateway leaf does not hold together.
+const LEAF_INVALID_EXPORT: &str =
+    "La feuille PQ de cet export ne se vérifie pas sous le CA-PQ de ce domaine.";
+
+/// The message of an export that cannot draft a document from its gateway.
+const INCOMPLETE_EXPORT: &str = "Cet export ne suffit pas à construire le document : refaire \
+     `heliosd export-enrolment` sur la gateway, le pair étant admis.";
+
+/// The message of a domain relay that is absent or unreadable.
+const RELAY_UNAVAILABLE: &str = "Le relais du domaine est absent ou illisible : l'export ne peut \
+     pas être vérifié contre lui.";
+
+/// The message of an export whose trust block differs from the relay in one family.
+fn relay_mismatch(refusal: Refusal) -> &'static str {
+    match refusal {
+        Refusal::ExportRelayRpId => {
+            "L'export ne correspond pas au relais du domaine (RP ID WebAuthn)."
+        }
+        Refusal::ExportRelayCaTls => {
+            "L'export ne correspond pas au relais du domaine (CA-TLS client)."
+        }
+        Refusal::ExportRelayEpochs => {
+            "L'export ne correspond pas au relais du domaine (époques de CA-PQ et de CA-TLS)."
+        }
+        Refusal::ExportRelayServiceKey => {
+            "L'export ne correspond pas au relais du domaine (clé de service Astra)."
+        }
+        _ => "L'export ne correspond pas au relais du domaine (origine Astra).",
+    }
+}
+
+/// Whether two base64 ML-DSA-87 keys are the same key: parsed, not compared as text.
+fn same_ml_dsa_key(left: &str, right: &str) -> bool {
+    match (
+        MlDsa87PublicKey::parse(left.trim()),
+        MlDsa87PublicKey::parse(right.trim()),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// The export's trust block against the relay beside the vault, family by family.
+///
+/// Every value the relay holds is compared; a value the relay does not hold is a
+/// mismatch, never a pass. The first family that differs names the refusal.
+fn check_export_against_relay(
+    relay: &DomainHandoff,
+    trust: &orion_core::TrustMaterial,
+) -> Result<(), Refusal> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    if relay.rp_id.trim() != trust.webauthn_rp_id.trim() {
+        return Err(Refusal::ExportRelayRpId);
+    }
+    let decode = |value: &str| {
+        STANDARD
+            .decode(value.trim())
+            .ok()
+            .filter(|bytes| !bytes.is_empty())
+    };
+    let same_ca_tls = relay
+        .ca_tls_certificate
+        .as_deref()
+        .and_then(decode)
+        .zip(decode(&trust.client_tls_ca_der))
+        .is_some_and(|(relay, export)| relay == export);
+    if !same_ca_tls {
+        return Err(Refusal::ExportRelayCaTls);
+    }
+    if relay.ca_epoch != Some(trust.ca_epoch) || relay.ca_tls_epoch != Some(trust.ca_tls_epoch) {
+        return Err(Refusal::ExportRelayEpochs);
+    }
+    let same_service_key = relay
+        .astra_service_public_key
+        .as_deref()
+        .is_some_and(|key| same_ml_dsa_key(key, &trust.astra_service_public_key));
+    if !same_service_key || relay.astra_service_key_epoch != Some(trust.astra_service_key_epoch) {
+        return Err(Refusal::ExportRelayServiceKey);
+    }
+    if relay.astra_authority_url.as_deref().map(str::trim) != Some(trust.astra_authority_url.trim())
+    {
+        return Err(Refusal::ExportRelayAuthority);
+    }
+    Ok(())
+}
+
 /// Reads the export the operator chose, and checks it as the connected
 /// gateway's answer would be checked: the same pin, the same peer, the same
-/// domain and the same leaf. Every refusal is before any key.
+/// domain and the same leaf, then the domain relay beside the vault and the
+/// leaf the invitation pins. Every refusal is before any key, and names what
+/// differs.
 fn read_export(
     text: &str,
     accepted: &AcceptedEnrollment,
     vault: &AuthorityVault,
+    relay: &DomainHandoff,
+    invitation: &EnrollmentInvitation,
     pin: &GatewayPin,
 ) -> Result<(GatewayMaterial, Admission), (Refusal, String)> {
-    let mismatch = |message: &str| (Refusal::HandoffMismatch, message.to_string());
-    let export = decode_enrolment_export_file(text).map_err(|_| mismatch(NOT_AN_EXPORT))?;
+    let refuse = |refusal: Refusal, message: &str| (refusal, message.to_string());
+    let export = decode_enrolment_export_file(text)
+        .map_err(|_| refuse(Refusal::ExportUnreadable, NOT_AN_EXPORT))?;
     let (material, admission) = orion_core::gateway_admin::material_from_export(&export)
-        .map_err(|error| mismatch(&error.to_string()))?;
-    pin.check(&material)?;
+        .map_err(|_| refuse(Refusal::ExportUnreadable, NOT_AN_EXPORT))?;
+    if !pin.matches(&material) {
+        return Err(refuse(Refusal::ExportOtherGateway, OTHER_GATEWAY_EXPORT));
+    }
+
+    let leaf = orion_core::enrollment_draft::pinned_gateway_leaf(&material)
+        .map_err(|_| refuse(Refusal::ExportLeafInvalid, LEAF_INVALID_EXPORT))?;
+    let fingerprint_matches = leaf
+        .fingerprint()
+        .is_ok_and(|fingerprint| fingerprint == material.pq_certificate_sha256.trim());
+    if !fingerprint_matches {
+        return Err(refuse(Refusal::ExportLeafInvalid, LEAF_INVALID_EXPORT));
+    }
+    // The leaf the invitation pinned, not any leaf of the same gateway: a leaf
+    // re-issued since the invitation is another certificate.
+    let pinned_leaf = aether::certificates::gateway::pq_certificate_fingerprint(&leaf).ok();
+    if pinned_leaf != Some(invitation.gateway_certificate_fingerprint) {
+        return Err(refuse(Refusal::ExportOtherGateway, OTHER_GATEWAY_EXPORT));
+    }
 
     let same_peer = WireGuardKey::parse(export.peer_public_key.trim())
         .map(|key| key == accepted.request.client_wg_public_key)
         .unwrap_or(false);
     if !same_peer {
-        return Err(mismatch(
-            "cet export nomme un autre poste que la demande acceptée",
-        ));
+        return Err(refuse(Refusal::ExportOtherPeer, OTHER_PEER_EXPORT));
     }
 
-    let other_domain = "cet export vient d'un autre domaine que ce coffre";
     let Some(trust) = admission.trust.as_ref() else {
-        return Err(mismatch(other_domain));
+        return Err(refuse(Refusal::ExportOtherDomain, OTHER_DOMAIN_EXPORT));
     };
-    let same_domain = trust.ca_pq_public_key.trim() == vault.ca_pq_public_key.trim()
+    let same_domain = same_ml_dsa_key(&trust.ca_pq_public_key, &vault.ca_pq_public_key)
         && TrustDomainId::parse_hex(trust.trust_domain_id.trim())
             .is_ok_and(|id| id == vault.trust_domain_id);
     if !same_domain {
-        return Err(mismatch(other_domain));
+        return Err(refuse(Refusal::ExportOtherDomain, OTHER_DOMAIN_EXPORT));
     }
 
-    let leaf = orion_core::enrollment_draft::pinned_gateway_leaf(&material)
-        .map_err(|error| mismatch(&format!("{error:#}")))?;
-    let fingerprint_matches = leaf
-        .fingerprint()
-        .is_ok_and(|fingerprint| fingerprint == material.pq_certificate_sha256.trim());
-    if !fingerprint_matches {
-        return Err(mismatch(
-            "la feuille PQ de cet export ne correspond pas à son empreinte",
-        ));
-    }
+    check_export_against_relay(relay, trust)
+        .map_err(|refusal| (refusal, relay_mismatch(refusal).to_string()))?;
+
     orion_core::config::verify_pinned_gateway_certificate(
         &leaf,
         &material.server_name,
@@ -1007,8 +1125,36 @@ fn read_export(
         Some(trust),
         now_unix(),
     )
-    .map_err(|error| mismatch(&format!("{error:#}")))?;
+    .map_err(|_| refuse(Refusal::ExportLeafInvalid, LEAF_INVALID_EXPORT))?;
     Ok((material, admission))
+}
+
+/// The domain relay beside the vault, required for an offline resumption: an
+/// export is checked against it, and an absent or unreadable one refuses.
+fn load_export_relay(vault_path: &Path) -> Result<DomainHandoff, (Refusal, String)> {
+    astra_operator::handoff::load(&astra_operator::handoff::path_beside(vault_path)).map_err(|_| {
+        (
+            Refusal::ExportRelayUnavailable,
+            RELAY_UNAVAILABLE.to_string(),
+        )
+    })
+}
+
+/// The offline draft: the export read and checked, then drafted, all before any
+/// key. A draft Orion would not read is refused here, while nothing is signed.
+fn draft_from_export(
+    text: &str,
+    accepted: &AcceptedEnrollment,
+    vault: &AuthorityVault,
+    vault_path: &Path,
+    invitation: &EnrollmentInvitation,
+    pin: &GatewayPin,
+    delivery: &Delivery<'_>,
+) -> Result<aether::key_negotiation::EnrollmentDocument, (Refusal, String)> {
+    let relay = load_export_relay(vault_path)?;
+    let (material, admission) = read_export(text, accepted, vault, &relay, invitation, pin)?;
+    draft_from_material(accepted, delivery, pin, material, admission, now_unix())
+        .map_err(|_| (Refusal::ExportIncomplete, INCOMPLETE_EXPORT.to_string()))
 }
 
 /// Hands over the kept leaves and the line that admits the peer by hand, then
@@ -1268,10 +1414,11 @@ fn hand_over_leaves(
     });
     // The export is taken on the gateway after the peer is added: the file
     // then carries what the document needs, without a tunnel.
+    // The file is named from the request, as the leaves are: the device's name
+    // is its choice, and a name with a `/` would write elsewhere.
     let export = format!(
-        "heliosd export-enrolment --public-key {} > {}.enrolment.json",
+        "heliosd export-enrolment --public-key {} > {stem}.enrolment.json",
         astra_operator::admission::shell_word(&accepted.request.client_wg_public_key.to_base64()),
-        astra_operator::admission::shell_word(&accepted.request.requested_name),
     );
     deposit(OperatorArtifact {
         file_name: "admission.txt".to_string(),
@@ -1296,15 +1443,25 @@ fn sign_delivery(
     accepted: &AcceptedEnrollment,
     delivery: &Delivery<'_>,
     pin: &GatewayPin,
-    offline: Option<(GatewayMaterial, Admission)>,
+    offline: Option<aether::key_negotiation::EnrollmentDocument>,
+) -> Result<OperatorArtifact, (Refusal, String)> {
+    let draft = match offline {
+        Some(draft) => draft,
+        None => draft_delivery(accepted, delivery, pin)?,
+    };
+    sign_artifact(registry, vault, opened, accepted, draft)
+}
+
+/// Signs a drafted document under the opening that issued the leaves, and names
+/// the file Orion imports. Every failure is `DocumentNotSigned`.
+fn sign_artifact(
+    registry: &InvitationRegistry,
+    vault: &AuthorityVault,
+    opened: &astra_operator::authenticator::Opened,
+    accepted: &AcceptedEnrollment,
+    draft: aether::key_negotiation::EnrollmentDocument,
 ) -> Result<OperatorArtifact, (Refusal, String)> {
     let not_signed = |error: String| (Refusal::DocumentNotSigned, error);
-    let draft = match offline {
-        Some((material, admission)) => {
-            draft_from_material(accepted, delivery, pin, material, admission, now_unix())
-        }
-        None => draft_delivery(accepted, delivery, pin),
-    }?;
     let request = &accepted.request;
     let signed = astra_operator::signing::sign_document(vault, opened, registry, draft)
         .map_err(|error| not_signed(format!("{error:#}")))?;

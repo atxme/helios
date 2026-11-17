@@ -379,6 +379,35 @@ pub enum Refusal {
     /// The peer is admitted, but its document could not be built or signed:
     /// the acceptance is resumed, not redone.
     DocumentNotSigned,
+    /// The file is not a `heliosd export-enrolment` export: nothing was read from it.
+    ExportUnreadable,
+    /// The export describes another gateway than the invitation pins, by key, name
+    /// or leaf.
+    ExportOtherGateway,
+    /// The export names another peer than the accepted request.
+    ExportOtherPeer,
+    /// The export's trust block names another domain or another `CA-PQ` than the vault.
+    ExportOtherDomain,
+    /// The gateway leaf of the export does not verify under the domain's `CA-PQ`, or
+    /// does not match its own fingerprint.
+    ExportLeafInvalid,
+    /// The export does not describe the gateway well enough to draft a document from
+    /// it (no negotiation port, an address Orion refuses).
+    ExportIncomplete,
+    /// The domain relay beside the vault is absent or unreadable: the export cannot be
+    /// checked against it.
+    ExportRelayUnavailable,
+    /// The export's `rp_id` is not the relay's.
+    ExportRelayRpId,
+    /// The export's CA-TLS anchor is not the relay's `ca_tls_certificate`, or the
+    /// relay names none.
+    ExportRelayCaTls,
+    /// The export's CA-PQ or CA-TLS epochs are not the relay's.
+    ExportRelayEpochs,
+    /// The export's Astra service key or its epoch is not the relay's.
+    ExportRelayServiceKey,
+    /// The export's Astra authority origin is not the relay's.
+    ExportRelayAuthority,
     /// A vault already exists where a new one would be created.
     VaultExists,
     /// The place the vault would be kept cannot be reached or written.
@@ -1402,6 +1431,29 @@ mod tests {
             serde_json::to_value(Refusal::DocumentNotSigned).expect("refusal"),
             serde_json::json!({ "refusal": "document_not_signed" })
         );
+    }
+
+    #[test]
+    fn the_export_refusals_carry_no_text() {
+        for (refusal, tag) in [
+            (Refusal::ExportUnreadable, "export_unreadable"),
+            (Refusal::ExportOtherGateway, "export_other_gateway"),
+            (Refusal::ExportOtherPeer, "export_other_peer"),
+            (Refusal::ExportOtherDomain, "export_other_domain"),
+            (Refusal::ExportLeafInvalid, "export_leaf_invalid"),
+            (Refusal::ExportIncomplete, "export_incomplete"),
+            (Refusal::ExportRelayUnavailable, "export_relay_unavailable"),
+            (Refusal::ExportRelayRpId, "export_relay_rp_id"),
+            (Refusal::ExportRelayCaTls, "export_relay_ca_tls"),
+            (Refusal::ExportRelayEpochs, "export_relay_epochs"),
+            (Refusal::ExportRelayServiceKey, "export_relay_service_key"),
+            (Refusal::ExportRelayAuthority, "export_relay_authority"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(refusal).expect("refusal"),
+                serde_json::json!({ "refusal": tag })
+            );
+        }
     }
 
     #[test]

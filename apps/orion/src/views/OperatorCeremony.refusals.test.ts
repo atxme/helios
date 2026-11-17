@@ -40,6 +40,46 @@ describe('refusalSentence for the acceptance', () => {
   })
 })
 
+describe('refusalSentence for an offline export', () => {
+  it('names_a_file_that_is_not_an_export_verbatim', () => {
+    expect(refusalSentence({ refusal: 'export_unreadable' })).toBe(
+      "Ce fichier n'est pas un export d'enrôlement de `heliosd export-enrolment`.",
+    )
+  })
+
+  it('says_the_export_of_another_gateway_with_its_own_sentence', () => {
+    expect(refusalSentence({ refusal: 'export_other_gateway' })).toBe(
+      "Cet export vient d'une autre gateway que celle de l'invitation.",
+    )
+    expect(refusalSentence({ refusal: 'export_other_gateway' })).not.toMatch(/connectée/)
+  })
+
+  it('names_each_export_refusal_by_its_cause', () => {
+    expect(refusalSentence({ refusal: 'export_other_peer' })).toMatch(/un autre poste/)
+    expect(refusalSentence({ refusal: 'export_other_domain' })).toMatch(/un autre domaine/)
+    expect(refusalSentence({ refusal: 'export_leaf_invalid' })).toMatch(/feuille PQ/)
+    expect(refusalSentence({ refusal: 'export_incomplete' })).toMatch(/export-enrolment/)
+  })
+
+  it('names_each_relay_family_that_differs', () => {
+    expect(refusalSentence({ refusal: 'export_relay_unavailable' })).toMatch(/relais du domaine/)
+    expect(refusalSentence({ refusal: 'export_relay_rp_id' })).toMatch(/RP ID WebAuthn/)
+    expect(refusalSentence({ refusal: 'export_relay_ca_tls' })).toMatch(/CA-TLS client/)
+    expect(refusalSentence({ refusal: 'export_relay_epochs' })).toMatch(/époques/)
+    expect(refusalSentence({ refusal: 'export_relay_service_key' })).toMatch(/clé de service/)
+    expect(refusalSentence({ refusal: 'export_relay_authority' })).toMatch(/origine Astra/)
+    for (const refusal of [
+      'export_relay_rp_id',
+      'export_relay_ca_tls',
+      'export_relay_epochs',
+      'export_relay_service_key',
+      'export_relay_authority',
+    ] as const) {
+      expect(refusalSentence({ refusal })).toMatch(/^L'export ne correspond pas au relais/)
+    }
+  })
+})
+
 describe('refusalSentence for the issuer delegation', () => {
   it('the_delegation_refusals_have_their_sentences', () => {
     expect(refusalSentence({ refusal: 'delegation_request_invalid' })).toBe(
