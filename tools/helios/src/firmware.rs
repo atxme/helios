@@ -139,6 +139,11 @@ struct Plan {
     after_boot: Option<String>,
 }
 
+enum MaintenanceMode {
+    Update { yes: bool },
+    Resume { confirm_installed: bool },
+}
+
 pub fn run(command: FirmwareCmd) -> Result<()> {
     match command {
         FirmwareCmd::List { ssh_target } => match ssh_target {
@@ -160,6 +165,7 @@ pub fn run(command: FirmwareCmd) -> Result<()> {
             &target_version,
             &plan,
             private_key.as_deref(),
+            SshGateway::new,
         ),
         FirmwareCmd::Update {
             plan,
@@ -171,9 +177,10 @@ pub fn run(command: FirmwareCmd) -> Result<()> {
             &plan,
             authorization.as_deref(),
             private_key.as_deref(),
-            Some(yes),
-            false,
+            MaintenanceMode::Update { yes },
             timeout,
+            SshGateway::new,
+            crate::interactive::confirm,
         ),
         FirmwareCmd::Resume {
             plan,
@@ -185,9 +192,10 @@ pub fn run(command: FirmwareCmd) -> Result<()> {
             &plan,
             authorization.as_deref(),
             private_key.as_deref(),
-            None,
-            confirm_installed,
+            MaintenanceMode::Resume { confirm_installed },
             timeout,
+            SshGateway::new,
+            crate::interactive::confirm,
         ),
         FirmwareCmd::Status { plan } => {
             let plan = load_plan(&plan)?;
@@ -573,12 +581,13 @@ fn recover(backup: &FirmwareBackup, private_path: &Path) -> Result<Zeroizing<Vec
     firmware_recovery::check_secret(&backup.request, &recovered)?;
     Ok(recovered)
 }
-fn prepare(
+fn prepare<G: Gateway>(
     target: &str,
     device: &str,
     version: &str,
     path: &Path,
     private_path: Option<&Path>,
+    connect: impl FnOnce(&str) -> Result<G>,
 ) -> Result<()> {
     valid_device_id(device)?;
     valid_version(version)?;
@@ -587,7 +596,7 @@ fn prepare(
         !path.try_exists()?,
         "plan already exists; choose a new plan or resume it"
     );
-    let mut gateway = SshGateway::new(target)?;
+    let mut gateway = connect(target)?;
     let before = gateway.identity()?;
     ensure_external(&before.machine)?;
     gateway.check_installer()?;
@@ -654,17 +663,18 @@ fn ensure_available(devices: &[FirmwareDevice], device: &str, version: &str) -> 
     Ok(())
 }
 
-fn maintain(
+fn maintain<G: Gateway>(
     path: &Path,
     authorization: Option<&Path>,
     private_path: Option<&Path>,
-    install: Option<bool>,
-    confirm_installed: bool,
+    mode: MaintenanceMode,
     timeout: u64,
+    connect: impl FnOnce(&str) -> Result<G>,
+    confirm: impl FnOnce(&str) -> Result<bool>,
 ) -> Result<()> {
     let _lock = PlanLock::acquire(path)?;
     let mut plan = load_plan(path)?;
-    let mut gateway = SshGateway::new(&plan.ssh_target)?;
+    let mut gateway = connect(&plan.ssh_target)?;
     let actual = gateway.identity()?;
     ensure_external(&actual.machine)?;
     anyhow::ensure!(
@@ -705,48 +715,52 @@ fn maintain(
         println!("Firmware maintenance already completed.");
         return Ok(());
     }
-    if let Some(yes) = install {
-        anyhow::ensure!(
-            plan.phase == Phase::Prepared,
-            "installation has already started; use firmware resume"
-        );
-        let identity = gateway.identity()?;
-        anyhow::ensure!(
-            identity == plan.before,
-            "gateway changed or rebooted; prepare a new plan before installation"
-        );
-        anyhow::ensure!(
-            gateway.sealing()? == plan.backup.is_some(),
-            "TPM posture changed since preparation"
-        );
-        ensure_available(
-            &gateway.inventory(true)?,
-            &plan.device,
-            &plan.target_version,
-        )?;
-        if let Some((auth, _)) = &credentials {
-            gateway.preflight(auth)?;
+    match mode {
+        MaintenanceMode::Update { yes } => {
+            anyhow::ensure!(
+                plan.phase == Phase::Prepared,
+                "installation has already started; use firmware resume"
+            );
+            let identity = gateway.identity()?;
+            anyhow::ensure!(
+                identity == plan.before,
+                "gateway changed or rebooted; prepare a new plan before installation"
+            );
+            anyhow::ensure!(
+                gateway.sealing()? == plan.backup.is_some(),
+                "TPM posture changed since preparation"
+            );
+            ensure_available(
+                &gateway.inventory(true)?,
+                &plan.device,
+                &plan.target_version,
+            )?;
+            if let Some((auth, _)) = &credentials {
+                gateway.preflight(auth)?;
+            }
+            println!("Gateway {} · device {} · version {}\nThe gateway will stop and reboot. SSH must remain reachable independently of its VPN.", plan.ssh_target, plan.device, plan.target_version);
+            if !yes && !confirm("Install the firmware and reboot this gateway?")? {
+                return Ok(());
+            }
+            install_prepared(
+                &mut gateway,
+                &mut plan,
+                path,
+                credentials.as_ref().map(|(auth, _)| auth.as_slice()),
+            )?;
         }
-        println!("Gateway {} · device {} · version {}\nThe gateway will stop and reboot. SSH must remain reachable independently of its VPN.", plan.ssh_target, plan.device, plan.target_version);
-        if !yes && !crate::interactive::confirm("Install the firmware and reboot this gateway?")? {
-            return Ok(());
+        MaintenanceMode::Resume { confirm_installed } if plan.phase == Phase::Installing => {
+            anyhow::ensure!(confirm_installed, FirmwareError::InstallationUncertain);
+            anyhow::ensure!(
+                confirm(
+                    "Have you verified that fwupd finished installing this exact device/version?"
+                )?,
+                "installation remains uncertain"
+            );
+            plan.phase = Phase::Installed;
+            save_plan(path, &plan, false)?;
         }
-        install_prepared(
-            &mut gateway,
-            &mut plan,
-            path,
-            credentials.as_ref().map(|(auth, _)| auth.as_slice()),
-        )?;
-    } else if plan.phase == Phase::Installing {
-        anyhow::ensure!(confirm_installed, FirmwareError::InstallationUncertain);
-        anyhow::ensure!(
-            crate::interactive::confirm(
-                "Have you verified that fwupd finished installing this exact device/version?"
-            )?,
-            "installation remains uncertain"
-        );
-        plan.phase = Phase::Installed;
-        save_plan(path, &plan, false)?;
+        MaintenanceMode::Resume { .. } => {}
     }
     anyhow::ensure!(
         plan.phase != Phase::Prepared,
@@ -1130,6 +1144,8 @@ mod tests {
     }
     struct FakeGateway {
         identity: Identity,
+        identity_calls: usize,
+        reboot_on_identity: Option<usize>,
         sealed: bool,
         events: Vec<String>,
         preflight_ok: bool,
@@ -1154,6 +1170,10 @@ mod tests {
             Ok(())
         }
         fn identity(&mut self) -> Result<Identity> {
+            self.identity_calls += 1;
+            if self.reboot_on_identity == Some(self.identity_calls) {
+                self.identity.boot = "unexpected-boot".into();
+            }
             Ok(self.identity.clone())
         }
         fn sealing(&mut self) -> Result<bool> {
@@ -1221,13 +1241,40 @@ mod tests {
             Ok(())
         }
     }
+    impl FakeGateway {
+        fn new(sealed: bool) -> Self {
+            Self {
+                identity: Identity {
+                    machine: "gateway".into(),
+                    boot: "old-boot".into(),
+                },
+                identity_calls: 0,
+                reboot_on_identity: None,
+                sealed,
+                events: vec![],
+                preflight_ok: true,
+                preflight_calls: 0,
+                preflight_fail_at: None,
+                stop_ok: true,
+                installer_ok: true,
+                install_ok: true,
+                reboot_applies: true,
+                restore_ok: true,
+                restore_applied: false,
+                restore_applies_then_loses_reply: false,
+                restore_frame_fingerprints: vec![],
+                ready: true,
+                reboot_during_health: false,
+                version: "2011".into(),
+                update_state: None,
+            }
+        }
+    }
+
     fn transaction(sealed: bool) -> (tempfile::TempDir, PathBuf, Plan, FakeGateway) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("maintenance.json");
-        let identity = Identity {
-            machine: "gateway".into(),
-            boot: "old-boot".into(),
-        };
+        let gateway = FakeGateway::new(sealed);
         let backup = sealed.then(|| FirmwareBackup {
             request: aether::sig::FirmwareRecoveryPayload {
                 version: 1,
@@ -1240,8 +1287,8 @@ mod tests {
         });
         let plan = Plan {
             format_version: 1,
-            ssh_target: "operator@gateway".into(),
-            before: identity.clone(),
+            ssh_target: TARGET.into(),
+            before: gateway.identity.clone(),
             device: ID.into(),
             target_version: "2023".into(),
             backup,
@@ -1249,28 +1296,325 @@ mod tests {
             after_boot: None,
         };
         save_plan(&path, &plan, true).unwrap();
-        let gateway = FakeGateway {
-            identity,
-            sealed,
-            events: vec![],
-            preflight_ok: true,
-            preflight_calls: 0,
-            preflight_fail_at: None,
-            stop_ok: true,
-            installer_ok: true,
-            install_ok: true,
-            reboot_applies: true,
-            restore_ok: true,
-            restore_applied: false,
-            restore_applies_then_loses_reply: false,
-            restore_frame_fingerprints: vec![],
-            ready: true,
-            reboot_during_health: false,
-            version: "2011".into(),
-            update_state: None,
-        };
         (dir, path, plan, gateway)
     }
+    const TARGET: &str = "operator@gateway";
+
+    #[test]
+    fn prepare_persists_a_stable_unsealed_gateway_without_a_recovery_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("maintenance.json");
+        prepare(TARGET, ID, "2023", &path, None, |target| {
+            assert_eq!(target, TARGET);
+            assert!(
+                PlanLock::acquire(&path).is_err(),
+                "hold lock before connecting"
+            );
+            Ok(FakeGateway::new(false))
+        })
+        .unwrap();
+
+        let plan = load_plan(&path).unwrap();
+        assert_eq!(plan.phase, Phase::Prepared);
+        assert_eq!(plan.ssh_target, TARGET);
+        assert_eq!(plan.before, FakeGateway::new(false).identity);
+        assert_eq!(plan.device, ID);
+        assert_eq!(plan.target_version, "2023");
+        assert!(plan.backup.is_none() && plan.after_boot.is_none());
+        assert!(!path.with_extension("request.json").exists());
+        run(FirmwareCmd::Status { plan: path }).unwrap();
+    }
+
+    #[test]
+    fn prepare_rejects_an_existing_plan_before_connecting() {
+        let (_dir, path, _, _) = transaction(false);
+        let previous = std::fs::read(&path).unwrap();
+        let error = prepare::<FakeGateway>(TARGET, ID, "2023", &path, None, |_| {
+            panic!("existing plan must not contact the gateway")
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("plan already exists"));
+        assert_eq!(std::fs::read(&path).unwrap(), previous);
+    }
+
+    #[test]
+    fn prepare_leaves_no_plan_after_failed_checks_or_reboot() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                FakeGateway {
+                    installer_ok: false,
+                    ..FakeGateway::new(false)
+                },
+                "2023",
+                "unsupported fwupdmgr",
+            ),
+            (
+                FakeGateway::new(false),
+                "2024",
+                "absent from available upgrades",
+            ),
+            (FakeGateway::new(true), "2023", "requires --private-key"),
+            (
+                FakeGateway {
+                    reboot_on_identity: Some(2),
+                    ..FakeGateway::new(false)
+                },
+                "2023",
+                "rebooted during preparation",
+            ),
+        ];
+        for (index, (gateway, version, expected)) in cases.into_iter().enumerate() {
+            let path = dir.path().join(format!("maintenance-{index}.json"));
+            let error = prepare(TARGET, ID, version, &path, None, |_| Ok(gateway)).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+            assert!(!path.exists());
+            assert!(!path.with_extension("request.json").exists());
+        }
+    }
+
+    #[test]
+    fn update_with_explicit_consent_runs_to_completion() {
+        let (_dir, path, _, gateway) = transaction(false);
+        maintain(
+            &path,
+            None,
+            None,
+            MaintenanceMode::Update { yes: true },
+            10,
+            |target| {
+                assert_eq!(target, TARGET);
+                Ok(gateway)
+            },
+            |_| panic!("explicit consent must not open a prompt"),
+        )
+        .unwrap();
+
+        let plan = load_plan(&path).unwrap();
+        assert_eq!(plan.phase, Phase::Complete);
+        assert_eq!(plan.after_boot.as_deref(), Some("new-boot"));
+    }
+
+    #[test]
+    fn update_declined_at_the_prompt_keeps_the_prepared_plan() {
+        let (_dir, path, _, mut gateway) = transaction(false);
+        gateway.stop_ok = false;
+        let previous = std::fs::read(&path).unwrap();
+        let mut prompted = false;
+        maintain(
+            &path,
+            None,
+            None,
+            MaintenanceMode::Update { yes: false },
+            10,
+            |_| Ok(gateway),
+            |prompt| {
+                assert!(prompt.contains("Install the firmware"));
+                prompted = true;
+                Ok(false)
+            },
+        )
+        .unwrap();
+
+        assert!(prompted);
+        assert_eq!(std::fs::read(&path).unwrap(), previous);
+    }
+
+    #[test]
+    fn update_rejects_changed_gateway_or_sealing_before_confirmation() {
+        let mut wrong_machine = FakeGateway::new(false);
+        wrong_machine.identity.machine = "different-gateway".into();
+        let mut wrong_boot = FakeGateway::new(false);
+        wrong_boot.identity.boot = "unexpected-boot".into();
+        for (gateway, expected) in [
+            (wrong_machine, "another machine"),
+            (wrong_boot, "changed or rebooted"),
+            (FakeGateway::new(true), "TPM posture changed"),
+        ] {
+            let (_dir, path, _, _) = transaction(false);
+            let previous = std::fs::read(&path).unwrap();
+            let error = maintain(
+                &path,
+                None,
+                None,
+                MaintenanceMode::Update { yes: false },
+                10,
+                |_| Ok(gateway),
+                |_| panic!("changed gateway must be rejected before confirmation"),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+            assert_eq!(std::fs::read(&path).unwrap(), previous);
+        }
+    }
+
+    #[test]
+    fn sealed_plan_requires_a_readable_authorization_before_any_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let malformed = dir.path().join("authorization.json");
+        std::fs::write(&malformed, b"not a signed document").unwrap();
+
+        for auth in [None, Some(malformed.as_path())] {
+            let (_dir, path, _, _) = transaction(true);
+            let previous = std::fs::read(&path).unwrap();
+            let error = maintain(
+                &path,
+                auth,
+                None,
+                MaintenanceMode::Update { yes: false },
+                10,
+                |_| Ok(FakeGateway::new(true)),
+                |_| panic!("authorization must be checked before confirmation"),
+            )
+            .unwrap_err();
+            if auth.is_none() {
+                assert!(error.to_string().contains("requires --authorization"));
+            } else {
+                assert!(
+                    error.downcast_ref::<serde_json::Error>().is_some(),
+                    "{error:#}"
+                );
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), previous);
+        }
+    }
+
+    #[test]
+    fn resume_rejects_a_plan_that_never_started_installation() {
+        let (_dir, path, _, gateway) = transaction(false);
+        let previous = std::fs::read(&path).unwrap();
+        let error = maintain(
+            &path,
+            None,
+            None,
+            MaintenanceMode::Resume {
+                confirm_installed: true,
+            },
+            10,
+            |_| Ok(gateway),
+            |_| panic!("the installation never started"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("nothing installed"));
+        assert_eq!(std::fs::read(&path).unwrap(), previous);
+    }
+
+    #[test]
+    fn interrupted_installation_requires_explicit_confirmation_and_never_reinstalls() {
+        let interrupted = || {
+            let (dir, path, mut plan, gateway) = transaction(false);
+            plan.phase = Phase::Installing;
+            save_plan(&path, &plan, false).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            (dir, path, gateway, before)
+        };
+        let (_dir, path, gateway, before) = interrupted();
+
+        let update_error = maintain(
+            &path,
+            None,
+            None,
+            MaintenanceMode::Update { yes: true },
+            10,
+            |_| Ok(gateway),
+            |_| panic!("interrupted update should use resume"),
+        )
+        .unwrap_err();
+        assert!(update_error
+            .to_string()
+            .contains("installation has already started"));
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let (_dir, path, gateway, before) = interrupted();
+        let missing_flag = maintain(
+            &path,
+            None,
+            None,
+            MaintenanceMode::Resume {
+                confirm_installed: false,
+            },
+            10,
+            |_| Ok(gateway),
+            |_| panic!("resume requires an explicit flag before prompting"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            missing_flag.downcast_ref::<FirmwareError>(),
+            Some(FirmwareError::InstallationUncertain)
+        ));
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let (_dir, path, gateway, before) = interrupted();
+        let declined = maintain(
+            &path,
+            None,
+            None,
+            MaintenanceMode::Resume {
+                confirm_installed: true,
+            },
+            10,
+            |_| Ok(gateway),
+            |_| Ok(false),
+        )
+        .unwrap_err();
+        assert!(declined
+            .to_string()
+            .contains("installation remains uncertain"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let (_dir, path, mut gateway, _) = interrupted();
+        gateway.stop_ok = false;
+        gateway.install_ok = false;
+        maintain(
+            &path,
+            None,
+            None,
+            MaintenanceMode::Resume {
+                confirm_installed: true,
+            },
+            10,
+            |_| Ok(gateway),
+            |prompt| {
+                assert!(prompt.contains("verified that fwupd finished"));
+                Ok(true)
+            },
+        )
+        .unwrap();
+        let plan = load_plan(&path).unwrap();
+        assert_eq!(plan.phase, Phase::Complete);
+        assert_eq!(plan.after_boot.as_deref(), Some("new-boot"));
+    }
+
+    #[test]
+    fn resume_on_completed_plan_does_not_restart_maintenance() {
+        let (_dir, path, mut plan, mut gateway) = transaction(false);
+        plan.phase = Phase::Complete;
+        plan.after_boot = Some("new-boot".into());
+        save_plan(&path, &plan, false).unwrap();
+        let previous = std::fs::read(&path).unwrap();
+        gateway.install_ok = false;
+        gateway.stop_ok = false;
+        gateway.ready = false;
+        maintain(
+            &path,
+            None,
+            None,
+            MaintenanceMode::Resume {
+                confirm_installed: false,
+            },
+            10,
+            |_| Ok(gateway),
+            |_| panic!("completed plan must not prompt"),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), previous);
+    }
+
     #[test]
     fn lost_reboot_response_still_requires_changed_boot_root_restore_version_and_readiness() {
         let (_dir, path, mut plan, mut gateway) = transaction(true);
