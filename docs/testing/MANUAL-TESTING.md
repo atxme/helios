@@ -1688,7 +1688,8 @@ action, puis état attendu. Les écrans sont nommés à chaque étape.
     « consommée » avec « Reprendre », aucune clé n'est touchée.
 142. **`heliosd export-enrolment` avant `heliosd peer add` refusé.** Sur la gateway, exporter
     pour une clé qui n'est pas dans `network.toml`. Attendu : refus « admit it first, with
-    `heliosd peer add` » ; aucun fichier produit, aucune admission vide.
+    `heliosd peer add` » ; aucune admission vide. Avec la redirection `> <nom>.enrolment.json`,
+    le shell crée un fichier vide, que « Reprendre » refuse.
 143. **Reprise en ligne inchangée, fichier choisi.** Tunnel monté, avec un fichier d'export
     choisi dans « Reprendre ». Attendu : la gateway connectée fait foi, le fichier est
     ignoré, et le document est produit comme avant le lot 7.
