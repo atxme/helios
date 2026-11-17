@@ -408,21 +408,32 @@ d'administration. Le parcours se fait en trois temps :
    champ « Adresse publique de la gateway » est obligatoire : sans lui le bouton
    « Reprendre l’enrôlement » reste inactif.
 
-Avant toute clé, Orion contrôle que ce fichier désigne la même gateway que
-l'invitation (clé WireGuard et nom de service, par l'épingle de l'invitation),
-le même pair que la demande acceptée, et le même domaine et la même `CA-PQ` que
-le relais du domaine. La feuille PQ est vérifiée sous `CA-PQ` et son empreinte
-recalculée.
+   Le fichier est copié sur le poste par `scp`, pas par une redirection
+   PowerShell : PowerShell 5.1 écrit en UTF-16, et Orion le refuse comme n'étant
+   pas un export.
 
-**Ce que le fichier peut tromper.** La feuille PQ et la clé WireGuard de la
-gateway sont liées par `CA-PQ` et par l'épingle de l'invitation : un fichier qui
-les substitue est refusé. Le certificat TLS de négociation, le port et
-`heliosd_url` ne sont liés à rien de signé, ni en ligne ni dans l'ancien
-`helios enroll document` hors ligne, qui lisait le même certificat par SSH. Un
-fichier faux sur ces trois valeurs donne un poste qui ne se connecte pas (la
-négociation v5 authentifie la gateway par sa feuille PQ), et non un poste
-détourné. Cette limite est acceptée ; aucune liaison supplémentaire n'est
-ajoutée.
+Avant toute clé, Orion contrôle que ce fichier désigne la même gateway que
+l'invitation (clé WireGuard, nom de service et feuille PQ, par l'épingle de
+l'invitation), le même pair que la demande acceptée, et le même domaine et la
+même `CA-PQ` que le relais du domaine. Il compare ensuite au relais, à côté du
+coffre, chaque valeur du bloc de confiance que le relais porte : RP ID,
+certificat CA-TLS client, époques de `CA-PQ` et de `CA-TLS`, clé de service
+Astra et son époque, origine d'Astra. Sans relais lisible, la reprise hors ligne
+est refusée. La feuille PQ est vérifiée sous `CA-PQ` et son empreinte
+recalculée. Le document est construit avant la clé : un fichier qu'Orion ne
+saurait pas lire ne coûte aucune signature.
+
+**Ce que le fichier peut tromper.** Hors ligne, un fichier ne lie que ce que le
+relais et l'invitation portent. La feuille PQ et la clé WireGuard de la gateway
+sont liées par `CA-PQ` et par l'épingle de l'invitation, et le bloc de confiance
+est comparé au relais : un fichier qui substitue l'une de ces valeurs est
+refusé. Restent **non liées** les valeurs que le relais ne porte pas :
+`astra_policy_fingerprint`, `active_gateway_identity_epoch`,
+`gateway_decision_epoch`, `client_generation`, les adresses du pair (`address`,
+`address_v6`), le certificat TLS de négociation, son port et `heliosd_url`. Un
+fichier faux sur ces valeurs ne donne pas accès à la gateway, mais peut laisser
+un poste mal configuré sans message. Cette limite est acceptée ; la lier
+demanderait que le relais porte ces valeurs.
 
 5. **Import** — Orion, sur le poste client, vérifie la signature sous la `CA-PQ`
    épinglée à l'étape 2, la liaison à sa demande en attente, les feuilles contre

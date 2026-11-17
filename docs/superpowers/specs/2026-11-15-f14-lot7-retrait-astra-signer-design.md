@@ -131,34 +131,41 @@ Pour la forme du fichier :
   fichier au lieu de l'API, puis suit exactement le chemin en ligne :
   - `GatewayPin::check` : la clé WireGuard et le nom de service du fichier sont ceux que
     l'invitation épingle, sinon refus avant toute clé ;
-  - la feuille PQ du fichier est vérifiée sous la `CA-PQ` du relais, et son empreinte
-    recalculée, avant toute clé ;
+  - la feuille PQ du fichier est celle que l'invitation épingle (son empreinte), vérifiée
+    sous la `CA-PQ` du relais, et son empreinte recalculée, avant toute clé ;
   - la clé WireGuard du pair dans l'export est celle de la demande acceptée, sinon refus ;
-  - le bloc de confiance est contrôlé comme en ligne (domaine et `CA-PQ` du relais) ;
+  - le bloc de confiance est contrôlé avant toute clé : le domaine (identifiant et `CA-PQ`)
+    et chaque valeur que le relais à côté du coffre porte (RP ID, CA-TLS client, époques
+    de `CA-PQ` et de `CA-TLS`, clé de service Astra et son époque, origine d'Astra). Un
+    relais absent ou illisible refuse la reprise hors ligne ;
   - l'admission est sautée, par le chemin existant d'un pair déjà admis (`admit: false`) :
     la présence du pair dans l'export prouve qu'il est admis ;
   - le brouillon est construit par le même `build_draft`, depuis la même matière et la
-    même admission, que la source soit l'API ou le fichier (la forme interne de
-    `Delivery` est laissée au constructeur) ;
+    même admission, que la source soit l'API ou le fichier, et avant la clé : un export
+    dont le brouillon ne se construit pas est refusé sans signature ;
   - puis une clé, la signature du brouillon sous `CA-PQ` et le dépôt du `.orion`, comme
     en ligne.
 - **Sans gateway ni fichier** : comme aujourd'hui, arrêt avec les feuilles et
   `admission.txt`.
-- Les refus réutilisent les classes existantes (gateway différente de l'invitation,
-  `DocumentNotSigned`) ; un fichier illisible ou d'un autre format dit « Ce fichier n'est
-  pas un export d'enrôlement de `heliosd export-enrolment`. » *(texte : mon choix)*.
+- Chaque refus d'un export a sa classe typée et sa phrase : un fichier illisible ou d'un
+  autre format dit « Ce fichier n'est pas un export d'enrôlement de `heliosd
+  export-enrolment`. » ; une autre gateway (clé, nom ou feuille) dit « Cet export vient
+  d'une autre gateway que celle de l'invitation. » *(texte : mon choix)* ; les autres
+  écarts (pair, domaine, feuille, relais, brouillon) ont leur phrase dans Orion.
 - **`admission.txt`** contient, après la ligne `heliosd peer add …`, la ligne
   `heliosd export-enrolment --public-key <clé> > <nom>.enrolment.json` et une phrase :
   ajouter `--admin` pour le premier administrateur, puis « Reprendre » avec ce fichier.
 - La WebView ne reçoit que l'état de la cérémonie et le document produit, comme
   aujourd'hui ; le fichier d'export, public, ne contient aucun secret.
 - **Ce que le fichier peut tromper** : la feuille PQ et la clé WireGuard sont liées par
-  `CA-PQ` et l'épingle de l'invitation. Le certificat TLS de négociation, le port et
-  `heliosd_url` ne sont liés à rien de signé, ni en ligne ni dans l'ancien
-  `helios enroll document` hors ligne, qui lisait le même certificat par SSH. Un fichier
-  faux sur ces trois valeurs donne un poste qui ne se connecte pas (la négociation v5
-  authentifie la gateway par sa feuille PQ), pas un poste détourné. Aucune liaison
-  nouvelle *(mon choix)* ; la limite est écrite dans OPERATOR-TOOLING.
+  `CA-PQ` et l'épingle de l'invitation ; le bloc de confiance est comparé au relais, et
+  toute valeur qui diffère est refusée. Restent non liées, parce que le relais ne les
+  porte pas : `astra_policy_fingerprint`, `active_gateway_identity_epoch`,
+  `gateway_decision_epoch`, `client_generation`, les adresses du pair (`address`,
+  `address_v6`), le certificat TLS de négociation, son port et `heliosd_url`. Un fichier
+  faux sur ces valeurs ne donne pas accès à la gateway, mais peut laisser un poste mal
+  configuré sans message. Cette limite est acceptée ; la lier demanderait que le relais
+  porte ces valeurs. La limite est écrite dans OPERATOR-TOOLING.
 
 ### 4.3 Ce qui est retiré
 
