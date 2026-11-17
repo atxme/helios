@@ -366,6 +366,72 @@ async fn a_malformed_request_id_is_refused() {
 }
 
 #[tokio::test]
+async fn an_unconfirmed_or_invalidly_signed_invitation_creates_no_pending_enrollment() {
+    use aether::key_negotiation::encode_invitation_file;
+
+    let scratch = Scratch::new("unconfirmed-enrollment");
+    let client = client_on(&scratch).await;
+    let expires_at = certificates::now_unix() + 3_600;
+    let invitation = enrollment::tests::signed_invitation(expires_at);
+    let reply = client
+        .call(EngineCommand::BeginEnrollment {
+            invitation: encode_invitation_file(&invitation),
+            confirmed_ca_fingerprint: "00".repeat(32),
+            requested_name: "laptop-alice".into(),
+        })
+        .await;
+    let error = reply.expect_err("the fingerprint must be confirmed");
+    assert!(
+        error.starts_with("l'empreinte saisie ne correspond pas à celle de l'invitation"),
+        "{error}"
+    );
+
+    let mut altered = invitation;
+    altered.server_name = "other.example.net".into();
+    let reply = client
+        .call(EngineCommand::BeginEnrollment {
+            invitation: encode_invitation_file(&altered),
+            confirmed_ca_fingerprint: altered
+                .operator_ca_public_key
+                .authority_fingerprint()
+                .to_hex(),
+            requested_name: "laptop-alice".into(),
+        })
+        .await;
+    assert_eq!(
+        reply.expect_err("the confirmed CA must have signed the invitation"),
+        "invitation refusée : the enrollment signature does not verify"
+    );
+    assert!(!paths_under(&scratch.0).identities.exists());
+}
+
+#[tokio::test]
+async fn an_absent_pending_request_cannot_be_exported_and_can_be_discarded_again() {
+    let scratch = Scratch::new("absent-pending-request");
+    let client = client_on(&scratch).await;
+    let id = "ab".repeat(16);
+    let reply = client
+        .call(EngineCommand::ExportPendingRequest {
+            request_id: format!(" {id} "),
+        })
+        .await;
+    let error = reply.expect_err("there is no request file to export");
+    assert!(
+        error.contains(&format!("« pending-enrollment-{id} »")),
+        "{error}"
+    );
+
+    for _ in 0..2 {
+        let reply = client
+            .call(EngineCommand::DiscardPendingEnrollment {
+                request_id: id.clone(),
+            })
+            .await;
+        assert!(matches!(reply, Ok(EngineReply::Unit)), "reply: {reply:?}");
+    }
+}
+
+#[tokio::test]
 async fn pending_enrollments_answer_through_the_client() {
     let scratch = Scratch::new("pending-enrollments");
     let service = EngineService::open(
