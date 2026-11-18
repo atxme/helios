@@ -677,6 +677,18 @@ export type Refusal =
   | { refusal: 'gateway_identity_missing' }
   | { refusal: 'domain_complete' }
   | { refusal: 'handoff_mismatch' }
+  | { refusal: 'export_unreadable' }
+  | { refusal: 'export_other_gateway' }
+  | { refusal: 'export_other_peer' }
+  | { refusal: 'export_other_domain' }
+  | { refusal: 'export_leaf_invalid' }
+  | { refusal: 'export_incomplete' }
+  | { refusal: 'export_relay_unavailable' }
+  | { refusal: 'export_relay_rp_id' }
+  | { refusal: 'export_relay_ca_tls' }
+  | { refusal: 'export_relay_epochs' }
+  | { refusal: 'export_relay_service_key' }
+  | { refusal: 'export_relay_authority' }
   | { refusal: 'bootstrap_request_invalid' }
   | { refusal: 'delegation_request_invalid' }
   | { refusal: 'delegation_request_mismatch' }
@@ -978,6 +990,8 @@ export type EnrollmentGesture =
       endpoint: string
       allowed_ips?: string
       ssh_target?: string
+      /** Contenu du fichier `heliosd export-enrolment`, lu seulement sans tunnel. */
+      enrolment_export?: string
     }
 
 /**
@@ -1149,7 +1163,7 @@ export interface RotationJournalView {
   activationAt: number
   notAfter: number
   nextFingerprint: string
-  /** Sans dépôt d'Orion : une rotation signée hors ligne, que `astra-signer` peut encore reprendre. */
+  /** Sans dépôt d'Orion : une rotation signée hors ligne, que l'ancien `astra-signer` pouvait reprendre. */
   offline: boolean
   /** Signée sans campagne : la reprise se fait sur la gateway seule. Absent des anciens journaux : `false`. */
   withoutCampaign: boolean

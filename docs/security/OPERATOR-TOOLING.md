@@ -214,7 +214,7 @@ prochain handshake, il n'existe pas de liste de révocation.
 > servi. La cible acceptée par
 > [ADR-008](../adr/ADR-008-ASTRA-AUTORITE-CERTIFICATS.md) déplace le cycle de
 > vie vers Astra, conserve les CA maîtresses chiffrées et les ouvre localement
-> avec `astra-signer` et une YubiKey. Ce lot est livré
+> avec Orion et une clé de sécurité. Ce lot est livré
 > ([DEPLOIEMENT-ASTRA](../DEPLOIEMENT-ASTRA.md)) ; les commandes ci-dessous
 > restent celles des scripts d'installation et d'un domaine qui n'est pas passé
 > sous Astra.
@@ -314,15 +314,14 @@ restaure donc le slot précédent.
 
 Un client Helios s'enrôle sans qu'aucune clé privée quitte son poste
 ([NEGOCIATION-DE-CLE-V5 §15](../specification/NEGOCIATION-DE-CLE-V5.md#15-enrôlement)).
-Prérequis : un domaine de confiance (`astra-signer init`, puis
-`heliosd init-trust-domain`), donc une leaf PQ gateway émise sous `CA-PQ`, et
+Prérequis : un domaine de confiance (« Créer le domaine » dans Orion, onglet
+*Astra*, « Coffre et clés », puis `heliosd init-trust-domain`), donc une leaf PQ gateway émise sous `CA-PQ`, et
 un credential opérateur matériel enregistré dans le coffre.
 
 Le côté opérateur se joue **dans Orion**, onglet *Astra*, sous-onglet
-« Enrôlement » (l'onglet d'ouverture). Les commandes `astra-signer enroll …` et
-`helios enroll document` existent encore, **à titre transitoire**, jusqu'au lot 7
-de F14 ; elles sont décrites en fin de section. Le parcours dans Orion est à
-valider en recette sous Windows.
+« Enrôlement » (l'onglet d'ouverture). Il n'existe plus de commande pour ce
+parcours : `astra-signer` et `helios enroll document` sont retirés au lot 7 de
+F14. Le parcours dans Orion est à valider en recette sous Windows.
 
 1. **Invitation** — « Inviter un poste… ». L'opérateur saisit le nom du poste,
    la durée (24 h au plus) et, pour réadmettre une clé retirée, coche
@@ -358,16 +357,83 @@ valider en recette sous Windows.
 
    Si aucune gateway ne répond, ou si elle refuse l'admission, le geste s'arrête
    après les feuilles. Les artefacts sont alors les deux feuilles (la feuille
-   `.der` est remise en octets bruts) et `admission.txt`, qui contient la ligne
-   `heliosd peer add … --minimum-mode ml-kem`. La lancer en console sur la
-   gateway (ajouter `--admin` pour le premier administrateur), puis « Reprendre »
-   (étape 4).
+   `.der` est remise en octets bruts) et `admission.txt`, dont les trois lignes
+   sont : `heliosd peer add … --minimum-mode ml-kem` ;
+   `heliosd export-enrolment --public-key <clé> > <nom>.enrolment.json` ; et
+   « Ajouter --admin à la première ligne pour le premier administrateur, puis
+   « Reprendre » avec ce fichier. ». Le premier administrateur sans tunnel est
+   décrit à la suite de la reprise (étape 4).
 
 4. **Reprise** — « Reprendre » dans la liste des invitations. Orion ne réémet
    jamais les feuilles : il revérifie la gateway, saute l'admission si le pair
    est déjà admis, et demande **une** clé pour signer le document. Une acceptation
    faite par la CLI (aucun `.accepted.json` ici) est refusée : ses feuilles ne
    sont pas sur ce poste.
+
+   Sans tunnel, « Reprendre » demande le fichier d'export de la gateway, dans le
+   champ « Export d'enrôlement de la gateway », avec la phrase « Sans tunnel : le
+   fichier de `heliosd export-enrolment`. ». Tunnel monté, ce fichier est ignoré :
+   la gateway connectée fait foi.
+
+**Premier administrateur, sans tunnel.** Le premier pair administrateur n'a pas
+encore de tunnel vers la gateway, donc aucune admission ne passe par l'API
+d'administration. Le parcours se fait en trois temps :
+
+1. Accepter la demande du poste (étape 3) : Orion écrit les feuilles et
+   `admission.txt`, puis s'arrête. La réponse est une invitation « consommée »
+   avec « Reprendre ».
+2. Copier sur la gateway les deux feuilles écrites à côté d'`admission.txt`,
+   `<id>-client-cert.der` et `<id>-client-pq-cert.json` (`<id>` est l'identifiant
+   hexadécimal de la demande), dans le répertoire où l'on lance la commande :
+   la ligne les nomme par chemin relatif. Puis, en console sur la gateway, lancer
+   la **première ligne** d'`admission.txt`, avec `--admin` ajouté à la fin, puis la
+   deuxième. La première ligne d'`admission.txt` est, pour un poste nommé
+   `poste-admin` :
+
+   ```sh
+   sudo heliosd peer add --name poste-admin --public-key <clé> \
+     --certificate <id>-client-cert.der --pq-certificate <id>-client-pq-cert.json \
+     --minimum-mode ml-kem --admin
+   sudo heliosd export-enrolment --public-key <clé> > poste-admin.enrolment.json
+   ```
+
+   Sans les deux feuilles, `peer add` refuse sur une gateway qui a un domaine de
+   confiance, et `export-enrolment` échoue faute de feuilles.
+
+   `export-enrolment` imprime un JSON de format `helios-enrolment-export-v1`, sans
+   démon ni réseau. Il refuse un pair absent de `network.toml` (« admit it first,
+   with `heliosd peer add` ») et une gateway sans domaine de confiance. Le fichier
+   est public : il ne contient aucun secret.
+3. Sur le poste, « Reprendre » (étape 4) avec `poste-admin.enrolment.json`. Le
+   champ « Adresse publique de la gateway » est obligatoire : sans lui le bouton
+   « Reprendre l’enrôlement » reste inactif.
+
+   Le fichier est copié sur le poste par `scp`, pas par une redirection
+   PowerShell : PowerShell 5.1 écrit en UTF-16, et Orion le refuse comme n'étant
+   pas un export.
+
+Avant toute clé, Orion contrôle que ce fichier désigne la même gateway que
+l'invitation (clé WireGuard, nom de service et feuille PQ, par l'épingle de
+l'invitation), le même pair que la demande acceptée, et le même domaine et la
+même `CA-PQ` que le relais du domaine. Il compare ensuite au relais, à côté du
+coffre, chaque valeur du bloc de confiance que le relais porte : RP ID,
+certificat CA-TLS client, époques de `CA-PQ` et de `CA-TLS`, clé de service
+Astra et son époque, origine d'Astra. Sans relais lisible, la reprise hors ligne
+est refusée. La feuille PQ est vérifiée sous `CA-PQ` et son empreinte
+recalculée. Le document est construit avant la clé : un fichier qu'Orion ne
+saurait pas lire ne coûte aucune signature.
+
+**Ce que le fichier peut tromper.** Hors ligne, un fichier ne lie que ce que le
+relais et l'invitation portent. La feuille PQ et la clé WireGuard de la gateway
+sont liées par `CA-PQ` et par l'épingle de l'invitation, et le bloc de confiance
+est comparé au relais : un fichier qui substitue l'une de ces valeurs est
+refusé. Restent **non liées** les valeurs que le relais ne porte pas :
+`astra_policy_fingerprint`, `active_gateway_identity_epoch`,
+`gateway_decision_epoch`, `client_generation`, les adresses du pair (`address`,
+`address_v6`), le certificat TLS de négociation, son port et `heliosd_url`. Un
+fichier faux sur ces valeurs ne donne pas accès à la gateway, mais peut laisser
+un poste mal configuré sans message. Cette limite est acceptée ; la lier
+demanderait que le relais porte ces valeurs.
 
 5. **Import** — Orion, sur le poste client, vérifie la signature sous la `CA-PQ`
    épinglée à l'étape 2, la liaison à sa demande en attente, les feuilles contre
@@ -391,30 +457,12 @@ pair de ce poste doit porter le drapeau `admin` ») : le geste s'arrête alors
 après les feuilles et se termine avec `admission.txt` (étape 3). Ce que la
 gateway accorde réellement se constate en recette (MANUAL-TESTING).
 
-**CLI transitoire.** Jusqu'au lot 7, les mêmes gestes existent en ligne de
-commande ; Orion et la CLI partagent le registre des invitations et
-l'assemblage du brouillon (`orion_core::enrollment_draft`), mais une acceptation
-faite par la CLI ne se reprend pas dans Orion.
-
-- `astra-signer enroll invite --gateway-certificate key-negotiation-pq-cert.json
-  --valid-for-hours 24 --out poste.helios-invite` (`--allow-readmission` pour
-  deux credentials) ;
-- `astra-signer enroll accept --request poste.helios-request --out-dir ./feuilles`
-  écrit les feuilles et imprime la ligne `heliosd peer add …` ;
-- `helios enroll document --request poste.helios-request --tls-certificate
-  ./feuilles/<id>-client-cert.der --pq-certificate
-  ./feuilles/<id>-client-pq-cert.json --endpoint vpn.example.net:51820 --out
-  poste.draft.json` assemble le brouillon (en ligne il lit la gateway par l'API ;
-  hors ligne, `--gateway-certificate`, `--gateway-pq-certificate`, `--address` et
-  `--trust-material`, la sortie de `heliosd show-trust-enrolment`, la
-  remplacent) ;
-- `astra-signer enroll sign-document --draft poste.draft.json --out poste.orion`
-  signe le brouillon sous `CA-PQ` ;
-- `astra-signer enroll list` et `enroll revoke <id>` listent et révoquent.
-
-L'ancien `helios enroll`, qui émettait les clés du client sur le poste opérateur
-et les livrait dans le profil, n'existe plus ; Orion refuse un document v1 Helios
-en renvoyant ici. `scripts/provision-client.sh` refuse pour la même raison, et
+**Retrait au lot 7.** `astra-signer enroll …` et `helios enroll document` ont
+été retirés. Le brouillon de l'enrôlement reste assemblé par
+`orion_core::enrollment_draft`, que consomme Orion. L'ancien `helios enroll`,
+qui émettait les clés du client sur le poste opérateur et les livrait dans le
+profil, n'existe plus ; Orion refuse un document v1 Helios.
+`scripts/provision-client.sh` refuse pour la même raison, et
 `scripts/key-negotiation-setup.sh` ne prépare plus que la gateway.
 
 ### Profil WireGuard classique
@@ -472,13 +520,16 @@ Tout le parcours est **à valider en recette sous Windows** (MANUAL-TESTING,
 * **Rotations (amendement du 8 novembre 2026, F14 lot 5b).** Les rotations de
   CA-PQ et de CA TLS, « Terminer », la reprise, le renouvellement de la
   délégation et l'envoi de la copie du coffre se jouent dans Orion (onglet
-  *Astra* › *Rotations*), sans commande ni fichier ; les commandes
-  d'`astra-signer` restent le recours jusqu'au lot 7. Voir
+  *Astra* › *Rotations*), sans commande ni fichier. `astra-signer` est retiré au lot 7. Voir
   `RENOUVELLEMENT-CERTIFICATS.md`.
-* **Hors périmètre.** `approve-campaign` hors ligne n'est pas porté : aucun composant du dépôt
-  ne lit un fichier `CampaignApproval`. Les campagnes de révocation, d'identité de
-  gateway et d'amorçage restent « pas encore disponibles » dans *Approbations*
-  (lots 5c et 6b) ; celles d'ancre se lancent depuis *Rotations*. `astra-signer` disparaît au lot 7.
+* **Hors périmètre.** `approve-campaign` hors ligne n'est pas porté : aucun
+  composant du dépôt ne lit un fichier `CampaignApproval`. L'approbation de
+  `approve` par fichier, hors tunnel, et le transport HTTPS public
+  (`--authority-url`) de `recover` et des campagnes ne sont pas portés non plus ;
+  Orion passe par le tunnel. Les campagnes se lancent et s'approuvent dans
+  *Approbations* ; la révocation d'un poste dans *Postes* ; l'identité de la
+  gateway et les rotations dans *Rotations* ; l'amorçage de la gateway par « Amorcer
+  la gateway… » dans *Domaine*. `astra-signer` est retiré au lot 7.
 
 ## Ce que cet outillage ne fait pas
 

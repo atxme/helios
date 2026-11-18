@@ -18,10 +18,10 @@ clés privées du poste dans le profil.
 
 L'enrôlement v5 se fait en trois gestes, décrits dans
 docs/security/OPERATOR-TOOLING.md §6 :
-  1. astra-signer enroll invite      — invitation signée sous CA-PQ
+  1. Orion, Astra › Enrôlement       — invitation signée sous CA-PQ
   2. Orion « Demande d'enrôlement »  — le poste génère ses clés et sa demande
-  3. astra-signer enroll accept, helios enroll document,
-     astra-signer enroll sign-document — le document signé revient au poste
+  3. Orion, Astra › Enrôlement       — acceptation de la demande, puis document
+     signé, qui revient au poste
 
 La préparation de la gateway reste scriptée : ./scripts/key-negotiation-setup.sh
 EOF

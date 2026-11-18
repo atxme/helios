@@ -133,9 +133,7 @@ pub(super) fn print_issuer_request(
                 opening.opened.campaign_fingerprint
             );
             eprintln!(
-                "sign it from the operator machine:\n  astra-signer authorize-issuer \\\n    \
-                 --authority-url {} \\\n    --operation-id {}",
-                opening.authority_url,
+                "approve it in Orion, Astra › Approbations, operation {}",
                 opening.opened.operation_id.to_hex()
             );
             eprintln!(
@@ -145,7 +143,7 @@ pub(super) fn print_issuer_request(
         }
         None => {
             eprintln!(
-            "hors campagne      : `astra-signer authorize-issuer --request <file> --out <file>`, \
+            "hors campagne      : approuver le fichier de demande dans Orion, Astra › Approbations, \
              puis `astra issuer install`. Rien ne rattache alors cette demande à cette autorité : \
              l'opérateur signe le fichier qu'on lui présente. Passer --reason et --requested-by \
              pour la cérémonie du §8.2."

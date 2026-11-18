@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
@@ -207,6 +207,7 @@ export function EnrollmentOperatorPanel({
       <ResumeDialog
         entry={resuming}
         endpoint={gateway.endpoint}
+        connected={gateway.connected}
         busy={busy}
         onClose={() => setResuming(null)}
         onSubmit={async (gesture) => {
@@ -528,12 +529,14 @@ function AcceptForm({
 function ResumeDialog({
   entry,
   endpoint: prefill,
+  connected,
   busy,
   onClose,
   onSubmit,
 }: {
   entry: InvitationView | null
   endpoint: string
+  connected: boolean
   busy: boolean
   onClose: () => void
   onSubmit: (gesture: EnrollmentGesture) => Promise<void>
@@ -541,6 +544,36 @@ function ResumeDialog({
   const [endpoint, setEndpoint] = useEndpoint(prefill)
   const [allowedIps, setAllowedIps] = useState('')
   const [sshTarget, setSshTarget] = useState('')
+  const [exportText, setExportText] = useState<string | null>(null)
+  const [fileError, setFileError] = useState<string | null>(null)
+  // Bumped on every reset, so a read that finishes after the dialog moved on is dropped.
+  const generation = useRef(0)
+
+  // A file chosen for one invitation never travels with another, nor with a reopened dialog.
+  const invitationId = entry?.invitation_id ?? null
+  useEffect(() => {
+    generation.current += 1
+    setExportText(null)
+    setFileError(null)
+  }, [invitationId])
+
+  const pick = async (file: File | undefined) => {
+    const current = ++generation.current
+    setFileError(null)
+    if (!file) {
+      setExportText(null)
+      return
+    }
+    try {
+      const text = await readFileText(file)
+      if (current === generation.current) setExportText(text)
+    } catch (cause) {
+      if (current !== generation.current) return
+      setExportText(null)
+      setFileError(String(cause instanceof Error ? cause.message : cause))
+    }
+  }
+
   return (
     <Dialog open={entry !== null} onClose={onClose} fullWidth maxWidth="xs">
       <DialogTitle sx={{ fontSize: 14 }}>Reprendre l’enrôlement</DialogTitle>
@@ -558,6 +591,26 @@ function ResumeDialog({
             sshTarget={sshTarget}
             setSshTarget={setSshTarget}
           />
+          <Box>
+            <TextField
+              size="small"
+              type="file"
+              label="Export d'enrôlement de la gateway"
+              slotProps={{ inputLabel: { shrink: true } }}
+              onChange={(event) => void pick((event.target as HTMLInputElement).files?.[0])}
+              fullWidth
+            />
+            <Typography color="text.secondary" sx={{ fontSize: 10.5, mt: 0.5 }}>
+              {connected
+                ? 'Ignoré tunnel monté : la gateway connectée fait foi.'
+                : 'Sans tunnel : le fichier de heliosd export-enrolment.'}
+            </Typography>
+            {fileError && (
+              <Alert severity="error" variant="outlined" sx={{ mt: 0.75, fontSize: 11.5 }}>
+                {fileError}
+              </Alert>
+            )}
+          </Box>
         </Stack>
       </DialogContent>
       <DialogActions>
@@ -574,6 +627,7 @@ function ResumeDialog({
               endpoint: endpoint.trim(),
               ...(optional(allowedIps) ? { allowed_ips: optional(allowedIps) } : {}),
               ...(optional(sshTarget) ? { ssh_target: optional(sshTarget) } : {}),
+              ...(exportText !== null ? { enrolment_export: exportText } : {}),
             })
           }
         >

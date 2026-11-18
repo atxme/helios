@@ -153,13 +153,13 @@ impl DomainHandoff {
         }
     }
 
-    /// A value the deployment recorded, or a refusal naming the flag that
-    /// records it.
-    pub fn require<'a, T>(&self, value: Option<&'a T>, what: &str, flag: &str) -> Result<&'a T> {
+    /// A value the deployment recorded, or a refusal naming the place in Orion
+    /// that records it.
+    pub fn require<'a, T>(&self, value: Option<&'a T>, what: &str) -> Result<&'a T> {
         value.ok_or_else(|| {
             anyhow::anyhow!(
-                "le relais de domaine ne porte pas {what} : le renseigner par `astra-signer \
-                 domain {flag} <valeur>`"
+                "le relais de domaine ne porte pas {what} : le renseigner dans Orion, Domaine, \
+                 « Modifier »"
             )
         })
     }
@@ -203,12 +203,10 @@ pub fn identity_of(handoff: &DomainHandoff) -> Result<DomainIdentity> {
     let gateway = handoff.require(
         handoff.gateway_wg_public_key.as_ref(),
         "la clé publique de la gateway",
-        "--gateway-wg-public-key",
     )?;
     let server_name = handoff.require(
         handoff.server_name.as_ref(),
         "le nom de service de la gateway",
-        "--server-name",
     )?;
     Ok(DomainIdentity {
         trust_domain_id: TrustDomainId::parse_hex(&handoff.trust_domain_id)?,
@@ -235,7 +233,7 @@ pub fn expected_authority_url(handoff: &DomainHandoff, channel: &Campaign) -> Re
         (None, Campaign::Origin(origin)) => Ok(origin.base().to_string()),
         (None, Campaign::Tunnel(_)) => bail!(
             "le relais de domaine ne porte pas l'origine déclarée par l'autorité : la renseigner \
-             par `astra-signer domain --astra-authority-url <url>`. Dans le tunnel aucune URL \
+             dans Orion, Domaine › « Modifier », « Origine d'Astra ». Dans le tunnel aucune URL \
              n'est composée, donc rien d'autre ne peut servir de valeur attendue à la demande \
              signée."
         ),
@@ -260,8 +258,9 @@ pub fn verify_campaign_request(
 ) -> Result<()> {
     let service_key = handoff.astra_service_public_key.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
-            "ce relais de domaine ne porte pas la clé de service Astra : la réémettre par \
-             `astra-signer domain`, sinon rien ne vérifie ce que l'origine renvoie"
+            "ce relais de domaine ne porte pas la clé de service Astra : la renseigner dans \
+             Orion, Domaine › « Modifier », « Clé de service Astra », sinon rien ne vérifie ce \
+             que l'origine renvoie"
         )
     })?;
     let service_key_epoch = handoff.astra_service_key_epoch.ok_or_else(|| {

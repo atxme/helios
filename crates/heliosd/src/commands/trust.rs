@@ -7,7 +7,11 @@
 
 use std::path::Path;
 
+use aether::certificates::encoding::WireGuardKey;
+use aether::key_negotiation::{encode_enrolment_export_file, EnrollmentExport, PqCertificate};
+use aether::{NetworkConfig, WgPeer};
 use anyhow::Context;
+use helios_provisioning::certificates::CertificateRegistry;
 use helios_tpm::TpmSettings;
 use tracing::{info, warn};
 
@@ -260,56 +264,119 @@ fn now_unix() -> anyhow::Result<u64> {
         .as_secs())
 }
 
-/// Creates the gateway's certificate registry.
+/// Writes the public file an Orion enrolment is signed from, for a first
+/// administrator whose workstation has no tunnel yet.
 ///
-/// # Where each value comes from, and why not from an argument
-///
-/// The server name and the gateway's WireGuard identity are read out of the PQ
-/// leaf already on disk, never retyped: the registry has to describe the
-/// identity this gateway actually serves. An operator who mistyped either
-/// would produce a registry that disagrees with the certificate every client
-/// pins — and the disagreement would only surface at the first staging, as a
-/// refusal naming neither.
-///
-/// The anchors, by contrast, *must* come from the operator: `CA-PQ` is born on
-/// their machine inside `astra-signer`, and the Astra service key inside the
-/// container. Neither is derivable here, and confirming them out of band is
-/// the point (ADR-008 §3).
-/// Prints one peer's §19 trust block, as an Orion profile embeds it.
-///
-/// JSON on stdout and nothing else, so it can be captured into a file for
-/// `helios enroll document --trust-material`, beside the two gateway
-/// certificates fetched over SSH. The same block the admin API serves, from the same reading
-/// of the same registry — a second shape here would be a second thing to keep
-/// equal by hand.
-pub(crate) fn show_trust_enrolment(public_key: &str) -> anyhow::Result<()> {
-    use helios_provisioning::certificates::CertificateRegistry;
+/// The same values the online routes serve, read from the same files and the
+/// same registry: `GET /api/key-negotiation`, the network view and the §19
+/// trust block of the peer. Printed on stdout and nothing else, so it can be
+/// captured into a file. Public material only.
+pub(crate) fn export_enrolment(public_key: &str) -> anyhow::Result<()> {
+    let network = NetworkConfig::load().context("loading the network config")?;
+    admitted_in_network(&network, public_key)?;
+    let material = key_negotiation::public_material()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "this gateway has no key-negotiation material — run `heliosd init-key-negotiation`"
+        )
+    })?;
+    let registry = load_trust_domain(&CertificateRegistry::path())?;
+    let export = enrolment_export(
+        &network,
+        &material.certificate_der,
+        &material.pq_certificate_json,
+        &registry,
+        public_key,
+    )?;
+    println!("{}", encode_enrolment_export_file(&export));
+    Ok(())
+}
 
-    let path = CertificateRegistry::path();
-    let registry = CertificateRegistry::load(&path)
+/// Builds the export of one admitted peer from values already read.
+///
+/// Pure: no file is opened here, so every refusal is testable on its own. The
+/// gateway's identity is read out of the PQ leaf on disk, never retyped, and
+/// the leaf must name the WireGuard identity the sealed key derives to —
+/// otherwise every client would pin a certificate that cannot be served.
+pub(crate) fn enrolment_export(
+    network: &NetworkConfig,
+    certificate_der: &[u8],
+    pq_certificate_json: &[u8],
+    registry: &CertificateRegistry,
+    public_key: &str,
+) -> anyhow::Result<EnrollmentExport> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let peer = admitted_in_network(network, public_key)?;
+    let trust = trust_enrolment_view(registry, public_key)?;
+    let leaf: PqCertificate = serde_json::from_slice(pq_certificate_json)
+        .map_err(|_| anyhow::anyhow!("the gateway PQ certificate on disk is unreadable"))?;
+    let fingerprint = leaf
+        .fingerprint()
+        .map_err(|_| anyhow::anyhow!("the gateway PQ certificate cannot be fingerprinted"))?;
+    let private = network.wg_private_key.expose();
+    if !private.is_empty() {
+        if let Ok(public) = aether::wg::public_from_private(private) {
+            if public != leaf.wireguard_public_key.trim() {
+                anyhow::bail!(
+                    "the negotiation certificate is bound to another WireGuard identity — run \
+                     `heliosd init-key-negotiation --rotate`"
+                );
+            }
+        }
+    }
+    Ok(EnrollmentExport {
+        server_name: leaf.subject.clone(),
+        gateway_ca_der: STANDARD.encode(certificate_der),
+        gateway_pq_certificate: STANDARD.encode(pq_certificate_json),
+        pq_certificate_sha256: fingerprint,
+        wireguard_public_key: leaf.wireguard_public_key.clone(),
+        negotiation_port: network.key_negotiation_port,
+        gateway_wg_address: network.wg_address.clone(),
+        peer_public_key: peer.public_key.clone(),
+        address: peer.address.clone(),
+        address_v6: peer.address_v6.map(aether::net::format_vip_v6),
+        trust: serde_json::to_value(&trust).context("encoding the trust block")?,
+    })
+}
+
+fn parse_wireguard_key(public_key: &str) -> anyhow::Result<WireGuardKey> {
+    WireGuardKey::parse(public_key.trim())
+        .map_err(|error| anyhow::anyhow!("invalid WireGuard public key: {error}"))
+}
+
+/// The peer as `network.toml` admits it, the first refusal of an export.
+fn admitted_in_network<'a>(
+    network: &'a NetworkConfig,
+    public_key: &str,
+) -> anyhow::Result<&'a WgPeer> {
+    let key = parse_wireguard_key(public_key)?;
+    network
+        .peers
+        .iter()
+        .find(|peer| peer.public_key.trim() == key.to_base64())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no such peer in network.toml — admit it first, with `heliosd peer add`"
+            )
+        })
+}
+
+fn load_trust_domain(path: &Path) -> anyhow::Result<CertificateRegistry> {
+    CertificateRegistry::load(path)
         .with_context(|| format!("reading {}", path.display()))?
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "this gateway has no trust domain: run `heliosd init-trust-domain` first. An \
                  absent registry is not an empty one — the lifecycle routes stay closed."
             )
-        })?;
-    let view = trust_enrolment_view(&registry, public_key)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&view).context("encoding the trust block")?
-    );
-    Ok(())
+        })
 }
 
 fn trust_enrolment_view(
-    registry: &helios_provisioning::certificates::CertificateRegistry,
+    registry: &CertificateRegistry,
     public_key: &str,
 ) -> anyhow::Result<helios_api::certificates::TrustEnrolmentView> {
-    use aether::certificates::encoding::WireGuardKey;
-
-    let key = WireGuardKey::parse(public_key.trim())
-        .map_err(|error| anyhow::anyhow!("invalid WireGuard public key: {error}"))?;
+    let key = parse_wireguard_key(public_key)?;
     let peer = registry.peer(&key).ok_or_else(|| {
         anyhow::anyhow!(
             "no such peer in the certificate registry — admit it first, with `heliosd peer add` \
@@ -323,7 +390,7 @@ fn trust_enrolment_view(
 ///
 /// The domain's own anchor when the deployment supplies it, and the operator
 /// admission CA otherwise. The fallback exists because a domain may be
-/// bootstrapped before `astra-signer issue-ca-tls` has run, but it is never
+/// bootstrapped before the domain's CA-TLS is issued in Orion, but it is never
 /// silent: a registry seeded with the admission CA stages no renewal — the
 /// candidate leaf chains to Astra's delegated intermediate, which is signed by
 /// the domain anchor — and §9.4 cannot repair it afterwards, because a
@@ -400,6 +467,21 @@ pub(crate) fn repair_client_tls_ca_bootstrap(
     Ok(())
 }
 
+/// Creates the gateway's certificate registry.
+///
+/// # Where each value comes from, and why not from an argument
+///
+/// The server name and the gateway's WireGuard identity are read out of the PQ
+/// leaf already on disk, never retyped: the registry has to describe the
+/// identity this gateway actually serves. An operator who mistyped either
+/// would produce a registry that disagrees with the certificate every client
+/// pins — and the disagreement would only surface at the first staging, as a
+/// refusal naming neither.
+///
+/// The anchors, by contrast, *must* come from the operator: `CA-PQ` is born on
+/// their machine inside Orion, and the Astra service key inside the
+/// container. Neither is derivable here, and confirming them out of band is
+/// the point (ADR-008 §3).
 pub(crate) fn init_trust_domain(
     trust_domain_id: &str,
     ca_public_key: &str,
@@ -590,12 +672,17 @@ fn initial_trust_domain_state(
 
 #[cfg(test)]
 mod trust_domain_seeding_tests {
-    use super::{domain_client_tls_ca, initial_trust_domain_state, trust_enrolment_view};
+    use super::{
+        domain_client_tls_ca, enrolment_export, initial_trust_domain_state, load_trust_domain,
+        trust_enrolment_view,
+    };
+    use crate::certificates::enrolment_view;
     use aether::certificates::client::ClientCertificateGeneration;
     use aether::certificates::encoding::{
         generate_ml_dsa_87_keypair, DerCertificate, Fingerprint, TrustDomainId, WireGuardKey,
     };
     use aether::certificates::state::ClientCertificateState;
+    use aether::key_negotiation::{decode_enrolment_export_file, encode_enrolment_export_file};
     use helios_provisioning::certificates::{CertificateRegistry, PeerCertificates};
 
     const AUTHORITY_URL: &str = "https://astra.example";
@@ -655,6 +742,9 @@ mod trust_domain_seeding_tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let peer_key = WireGuardKey::from_bytes([3; 32]);
         let mut state = initial_state(gateway_identity(&key(9).to_base64()));
+        // A genuine anchor: the trust block carries it, and Orion parses it.
+        state.client_tls_ca.active_client_tls_ca_certificate =
+            aether::certificates::test_x509::client_material("workstation").authority;
         state.peers.insert(
             peer_key.to_base64(),
             PeerCertificates {
@@ -887,5 +977,226 @@ mod trust_domain_seeding_tests {
         assert_eq!(view.client_generation, 7);
         assert_eq!(view.astra_authority_url, AUTHORITY_URL);
         assert_eq!(view.webauthn_rp_id, RP_ID);
+    }
+
+    /// A network that admits `public_key`, with the gateway's private key as
+    /// `wg_private` (empty when the identity is sealed in the TPM vault).
+    fn network_admitting(public_key: &str, wg_private: &str) -> aether::NetworkConfig {
+        let mut network = aether::NetworkConfig::default();
+        network.peers.push(aether::WgPeer {
+            name: "workstation".into(),
+            public_key: public_key.into(),
+            address: "100.64.1.2/32".into(),
+            address_v6: Some("fd00::2".parse().expect("VIP")),
+            admin: false,
+            preshared_key: None,
+            key_negotiation_certificate_sha256: None,
+            key_negotiation_pq_certificate_sha256: None,
+            minimum_key_negotiation_mode: None,
+            persistent_keepalive_secs: aether::config::DEFAULT_PERSISTENT_KEEPALIVE_SECS,
+        });
+        network.key_negotiation_port = Some(4443);
+        network.wg_private_key = aether::SecretString::new(wg_private);
+        network
+    }
+
+    /// The bytes the negotiation files hold: the TLS DER and the PQ leaf, as
+    /// `served_identity` reads them from disk.
+    fn negotiation_files(registry: &CertificateRegistry) -> (Vec<u8>, Vec<u8>) {
+        let leaf = &registry.state().gateway.active_gateway_certificate;
+        (
+            certificate(2).as_bytes().to_vec(),
+            serde_json::to_vec(leaf).expect("encoding the leaf"),
+        )
+    }
+
+    #[test]
+    fn export_carries_what_the_online_routes_serve() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let (registry, _directory, peer_key) = registry_with_peer();
+        let network = network_admitting(&peer_key.to_base64(), "");
+        let (certificate_der, pq_json) = negotiation_files(&registry);
+
+        let export = enrolment_export(
+            &network,
+            &certificate_der,
+            &pq_json,
+            &registry,
+            &peer_key.to_base64(),
+        )
+        .expect("an admitted peer has an export");
+
+        let leaf = &registry.state().gateway.active_gateway_certificate;
+        assert_eq!(export.server_name, leaf.subject);
+        assert_eq!(
+            export.pq_certificate_sha256,
+            leaf.fingerprint().expect("fingerprint")
+        );
+        assert_eq!(export.wireguard_public_key, leaf.wireguard_public_key);
+        assert_eq!(
+            STANDARD.decode(&export.gateway_ca_der).expect("base64"),
+            certificate_der
+        );
+        assert_eq!(
+            STANDARD
+                .decode(&export.gateway_pq_certificate)
+                .expect("base64"),
+            pq_json
+        );
+        assert_eq!(export.negotiation_port, Some(4443));
+        assert_eq!(export.gateway_wg_address, network.wg_address);
+        assert_eq!(export.peer_public_key, peer_key.to_base64());
+        assert_eq!(export.address, "100.64.1.2/32");
+        assert_eq!(export.address_v6.as_deref(), Some("fd00::2/128"));
+        assert_eq!(
+            export.trust,
+            serde_json::to_value(enrolment_view(
+                registry.state(),
+                registry.peer(&peer_key).expect("peer")
+            ))
+            .expect("encoding the trust block")
+        );
+    }
+
+    #[test]
+    fn an_export_is_one_orion_reads() {
+        let (registry, _directory, peer_key) = registry_with_peer();
+        let network = network_admitting(&peer_key.to_base64(), "");
+        let (certificate_der, pq_json) = negotiation_files(&registry);
+        let export = enrolment_export(
+            &network,
+            &certificate_der,
+            &pq_json,
+            &registry,
+            &peer_key.to_base64(),
+        )
+        .expect("export");
+
+        let text = encode_enrolment_export_file(&export);
+        let read = decode_enrolment_export_file(&text).expect("the file reads back");
+        let (material, admission) =
+            orion_core::gateway_admin::material_from_export(&read).expect("Orion reads the export");
+
+        assert_eq!(
+            material.server_name,
+            registry.state().gateway.active_gateway_certificate.subject
+        );
+        assert_eq!(admission.address, "100.64.1.2/32");
+        admission
+            .trust
+            .expect("the trust block is present")
+            .validate()
+            .expect("Orion accepts the trust block");
+    }
+
+    #[test]
+    fn export_refuses_a_peer_not_in_network_toml() {
+        let (registry, _directory, peer_key) = registry_with_peer();
+        let network = aether::NetworkConfig::default();
+        let (certificate_der, pq_json) = negotiation_files(&registry);
+
+        let error = enrolment_export(
+            &network,
+            &certificate_der,
+            &pq_json,
+            &registry,
+            &peer_key.to_base64(),
+        )
+        .expect_err("a peer absent from network.toml has no export");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("no such peer in network.toml"),
+            "{message}"
+        );
+        assert!(message.contains("heliosd peer add"), "{message}");
+    }
+
+    #[test]
+    fn export_refuses_a_peer_the_registry_does_not_hold() {
+        let (registry, _directory, _peer_key) = registry_with_peer();
+        let absent = key(4).to_base64();
+        let network = network_admitting(&absent, "");
+        let (certificate_der, pq_json) = negotiation_files(&registry);
+
+        let error = enrolment_export(&network, &certificate_der, &pq_json, &registry, &absent)
+            .expect_err("a peer absent from the registry has no export");
+
+        assert!(error
+            .to_string()
+            .contains("no such peer in the certificate registry"));
+    }
+
+    #[test]
+    fn export_refuses_without_a_trust_domain() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let error = load_trust_domain(&directory.path().join("certificates.json"))
+            .expect_err("an absent registry is not an empty one");
+
+        let message = error.to_string();
+        assert!(message.contains("init-trust-domain"), "{message}");
+        assert!(
+            message.contains("absent registry is not an empty one"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn export_refuses_an_unreadable_key() {
+        let (registry, _directory, peer_key) = registry_with_peer();
+        let network = network_admitting(&peer_key.to_base64(), "");
+        let (certificate_der, pq_json) = negotiation_files(&registry);
+
+        let error = enrolment_export(&network, &certificate_der, &pq_json, &registry, "%%%")
+            .expect_err("an unreadable key is refused before any lookup");
+
+        assert!(error.to_string().contains("invalid WireGuard public key"));
+    }
+
+    #[test]
+    fn export_refuses_a_leaf_bound_to_another_identity() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let (registry, _directory, peer_key) = registry_with_peer();
+        // A private key whose public half is not the leaf's WireGuard key.
+        let other_private = STANDARD.encode([5u8; 32]);
+        let network = network_admitting(&peer_key.to_base64(), &other_private);
+        let (certificate_der, pq_json) = negotiation_files(&registry);
+
+        let error = enrolment_export(
+            &network,
+            &certificate_der,
+            &pq_json,
+            &registry,
+            &peer_key.to_base64(),
+        )
+        .expect_err("a leaf bound to another identity is never exported");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("bound to another WireGuard identity"),
+            "{message}"
+        );
+        assert!(
+            message.contains("init-key-negotiation --rotate"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn export_ignores_a_sealed_identity() {
+        let (registry, _directory, peer_key) = registry_with_peer();
+        let network = network_admitting(&peer_key.to_base64(), "");
+        let (certificate_der, pq_json) = negotiation_files(&registry);
+
+        enrolment_export(
+            &network,
+            &certificate_der,
+            &pq_json,
+            &registry,
+            &peer_key.to_base64(),
+        )
+        .expect("with the identity sealed there is nothing to compare, and the export is made");
     }
 }

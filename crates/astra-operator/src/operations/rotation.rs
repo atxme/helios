@@ -261,14 +261,12 @@ impl LocalDomain {
             RotationKind::CaTls => Some(DerCertificate::parse(relay.require(
                 relay.ca_tls_certificate.as_ref(),
                 "le certificat CA-TLS en service",
-                "--ca-tls-certificate",
             )?)?),
         };
         let authority_url = relay
             .require(
                 relay.astra_authority_url.as_ref(),
                 "l'origine déclarée par l'autorité",
-                "--astra-authority-url",
             )?
             .clone();
         Ok(Self {
@@ -535,7 +533,7 @@ pub fn ensure_nothing_outstanding(vault_path: &Path) -> Result<()> {
     rotation_journal::ensure_none_in_flight(vault_path)?;
     if rotation_journal::legacy_ca_pq_path_beside(vault_path).exists() {
         bail!(
-            "une rotation CA-PQ préparée par astra-signer reste à reprendre. Rien n'a été signé."
+            "une rotation CA-PQ préparée par l'ancien outil de signature reste à reprendre dans Orion, Astra › Rotations. Rien n'a été signé."
         );
     }
     if prepared::load(&prepared::path_beside(vault_path))?.is_some() {
@@ -1128,7 +1126,7 @@ impl CaTlsFinish {
     ///
     /// The record is the same one whichever wrote it, and it names the certificate
     /// because the journal is gone by now. It must have been through a journal, which
-    /// is what proves the gateway named the anchor. A record `astra-signer` left is
+    /// is what proves the gateway named the anchor. A record the former `astra-signer` left is
     /// adopted by the resumption first, and comes back here marked so.
     pub fn begin(vault_path: &Path, now: u64) -> Result<Self> {
         rotation_journal::ensure_none_in_flight(vault_path).context(FinishRefusal::InFlight)?;
@@ -1244,7 +1242,6 @@ fn finish_manifest(
     let outgoing = DerCertificate::parse(relay.require(
         relay.ca_tls_certificate.as_ref(),
         "le certificat CA-TLS en service",
-        "--ca-tls-certificate",
     )?)?;
     Ok(AstraManifest::CaRotation(CaRotationManifest {
         trust_domain_id: vault.trust_domain_id,

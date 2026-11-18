@@ -148,7 +148,7 @@ mod trust_material_validation {
                 .expect_err("a zero gateway epoch is not a domain state");
             let message = format!("{error}");
             assert!(
-                message.contains("show-trust-enrolment"),
+                message.contains("export-enrolment"),
                 "the message must name the command that repairs it: {message}"
             );
         }

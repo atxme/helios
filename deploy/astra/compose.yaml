@@ -6,7 +6,7 @@
 # s'échapper décide de la même chose.
 #
 # `scripts/deploy.sh` fait tout cela tout seul dès qu'un relais de domaine
-# existe — celui qu'écrit `astra-signer init` à côté du coffre. Il construit
+# existe — celui que crée Orion (Astra › Coffre et clés) à côté du coffre. Il construit
 # l'image, la transfère, amorce Astra, capture la clé de service et la tête
 # d'audit, écrit le `.env` ci-dessous et enchaîne sur `heliosd
 # init-trust-domain`. Rien n'est recopié à la main.

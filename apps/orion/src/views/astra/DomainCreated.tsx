@@ -56,10 +56,7 @@ export function DomainCreated() {
           Déployer la gateway : <Box component="code" sx={code}>./scripts/deploy.sh</Box>.
         </li>
         <li>
-          Amorcer la gateway, encore en ligne de commande :{' '}
-          <Box component="code" sx={code}>astra-signer issue-gateway-bootstrap</Box> (avec{' '}
-          <Box component="code" sx={code}>--vault</Box> si le coffre n’est pas à l’emplacement par
-          défaut).
+          Amorcer la gateway : « Domaine » → « Amorcer la gateway… ».
         </li>
         <li>
           « Domaine » → « Finaliser le domaine », puis{' '}

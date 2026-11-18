@@ -39,7 +39,7 @@
 //! [`approval::AstraCredentialBinding`] is checked under `CA-PQ` and
 //! [`webauthn::verify_assertion`] checks an assertion under the credential's
 //! own public key, both on synthetic material. The **producing** half — a
-//! FIDO2 `hmac-secret` key slot, a physical touch, the `astra-signer`
+//! FIDO2 `hmac-secret` key slot, a physical touch, the former `astra-signer`
 //! companion — needs an authenticator no WSL2 build can provide.
 //!
 //! It is worth being exact about what that layer does, because the obvious

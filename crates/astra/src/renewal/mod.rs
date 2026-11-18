@@ -125,7 +125,7 @@ pub enum RenewalError {
     #[error(
         "this authority holds no credential document: no operator credential can approve a \
          renewal, so the ceremony has no allow-list to run against. Copy the one \
-         `astra-signer bindings` emits."
+         that Orion's Domaine, « Finaliser le domaine », emits."
     )]
     NoOperatorCredential,
     #[error("operation: {0}")]

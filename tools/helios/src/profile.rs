@@ -12,12 +12,12 @@
 //!
 //! `emit` admits nobody. Admission requires the client's TLS and PQ
 //! key-negotiation certificates (floor `ml_kem`), which this command neither
-//! issues nor carries: a new Helios client is enrolled from an
-//! `astra-signer enroll invite` invitation (NEGOCIATION-DE-CLE-V5 §15), whose
-//! signed document `helios enroll document` drafts. A profile emitted for a
-//! key the gateway does not know would bring up no tunnel, so such a key is
-//! refused. The assisted mode, where the operator generated the pair, is
-//! gone: the pair it generated could never be admitted.
+//! issues nor carries: a new Helios client is enrolled in Orion, under
+//! Astra › Enrôlement (NEGOCIATION-DE-CLE-V5 §15), which signs the v5
+//! document. A profile emitted for a key the gateway does not know would bring
+//! up no tunnel, so such a key is refused. The assisted mode, where the
+//! operator generated the pair, is gone: the pair it generated could never be
+//! admitted.
 
 use std::path::{Path, PathBuf};
 
@@ -73,8 +73,7 @@ struct Document<'a> {
 pub fn render(profile: Profile<'_>) -> Result<zeroize::Zeroizing<String>> {
     if profile.key_negotiation.is_some() {
         bail!(
-            "a Helios profile travels as a signed v5 document: `helios enroll document`, then \
-             `astra-signer enroll sign-document`"
+            "a Helios profile travels as a signed v5 document, signed in Orion's Astra › Enrôlement"
         );
     }
     let public = serde_json::to_vec(&Document {
@@ -245,8 +244,7 @@ pub async fn emit(client: &Client, base: &str, options: EmitOptions) -> Result<(
         allowed_ips: options.allowed_ips.as_deref(),
         ssh_target: options.ssh_target.as_deref(),
         heliosd_url: heliosd_url(&view.wg_address),
-        // A Helios profile is a signed v5 document, which `enroll document`
-        // drafts and `astra-signer` signs.
+        // A Helios profile is a signed v5 document, signed in Orion's Astra › Enrôlement.
         key_negotiation: None,
     })?;
 
@@ -268,7 +266,7 @@ fn resolve_public_key(options: &EmitOptions) -> Result<String> {
         bail!(
             "provide --public-key <public key of an admitted client>: `profile emit` re-emits \
              the invitation of a peer the gateway already holds. To enroll a new client, start \
-             from `astra-signer enroll invite`"
+             from Orion's Astra › Enrôlement"
         );
     };
     let public_key = public_key.trim().to_string();
@@ -290,7 +288,7 @@ fn reuse_admission(peers: &[NetworkPeerView], name: &str, public_key: &str) -> R
              `helios peer add --name {name} --public-key <key> \
              --key-negotiation-certificate-sha256 <sha256> \
              --key-negotiation-pq-certificate-sha256 <sha256>`, then re-run this command; \
-             or enroll it from `astra-signer enroll invite`"
+             or enroll it from Orion's Astra › Enrôlement"
         );
     };
     if existing.public_key.trim() != public_key {
@@ -600,10 +598,7 @@ mod tests {
             error.contains("--key-negotiation-pq-certificate-sha256"),
             "message: {error}"
         );
-        assert!(
-            error.contains("astra-signer enroll invite"),
-            "message: {error}"
-        );
+        assert!(error.contains("Astra › Enrôlement"), "message: {error}");
     }
 
     #[test]
@@ -633,10 +628,7 @@ mod tests {
     fn without_a_public_key_the_tool_refuses_and_points_to_enroll() {
         let error = resolve_public_key(&options()).unwrap_err().to_string();
         assert!(error.contains("--public-key"), "message: {error}");
-        assert!(
-            error.contains("astra-signer enroll invite"),
-            "message: {error}"
-        );
+        assert!(error.contains("Astra › Enrôlement"), "message: {error}");
     }
 
     #[test]

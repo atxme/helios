@@ -226,7 +226,7 @@ impl TrustMaterial {
         if self.active_gateway_identity_epoch == 0 || self.gateway_decision_epoch == 0 {
             anyhow::bail!(
                 "bloc de confiance trop ancien : il ne porte pas les époques d'identité de la \
-                 gateway. Le réimprimer avec `heliosd show-trust-enrolment --public-key <clé>`"
+                 gateway. Le réimprimer avec `heliosd export-enrolment --public-key <clé>`"
             );
         }
         Ok(())

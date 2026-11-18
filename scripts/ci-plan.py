@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 WINDOWS_PACKAGES = {
-    "aether-fido", "orion-core", "orion", "astra-signer",
+    "aether-fido", "orion-core", "orion",
 }
 
 

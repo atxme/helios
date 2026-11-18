@@ -82,8 +82,10 @@ enum Command {
         authority_url: String,
         #[arg(long)]
         webauthn_rp_id: String,
-        /// SHA-256 of the client `CA-TLS` in service, hex — printed by
-        /// `astra-signer issue-ca-tls` and by `heliosd show-trust-enrolment`.
+        /// SHA-256 of the client `CA-TLS` DER in service, hex. By hand, it is the
+        /// SHA-256 of the `client_tls_ca_der` (base64 DER) that the trust block of
+        /// `heliosd export-enrolment --public-key <clé>` carries; deploy.sh computes it
+        /// from the relay's `ca_tls_certificate`.
         ///
         /// Optional, and named rather than inferred: without it this authority
         /// pins the epoch of that anchor without pinning the anchor, and a
@@ -373,7 +375,7 @@ enum IssuerCommand {
     ///
     /// The request is public: an ML-DSA-87 public key and a PKCS#10 request
     /// for the TLS intermediate. It goes to the operator's machine, where
-    /// `astra-signer authorize-issuer` signs it under `CA-PQ` at a security
+    /// Orion (Astra › Approbations) signs it under `CA-PQ` at a security
     /// key. Nothing here can sign anything until that authorization comes
     /// back — the keys exist, and no object names them.
     Request {

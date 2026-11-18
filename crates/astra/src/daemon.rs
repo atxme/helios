@@ -507,7 +507,7 @@ fn load_approval_credentials(
         tracing::warn!(
             path = %path.display(),
             "no credential document: no operator credential can approve a renewal, so every \
-             ordinary rotation will be refused until `astra-signer bindings` is copied here"
+             ordinary rotation will be refused until the credential document of Orion's Domaine, « Finaliser le domaine », is copied here"
         );
         return Ok(astra::service::ApprovalCredentials {
             ids: Vec::new(),

@@ -118,7 +118,7 @@ pub enum CertificateActionBlock {
     /// variant survives so that an earlier serialized state still reads back,
     /// and `renewal_block` no longer returns it.
     CompanionTransportMissing,
-    /// Needs a hardware credential and the `astra-signer` companion (not the
+    /// Needed a hardware credential and the former `astra-signer` companion (not the
     /// ordinary renewal, which Orion approves itself).
     OperatorCredentialRequired,
 }
@@ -166,14 +166,14 @@ impl CertificateActionBlock {
             Self::CompanionTransportMissing => {
                 "Ce profil peut demander son renouvellement : la requête part, l'autorité ouvre \
                  l'opération et attend la clé matérielle de l'opérateur. C'est là que la chaîne \
-                 s'arrête — le compagnon « astra-signer » ne sait pas encore lire sa demande à \
+                 s'arrête — le compagnon de signature ne sait pas encore lire sa demande à \
                  travers le tunnel, et ses routes publiques répondent 501. Le renouvellement \
                  reste donc en attente d'opérateur jusqu'à ce que ce transport existe."
                     .into()
             }
             Self::OperatorCredentialRequired => {
                 "Cette opération exige une clé matérielle d'opérateur et le compagnon \
-                 « astra-signer », qu'Astra refuse explicitement dans cette version."
+                 de signature, qu'Astra refuse explicitement dans cette version."
                     .into()
             }
         }
@@ -271,8 +271,8 @@ fn recovery_block(
         return Some(CertificateActionBlock::NothingExpired);
     }
     // Nothing blocks it any more. `certificate_recovery` signs the historical
-    // request against Astra's public origin, `astra-signer recover` opens the
-    // vault once, and the commit comes back through the private channel — the
+    // request against Astra's public origin, the former `astra-signer recover` opened the
+    // vault once, and the commit came back through the private channel — the
     // client has no tunnel, which is the whole premise.
     None
 }

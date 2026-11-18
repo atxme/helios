@@ -1,6 +1,6 @@
 //! The campaign summary a prepared CA-TLS rotation records.
 //!
-//! This was the local protocol between Orion and the `astra-signer` companion.
+//! This was the local protocol between Orion and the former `astra-signer` companion.
 //! Orion now runs that ceremony itself, so the channel is gone; only the
 //! manifest stays, because records written by an older build carry it and a
 //! resume must still read them.

@@ -3,8 +3,8 @@
 //!
 //! # Why this lives in Orion at all
 //!
-//! ADR-008 §4 keeps `astra-signer` away from every other program because it is
-//! the one that holds `CA-PQ` in the clear. The **ordinary approval** holds
+//! ADR-008 §4 keeps the one ceremony that holds `CA-PQ` in the clear, run by Orion on the
+//! operator's workstation, away from every other program. The **ordinary approval** holds
 //! nothing: §14.1 requires it to obtain no PRF output and open no key-slot, and
 //! [`aether_fido::approve_renewal`] enforces that by taking no vault and
 //! passing no salt. The gesture is therefore separable from the program, and

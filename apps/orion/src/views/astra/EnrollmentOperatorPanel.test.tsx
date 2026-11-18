@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const api = vi.hoisted(() => ({
@@ -151,6 +151,134 @@ describe('EnrollmentOperatorPanel', () => {
       invitation_id: 'a'.repeat(32),
       endpoint: '198.51.100.7:51820',
     })
+  })
+
+  it('resume_without_a_tunnel_names_the_export_and_sends_its_text', async () => {
+    api.getState.mockResolvedValue('down')
+    api.operatorInvitations.mockResolvedValue([invitation('a', { resumable: true })])
+    render(<EnrollmentOperatorPanel onCeremony={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Reprendre' }))
+    expect(
+      await screen.findByText('Sans tunnel : le fichier de heliosd export-enrolment.'),
+    ).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('Adresse publique de la gateway'), {
+      target: { value: '198.51.100.7:51820' },
+    })
+    const file = new File(['EXPORT-TEXT'], 'pc-salon.enrolment.json', { type: 'application/json' })
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Export d'enrôlement de la gateway"), {
+        target: { files: [file] },
+      })
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Reprendre l’enrôlement' }))
+    await waitFor(() => expect(api.beginEnrollmentCeremony).toHaveBeenCalledTimes(1))
+    expect(api.beginEnrollmentCeremony).toHaveBeenCalledWith({
+      gesture: 'resume',
+      invitation_id: 'a'.repeat(32),
+      endpoint: '198.51.100.7:51820',
+      enrolment_export: 'EXPORT-TEXT',
+    })
+  })
+
+  it('resume_without_a_file_sends_no_export_key', async () => {
+    api.getState.mockResolvedValue('down')
+    api.operatorInvitations.mockResolvedValue([invitation('a', { resumable: true })])
+    render(<EnrollmentOperatorPanel onCeremony={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Reprendre' }))
+    fireEvent.change(await screen.findByLabelText('Adresse publique de la gateway'), {
+      target: { value: '198.51.100.7:51820' },
+    })
+    const send = screen.getByRole('button', { name: 'Reprendre l’enrôlement' }) as HTMLButtonElement
+    expect(send.disabled).toBe(false)
+    fireEvent.click(send)
+    await waitFor(() => expect(api.beginEnrollmentCeremony).toHaveBeenCalledTimes(1))
+    const [gesture] = api.beginEnrollmentCeremony.mock.calls[0]
+    expect(Object.keys(gesture)).not.toContain('enrolment_export')
+  })
+
+  it('a_chosen_export_is_forgotten_when_the_dialog_is_reopened', async () => {
+    api.getState.mockResolvedValue('down')
+    api.operatorInvitations.mockResolvedValue([invitation('a', { resumable: true })])
+    render(<EnrollmentOperatorPanel onCeremony={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Reprendre' }))
+    fireEvent.change(await screen.findByLabelText('Adresse publique de la gateway'), {
+      target: { value: '198.51.100.7:51820' },
+    })
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Export d'enrôlement de la gateway"), {
+        target: { files: [new File(['EXPORT-TEXT'], 'pc.json')] },
+      })
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Annuler' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    fireEvent.click(screen.getByRole('button', { name: 'Reprendre' }))
+    await screen.findByRole('dialog')
+    fireEvent.click(screen.getByRole('button', { name: 'Reprendre l’enrôlement' }))
+    await waitFor(() => expect(api.beginEnrollmentCeremony).toHaveBeenCalledTimes(1))
+    const [gesture] = api.beginEnrollmentCeremony.mock.calls[0]
+    expect(Object.keys(gesture)).not.toContain('enrolment_export')
+  })
+
+  it('a_chosen_export_is_not_sent_with_another_invitation', async () => {
+    api.getState.mockResolvedValue('down')
+    api.operatorInvitations.mockResolvedValue([
+      invitation('a', { resumable: true, requested_name: 'pc-salon' }),
+      invitation('b', { resumable: true, requested_name: 'tablette' }),
+    ])
+    render(<EnrollmentOperatorPanel onCeremony={vi.fn()} />)
+    await screen.findByText('pc-salon')
+    fireEvent.click(screen.getAllByRole('button', { name: 'Reprendre' })[0])
+    fireEvent.change(await screen.findByLabelText('Adresse publique de la gateway'), {
+      target: { value: '198.51.100.7:51820' },
+    })
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Export d'enrôlement de la gateway"), {
+        target: { files: [new File(['EXPORT-TEXT'], 'pc.json')] },
+      })
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Annuler' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    fireEvent.click(screen.getAllByRole('button', { name: 'Reprendre' })[1])
+    await screen.findByRole('dialog')
+    fireEvent.click(screen.getByRole('button', { name: 'Reprendre l’enrôlement' }))
+    await waitFor(() => expect(api.beginEnrollmentCeremony).toHaveBeenCalledTimes(1))
+    const [gesture] = api.beginEnrollmentCeremony.mock.calls[0]
+    expect(gesture.invitation_id).toBe('b'.repeat(32))
+    expect(Object.keys(gesture)).not.toContain('enrolment_export')
+  })
+
+  it('clearing_the_file_selection_forgets_the_chosen_export', async () => {
+    api.getState.mockResolvedValue('down')
+    api.operatorInvitations.mockResolvedValue([invitation('a', { resumable: true })])
+    render(<EnrollmentOperatorPanel onCeremony={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Reprendre' }))
+    fireEvent.change(await screen.findByLabelText('Adresse publique de la gateway'), {
+      target: { value: '198.51.100.7:51820' },
+    })
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Export d'enrôlement de la gateway"), {
+        target: { files: [new File(['EXPORT-TEXT'], 'pc.json')] },
+      })
+    })
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText("Export d'enrôlement de la gateway"), {
+        target: { files: [] },
+      })
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Reprendre l’enrôlement' }))
+    await waitFor(() => expect(api.beginEnrollmentCeremony).toHaveBeenCalledTimes(1))
+    const [gesture] = api.beginEnrollmentCeremony.mock.calls[0]
+    expect(Object.keys(gesture)).not.toContain('enrolment_export')
+  })
+
+  it('resume_with_a_tunnel_up_says_the_export_is_ignored', async () => {
+    api.operatorInvitations.mockResolvedValue([invitation('a', { resumable: true })])
+    render(<EnrollmentOperatorPanel onCeremony={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Reprendre' }))
+    expect(
+      await screen.findByText('Ignoré tunnel monté : la gateway connectée fait foi.'),
+    ).toBeTruthy()
+    expect(screen.queryByText(/Sans tunnel/)).toBeNull()
   })
 
   it('revoking_asks_for_a_confirmation_first', async () => {

@@ -929,8 +929,7 @@ fn campaign_open_goes_through_the_running_service() {
     assert!(printed.contains("empreinte de campagne : "), "{printed}");
     assert!(
         printed.contains(&format!(
-            "approuver depuis le poste opérateur :\n  astra-signer approve-campaign \\\n    \
-             --authority-url https://astra.example \\\n    --operation-id {operation_id}"
+            "approuver dans Orion : Astra › Approbations\n  autorité  : https://astra.example\n  opération : {operation_id}"
         )),
         "{printed}"
     );
@@ -946,8 +945,8 @@ fn campaign_open_goes_through_the_running_service() {
     );
 }
 
-/// The revocation prints the whole `astra-signer revoke` line, with the
-/// generation's signed expiry: the docs and the companion read it as is.
+/// The revocation prints the operation to sign in Orion, with the
+/// generation's signed expiry.
 #[test]
 fn revocation_open_prints_the_full_revoke_line() {
     let directory = tempfile::tempdir().expect("temp dir");
@@ -990,9 +989,7 @@ fn revocation_open_prints_the_full_revoke_line() {
     );
     assert!(
         printed.contains(&format!(
-            "signer depuis le poste opérateur :\n  astra-signer revoke --authority-url \
-             https://astra.example --operation-id {operation_id} --not-after \
-             {WORKSTATION_NOT_AFTER}"
+            "signer dans Orion : Astra › Postes, opération {operation_id} (échéance {WORKSTATION_NOT_AFTER})"
         )),
         "{printed}"
     );

@@ -531,8 +531,10 @@ describe('the stops', () => {
     expect(label).not.toBe(stopSentence('domain_conflict', journal))
   })
 
-  it('an_offline_CA_PQ_conflict_points_to_the_signer', () => {
-    expect(stopSentence('domain_conflict', journal)).toMatch(/astra-signer rotate-ca-pq/)
+  it('an_offline_CA_PQ_conflict_names_no_command', () => {
+    expect(stopSentence('domain_conflict', journal)).toBe(
+      'Domaine en désaccord. Intervention manuelle requise.',
+    )
     expect(stopSentence('domain_conflict', { ...journal, kind: 'ca_tls' })).not.toMatch(/astra-signer/)
   })
 

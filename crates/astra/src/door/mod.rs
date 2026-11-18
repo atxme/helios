@@ -475,7 +475,7 @@ pub enum DoorRefusal {
     #[error(
         "une autre ancre CA-TLS est déjà épinglée ici : remplacer une ancre épinglée est une \
          rotation, et une rotation se signe (`astra campaign open --scope trust-authorities`, \
-         puis `astra-signer rotate-ca-tls`)"
+         puis dans Orion : Astra › Rotations)"
     )]
     ClientTlsAnchorAlreadyPinned,
     #[error("cette délégation ne s'installe pas ici, et rien n'a été enregistré : {0}")]

@@ -165,8 +165,8 @@ pub async fn signer_result(
         return Err(RenewalError::Revoked);
     }
 
-    // `astra-signer` cannot hold the online service key and deliberately
-    // submits a placeholder signature.  Verify every independent proof before
+    // The former `astra-signer` companion could not hold the online service key and
+    // deliberately submitted a placeholder signature.  Verify every independent proof before
     // countersigning it: otherwise a valid companion result is always refused
     // (full verification on the placeholder), or Astra signs invalid evidence
     // before discovering it.

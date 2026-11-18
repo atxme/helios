@@ -115,22 +115,22 @@ un **contrat à finir d'implémenter**, pas une description du système.
 > la révocation se font dans Orion, onglet *Astra* ; voir
 > [OPERATOR-TOOLING §6](../security/OPERATOR-TOOLING.md#6-profil-client). Les
 > mentions de `astra-signer enroll` et de `helios enroll document` ci-dessous
-> décrivent la CLI, **transitoire** jusqu'au lot 7. Le parcours Orion est à valider
+> décrivent l'ancienne CLI, retirée au lot 7 de F14 (15 novembre 2026). Le parcours Orion est à valider
 > en recette sous Windows.
 >
 > **Amendement du 2026-10-23 — enrôlement sans clé privée.** Le
 > [§15](#15-enrôlement) est implémenté sur la branche `feat/v5-enrolement`, non
 > fusionnée. L'invitation, l'acceptation et la signature du document sont des
-> gestes `astra-signer enroll` (`invite`, `accept`, `sign-document`, `list`,
-> `revoke`) sous un credential opérateur matériel ; `helios enroll document`
-> n'assemble plus que le brouillon public ; Orion importe l'invitation, fait
+> gestes de l'ancien `astra-signer enroll` (`invite`, `accept`, `sign-document`, `list`,
+> `revoke`) sous un credential opérateur matériel ; l'ancien `helios enroll document`
+> n'assemblait que le brouillon public ; Orion importe l'invitation, fait
 > recopier l'empreinte `CA-PQ`, génère et scelle ses trois paires avant
 > d'écrire la demande, puis complète le document signé. L'ancien
 > `helios enroll`, qui livrait les clés privées dans le profil, est retiré, et
 > Orion refuse un document v1 Helios en nommant la procédure qui le remplace.
 > Choix d'implémentation que ce texte ne fixait pas :
 >
-> - une invitation exige un domaine de confiance (`astra-signer init`, puis
+> - une invitation exige un domaine de confiance (création du domaine dans Orion, « Astra › Coffre et clés », puis
 >   `heliosd init-trust-domain`) : elle est signée sous `CA-PQ` et nomme une
 >   leaf gateway émise sous elle ;
 > - le registre des invitations est `~/.helios/enrollment-invitations`, que
@@ -138,7 +138,7 @@ un **contrat à finir d'implémenter**, pas une description du système.
 > - une tolérance d'horloge de 300 s s'applique au bord d'ouverture de la
 >   fenêtre seulement, jamais à l'échéance ;
 > - l'admission passe par la ligne `heliosd peer add` qu'imprime
->   `astra-signer enroll accept`, en console sur la gateway ;
+>   « Accepter une demande… » dans Orion (« Astra › Enrôlement »), à partir de la demande ;
 > - `client_pq_certificate` est le base64 du JSON de la leaf, l'encodage de
 >   `gateway_pq_certificate` ; le document refuse flottants et entiers
 >   au-delà de 2^53, que JCS ne signe pas sans ambiguïté ;
@@ -2423,8 +2423,8 @@ flowchart TD
     A --> B --> C --> D --> E --> F --> G --> H --> I
 ```
 
-`astra-signer enroll invite` produit un `EnrollmentInvitation` public. Il
-exige un domaine de confiance — `astra-signer init`, puis
+« Inviter un poste… » dans Orion (« Astra › Enrôlement ») produit un `EnrollmentInvitation` public. Il
+exige un domaine de confiance — créé dans Orion (« Astra › Coffre et clés »), puis
 `heliosd init-trust-domain` — et la leaf PQ que la gateway sert sous `CA-PQ` :
 sans domaine, il n'existe ni ancre à faire confirmer ni leaf à nommer.
 
@@ -2509,10 +2509,9 @@ certificat ou de modifier l'admission. Un échec ultérieur exige une nouvelle
 invitation : il ne rouvre jamais l'ancienne. Une clé retirée par `peer remove`
 ne peut être réadmise que par une invitation portant `allow_readmission = true`.
 
-`astra-signer enroll accept` traite la demande, écrit les deux feuilles et
-imprime la ligne `heliosd peer add` qui admet le pair ; `helios enroll document`
-assemble le brouillon public autour d'elles ; `astra-signer enroll
-sign-document` le signe après avoir vérifié qu'il nomme les feuilles émises,
+« Accepter une demande… » dans Orion (« Astra › Enrôlement ») traite la demande, écrit les deux feuilles et
+imprime la ligne `heliosd peer add` qui admet le pair ; Orion assemble le brouillon
+public autour d'elles, puis le signe après avoir vérifié qu'il nomme les feuilles émises,
 la `CA-PQ` et la gateway de l'invitation.
 
 Le document `.orion` produit en retour contient le profil, le bloc public de
@@ -2608,7 +2607,7 @@ produit `GatewayBootstrapRequest`, demande publique signée par la nouvelle clé
 et liée à la clé WireGuard gateway. Il ne produit aucune leaf PQ. Le poste
 opérateur vérifie la preuve de possession, exige les deux credentials de
 `CampaignScope::GatewayBootstrap`, puis émet la leaf PQ sous `CA-PQ` par
-`astra-signer issue-gateway-bootstrap`. `heliosd init-trust-domain` reçoit
+« Amorcer la gateway… » dans Orion (onglet *Domaine*). `heliosd init-trust-domain` reçoit
 ensuite cette leaf publique, la vérifie sous l'ancre fournie et refuse une leaf
 auto-signée avant de créer le registre d'époque 1. Aucune clé privée ne revient
 vers la gateway ; l'échange se fait par fichiers, avant qu'Astra possède un
@@ -3138,8 +3137,8 @@ courant détaillé en tête de note.
 | [`aether::key_negotiation::enrollment`](../../crates/aether/src/key_negotiation/enrollment.rs) | invitation, demande, preuve WireGuard, octets signés et empreintes ; document `.orion` v5 et sa forme JCS |
 | [`astra-operator::enrollment`](../../crates/astra-operator/src/enrollment.rs) | registre des invitations à usage unique, verrou par invitation, consommation avant émission, réadmission |
 | [`astra-operator::signing::enrollment`](../../crates/astra-operator/src/signing/enrollment.rs) | signature de l'invitation, acceptation de la demande et émission des feuilles, signature du document après contrôle des feuilles émises |
-| [`astra-signer enroll`](../../tools/astra-signer/src/commands/enrollment.rs) | gestes `invite`, `accept`, `sign-document` sous credential matériel ; `list` et `revoke` sans credential, car ils ne font que restreindre |
-| [`helios::enroll`](../../tools/helios/src/enroll.rs) | brouillon public du document : matériel gateway, bloc de confiance, contrôle des feuilles contre la demande |
+| Orion, « Astra › Enrôlement » (l'ancien `astra-signer enroll` est retiré au lot 7 de F14) | gestes `invite`, `accept`, `sign-document` sous credential matériel ; `list` et `revoke` sans credential, car ils ne font que restreindre |
+| `orion_core::enrollment_draft` (l'ancien `helios enroll document` est retiré au lot 7 de F14) | brouillon public du document : matériel gateway, bloc de confiance, contrôle des feuilles contre la demande |
 | [`orion-core::enrollment`](../../crates/orion-core/src/enrollment.rs) | prévisualisation de l'invitation, confirmation de l'empreinte, génération et scellement de la demande en attente, vérification et complétion du document signé |
 
 `AGENTS.md` décrit l'implémentation v5 effectivement servie et nomme les écarts

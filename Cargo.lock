@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "aether"
-version = "3.4.0"
+version = "3.5.0"
 dependencies = [
  "aws-lc-rs",
  "aws-lc-sys",
@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "aether-fido"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "aether",
  "anyhow",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "astra"
-version = "1.8.0"
+version = "1.8.1"
 dependencies = [
  "aether",
  "anyhow",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "astra-operator"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "aether",
  "aether-fido",
@@ -301,25 +301,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "time",
- "x509-parser",
- "zeroize",
-]
-
-[[package]]
-name = "astra-signer"
-version = "3.0.19"
-dependencies = [
- "aether",
- "aether-fido",
- "anyhow",
- "astra-operator",
- "base64 0.23.1",
- "clap",
- "hex",
- "rpassword",
- "serde",
- "serde_json",
- "tempfile",
  "x509-parser",
  "zeroize",
 ]
@@ -2302,7 +2283,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "helios"
-version = "3.5.5"
+version = "3.6.0"
 dependencies = [
  "aether",
  "aether-key-negotiation",
@@ -2336,7 +2317,7 @@ dependencies = [
 
 [[package]]
 name = "helios-api"
-version = "1.23.0"
+version = "1.23.1"
 dependencies = [
  "aether",
  "anyhow",
@@ -2472,7 +2453,7 @@ dependencies = [
 
 [[package]]
 name = "heliosd"
-version = "3.5.5"
+version = "3.6.0"
 dependencies = [
  "aether",
  "aether-key-negotiation",
@@ -3880,7 +3861,7 @@ dependencies = [
 
 [[package]]
 name = "orion"
-version = "4.5.4"
+version = "4.6.0"
 dependencies = [
  "aether",
  "aether-fido",
@@ -3905,7 +3886,7 @@ dependencies = [
 
 [[package]]
 name = "orion-core"
-version = "3.37.1"
+version = "3.38.0"
 dependencies = [
  "aether",
  "aether-fido",
@@ -4651,27 +4632,6 @@ dependencies = [
  "libc",
  "untrusted 0.9.0",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rpassword"
-version = "7.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2da316a15f47e3d053de9cb2c439650bd8fa4aaeb9365f2e5f27f492ff73c196"
-dependencies = [
- "libc",
- "rtoolbox",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "rtoolbox"
-version = "0.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a1efe12a1469752d0e6ff5ebec0b6ef4924cc5c4c71046b0ec730040535819d"
-dependencies = [
- "libc",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

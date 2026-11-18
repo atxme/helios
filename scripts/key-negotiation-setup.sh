@@ -80,7 +80,7 @@ EOF
 refuser_enrolement() {
     cat >&2 <<EOF
 $1 : ce script n'enrôle plus de client. L'enrôlement v5 ne transmet aucune
-clé privée : invitation signée par astra-signer, demande produite par Orion,
+clé privée : invitation signée dans Astra › Enrôlement, demande produite par Orion,
 document signé en retour. Voir docs/security/OPERATOR-TOOLING.md §6.
 EOF
     exit 2
@@ -384,7 +384,7 @@ echo "==> Gateway identity ready; public certificates are in $SORTIE"
 if [ ! -s "$SORTIE/gateway-pq-cert.json" ]; then
     # Le premier passage d'un domaine neuf : la leaf sous CA-PQ n'existe pas
     # encore, et aucune invitation ne peut la nommer tant qu'elle manque.
-    echo "    Pas encore de leaf sous CA-PQ : astra-signer issue-gateway-bootstrap," >&2
+    echo "    Pas encore de leaf sous CA-PQ : « Amorcer la gateway… » dans Orion (Astra › Domaine)," >&2
     echo "    puis heliosd init-trust-domain, avant toute invitation." >&2
 fi
 cat <<EOF
@@ -394,5 +394,5 @@ cat <<EOF
   UDP $PORT_NEGO  → négociation de clé
 
 Enrôler un client : docs/security/OPERATOR-TOOLING.md §6
-  (astra-signer enroll invite --gateway-certificate $SORTIE/gateway-pq-cert.json …)
+  (Orion, Astra › Enrôlement, avec $SORTIE/gateway-pq-cert.json)
 EOF

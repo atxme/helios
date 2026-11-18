@@ -1,5 +1,9 @@
 # Audit et proposition de réorganisation des crates
 
+> **Lot 7 de F14 (15 novembre 2026).** `tools/astra-signer` et `helios enroll document`
+> sont retirés : les mentions d'`astra-signer` ci-dessous décrivent l'état d'avant ce
+> retrait, et l'outil opérateur est Orion.
+>
 > Document d’audit préalable. Cette livraison ne migre aucun code, ne modifie
 > aucun manifest et ne change aucun contrat. Les décisions proposées doivent
 > être relues et validées avant toute phase d’implémentation.
@@ -160,7 +164,7 @@ de fusionner les deux crates.
 `astra-signer` et `helios-astra-helper` étaient des processus distincts avec des
 privilèges et des chemins de vie différents. `helios-astra-helper` a depuis été
 supprimé (F11, [§13.6](#136-f11--orion-engine-ajouté-helios-astra-helper-retiré)) ;
-`astra-signer` reste un outil.
+`astra-signer` a été retiré au lot 7 de F14.
 
 ### Firewall, WireGuard et sécurité
 
@@ -194,7 +198,7 @@ astra-operator
   -> helios-fido
   -> helios-vault
 
-astra-signer
+astra-signer (retiré au lot 7 de F14)
   -> aether
   -> astra-operator
   -> helios-fido
@@ -296,7 +300,7 @@ de production.
 | `aether` | 18 | 0 |
 | `astra` | 1 | 2 |
 | `astra-operator` | 2 | 4 |
-| `astra-signer` | 0 | 3 |
+| `astra-signer` (retiré au lot 7 de F14) | 0 | 3 |
 | `helios-tpm` | 1 | 2 |
 | `helios-api` | 2 | 5 |
 | `helios-astra-helper` (retiré par F11) | 0 | 3 |
@@ -323,7 +327,7 @@ de build ne créent pas de cycle Cargo, mais `heliosd -> orion-core` brouille la
 lecture produit Helios/client Orion.
 
 Packages à zéro consommateur normal : les outils/apps feuilles
-(`astra-signer`, `helios-astra-helper` [retiré par F11], `helios-ctl`, `helios-installer`,
+(`astra-signer` [retiré au lot 7 de F14], `helios-astra-helper` [retiré par F11], `helios-ctl`, `helios-installer`,
 `helios-publisher`, `heliosd`, `orion`, `xtask`). Package de sous-système à un
 consommateur : `astra` n’est utilisé normalement que par `astra-operator` ;
 cela renforce le besoin de découpler ses contrats sans imposer une fusion.
@@ -456,7 +460,7 @@ de tests dans les sous-systèmes.
 | `helios-fido` | CTAP2 HID et WebAuthn Windows | **RENAME** | adaptateur utilisé par Orion et l’opérateur ; candidate `aether-fido`, à garder séparé d’Aether si la dépendance plateforme l’exige |
 | `orion-core` | Logique client portable, coffre, provisioning, certificats et backend VPN | **KEEP** | cycle de vie client cohérent ; pas de troisième crate prouvée |
 | `heliosd` | CLI gateway, lifecycle et composition des sous-systèmes | **KEEP** | composition root à amincir ; `helios-runtime` non démontré |
-| `astra-signer` | CLI d’approbation/signature opérateur | **KEEP** | processus hors ligne et privilège distincts |
+| `astra-signer` (retiré au lot 7 de F14) | CLI d’approbation/signature opérateur | **KEEP** | processus hors ligne et privilège distincts |
 | `helios-astra-helper` (retiré par F11) | Compagnon interactif Windows | **KEEP** | processus et intégration Win32 propres |
 | `helios-ctl` | CLI opérateur : admission, campagnes, escrow, update, profils | **KEEP** | composition root d’outil |
 | `helios-installer` | Helper privilégié d’installation/rollback | **KEEP** | frontière de privilège distincte |
@@ -513,7 +517,7 @@ tools/
   helios-ctl/
   helios-installer/
   helios-publisher/
-  astra-signer/
+  astra-signer/   # retiré au lot 7 de F14
   helios-astra-helper/   # retiré par F11
   xtask/
 ```
@@ -1025,7 +1029,7 @@ change la composition de l’arbre, sans changer le nombre de binaires livrés
 | `crates/orion-engine/` | **ajouté** | Crate portable partagée par l’IHM et le moteur : protocole de trames JSON bornées (`wire`, `command`, `events`), jeton de session, cycle de vie du moteur (`lifecycle`), service du moteur (`service`), serveur et client du canal (`serve`, `client`), tube nommé Windows (`pipe`), nettoyage de l’ancien coffre (`legacy_cleanup`). Dépend d’`orion-core` et d’`aether`. |
 | `tools/helios-astra-helper/` | **retiré** | Les cérémonies opérateur s’exécutent dans l’IHM non élevée (`apps/orion/src-tauri/src/operator/`) ; aucun compagnon n’est livré. |
 | `apps/orion/src-tauri/src/deelevate.rs` | **renommé `launch.rs`** | Il ne désélève plus : l’IHM est non élevée, et `launch.rs` refuse de lancer un enfant (terminal SSH, `astra-signer`) si son propre jeton est élevé. |
-| `apps/orion/src-tauri/src/astra.rs`, `companion.rs`, `crates/astra-operator/src/orion.rs` | **retirés (F14 lot 5b)** | Orion ne lance plus `astra-signer` : les rotations se jouent dans l’IHM (`operator/ceremony/`), reprises par le journal `astra_operator::rotation_journal`. Le mode caché `astra-signer orion` est retiré ; `astra-signer` reste un outil en ligne de commande, recours transitoire jusqu’au lot 7. |
+| `apps/orion/src-tauri/src/astra.rs`, `companion.rs`, `crates/astra-operator/src/orion.rs` | **retirés (F14 lot 5b)** | Orion ne lance plus `astra-signer` : les rotations se jouent dans l’IHM (`operator/ceremony/`), reprises par le journal `astra_operator::rotation_journal`. Le mode caché `astra-signer orion` est retiré ; `astra-signer` lui-même a été retiré au lot 7 de F14. |
 | `apps/orion/src-tauri/src/engine_host.rs`, `engine_launch.rs` | **ajoutés** | Le moteur (`orion.exe --engine`, élevé) et son lancement par l’IHM (`ShellExecuteExW` `runas`). |
 | `orion-core::protected_root` | **ajouté** | Racine protégée sous `%ProgramData%`, contrôle de l’installation ; la migration de l’ancien coffre est `vault/relocation.rs`. |
 
@@ -1675,7 +1679,7 @@ tools/xtask/src/
   orion_helper.rs
 ```
 
-`astra-signer` est le seul de ces outils où le split de production est
+`astra-signer` (retiré au lot 7 de F14) était le seul de ces outils où le split de production était
 prioritaire : 3 931 lignes couvrent plusieurs cérémonies distinctes. Le nom de
 chaque fichier cible correspond à une commande ou une famille de décisions de
 sécurité. `helios-ctl` conserve ses modules actuels et extrait seulement le

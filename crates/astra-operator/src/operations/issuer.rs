@@ -70,7 +70,7 @@ use crate::vault::AuthorityVault;
 use crate::vault_gestures::DAY_SECS;
 use crate::{credentials, gestures, handoff, origin, signing, store};
 
-/// Lifetime of one delegation, in days — `astra-signer`'s.
+/// Lifetime of one delegation, in days, as the former `astra-signer` set it.
 pub const DELEGATION_DAYS: u64 = 30;
 
 /// Longest leaf the delegated issuer may sign, in days, before the pinned

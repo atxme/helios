@@ -513,3 +513,103 @@ async fn a_refused_revocation_keeps_the_gateways_status() {
         }
     );
 }
+
+fn trust_material_fixture() -> TrustMaterial {
+    TrustMaterial {
+        trust_domain_id: "0102030405060708090a0b0c0d0e0f10".into(),
+        ca_epoch: 1,
+        ca_pq_public_key: "Q0E=".into(),
+        ca_tls_epoch: 1,
+        client_tls_ca_der: "Y2xpZW50".into(),
+        client_generation: 4,
+        active_gateway_identity_epoch: 1,
+        gateway_decision_epoch: 1,
+        astra_authority_url: "https://astra.example".into(),
+        webauthn_rp_id: "astra.example".into(),
+        astra_policy_fingerprint: "11".repeat(32),
+        credential_registry_epoch: 1,
+        astra_credential_bindings: Vec::new(),
+        astra_service_key_epoch: 1,
+        astra_service_public_key: "c2VydmljZQ==".into(),
+    }
+}
+
+fn export_of(trust: serde_json::Value) -> EnrollmentExport {
+    EnrollmentExport {
+        server_name: "vpn.example.net".into(),
+        gateway_ca_der: "Y2E=".into(),
+        gateway_pq_certificate: "cHE=".into(),
+        pq_certificate_sha256: "sha".into(),
+        wireguard_public_key: GATEWAY_KEY.into(),
+        negotiation_port: Some(51821),
+        gateway_wg_address: "100.64.0.1/24".into(),
+        peer_public_key: CLIENT_KEY.into(),
+        address: "100.64.1.2/32".into(),
+        address_v6: None,
+        trust,
+    }
+}
+
+#[tokio::test]
+async fn material_from_export_matches_the_online_shape() {
+    let trust = trust_material_fixture();
+    let trust_path: &'static str =
+        "/api/key-negotiation/trust-enrolment/ClientKeyClientKeyClientKeyClientKeyClie0000%3D";
+    let (base, _) = fake_gateway(vec![
+        ("/api/network", 200, network_view(Some(GATEWAY_KEY))),
+        ("/api/key-negotiation", 200, negotiation_view(GATEWAY_KEY)),
+        (trust_path, 200, serde_json::to_string(&trust).unwrap()),
+    ])
+    .await;
+    let (online_material, online_admission) = gateway_material(&client(), &base, CLIENT_KEY)
+        .await
+        .unwrap();
+
+    let (material, admission) =
+        material_from_export(&export_of(serde_json::to_value(&trust).unwrap())).unwrap();
+
+    assert_eq!(material.server_name, online_material.server_name);
+    assert_eq!(material.gateway_ca_der, online_material.gateway_ca_der);
+    assert_eq!(
+        material.gateway_pq_certificate,
+        online_material.gateway_pq_certificate
+    );
+    assert_eq!(
+        material.wireguard_public_key,
+        online_material.wireguard_public_key
+    );
+    assert_eq!(
+        material.pq_certificate_sha256,
+        online_material.pq_certificate_sha256
+    );
+    assert_eq!(material.negotiation_port, online_material.negotiation_port);
+    assert_eq!(admission.address, online_admission.address);
+    assert_eq!(admission.address_v6, online_admission.address_v6);
+    assert_eq!(admission.heliosd_url, online_admission.heliosd_url);
+    assert_eq!(admission.trust, online_admission.trust);
+    assert_eq!(
+        admission.heliosd_url.as_deref(),
+        Some(format!("http://100.64.0.1:{}", aether::API_PORT).as_str())
+    );
+    assert_eq!(admission.trust, Some(trust));
+}
+
+#[test]
+fn material_from_export_refuses_an_unreadable_trust_block() {
+    let error = material_from_export(&export_of(serde_json::json!({"trust_domain_id": 3})))
+        .err()
+        .unwrap();
+    assert_eq!(
+        error,
+        GatewayAdminError::Invalid("le bloc de confiance illisible".into())
+    );
+}
+
+#[test]
+fn material_from_export_drops_an_empty_ipv6() {
+    let trust = serde_json::to_value(trust_material_fixture()).unwrap();
+    let mut export = export_of(trust);
+    export.address_v6 = Some("  ".into());
+    let (_, admission) = material_from_export(&export).unwrap();
+    assert_eq!(admission.address_v6, None);
+}

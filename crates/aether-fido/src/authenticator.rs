@@ -45,7 +45,7 @@
 //!
 //! # CTAP n'est pas une feature de compilation
 //!
-//! Tout binaire `astra-signer` porte cette pile, sans condition. Un compagnon
+//! Tout binaire qui parle à une clé, Orion compris, porte cette pile, sans condition. Un compagnon
 //! qui ne parle à aucune clé n'ouvre aucun coffre, et la spécification refuse
 //! tout autre déverrouillage — ni PIN seul, ni assertion non liée au coffre,
 //! ni mot de passe de secours. Le bâtir sans le matériel produirait donc un
@@ -672,8 +672,6 @@ mod ctap {
                  périphérique à l'utilisateur courant",
             );
         }
-        diagnosis
-            .push_str("\n\n`astra-signer devices` liste chaque périphérique et son usage page.");
         diagnosis
     }
 

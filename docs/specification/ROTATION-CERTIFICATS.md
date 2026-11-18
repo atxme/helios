@@ -128,7 +128,7 @@ la contrainte de transport WireGuard reste applicable.
 Deux ambiguïtés antérieures sont closes :
 
 - « WireGuard prioritaire » signifie que **toute** opération ordinaire d'un
-  client actif, approbation `astra-signer` comprise, entre par `helios-api` et
+  client actif, approbation d'Orion comprise, entre par `helios-api` et
   est relayée sous forme typée à Astra. Les anciennes routes HTTPS publiques
   de demande et de commit ordinaires sont retirées ;
 - le seuil de 80 % prépare une demande, mais n'autorise plus son émission.
@@ -202,7 +202,7 @@ maîtresse vers la gateway.
   sa propre machine d'état. La valeur `ca_pq` de `manifest_authority_kind` est
   réservée et refusée pour ce canal ; le document hors ligne de §8.4 conserve
   sa signature globale `CA-PQ` ;
-- pour une campagne qui touche une ancre, `astra-signer` ouvre le coffre et
+- pour une campagne qui touche une ancre, l'onglet *Approbations* d'Orion ouvre le coffre et
   rend les **objets de transition signés une fois**, liés à la campagne. Astra
   les vérifie et les persiste, puis sa clé de service construit autant de
   manifestes par client que nécessaire. Le compagnon ne signe donc jamais un
@@ -329,7 +329,7 @@ au plus une campagne par famille, qui expire seule et ne fait rien sans clé.
 **Échéances de révocation.** La réponse d'ouverture d'une révocation porte les
 `not_after` signés des moitiés figées — un pour un client, deux pour la
 gateway —, hors des octets signés de la campagne : `SigningOperationView`, qui
-refuse tout champ inconnu, ne change pas, faute de quoi les `astra-signer` et
+refuse tout champ inconnu, ne change pas, faute de quoi les anciens `astra-signer` et
 Orion déjà livrés ne le liraient plus. Une valeur altérée en route ne révoque
 pas la mauvaise chose : Astra refuse le dépôt en la comparant à la génération
 active, comme avant.
@@ -425,7 +425,7 @@ automatique à la montée du tunnel **vers la gateway du domaine du journal
 seulement**, sans clé ; derrière l'écran terminé de l'opérateur lui-même, elle
 attend sa fermeture. Un journal Signé n'est effacé que si l'ancre courante de
 l'autorité égale l'ancre sortante de la transition ; un journal `Accepted` sans
-dépôt (CA-PQ ancien, adopté d'`astra-signer`) se lit d'abord auprès d'Astra,
+dépôt (CA-PQ ancien, adopté de l'ancien `astra-signer`) se lit d'abord auprès d'Astra,
 parce qu'il n'est pas la preuve d'une acceptation. La table de reprise est au
 § 10.3 de la conception du lot.
 
@@ -919,7 +919,7 @@ AstraSignerRequest {
 }
 ```
 
-`astra-signer` vérifie cette signature sous la clé de service déjà épinglée,
+l'ancien `astra-signer` vérifie cette signature sous la clé de service déjà épinglée,
 télécharge le coffre dont l'empreinte est fixée, affiche le manifeste exact et
 utilise CTAP localement. Le secret de déverrouillage et les clés privées
 maîtresses ne quittent jamais ce processus ; seul le résultat signé est
@@ -968,7 +968,7 @@ est le SHA-256 de la forme canonique ci-dessous :
 || created_at:u64 || expires_at:u64
 ```
 
-Dans ce format historique, `astra-signer` vérifie d'abord la signature de
+Dans ce format historique, l'ancien `astra-signer` vérifie d'abord la signature de
 service et affiche ces champs,
 puis demande `userPresence` et `userVerification` sous le `webauthn_rp_id` et
 l'origine signés, avec au plus les huit credentials actifs énumérés. L'origine
@@ -1825,7 +1825,7 @@ SHA-256(
 
 Astra exige `userVerification` et `userPresence`, l'origine exacte et le RP ID
 du profil, et un credential opérateur `active` du domaine, puis consomme le
-challenge. Le manifeste présenté par `astra-signer` borne cette autorisation au
+challenge. Le manifeste présenté par l'ancien `astra-signer` borne cette autorisation au
 pair, aux empreintes et à la génération demandée. Le validateur historique
 contrôle signature, chaîne, identités, empreintes et dernière génération
 enregistrée, mais ne contrôle pas la période ; il est un type séparé et ne peut
@@ -1846,7 +1846,7 @@ ne demande aucun sel de coffre et n'ouvre jamais `CA-PQ` ni `CA-TLS`.
 La récupération est refusée si le pair est absent ou `revoked`, si une
 génération plus récente existe, si l'ancienne clé n'est plus possédée ou si les
 nouvelles preuves échouent. `CA-PQ`, jamais l'émetteur Astra, autorise alors le
-staging de §7.2 : `astra-signer` ouvre localement le coffre, signe
+staging de §7.2 : Orion ouvre localement le coffre, signe
 l'autorisation exacte puis Astra la remet à Helios par le veth privé. Astra
 attend le reçu §7.3 avant de remettre le grant. La fenêtre porte
 `activation_at` à l'instant de la cérémonie : le candidat reste bloqué en
@@ -1940,8 +1940,8 @@ requête et le résultat suivent le relais de §8.1.2 ; Orion n'ouvre plus de
 compagnon pour l'approuver : sa cérémonie tourne dans l'IHM non élevée (§12.2),
 y compris pour les rotations de CA depuis le lot 5b (§0.10). Une récupération
 ou une console opérateur hors tunnel emploie `authority_url`.
-`astra-signer` (l'outil en ligne de commande, recours des cérémonies et
-transitoire jusqu'au lot 7 de F14) récupère lui-même la requête
+l'ancien `astra-signer` (outil en ligne de commande, recours des cérémonies et
+retiré au lot 7 de F14) récupérait lui-même la requête
 et le manifeste, vérifie leurs signatures et affiche au minimum le scope, le
 nombre de cibles, les empreintes actives, les générations et les autorités
 touchées. **Le minimum d'affichage vaut pour toute cérémonie, Orion compris** :
@@ -2637,7 +2637,7 @@ indistinct (`403`), et un corps trop gros reste `413`.
 
 #### 8.5.5 Choix du transport, sans repli
 
-`astra-signer` porte trois transports pour une campagne, et le choix est
+L'ancien `astra-signer` portait trois transports pour une campagne, et le choix était
 explicite :
 
 | Transport   | Arguments                            | Emploi                     |
@@ -2758,7 +2758,7 @@ Deux autorités distinctes se ressemblent et ont été confondues :
   ancre mTLS du listener de négociation : elle décide qui a le droit de se
   connecter, et elle émet la feuille de première génération d'un client ;
 * la **CA-TLS du domaine**, auto-signée depuis le coffre d'autorité par
-  `astra-signer issue-ca-tls`, portée par le relais de domaine sous
+  « Amorcer la gateway… » dans Orion (ancien `astra-signer issue-ca-tls`), portée par le relais de domaine sous
   `ca_tls_certificate` et épinglée dans Astra par `astra pin-ca-tls` : c'est
   l'ancre à laquelle une feuille **renouvelée** se rattache, au travers de
   l'intermédiaire délégué d'Astra.
@@ -3224,7 +3224,7 @@ libellé ambigu « Renouveler ».
 
 Les actions d'autorité de cette console — rotation des autorités, annulation
 d'une transition préparée, rollback gateway — sont des campagnes opérateur et
-suivent §8.5 : `astra-signer` (transitoire, jusqu'au lot 7 de F14) est lancé avec
+suivent §8.5 : la cérémonie d'Orion (qui a remplacé l'ancien `astra-signer`, retiré au lot 7 de F14) est lancée avec
 `heliosd_url` et `operation_id`, et l'origine publique n'est proposée que si
 aucun tunnel n'existe. La console
 n'offre pas de bascule automatique entre les deux.
@@ -3339,7 +3339,7 @@ n'offre pas de bascule automatique entre les deux.
   identité à demi scellée, ni clé orpheline, ni slot nommant un certificat sans
   clé privée. Le prix est qu'un arrêt perd les clés candidates et rouvre
   l'opération — l'échec bon marché, la génération active étant intacte.
-- `astra::vault` et `astra-signer` : coffre maître HVLT, key-slots FIDO2
+- `astra::vault` et l'ancien `astra-signer` (retiré au lot 7 de F14) : coffre maître HVLT, key-slots FIDO2
   `hmac-secret`/PRF et commandes `init`, `enrol`, `verify`, `list`, `remove`,
   `rename`, `issue-ca-tls`, `authorize-issuer`, `bindings`, `approve`,
   `approve-campaign`, `rotate-ca-pq`, `recover`, `revoke`,
@@ -3434,8 +3434,8 @@ contournés :
   clients, ce qui rend structurelle la règle « un `operation_id` de
   renouvellement ordinaire reçoit le même refus grossier qu'un identifiant
   inconnu » : il y est absent, pas écarté. `astra campaign open` résout la
-  campagne sur les cibles courantes et la dépose ; `astra-signer
-  approve-campaign --authority-url --operation-id` la récupère, l'affiche,
+  campagne sur les cibles courantes et la dépose ; l'ancienne `approve-campaign` d'`astra-signer` (retirée au lot 7 de F14)
+  la récupérait, l'affichait,
   recueille les assertions et les dépose. (Depuis le lot 5a de F14, c'est la
   porte du service qui résout et ouvre la campagne, §0.9 ; la commande n'en est
   plus que le connecteur local, et rien n'est déposé sur disque.)
@@ -3505,8 +3505,8 @@ contournés :
   révocation en silence est le seul échec que tout ce chemin existe pour
   éviter, et « rien ne s'est passé » ne se distingue de « rien n'était dû » que
   si l'un des deux est écrit.
-  **Le magasin d'objets de transition existe** : `astra-signer rotate-ca-pq
-  --authority-url --operation-id` exécute une campagne `trust_authorities`,
+  **Le magasin d'objets de transition existe** : l'ancien `astra-signer rotate-ca-pq
+  --authority-url --operation-id` exécutait une campagne `trust_authorities`,
   rend la `CaTransition` signée par `CA-PQ` **dans le même dépôt** que
   l'approbation, et `AstraRegistry::accept_transitions` la vérifie sous l'ancre
   et l'époque que ce registre épingle déjà avant d'écrire un octet. C'est
@@ -3529,10 +3529,10 @@ contournés :
   enregistré une fois par `astra pin-ca-tls`, et refuse de le remplacer par
   commande — remplacer une ancre est une rotation, et une rotation se signe.
   Un domaine antérieur à ce champ est refusé **par son nom** plutôt que
-  contrôlé contre un défaut qui accepterait tout. `astra-signer rotate-ca-tls`
-  crée l'ancre entrante, la fait auto-signer, signe la transition sous `CA-PQ`
+  contrôlé contre un défaut qui accepterait tout. L'ancien `astra-signer rotate-ca-tls`
+  créait l'ancre entrante, la fait auto-signer, signe la transition sous `CA-PQ`
   et **scelle la clé suivante à côté** de celle qui émet plutôt que par-dessus :
-  le coffre porte `active` et `next`, et `astra-signer promote-ca-tls` les
+  le coffre porte `active` et `next`, et l'ancien `astra-signer promote-ca-tls` les
   échange à `not_after` en détruisant la sortante dans la même écriture
   scellée. C'est ce que le §9.2 autorise et rien de plus. L'autorité émet sous
   l'ancre sortante pendant tout le recouvrement, parce que la gateway compare
@@ -3547,7 +3547,7 @@ contournés :
   en service, sans commande capable de déplacer le pin. La décision
   est écrite avant d'être annoncée : la cérémonie dépose `astra-prepared.json`
   — les octets exacts du dépôt — avant de contacter l'autorité, et
-  `astra-signer resume-rotation` rejoue ce dépôt à l'identique après une panne,
+  l'ancien `astra-signer resume-rotation` rejouait ce dépôt à l'identique après une panne,
   sans redemander de clé (§8.2). `heliosd install-client-tls-ca` met la
   transition en attente, les deux chaînes sont acceptées pendant le
   chevauchement, et l'ancienne est retirée par la même passe qui promeut les
@@ -3555,7 +3555,7 @@ contournés :
   s'exécute désormais : `astra revocation open --scope gateway` lit les deux
   feuilles et leurs échéances signées **en direct** sur le canal privé, auprès
   du démon qui les sert, parce que ce registre ne les a jamais détenues ;
-  `astra-signer revoke --scope gateway` nomme chaque moitié avec sa propre
+  l'ancien `astra-signer revoke --scope gateway` nommait chaque moitié avec sa propre
   échéance — les deux feuilles gateway n'expirent pas ensemble, contrairement à
   une génération cliente — et la gateway applique la décision sur son propre
   axe de compteur, terminale.
@@ -3583,7 +3583,7 @@ contournés :
   le pair que le registre enregistre déjà, consomme le challenge, et ouvre une
   opération de récupération dans un **troisième** magasin — un identifiant de
   récupération ne doit jamais se résoudre là où un renouvellement ordinaire
-  s'autorise. La cérémonie de récupération (`astra-signer recover --authority-url
+  s'autorise. La cérémonie de récupération (l'ancien `astra-signer recover --authority-url
   … --operation-id …`, ou l'onglet *Approbations* d'Orion depuis le lot 4 de F14,
   qui n'enchaîne sur la finalisation locale que si cet Orion a ouvert la
   récupération depuis *Certificats*) lit la demande, l'affiche, prend l'assertion de l'opérateur, la **vérifie avant**
@@ -3629,7 +3629,7 @@ contournés :
   survit au texte que son opérateur a lu.
   La moitié **autorité** s'exécute désormais aussi, et par une seule
   cérémonie : `astra campaign open --scope trust-authorities` résout la
-  campagne sur l'ancre que le registre détient, `astra-signer rotate-ca-pq
+  campagne sur l'ancre que le registre détient, l'ancien `astra-signer rotate-ca-pq
   --authority-url --operation-id` la vérifie contre l'ancre de son propre
   coffre — deux moitiés du domaine qui se contredisent sur ce qui est courant
   s'arrêtent, elles ne se réconcilient pas par une rotation —, prend les deux
@@ -3696,7 +3696,7 @@ contournés :
   `astra gateway-identity open` fige l'identité **lue en direct** sur le veth :
   ce registre n'a jamais détenu les feuilles de la gateway, et une valeur
   retapée produirait une campagne que le compagnon signe et que la gateway
-  refuse. `astra-signer sign-gateway-transition` émet la leaf sous `CA-PQ` et
+  refuse. L'ancien `astra-signer sign-gateway-transition` émettait la leaf sous `CA-PQ` et
   signe la transition dans le **même geste**, parce que la signature lie la
   leaf exacte. `heliosd install-gateway-transition` la vérifie sous les ancres
   que ce registre épingle déjà et refuse toute leaf dont la moitié privée n'est
@@ -3710,7 +3710,7 @@ contournés :
   atomiquement le coffre actif, puis détruit l'ancienne clé scellée. Un
   marqueur nommant la transition exacte couvre la fenêtre de coupure entre ces
   écritures. L'avortement de §6.3 est produit par
-  `astra-signer abort-gateway-transition` et appliqué par
+  l'ancien `astra-signer abort-gateway-transition` et appliqué par
   `heliosd abort-gateway-transition` ; il consomme l'époque.
   **Limite connue** : un client qui n'a jamais reçu la transition reste à
   l'époque précédente et refuse correctement le saut vers la suivante, sans
@@ -3723,8 +3723,8 @@ contournés :
   Le motif `emergency_replacement` de §6.1 est livré, et avec lui la sortie
   d'une révocation gateway — qui était jusque-là une panne de service
   définitive, aucun détenteur n'acceptant plus la moindre transition.
-  `astra-signer sign-gateway-transition --emergency-replacement` signe le
-  remplacement, `astra-signer revoke --replacement-transition <fichier>` le
+  l'ancien `astra-signer sign-gateway-transition --emergency-replacement` signait le
+  remplacement, l'ancien `astra-signer revoke --replacement-transition <fichier>` le
   nomme dans le champ `replacement_transition_fingerprint` du §10.1 — le
   fichier est lu, jamais l'empreinte saisie —, et l'état n'accepte ensuite que
   ce document exact. Il est **servi immédiatement** : il n'y a plus d'identité
@@ -3742,7 +3742,7 @@ contournés :
   clé, c'est le geste à ne pas faire, et rien ici ne prend cette décision à la
   place de l'opérateur.
   Le **rollback de service** de §11.1 étape 8 est livré :
-  `astra-signer sign-gateway-rollback` résout la campagne localement depuis la
+  l'ancien `astra-signer sign-gateway-rollback` résolvait la campagne localement depuis la
   transition signée — un rollback ne distribue rien, et le garde d'Astra
   l'impose, un résultat `gateway_identity` devant porter exactement un objet
   distribuable —, l'affiche, la fait attester par une clé autorisée puis signe
@@ -3769,7 +3769,7 @@ contournés :
   auto-signée vers `CA-PQ`, reste une procédure opérateur hors bande. Le
   bootstrap neuf du §13.1 est livré : `init-key-negotiation` ne produit plus
   de leaf PQ, mais une `GatewayBootstrapRequest` publique avec preuve de
-  possession ; `astra-signer issue-gateway-bootstrap` l'émet sous `CA-PQ` par
+  possession ; « Amorcer la gateway… » dans Orion (ancien `astra-signer issue-gateway-bootstrap`) l'émet sous `CA-PQ` par
   fichiers après deux credentials distincts ; `init-trust-domain` vérifie la
   leaf sous l'ancre fournie et refuse par son nom une auto-signature. Le
   **discriminant de profil Orion** `helios_key_negotiation`, lui,
@@ -3781,7 +3781,7 @@ contournés :
   `network.toml` existant, et l'octet `mode_id = 0` du manifeste.
   Le **bloc de confiance** est livré aussi : la gateway le
   sert sur `GET /api/key-negotiation/trust-enrolment/<clé>` et l'imprime par
-  `heliosd show-trust-enrolment`, `helios enroll document` le pose dans le
+  `heliosd export-enrolment` (qui remplace `heliosd show-trust-enrolment`) ; Orion, « Reprendre », le pose dans le
   brouillon d'enrôlement — en ligne depuis l'API, hors ligne depuis
   `--trust-material`. (Avant l'enrôlement v5 du 23 octobre 2026, c'était
   `helios enroll`, et `provision-client.sh` le rapatriait à côté des
@@ -3995,7 +3995,7 @@ la clé privée gateway nouvellement scellée. La demande ne porte ni
 opérateur qui émet directement l'époque 1. Elle ne transporte aucune clé
 privée.
 
-Le poste opérateur exécute `astra-signer issue-gateway-bootstrap --request
+Le poste opérateur exécutait l'ancien `astra-signer issue-gateway-bootstrap --request
 <demande> --out <leaf>`. Cette cérémonie n'est pas une campagne Astra en ligne :
 le domaine neuf n'a encore ni registre, ni clé de service, ni veth. Elle exige
 néanmoins **deux credentials actifs distincts**. C'est une réadmission sans
@@ -4404,7 +4404,7 @@ le dernier hash d'audit connu et refuser un fork de génération.
 | `astra` | coordinateur public HTTPS et privé veth, statut authentifié, renouvellements automatiques, campagnes, contrôle des approbations sensibles, émetteur délégué, transactions chunkées, registre et audit |
 | bibliothèque `astra-operator` | vérification et exécution des cérémonies sans dépendre d'une ligne de commande |
 | cérémonie opérateur dans l'IHM d'Orion (non élevée) | assertions FIDO2 des récupérations/campagnes lancées par Orion ; ouverture locale du coffre par PRF, puis zéroïsation (le sidecar `helios-astra-helper` a été supprimé) |
-| adaptateur `astra-signer` | flux portables et hors ligne tant que leur parité Orion n'est pas validée sur Windows |
+| adaptateur `astra-signer` (retiré au lot 7 de F14) | flux portables et hors ligne, désormais menés par Orion ; leur validation sous Windows reste à faire |
 | `aether-vault` | coffre maître et key-slots multiples liés aux credentials YubiKey |
 | `helios-api` | routes typées dans WireGuard, relais vers l'API Astra du veth, authentification de source et limites HTTP |
 | `astra-channel` | canal privé Astra–Helios du §8.3 : contrats échangés, configurations mTLS client et serveur des deux extrémités, ALPN, routeur de l'API privée de cycle de vie appelée par Astra, que `heliosd` héberge sur le veth ; ne dépend que d'`aether` (§0.8) |

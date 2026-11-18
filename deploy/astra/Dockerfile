@@ -4,7 +4,7 @@
 # `network.toml`, les coffres de `heliosd`, le plan de données WireGuard, les
 # secrets TPM. Un seul volume, son répertoire d'état — voir compose.yaml.
 #
-# `-p astra` et non `cargo build` : le second tirerait `astra-signer`, donc la
+# `-p astra` et non `cargo build` : le second tirait autrefois `astra-signer`, donc la
 # pile CTAP2 et `libudev`, dans une image qui n'a aucune clé de sécurité à
 # brancher. Le compagnon vit sur le poste opérateur, jamais ici.
 #

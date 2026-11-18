@@ -45,8 +45,7 @@ pub(super) fn print_approval(opening: &Opening) {
         opening.opened.campaign_fingerprint
     );
     eprintln!(
-        "approuver depuis le poste opérateur :\n  astra-signer approve-campaign \\\n    \
-         --authority-url {} \\\n    --operation-id {}",
+        "approuver dans Orion : Astra › Approbations\n  autorité  : {}\n  opération : {}",
         opening.authority_url,
         opening.opened.operation_id.to_hex()
     );

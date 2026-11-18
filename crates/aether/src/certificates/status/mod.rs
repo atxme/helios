@@ -34,8 +34,8 @@
 //! Its job is authentication and key derivation: presence plus user
 //! verification release a CTAP2 `hmac-secret` output, that output unwraps a
 //! key-slot of the authority vault, and the anchors inside it produce the
-//! ML-DSA-87 signature. The campaign fingerprint is what `astra-signer`
-//! **displays** before asking for the touch, and what the resulting `CA-PQ`
+//! ML-DSA-87 signature. The campaign fingerprint is what the approval ceremony in
+//! Orion (Astra › Approbations, formerly `astra-signer`) **displays** before asking for the touch, and what the resulting `CA-PQ`
 //! signature is bound to.
 //!
 //! `required_credentials` follows from that: two is not a threshold anyone
