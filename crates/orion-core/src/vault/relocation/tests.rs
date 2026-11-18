@@ -1124,3 +1124,52 @@ fn a_link_is_reported_once_per_path() {
         "a second report of the same path is not"
     );
 }
+
+#[test]
+fn a_vault_with_a_locked_nomad_profile_relocates() {
+    let base = scratch("locked-nomad");
+    let legacy = legacy_vault(&base, &["poste"]);
+    let sealed_nomad = ProfileStore::new(
+        legacy.layout.config_dir.clone(),
+        Box::new(legacy_root(&legacy.calls)),
+    );
+    sealed_nomad
+        .enrol_nomad_for_test(
+            &profile("portable"),
+            "cheval agrafe batterie correcte orion",
+        )
+        .unwrap();
+    let paths = EnginePaths::under(&base.join("root"));
+
+    let outcome = relocate(
+        &legacy.layout,
+        &paths,
+        &legacy_root(&legacy.calls),
+        &target(),
+    );
+
+    assert_eq!(
+        outcome.unwrap(),
+        Relocation::Moved {
+            profiles: 2,
+            identities: 1
+        }
+    );
+    let reopened = reopen(&paths);
+    assert_eq!(reopened.profiles.len(), 1);
+    assert_eq!(reopened.locked.len(), 1);
+    assert_eq!(reopened.locked[0].name, "portable");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_pending_next_manifest_is_not_counted_as_a_manifest() {
+    let base = scratch("next-not-counted");
+    let profiles = base.join(PROFILES_DIR);
+    std::fs::create_dir_all(&profiles).unwrap();
+    std::fs::write(profiles.join("0123.hvlt"), b"sealed").unwrap();
+    std::fs::write(profiles.join("0123.g2.next.hvlt"), b"pending").unwrap();
+
+    assert_eq!(count_manifests(&profiles).unwrap(), 1);
+    let _ = std::fs::remove_dir_all(&base);
+}

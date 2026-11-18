@@ -397,6 +397,7 @@ fn every_reply() -> Vec<EngineReply> {
     let config = ClientConfig {
         profiles: vec![secret_profile()],
         selected: Some("poste".into()),
+        locked: Vec::new(),
     };
     let imported = ImportOutcome {
         profile: ProfileView::from(&secret_profile()),
@@ -548,6 +549,7 @@ fn every_reply_serializes_without_secret_material() {
     let config = serde_json::to_string(&EngineReply::Config(ConfigView::from(&ClientConfig {
         profiles: vec![secret_profile()],
         selected: None,
+        locked: Vec::new(),
     })))
     .expect("a reply serialises");
     assert!(config.contains("\"has_private_key\":true"));

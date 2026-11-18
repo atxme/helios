@@ -85,6 +85,7 @@ fn config_with(profile: Option<ClientProfile>) -> Arc<Mutex<ClientConfig>> {
     Arc::new(Mutex::new(ClientConfig {
         profiles: profile.into_iter().collect(),
         selected: None,
+        locked: Vec::new(),
     }))
 }
 

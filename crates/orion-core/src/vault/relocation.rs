@@ -421,11 +421,13 @@ fn stage(
     let verified = staged_store.load()?;
     // The count is the registry's: a manifest without an entry is an orphan,
     // copied and reported, while an entry without a manifest fails the load.
+    // A locked nomad profile is in the registry and is not opened, so it
+    // counts as loaded here.
+    let loaded = verified.profiles.len() + verified.locked.len();
     let registered = staged_store.registered_count()?;
-    if verified.profiles.len() != registered {
+    if loaded != registered {
         return Err(VaultError::Relocation(format!(
-            "{} profils chargés pour {registered} entrées du registre",
-            verified.profiles.len()
+            "{loaded} profils chargés pour {registered} entrées du registre"
         )));
     }
     let manifests = count_manifests(&vault.join(PROFILES_DIR))?;
@@ -444,7 +446,7 @@ fn stage(
         }
     }
     Ok(Staged {
-        profiles: verified.profiles.len(),
+        profiles: loaded,
         identities: identity_count,
     })
 }
@@ -731,9 +733,16 @@ fn count_manifests(dir: &Path) -> Result<usize, VaultError> {
     Ok(children(dir)?
         .iter()
         .filter(|path| {
-            path.extension()
+            // A manifest step waiting to be settled is not a manifest yet.
+            let pending = path
+                .file_name()
                 .and_then(OsStr::to_str)
-                .is_some_and(|extension| extension == MANIFEST_EXTENSION)
+                .is_some_and(|name| name.ends_with(".next.hvlt"));
+            !pending
+                && path
+                    .extension()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|extension| extension == MANIFEST_EXTENSION)
         })
         .count())
 }

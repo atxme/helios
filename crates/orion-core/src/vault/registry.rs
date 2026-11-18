@@ -53,7 +53,7 @@ const MODE_SERVICE: u8 = 0;
 const MODE_NOMAD: u8 = 1;
 
 /// The only passphrase KDF identifier accepted. `1` is burned.
-const KDF_PBKDF2_HMAC_SHA512: u8 = 2;
+pub(crate) const KDF_PBKDF2_HMAC_SHA512: u8 = 2;
 
 /// The KDF identifier that was used before it was burned.
 const KDF_BURNED: u8 = 1;
@@ -78,6 +78,30 @@ impl ProfileMode {
 
     pub fn is_nomad(&self) -> bool {
         matches!(self, Self::Nomad { .. })
+    }
+}
+
+/// The registry's digest of one profile: its manifest's security digest, with
+/// the mode mixed in when the mode is `nomade`.
+///
+/// A `service` entry keeps the manifest digest unchanged, so every digest
+/// recorded before the mode existed still matches. A `nomade` entry binds its
+/// mode and salt as well: switching modes, or re-salting, is then a security
+/// change and raises the generation like the three others ADR-006 §2 lists.
+pub fn entry_digest(manifest_digest: [u8; 32], mode: &ProfileMode) -> [u8; 32] {
+    match mode {
+        ProfileMode::Service => manifest_digest,
+        ProfileMode::Nomad { kdf, salt } => {
+            let mut input = Vec::with_capacity(32 + 2 + SALT_LEN);
+            input.extend_from_slice(&manifest_digest);
+            input.push(MODE_NOMAD);
+            input.push(*kdf);
+            input.extend_from_slice(salt);
+            let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &input);
+            let mut out = [0u8; 32];
+            out.copy_from_slice(digest.as_ref());
+            out
+        }
     }
 }
 
@@ -352,6 +376,37 @@ mod tests {
         assert_eq!(poste.generation.0, 4);
         // The next write upgrades the layout.
         assert_eq!(decoded.encode().unwrap()[0], 3);
+    }
+
+    #[test]
+    fn a_service_entry_digest_is_the_manifest_digest() {
+        let manifest_digest = [9u8; 32];
+        assert_eq!(
+            entry_digest(manifest_digest, &ProfileMode::Service),
+            manifest_digest,
+            "every existing registry digest must stay stable"
+        );
+    }
+
+    #[test]
+    fn a_nomad_entry_digest_binds_the_mode_and_its_salt() {
+        let manifest_digest = [9u8; 32];
+        let first = entry_digest(
+            manifest_digest,
+            &ProfileMode::Nomad {
+                kdf: 2,
+                salt: [1u8; SALT_LEN],
+            },
+        );
+        let second = entry_digest(
+            manifest_digest,
+            &ProfileMode::Nomad {
+                kdf: 2,
+                salt: [2u8; SALT_LEN],
+            },
+        );
+        assert_ne!(first, manifest_digest);
+        assert_ne!(first, second, "a new salt is a new security state");
     }
 
     #[test]

@@ -161,6 +161,7 @@ impl RootKeyProvider for UnsupportedRootKeyProvider {
 }
 
 /// Which secrets seal and open a profile manifest.
+#[derive(Clone, Copy)]
 pub enum ManifestKey<'a> {
     /// The profile root key alone: the `service` profile.
     Service,

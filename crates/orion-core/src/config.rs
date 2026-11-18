@@ -831,6 +831,18 @@ impl Default for ClientProfile {
     }
 }
 
+/// A `nomade` profile whose passphrase has not opened it in this session.
+///
+/// Carries the name and the two public keys, read from the registry, and
+/// nothing from the sealed manifest: there is no secret here, and nothing
+/// that could be saved as a profile.
+#[derive(Debug, Clone)]
+pub struct LockedProfile {
+    pub name: String,
+    pub client_public_key: String,
+    pub gateway_public_key: String,
+}
+
 /// Persisted client configuration: set of profiles + current selection.
 #[derive(Debug, Deserialize, Default)]
 pub struct ClientConfig {
@@ -839,6 +851,10 @@ pub struct ClientConfig {
     /// Name of the currently selected profile.
     #[serde(default)]
     pub selected: Option<String>,
+    /// Nomad profiles still sealed. Filled by the vault only, never read from
+    /// or written to a file.
+    #[serde(skip)]
+    pub locked: Vec<LockedProfile>,
 }
 
 impl ClientConfig {

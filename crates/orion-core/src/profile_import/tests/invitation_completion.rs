@@ -109,6 +109,7 @@ fn completes_an_invitation_with_the_local_key_of_the_same_name() {
             ..ClientProfile::default()
         }],
         selected: None,
+        locked: Vec::new(),
     };
 
     let completed = complete_profile_import(invitation, &config, Vec::new()).unwrap();
