@@ -370,15 +370,33 @@ pub async fn run(
     }
     Ok(())
     }.await;
-    if let Err(error) = transition(
+    stop_data_plane(
         &shared_state,
         &event_tx,
-        TunnelState::Down,
         fw.as_ref(),
         &policy,
+        firewall_mode,
+        wg.as_ref(),
     )
-    .await
-    {
+    .await;
+    // The interface is gone; routes naming it would linger in our table and
+    // the rule would keep sending the range at an empty lookup. Harmless, but
+    // it is state the daemon put there and must take back.
+    let ipv6 = shared_ipv6.read().await.clone();
+    unpin_peer_vips(dry_run, &ipv6).await;
+    loop_result
+}
+
+/// Keep or restore the selected firewall posture before removing WireGuard.
+async fn stop_data_plane(
+    shared_state: &Arc<RwLock<TunnelState>>,
+    event_tx: &broadcast::Sender<HeliosEvent>,
+    fw: &dyn FirewallBackend,
+    policy: &FirewallPolicy,
+    firewall_mode: FirewallMode,
+    wg: &dyn WireguardBackend,
+) {
+    if let Err(error) = transition(shared_state, event_tx, TunnelState::Down, fw, policy).await {
         if firewall_mode.enforced() {
             warn!("engaging the kill-switch at shutdown: {error:#}");
         } else {
@@ -388,12 +406,6 @@ pub async fn run(
     if let Err(error) = wg.down().await {
         warn!("tearing down WireGuard at shutdown: {error}");
     }
-    // The interface is gone; routes naming it would linger in our table and
-    // the rule would keep sending the range at an empty lookup. Harmless, but
-    // it is state the daemon put there and must take back.
-    let ipv6 = shared_ipv6.read().await.clone();
-    unpin_peer_vips(dry_run, &ipv6).await;
-    loop_result
 }
 
 async fn wait_api_ready(api_ready: &AtomicBool) -> anyhow::Result<()> {

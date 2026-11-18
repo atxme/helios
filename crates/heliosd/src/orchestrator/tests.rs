@@ -183,6 +183,126 @@ fn emitted_logs_preserve_level_and_message_in_the_event_stream() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn api_readiness_stays_pending_until_the_listener_signals_ready() {
+    let ready = AtomicBool::new(false);
+    let waiting = wait_api_ready(&ready);
+    tokio::pin!(waiting);
+
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(std::future::Future::poll(waiting.as_mut(), &mut context).is_pending());
+    tokio::time::advance(Duration::from_millis(249)).await;
+    assert!(std::future::Future::poll(waiting.as_mut(), &mut context).is_pending());
+    ready.store(true, Ordering::Release);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("readiness wait must notice the signal")
+        .expect("API becomes ready on the next check");
+}
+
+#[tokio::test(start_paused = true)]
+async fn api_readiness_reports_a_listener_that_never_binds() {
+    let started = tokio::time::Instant::now();
+    let ready = AtomicBool::new(false);
+    let error = tokio::time::timeout(Duration::from_secs(11), wait_api_ready(&ready))
+        .await
+        .expect("API readiness wait must have its own deadline")
+        .expect_err("unavailable listener must prevent readiness");
+
+    assert!(error
+        .to_string()
+        .contains("API did not reach its ready state"));
+    assert_eq!(started.elapsed(), Duration::from_secs(10));
+}
+
+/// A teardown observes what the firewall and public state had reached before
+/// WireGuard removal. There is no real backend in this test.
+struct TeardownProbe<'a> {
+    firewall: &'a TransitionFirewall,
+    shared_state: &'a Arc<RwLock<TunnelState>>,
+    called: AtomicBool,
+    refuse: bool,
+}
+
+#[async_trait::async_trait]
+impl WireguardBackend for TeardownProbe<'_> {
+    async fn up(&self, _: &InterfaceConfig, _: &[PeerConfig]) -> helios_wireguard::Result<()> {
+        panic!("shutdown must not bring up WireGuard");
+    }
+
+    async fn down(&self) -> helios_wireguard::Result<()> {
+        assert!(!self.called.swap(true, Ordering::SeqCst));
+        assert_eq!(*self.shared_state.read().await, TunnelState::Down);
+        assert_eq!(
+            *self.firewall.states.lock().expect("firewall calls"),
+            [TunnelState::Down],
+            "shutdown must attempt the down firewall posture before removing WireGuard"
+        );
+        if self.refuse {
+            return Err(WgError::Unavailable("teardown refused".into()));
+        }
+        Ok(())
+    }
+
+    async fn sync_peers(&self, _: &[PeerConfig]) -> helios_wireguard::Result<()> {
+        panic!("shutdown must not sync peers");
+    }
+
+    async fn peers(&self) -> helios_wireguard::Result<Vec<PeerStatus>> {
+        panic!("shutdown must not read peers");
+    }
+
+    fn is_up(&self) -> bool {
+        !self.called.load(Ordering::Acquire)
+    }
+
+    fn kind(&self) -> &'static str {
+        "teardown-test"
+    }
+}
+
+#[tokio::test]
+async fn shutdown_applies_the_down_posture_before_removing_wireguard_even_on_errors() {
+    for (mode, refuse_firewall, refuse_wireguard) in [
+        (FirewallMode::Enforced, false, false),
+        (FirewallMode::Enforced, true, false),
+        (FirewallMode::DisabledForMaintenance, true, true),
+    ] {
+        let state = Arc::new(RwLock::new(TunnelState::Up));
+        let (event_tx, mut events) = broadcast::channel(4);
+        let firewall = TransitionFirewall {
+            states: std::sync::Mutex::new(Vec::new()),
+            refuse: refuse_firewall,
+        };
+        let wg = TeardownProbe {
+            firewall: &firewall,
+            shared_state: &state,
+            called: AtomicBool::new(false),
+            refuse: refuse_wireguard,
+        };
+
+        stop_data_plane(
+            &state,
+            &event_tx,
+            &firewall,
+            &configured_network().firewall_policy(),
+            mode,
+            &wg,
+        )
+        .await;
+
+        assert!(wg.called.load(Ordering::Acquire));
+        assert_eq!(*state.read().await, TunnelState::Down);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(HeliosEvent::StateChanged {
+                state: TunnelState::Down
+            })
+        ));
+    }
+}
+
 fn run_readiness_test_child(test_name: &str, path: &std::path::Path) {
     let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
         .args(["--exact", test_name, "--nocapture"])
