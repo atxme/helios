@@ -246,13 +246,15 @@ génération du registre est refusé) reste entier. **Choix de conception**, en
 trois écritures :
 
 1. le nouveau manifeste (génération + 1, nouveau mode) est écrit à côté,
-   `profiles/<id>.next.hvlt` ;
+   `profiles/<id>.g<génération>.next.hvlt` ;
 2. le registre est écrit avec le nouveau mode et la génération + 1 ;
-3. `<id>.next.hvlt` est renommé en `<id>.hvlt`.
+3. ce fichier est renommé en `<id>.hvlt`.
 
-Au chargement : un `<id>.next.hvlt` dont la génération dépasse celle du
-registre est un reste de l'étape 1, et il est supprimé ; un `<id>.next.hvlt` à
-la génération du registre est une étape 3 interrompue, et il est promu. Tests
+Au chargement, sans rien déchiffrer : un fichier `.next` dont la génération
+(lue dans son nom) dépasse celle du registre est un reste de l'étape 1, et il
+est supprimé ; un fichier `.next` à la génération du registre est une étape 3
+interrompue, et il est promu. Le nom n'est pas une preuve : l'ouverture
+contrôle ensuite la génération authentifiée du manifeste, comme aujourd'hui. Tests
 d'injection de panne après chaque écriture, comme ceux du magasin actuel.
 
 **Copies antérieures.** Passer en `nomade` ne protège pas les copies du profil
