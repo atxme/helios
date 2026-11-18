@@ -58,6 +58,7 @@ pub struct TestKey {
     pub touches: Cell<u32>,
     pub(crate) ignores_allow_list: Cell<bool>,
     pub declines: Cell<bool>,
+    pub(super) allow_combined_opening: Cell<bool>,
 }
 
 impl TestKey {
@@ -68,6 +69,7 @@ impl TestKey {
             touches: Cell::new(0),
             ignores_allow_list: Cell::new(false),
             declines: Cell::new(false),
+            allow_combined_opening: Cell::new(false),
         }
     }
 
@@ -77,6 +79,15 @@ impl TestKey {
 
     pub(crate) fn signing_key(&self) -> Ed25519KeyPair {
         Ed25519KeyPair::from_seed_unchecked(&[self.serial ^ 0x5A; 32]).expect("seed")
+    }
+
+    fn opening(&self, credential_id: Vec<u8>, salt: &[u8; 32]) -> Opened {
+        let mut output = *salt;
+        output.iter_mut().for_each(|byte| *byte ^= self.serial);
+        Opened {
+            credential_id,
+            secret: SlotSecret::new(output.to_vec()),
+        }
     }
 
     /// What a token does with an allow-list, and the one thing `declines` stops.
@@ -120,12 +131,7 @@ impl Authenticator for TestKey {
         _pin: &str,
     ) -> Result<Opened, AuthenticatorError> {
         let credential_id = self.answer(credentials)?;
-        let mut output = *salt;
-        output.iter_mut().for_each(|byte| *byte ^= self.serial);
-        Ok(Opened {
-            credential_id,
-            secret: SlotSecret::new(output.to_vec()),
-        })
+        Ok(self.opening(credential_id, salt))
     }
 
     fn approve(
@@ -159,13 +165,19 @@ impl Authenticator for TestKey {
 
     fn approve_and_derive(
         &self,
-        _rp_id: &str,
-        _credentials: &[Vec<u8>],
-        _client_data_json: &[u8],
-        _salt: &[u8; 32],
-        _pin: &str,
+        rp_id: &str,
+        credentials: &[Vec<u8>],
+        client_data_json: &[u8],
+        salt: &[u8; 32],
+        pin: &str,
     ) -> Result<ApprovedOpening, AuthenticatorError> {
-        unreachable!("a rotation takes its two gestures apart")
+        assert!(
+            self.allow_combined_opening.get(),
+            "this ceremony must keep approval and opening separate",
+        );
+        let approval = self.approve(rp_id, credentials, client_data_json, pin)?;
+        let opened = self.opening(approval.credential_id.clone(), salt);
+        Ok(ApprovedOpening { approval, opened })
     }
 }
 
