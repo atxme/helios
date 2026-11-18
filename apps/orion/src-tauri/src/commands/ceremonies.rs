@@ -2,7 +2,7 @@
 
 use super::*;
 
-use orion_engine::{ConfigView, EngineCommand, EngineReply};
+use orion_engine::{client::EngineClient, ConfigView, EngineCommand, EngineReply};
 
 /// Opens an operator ceremony for the operation the WebView names.
 ///
@@ -299,7 +299,7 @@ pub(crate) async fn adopt_connected_gateway(state: State<'_, AppState>) -> Resul
 
     ensure_no_open_ceremony(&state).await?;
     let vault_path = state.vault_location.path()?;
-    let (base, tunnel_peer_key, _) = connected_profile(&state).await?;
+    let (base, tunnel_peer_key, _) = connected_profile(&state.client).await?;
     let client = admin::orion_client().map_err(|error| error.to_string())?;
     let material = admin::gateway_negotiation(&client, &base)
         .await
@@ -423,18 +423,25 @@ pub(crate) async fn operator_overview(
 
 /// Everything the rotations screen shows, in one read and with no key.
 ///
-/// The gateway is the connected profile's. Without a tunnel the three reads are
+/// The gateway is the connected profile's. Without a tunnel the gateway reads are
 /// `unreachable` and `tunnel` says why. The vault is looked at where it is, and
 /// no folder is created for having looked. The page receives display data only.
 #[tauri::command]
 pub(crate) async fn operator_rotations_overview(
     state: State<'_, AppState>,
 ) -> Result<crate::operator::rotations::RotationsOverview, String> {
+    let vault_path = state.vault_location.path_to_look_at();
+    rotations_overview(&state.client, vault_path).await
+}
+
+async fn rotations_overview(
+    client: &EngineClient,
+    vault_path: Result<std::path::PathBuf, String>,
+) -> Result<crate::operator::rotations::RotationsOverview, String> {
     use crate::operator::rotations::{read_local, RotationsOverview};
     use orion_core::operator_rotations as reads;
 
-    let vault_path = state.vault_location.path_to_look_at();
-    let target = connected_target(&state).await.ok();
+    let target = connected_target_from(client).await.ok();
     // Concurrent: a gateway that hangs for its whole wait must not delay the vault.
     let reads = async {
         match &target {
@@ -482,18 +489,26 @@ pub(crate) async fn operator_rotations_overview(
 pub(crate) async fn operator_peers_overview(
     state: State<'_, AppState>,
 ) -> Result<crate::operator::peers::PeersOverview, String> {
-    use crate::operator::peers;
-    use orion_core::gateway_admin;
-    use orion_core::operator_rotations::{self as reads, Reach};
-
     let view = match state.client.call(EngineCommand::GetConfig).await? {
         EngineReply::Config(view) => view,
         _ => return Err(unexpected_engine_reply()),
     };
     let vault_path = state.vault_location.path_to_look_at();
-    let target = connected_target(&state).await.ok();
+    peers_overview(&state.client, &view, vault_path).await
+}
+
+async fn peers_overview(
+    client: &EngineClient,
+    view: &ConfigView,
+    vault_path: Result<std::path::PathBuf, String>,
+) -> Result<crate::operator::peers::PeersOverview, String> {
+    use crate::operator::peers;
+    use orion_core::gateway_admin;
+    use orion_core::operator_rotations::{self as reads, Reach};
+
+    let target = connected_target_from(client).await.ok();
     // The key of the profile the connected target belongs to, and no other.
-    let own_key = peers::own_key_of(&view, target.as_ref().map(|target| target.address.as_str()));
+    let own_key = peers::own_key_of(view, target.as_ref().map(|target| target.address.as_str()));
     // Concurrent: a gateway that hangs for its whole wait must not delay the others.
     let gateway_reads = async {
         match &target {
@@ -1028,14 +1043,22 @@ const NO_CONNECTED_GATEWAY: &str = "Connectez d'abord le profil de la gateway, a
 /// and a gateway reached any other way would not be the one the operator
 /// connected to.
 async fn connected_gateway(state: &AppState) -> Result<String, String> {
-    connected_profile(state).await.map(|(url, _, _)| url)
+    connected_profile(&state.client)
+        .await
+        .map(|(url, _, _)| url)
 }
 
 /// [`connected_gateway`] and the peer key, as the gateway a rotation may be carried to.
 pub(crate) async fn connected_target(
     state: &AppState,
 ) -> Result<crate::operator::GatewayTarget, String> {
-    connected_profile(state)
+    connected_target_from(&state.client).await
+}
+
+async fn connected_target_from(
+    client: &EngineClient,
+) -> Result<crate::operator::GatewayTarget, String> {
+    connected_profile(client)
         .await
         .map(
             |(address, peer_key, own_key)| crate::operator::GatewayTarget {
@@ -1048,12 +1071,14 @@ pub(crate) async fn connected_target(
 
 /// [`connected_gateway`], with the peer key of the connected profile and this
 /// workstation's own key, both read from the same answer of the engine.
-async fn connected_profile(state: &AppState) -> Result<(String, String, Option<String>), String> {
-    let tunnel = match state.client.call(EngineCommand::GetState).await? {
+async fn connected_profile(
+    client: &EngineClient,
+) -> Result<(String, String, Option<String>), String> {
+    let tunnel = match client.call(EngineCommand::GetState).await? {
         EngineReply::State(value) => value,
         _ => return Err(unexpected_engine_reply()),
     };
-    let view = match state.client.call(EngineCommand::GetConfig).await? {
+    let view = match client.call(EngineCommand::GetConfig).await? {
         EngineReply::Config(value) => value,
         _ => return Err(unexpected_engine_reply()),
     };
