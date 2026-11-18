@@ -45,7 +45,7 @@ use zeroize::Zeroizing;
 
 use super::{
     open_manifest,
-    registry::{Registry, RegistryEntry},
+    registry::{ProfileMode, Registry, RegistryEntry},
     seal_manifest, DeviceRootKey, ManifestKey, ProfileId, ProfileManifest, RootKeyProvider,
     SecurityGeneration, VaultError, DOMAIN_REGISTRY,
 };
@@ -534,6 +534,7 @@ impl ProfileStore {
             rotation_required: previous
                 .map(|entry| entry.rotation_required && !rotated)
                 .unwrap_or(false),
+            mode: ProfileMode::Service,
         })?;
         if registry.selected.is_none() {
             registry.selected = Some(id);
@@ -687,6 +688,7 @@ impl ProfileStore {
                 // The key lived in plaintext. Sealing it does not recall the
                 // copies already in backups and roaming profiles.
                 rotation_required: true,
+                mode: ProfileMode::Service,
             })?;
             report.migrated.push(profile.name.clone());
             report.rotation_required.push(profile.name.clone());
