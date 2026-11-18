@@ -15,8 +15,8 @@ fn peer(name: &str, address: &str, key: &str, admin: bool, age: Option<u64>) -> 
     })
 }
 
-fn status(peers: Vec<serde_json::Value>) -> Status {
-    serde_json::from_value(json!({
+fn status_json(peers: Vec<serde_json::Value>) -> serde_json::Value {
+    json!({
         "state": "connecting", "version": "1.13.0",
         "wan_ifaces": ["enp3s0", "wlo1"], "lan_ifaces": [], "wg_peers": [],
         "allow_ssh_from": ["192.168.1.0/24"], "admin_ifaces": ["nordlynx", "tailscale0"],
@@ -24,8 +24,11 @@ fn status(peers: Vec<serde_json::Value>) -> Status {
         "key_negotiation_port": 51821, "dry_run": false, "split_tunnel_cidrs": [],
         "mss_clamp": null, "captive_portal_gateway": null,
         "handshake_stale_after_seconds": 150
-    }))
-    .unwrap()
+    })
+}
+
+fn status(peers: Vec<serde_json::Value>) -> Status {
+    serde_json::from_value(status_json(peers)).unwrap()
 }
 
 fn gateway_peers() -> Vec<serde_json::Value> {
@@ -520,4 +523,196 @@ fn an_unreachable_api_is_one_failure_not_a_cascade_of_guesses() {
     let api = checks.iter().find(|check| check.label == "API").unwrap();
     assert_eq!(api.level, Level::Fail);
     assert!(checks.iter().all(|check| check.label != "Tunnel"));
+}
+
+fn loopback_client() -> Client {
+    Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .expect("loopback client")
+}
+
+async fn doctor_fixture(replies: [(&'static str, String); 5]) -> Result<()> {
+    let (base, server) = crate::tests::http_response_sequence(replies).await;
+    let api = Api {
+        client: loopback_client(),
+        base,
+        socket: None,
+    };
+    let result = doctor(&api).await;
+    let requests = server.await.expect("doctor requests");
+    let routes = requests
+        .iter()
+        .map(|request| request.lines().next().expect("request line"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        routes,
+        [
+            "GET /api/status HTTP/1.1",
+            "GET /api/health HTTP/1.1",
+            "GET /api/firewall/rules HTTP/1.1",
+            "GET /api/certificates HTTP/1.1",
+            "GET /api/update HTTP/1.1",
+        ]
+    );
+    result
+}
+
+fn firewall_json() -> String {
+    json!({"rules": RULESET, "default_verdict": "drop", "dry_run": false}).to_string()
+}
+
+#[tokio::test]
+async fn doctor_succeeds_when_the_optional_certificates_endpoint_is_absent() {
+    let mut peers = gateway_peers();
+    peers[0]["last_handshake_age_seconds"] = json!(12);
+    let mut status = status_json(peers);
+    status["state"] = json!("up");
+    let outcome = doctor_fixture([
+        ("200 OK", status.to_string()),
+        (
+            "200 OK",
+            json!({
+                "tpm": {"kind": "unsealed", "preserved_vaults": true},
+                "memory_total_bytes": 100,
+                "memory_available_bytes": 90,
+                "temperature_celsius": 55.0
+            })
+            .to_string(),
+        ),
+        ("200 OK", firewall_json()),
+        ("404 Not Found", "no trust domain".into()),
+        (
+            "200 OK",
+            serde_json::to_string(&healthy().release.unwrap()).unwrap(),
+        ),
+    ])
+    .await;
+
+    outcome.expect("absence of a trust domain is only a warning");
+}
+
+#[tokio::test]
+async fn doctor_collects_failures_across_all_routes_before_exiting() {
+    let outcome = doctor_fixture([
+        ("503 Service Unavailable", "gateway starting".into()),
+        ("200 OK", r#"{"tpm":{"kind":null}}"#.into()),
+        (
+            "200 OK",
+            json!({"rules": "", "default_verdict": "accept", "dry_run": false}).to_string(),
+        ),
+        ("403 Forbidden", "certificate inventory refused".into()),
+        ("200 OK", "invalid JSON".into()),
+    ])
+    .await;
+
+    assert_eq!(
+        outcome.expect_err("all five checks failed").to_string(),
+        "5 check(s) failed"
+    );
+}
+
+#[tokio::test]
+async fn negotiation_reads_public_material_for_open_and_closed_udp_ports() {
+    for port in [Some(51821), None] {
+        let body = json!({
+            "port": port,
+            "server_name": "gateway.example",
+            "wireguard_public_key": "test-gateway-key",
+            "pq_certificate_sha256": "test-fingerprint"
+        });
+        let (base, server) = crate::tests::one_response_server("200 OK", body.to_string()).await;
+
+        negotiation(&loopback_client(), &base)
+            .await
+            .expect("public negotiation material is readable for either port state");
+        assert!(server
+            .await
+            .unwrap()
+            .starts_with("GET /api/key-negotiation HTTP/1.1\r\n"));
+    }
+}
+
+#[tokio::test]
+async fn negotiation_reports_a_gateway_that_has_no_public_material() {
+    let (base, server) = crate::tests::one_response_server("404 Not Found", "not found").await;
+
+    let error = negotiation(&loopback_client(), &base)
+        .await
+        .expect_err("missing negotiation material");
+    assert_eq!(
+        error.to_string(),
+        "this gateway serves no key-negotiation material"
+    );
+    assert!(server
+        .await
+        .unwrap()
+        .starts_with("GET /api/key-negotiation HTTP/1.1\r\n"));
+}
+
+#[tokio::test]
+async fn certificates_distinguishes_missing_domain_from_an_http_refusal() {
+    for (status, expected) in [
+        (
+            "404 Not Found",
+            "this gateway has no trust domain — run `heliosd init-trust-domain`",
+        ),
+        ("403 Forbidden", "403 Forbidden : inventory unavailable"),
+    ] {
+        let (base, server) =
+            crate::tests::one_response_server(status, "inventory unavailable").await;
+        let error = super::certificates(&loopback_client(), &base)
+            .await
+            .expect_err("certificate inventory not available");
+        assert_eq!(error.to_string(), expected);
+        assert!(server
+            .await
+            .unwrap()
+            .starts_with("GET /api/certificates HTTP/1.1\r\n"));
+    }
+}
+
+#[tokio::test]
+async fn firewall_fetches_the_same_read_only_rules_for_raw_and_summary_modes() {
+    for raw in [false, true] {
+        let (base, server) = crate::tests::one_response_server("200 OK", firewall_json()).await;
+
+        super::firewall(&loopback_client(), &base, raw)
+            .await
+            .expect("read kernel rules without applying them");
+        assert!(server
+            .await
+            .unwrap()
+            .starts_with("GET /api/firewall/rules HTTP/1.1\r\n"));
+    }
+}
+
+#[tokio::test]
+async fn certificates_accepts_an_inventory_with_rotations_pending() {
+    let domain = json!({
+        "trust_domain_id": "test-domain",
+        "server_name": "gateway.example",
+        "now_unix": 1_791_400_000,
+        "ca_epoch": 1,
+        "ca_pq_fingerprint": "test-ca-pq",
+        "ca_transition_pending": true,
+        "gateway_identity_epoch": 2,
+        "gateway_tls_fingerprint": "test-gateway-tls",
+        "gateway_pq_fingerprint": "test-gateway-pq",
+        "gateway_transition_pending": true,
+        "astra_authority_url": "https://astra.example",
+        "issuer": null,
+        "peers": []
+    });
+    let (base, server) = crate::tests::one_response_server("200 OK", domain.to_string()).await;
+
+    super::certificates(&loopback_client(), &base)
+        .await
+        .expect("pending rotations are valid inventory data");
+    assert!(server
+        .await
+        .unwrap()
+        .starts_with("GET /api/certificates HTTP/1.1\r\n"));
 }
