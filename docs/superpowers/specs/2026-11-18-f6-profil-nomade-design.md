@@ -126,7 +126,8 @@ mode : Service
   **verrouillé** : nom, clés publiques et mode, venus du registre ; aucun champ
   du manifeste. Le démarrage d'Orion ne demande donc aucune passphrase.
 - **Choix de conception** : un profil verrouillé est d'un type distinct,
-  `LockedProfile { name, client_public_key, gateway_public_key, mode }`,
+  `LockedProfile { name, client_public_key, gateway_public_key }` (un profil
+  verrouillé est toujours `nomade` : le mode n'y est pas répété),
   porté par une liste à part de `ClientConfig`. `ClientProfile` reste complet,
   et rien ne peut sauvegarder un profil verrouillé par erreur : il n'a pas de
   manifeste à écrire. Les deux clés publiques sont déjà dans l'entrée du
