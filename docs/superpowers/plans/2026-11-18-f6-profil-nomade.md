@@ -101,7 +101,7 @@ Expected: FAIL (module `nomad` missing).
 
 ---
 
-### Task 2: Registry v2 with the profile mode
+### Task 2: Registry v3 with the profile mode
 
 **Files:**
 - Modify: `crates/orion-core/src/vault/registry.rs`
@@ -112,10 +112,10 @@ Expected: FAIL (module `nomad` missing).
 - Produces:
   - `#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum ProfileMode { Service, Nomad { kdf: u8, salt: [u8; SALT_LEN] } }` with `pub fn as_str(&self) -> &'static str` returning `"service"` / `"nomade"`, and `pub fn is_nomad(&self) -> bool`.
   - `RegistryEntry.mode: ProfileMode` (new field, last).
-  - `REGISTRY_VERSION = 2`. Encoding per entry, after `rotation_required`: `0` for `Service`; `1, kdf, salt[16]` for `Nomad`.
-  - Decoding: version `1` reads the v1 layout with every entry `Service`; version `2` reads the mode; `kdf == 1` → `Err(VaultError::Container(aether_vault::VaultError::BurnedKdf(1)))`; any `kdf` other than `2` → `Err(VaultError::Container(aether_vault::VaultError::UnsupportedKdf(kdf)))`; unknown mode byte → `ManifestEncoding`. `encode` always writes v2.
+  - `REGISTRY_VERSION = 3` (v2 is the current on-disk format, without mode). Encoding per entry, after `rotation_required`: `0` for `Service`; `1, kdf, salt[16]` for `Nomad`.
+  - Decoding: version `2` reads the current layout with every entry `Service`; version `3` reads the mode; version `1` stays refused as today; `kdf == 1` → `Err(VaultError::Container(aether_vault::VaultError::BurnedKdf(1)))`; any `kdf` other than `2` → `Err(VaultError::Container(aether_vault::VaultError::UnsupportedKdf(kdf)))`; unknown mode byte → `ManifestEncoding`. `encode` always writes v3.
 
-- [ ] **Step 1: Write the failing tests**: `a_v2_registry_round_trips_both_modes`, `a_v1_registry_reads_as_service` (bytes built with the v1 layout by hand), `a_burned_kdf_is_refused_and_named`, `an_unknown_kdf_is_refused`, `an_unknown_mode_byte_is_refused`.
+- [ ] **Step 1: Write the failing tests**: `a_v3_registry_round_trips_both_modes`, `a_v2_registry_reads_as_service` (bytes built with the v2 layout by hand), `a_burned_kdf_is_refused_and_named`, `an_unknown_kdf_is_refused`, `an_unknown_mode_byte_is_refused`.
 - [ ] **Step 2: Run** `scripts/wsl-cargo test -p orion-core vault::registry` — FAIL.
 - [ ] **Step 3: Implement.** Update the `entry()` test helper and every `RegistryEntry { .. }` literal in the crate (`mode: ProfileMode::Service`).
 - [ ] **Step 4: Run** `scripts/wsl-cargo test -p orion-core vault::` — PASS.

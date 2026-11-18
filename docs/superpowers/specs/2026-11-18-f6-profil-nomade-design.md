@@ -112,8 +112,9 @@ mode : Service
      | Nomade { kdf: u8 (= 2), salt: [u8; 16] }
 ```
 
-- Le registre passe en version 2. Une version 1 se lit, tous ses profils en
-  `service`, et la prochaine écriture produit une version 2.
+- Le registre passe en version 3 (la version 2, actuelle, a ajouté le
+  `security_digest`). Une version 2 se lit, tous ses profils en `service`, et
+  la prochaine écriture produit une version 3 ; la version 1 reste refusée.
 - Le mode entre dans le `security_digest` : une bascule élève la génération,
   comme un changement de PSK ou d'ancre.
 - Un `kdf` inconnu, ou `1`, est refusé avec un message qui le dit.
