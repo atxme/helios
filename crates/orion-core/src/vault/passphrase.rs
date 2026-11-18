@@ -91,15 +91,26 @@ pub enum PassphraseError {
     TooRepetitive,
 }
 
-/// Checks a passphrase and returns its normalised form, ready for the KDF.
+/// Normalises a passphrase for the KDF, without judging it.
+///
+/// Used alone when **opening** a profile: the policy judges a new passphrase
+/// once, at creation, and must not lock a user out of a profile whose
+/// passphrase predates a rule change.
+///
+/// The returned value is [`Zeroizing`]: it is the passphrase itself, and it
+/// must not survive the derivation that consumes it.
+pub fn normalise(raw: &str) -> Zeroizing<String> {
+    // Trim before counting: trailing spaces from a paste are invisible, and
+    // refusing on them would look like the dialog is broken.
+    Zeroizing::new(raw.trim().nfc().collect())
+}
+
+/// Checks a **new** passphrase and returns its normalised form, ready for the KDF.
 ///
 /// The returned value is [`Zeroizing`]: it is the passphrase itself, and it
 /// must not survive the derivation that consumes it.
 pub fn accept(raw: &str) -> Result<Zeroizing<String>, PassphraseError> {
-    // Trim before counting: trailing spaces from a paste are invisible, and
-    // refusing on them would look like the dialog is broken.
-    let normalised: String = raw.trim().nfc().collect();
-    let normalised = Zeroizing::new(normalised);
+    let normalised = normalise(raw);
 
     let characters = normalised.chars().count();
     if characters > MAX_LENGTH {
@@ -273,6 +284,14 @@ mod tests {
             accept(composed).unwrap().as_str(),
             accept(decomposed).unwrap().as_str()
         );
+    }
+
+    /// Opening must not judge the passphrase: a value the policy would refuse
+    /// still normalises, so the derivation can run on it.
+    #[test]
+    fn normalise_does_not_judge_the_passphrase() {
+        assert_eq!(normalise("  Password  ").as_str(), "Password");
+        assert_eq!(normalise("a").as_str(), "a");
     }
 
     #[test]

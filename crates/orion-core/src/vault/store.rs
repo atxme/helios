@@ -46,8 +46,8 @@ use zeroize::Zeroizing;
 use super::{
     open_manifest,
     registry::{Registry, RegistryEntry},
-    seal_manifest, DeviceRootKey, ProfileId, ProfileManifest, RootKeyProvider, SecurityGeneration,
-    VaultError, DOMAIN_REGISTRY,
+    seal_manifest, DeviceRootKey, ManifestKey, ProfileId, ProfileManifest, RootKeyProvider,
+    SecurityGeneration, VaultError, DOMAIN_REGISTRY,
 };
 use crate::config::{ClientConfig, ClientProfile};
 
@@ -399,6 +399,7 @@ impl ProfileStore {
             &entry.client_public_key,
             &entry.gateway_public_key,
             &blob,
+            ManifestKey::Service,
         )?;
         // The registry records the highest generation ever seen. A blob below
         // it was put back from an older copy.
@@ -512,7 +513,13 @@ impl ProfileStore {
         };
 
         let manifest = ProfileManifest::from_profile(profile, generation);
-        let blob = seal_manifest(&root, id, &manifest, &client_public_key)?;
+        let blob = seal_manifest(
+            &root,
+            id,
+            &manifest,
+            &client_public_key,
+            ManifestKey::Service,
+        )?;
         self.write(&self.manifest_path(id), &blob)?;
 
         registry.upsert(RegistryEntry {
@@ -644,7 +651,13 @@ impl ProfileStore {
                 .map(|entry| entry.id)
                 .map_or_else(ProfileId::generate, Ok)?;
             let manifest = ProfileManifest::from_profile(profile, SecurityGeneration(1));
-            let blob = seal_manifest(&root, id, &manifest, &client_public_key)?;
+            let blob = seal_manifest(
+                &root,
+                id,
+                &manifest,
+                &client_public_key,
+                ManifestKey::Service,
+            )?;
             self.write(&self.manifest_path(id), &blob)?;
 
             // Reopen and verify **before** publishing anything (ADR-006 §3).
@@ -658,6 +671,7 @@ impl ProfileStore {
                 &client_public_key,
                 &profile.peer_public_key,
                 &written,
+                ManifestKey::Service,
             )?;
             if reopened.generation != SecurityGeneration(1) {
                 return Err(VaultError::ContextDisagrees);

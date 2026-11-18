@@ -32,6 +32,7 @@
 pub mod codec;
 pub mod keys;
 pub mod manifest;
+pub mod nomad;
 pub mod passphrase;
 pub mod registry;
 pub mod relocation;
@@ -46,6 +47,7 @@ pub use settings::LocalSettings;
 pub use store::{Bootstrap, MigrationReport, ProfileStore};
 
 use aether_vault::Context;
+use zeroize::Zeroizing;
 
 /// Vault domain of an Orion profile manifest (ADR-006 §2).
 pub const DOMAIN_PROFILE: &str = "orion.profile";
@@ -158,23 +160,61 @@ impl RootKeyProvider for UnsupportedRootKeyProvider {
     }
 }
 
+/// Which secrets seal and open a profile manifest.
+pub enum ManifestKey<'a> {
+    /// The profile root key alone: the `service` profile.
+    Service,
+    /// The profile root key **and** the passphrase key: the `nomade` profile.
+    /// Neither one alone opens the manifest.
+    Nomad(&'a nomad::PassphraseKey),
+}
+
+/// IKM of a `nomade` manifest: the profile root key, then the passphrase key.
+fn nomad_ikm(
+    root_key: &[u8; KEY_LEN],
+    passphrase: &nomad::PassphraseKey,
+) -> Zeroizing<[u8; 2 * KEY_LEN]> {
+    let mut ikm = Zeroizing::new([0u8; 2 * KEY_LEN]);
+    ikm[..KEY_LEN].copy_from_slice(root_key);
+    passphrase.with_exposed(|bytes| ikm[KEY_LEN..].copy_from_slice(bytes));
+    ikm
+}
+
+/// Runs `operation` with the unlock that `key` selects.
+///
+/// The nomad IKM exists only for the duration of the call.
+fn with_unlock<R>(
+    root_key: &[u8; KEY_LEN],
+    key: &ManifestKey<'_>,
+    operation: impl FnOnce(&aether_vault::Unlock<'_>) -> Result<R, VaultError>,
+) -> Result<R, VaultError> {
+    match key {
+        ManifestKey::Service => operation(&aether_vault::Unlock::Key(root_key)),
+        ManifestKey::Nomad(passphrase) => {
+            let ikm = nomad_ikm(root_key, passphrase);
+            operation(&aether_vault::Unlock::Derived {
+                ikm: ikm.as_ref(),
+                info: nomad::NOMAD_INFO,
+            })
+        }
+    }
+}
+
 /// Seals a manifest for one profile.
 pub fn seal_manifest(
     root: &DeviceRootKey,
     id: ProfileId,
     manifest: &ProfileManifest,
     client_public_key: &str,
+    key: ManifestKey<'_>,
 ) -> Result<Vec<u8>, VaultError> {
-    let key = root.profile_root_key(id)?;
+    let root_key = root.profile_root_key(id)?;
     let context = profile_context(id, client_public_key, &manifest.peer_public_key);
     let encoded = manifest.encode()?;
-    aether_vault::seal(
-        DOMAIN_PROFILE,
-        &context,
-        &aether_vault::Unlock::Key(&key),
-        &encoded,
-    )
-    .map_err(VaultError::Container)
+    with_unlock(&root_key, &key, |unlock| {
+        aether_vault::seal(DOMAIN_PROFILE, &context, unlock, &encoded)
+            .map_err(VaultError::Container)
+    })
 }
 
 /// Opens a manifest and proves the context describes what is inside it.
@@ -188,16 +228,13 @@ pub fn open_manifest(
     client_public_key: &str,
     gateway_public_key: &str,
     blob: &[u8],
+    key: ManifestKey<'_>,
 ) -> Result<ProfileManifest, VaultError> {
-    let key = root.profile_root_key(id)?;
+    let root_key = root.profile_root_key(id)?;
     let context = profile_context(id, client_public_key, gateway_public_key);
-    let plaintext = aether_vault::open(
-        DOMAIN_PROFILE,
-        &context,
-        &aether_vault::Unlock::Key(&key),
-        blob,
-    )
-    .map_err(VaultError::Container)?;
+    let plaintext = with_unlock(&root_key, &key, |unlock| {
+        aether_vault::open(DOMAIN_PROFILE, &context, unlock, blob).map_err(VaultError::Container)
+    })?;
     let manifest = ProfileManifest::decode(&plaintext)?;
 
     let derived = aether::wg::public_from_private(manifest.private_key.expose())
@@ -274,6 +311,19 @@ pub enum VaultError {
     GenerationWentBackwards { observed: u64, offered: u64 },
     #[error("hygiène mémoire : {0}")]
     MemoryHygiene(&'static str),
+    #[error("le profil « {0} » est verrouillé : sa passphrase est demandée à la connexion")]
+    ProfileLocked(String),
+    #[error("Passphrase incorrecte, ou profil altéré.")]
+    WrongPassphrase,
+    #[error("Les deux saisies diffèrent.")]
+    PassphraseMismatch,
+    #[error(
+        "le moteur ne reçoit pas les notifications de verrouillage et de veille : un profil \
+         nomade ne peut pas être déverrouillé"
+    )]
+    LockWatchUnavailable,
+    #[error("{0}")]
+    NewPassphraseRefused(passphrase::PassphraseError),
     #[error("réglages locaux du coffre : {0}")]
     LocalSettings(String),
     #[error(transparent)]
@@ -321,7 +371,8 @@ mod tests {
         let id = ProfileId::generate().unwrap();
         let manifest = manifest_for(&private_key, &gateway_public);
 
-        let blob = seal_manifest(&root(), id, &manifest, &public_key).expect("seal");
+        let blob =
+            seal_manifest(&root(), id, &manifest, &public_key, ManifestKey::Service).expect("seal");
         assert!(
             !blob
                 .windows(private_key.len())
@@ -329,7 +380,15 @@ mod tests {
             "the private key is readable in the sealed blob"
         );
 
-        let opened = open_manifest(&root(), id, &public_key, &gateway_public, &blob).expect("open");
+        let opened = open_manifest(
+            &root(),
+            id,
+            &public_key,
+            &gateway_public,
+            &blob,
+            ManifestKey::Service,
+        )
+        .expect("open");
         assert_eq!(opened.private_key.expose(), private_key);
         assert_eq!(opened.generation, SecurityGeneration(1));
     }
@@ -347,9 +406,18 @@ mod tests {
             alice,
             &manifest_for(&private_key, &gateway_public),
             &public_key,
+            ManifestKey::Service,
         )
         .expect("seal");
-        assert!(open_manifest(&root(), bob, &public_key, &gateway_public, &blob).is_err());
+        assert!(open_manifest(
+            &root(),
+            bob,
+            &public_key,
+            &gateway_public,
+            &blob,
+            ManifestKey::Service
+        )
+        .is_err());
     }
 
     /// A blob is bound to its peer too: replaying one after the gateway key
@@ -366,9 +434,18 @@ mod tests {
             id,
             &manifest_for(&private_key, &gateway_public),
             &public_key,
+            ManifestKey::Service,
         )
         .expect("seal");
-        assert!(open_manifest(&root(), id, &public_key, &other_gateway, &blob).is_err());
+        assert!(open_manifest(
+            &root(),
+            id,
+            &public_key,
+            &other_gateway,
+            &blob,
+            ManifestKey::Service
+        )
+        .is_err());
     }
 
     /// Another installation's root opens nothing, which is what makes copying
@@ -383,11 +460,20 @@ mod tests {
             id,
             &manifest_for(&private_key, &gateway_public),
             &public_key,
+            ManifestKey::Service,
         )
         .expect("seal");
 
         let other = DeviceRootKey::from_unwrapped(Zeroizing::new([6u8; KEY_LEN]));
-        assert!(open_manifest(&other, id, &public_key, &gateway_public, &blob).is_err());
+        assert!(open_manifest(
+            &other,
+            id,
+            &public_key,
+            &gateway_public,
+            &blob,
+            ManifestKey::Service
+        )
+        .is_err());
     }
 
     /// The context must describe the secret actually inside, not merely be
@@ -406,10 +492,18 @@ mod tests {
             id,
             &manifest_for(&private_key, &gateway_public),
             &other_public,
+            ManifestKey::Service,
         )
         .expect("seal");
         assert!(matches!(
-            open_manifest(&root(), id, &other_public, &gateway_public, &blob),
+            open_manifest(
+                &root(),
+                id,
+                &other_public,
+                &gateway_public,
+                &blob,
+                ManifestKey::Service
+            ),
             Err(VaultError::ContextDisagrees)
         ));
     }
