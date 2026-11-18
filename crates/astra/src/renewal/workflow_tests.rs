@@ -3,6 +3,7 @@
 mod companion;
 mod concurrency;
 mod router;
+mod trust_distribution;
 
 use super::*;
 use aether::certificates::{
@@ -322,6 +323,7 @@ impl AstraChannelHandler for Gateway {
 
 struct Fixture {
     ca_private: Zeroizing<Vec<u8>>,
+    active_private: Zeroizing<Vec<u8>>,
     /// The private half of the pinned TLS intermediate, kept so a later
     /// delegation can reuse the chain the gateway already trusts.
     intermediate_private: Zeroizing<Vec<u8>>,
@@ -542,6 +544,7 @@ async fn fixture() -> Fixture {
     });
     Fixture {
         ca_private,
+        active_private,
         intermediate_private,
         service,
         gateway,
