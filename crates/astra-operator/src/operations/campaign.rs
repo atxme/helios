@@ -16,19 +16,15 @@
 //! an object in the same ceremony as its approval, so submitting the empty
 //! result used for client leaves would spend a gesture and then be refused.
 //!
-//! # Où sont les tests
-//!
-//! Ce module n'assemble que des entrées déjà vérifiées ailleurs : la campagne
-//! est authentifiée par [`crate::handoff::verify_campaign_request`] et le geste
-//! par [`crate::signing::approve_campaign`], tous deux éprouvés contre des
-//! clés simulées dans `tests/signing.rs`. Y ajouter un test qui n'exerce ni
-//! l'un ni l'autre donnerait l'apparence d'une couverture sans la substance.
+//! The ceremony tests use signed Astra requests, the real vault and simulated
+//! authenticator assertions. The fetch and deposit are replaced at the transport
+//! boundary so the tests can check the exact result and progress events.
 
 use std::path::Path;
 
 use aether::certificates::encoding::{Id16, MlDsa87PublicKey};
 use aether::certificates::operator_session::{CampaignManifest, RemoteState};
-use aether::certificates::status::{AstraRotationCampaign, CampaignApproval};
+use aether::certificates::status::{AstraRotationCampaign, AstraSignerResult, CampaignApproval};
 use anyhow::{bail, Context, Result};
 
 use crate::authenticator::Authenticator;
@@ -76,6 +72,24 @@ pub fn begin(
     offered_webauthn_origin: Option<&str>,
     now: u64,
 ) -> Result<Verified> {
+    begin_with_fetch(
+        vault_path,
+        operation,
+        offered_authority_url,
+        offered_webauthn_origin,
+        now,
+        origin::Origin::fetch,
+    )
+}
+
+fn begin_with_fetch(
+    vault_path: &Path,
+    operation: Id16,
+    offered_authority_url: Option<&str>,
+    offered_webauthn_origin: Option<&str>,
+    now: u64,
+    fetch: impl FnOnce(&origin::Origin, &Id16) -> Result<origin::CampaignRequest>,
+) -> Result<Verified> {
     let vault = store::load(vault_path)?;
     let handoff = handoff::DomainHandoff::beside(vault_path, &vault)?;
     let identity = handoff::identity_of(&handoff)?;
@@ -92,7 +106,7 @@ pub fn begin(
         offered_authority_url,
     )?;
     let client = origin::Origin::new(&authority_url)?;
-    let request = client.fetch(&operation)?;
+    let request = fetch(&client, &operation)?;
     handoff::verify_campaign_request(&handoff, &vault, &request, &authority_url, now)?;
     let campaign = request.campaign.as_ref().clone();
 
@@ -191,14 +205,174 @@ impl InProgressApproval {
         now: u64,
         progress: &mut dyn FnMut(RemoteState),
     ) -> Result<CampaignApproval> {
+        self.finish_with_submit(now, progress, |client, operation, token, result| {
+            client.submit(operation, token, result).map(|_| ())
+        })
+    }
+
+    fn finish_with_submit(
+        self,
+        now: u64,
+        progress: &mut dyn FnMut(RemoteState),
+        submit: impl FnOnce(&origin::Origin, &Id16, &str, &AstraSignerResult) -> Result<()>,
+    ) -> Result<CampaignApproval> {
         let approval = self.approval.finish(now)?;
         progress(RemoteState::Prepared);
 
         let result = super::campaign_result(&approval, Vec::new(), None);
-        self.client
-            .submit(&self.operation, &self.result_token, &result)
+        submit(&self.client, &self.operation, &self.result_token, &result)
             .context("dépôt de l'approbation")?;
         progress(RemoteState::Deposited);
         Ok(approval)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operations::fixtures::{domain, operation, Domain, EXPIRES, NOW};
+    use aether::certificates::{
+        encoding::{Fingerprint, WireGuardKey},
+        status::{CampaignScope, CampaignTarget, CertificateKind},
+    };
+    use std::cell::RefCell;
+
+    fn client_campaign(domain: &Domain) -> AstraRotationCampaign {
+        domain.campaign(
+            CampaignScope::OrionProfile,
+            vec![CampaignTarget {
+                certificate_kind: CertificateKind::ClientTls,
+                identity_key: WireGuardKey::from_bytes([7; 32]),
+                epoch: 1,
+                generation: 1,
+                active_tls_certificate_fingerprint: Fingerprint::of(b"active TLS leaf"),
+                active_pq_certificate_fingerprint: Fingerprint::of(b"active PQ leaf"),
+            }],
+            EXPIRES,
+        )
+    }
+
+    fn verify(domain: &Domain, request: origin::CampaignRequest) -> Result<Verified> {
+        begin_with_fetch(&domain.path, operation(), None, None, NOW, |_, id| {
+            assert_eq!(*id, operation());
+            Ok(request)
+        })
+    }
+
+    #[test]
+    fn verified_client_campaign_deposits_only_the_approval_shown_to_the_operator() {
+        let domain = domain();
+        let campaign = client_campaign(&domain);
+        let request = domain.request(campaign.clone());
+        let token = request.result_token.clone();
+        let verified = verify(&domain, request).expect("verify signed campaign");
+        assert_eq!(verified.manifest().campaign.as_ref(), &campaign);
+        assert_eq!(verified.manifest().fingerprint, campaign.fingerprint());
+        assert_eq!(verified.required_credentials(), 1);
+        assert_eq!(verified.operation(), operation());
+        assert_eq!(domain.touches(), 0);
+
+        let mut approval = verified.start_approval(NOW).expect("prepare assertion");
+        assert_eq!(approval.required_credentials(), 1);
+        let label = approval
+            .approve_key(&domain.keys[0], "", NOW)
+            .expect("approve");
+        assert_eq!(label, "Clé 1");
+        assert_eq!(domain.keys[0].touches.get(), 1);
+
+        let events = RefCell::new(Vec::new());
+        let mut deposited = None;
+        let decision = approval
+            .finish_with_submit(
+                NOW,
+                &mut |state| events.borrow_mut().push(state),
+                |_, id, result_token, result| {
+                    assert_eq!(*events.borrow(), [RemoteState::Prepared]);
+                    assert_eq!(*id, operation());
+                    assert_eq!(result_token, token);
+                    assert!(result.objects.is_empty());
+                    assert!(result.credential_registry.is_none());
+                    assert!(result.issuer_authorization.is_none());
+                    deposited = Some(result.approval.as_ref().clone());
+                    Ok(())
+                },
+            )
+            .expect("deposit the approval");
+        assert_eq!(deposited, Some(decision.clone()));
+        assert_eq!(decision.campaign_fingerprint, campaign.fingerprint());
+        assert_eq!(
+            *events.borrow(),
+            [RemoteState::Prepared, RemoteState::Deposited]
+        );
+    }
+
+    #[test]
+    fn a_different_campaign_family_or_rp_id_is_refused_without_a_hardware_gesture() {
+        let domain = domain();
+        let request = domain.request(domain.authority_campaign(EXPIRES));
+        let Err(error) = verify(&domain, request) else {
+            panic!("an anchor campaign requires another ceremony");
+        };
+        assert!(error.to_string().contains("cérémonie dédiée"), "{error}");
+
+        let mut request = domain.request(client_campaign(&domain));
+        request.webauthn_rp_id = "other.example.test".into();
+        let Err(error) = verify(&domain, request) else {
+            panic!("the pinned relying party must match");
+        };
+        assert!(error.to_string().contains("RP ID"), "{error}");
+        assert_eq!(domain.touches(), 0);
+    }
+
+    #[test]
+    fn an_origin_that_conflicts_with_the_relay_is_refused_before_fetch() {
+        let domain = domain();
+        let Err(error) = begin_with_fetch(
+            &domain.path,
+            operation(),
+            Some("https://other.example.test"),
+            None,
+            NOW,
+            |_, _| panic!("a conflicting origin must never receive a request"),
+        ) else {
+            panic!("the caller cannot override the relay");
+        };
+        assert!(error.to_string().contains("origine"), "{error}");
+        assert_eq!(domain.touches(), 0);
+    }
+
+    #[test]
+    fn a_declined_key_does_not_allow_deposit_and_a_failed_deposit_stays_prepared() {
+        let domain = domain();
+        let start = || {
+            verify(&domain, domain.request(client_campaign(&domain)))
+                .expect("verify signed campaign")
+                .start_approval(NOW)
+                .expect("prepare assertion")
+        };
+
+        let mut refused = start();
+        domain.keys[0].declines.set(true);
+        assert!(refused.approve_key(&domain.keys[0], "", NOW).is_err());
+        assert!(refused
+            .finish_with_submit(
+                NOW,
+                &mut |_| panic!("no approval to report"),
+                |_, _, _, _| panic!("a declined gesture authorizes nothing"),
+            )
+            .is_err());
+
+        let mut approved = start();
+        approved
+            .approve_key(&domain.keys[1], "", NOW)
+            .expect("approve with a recovery key");
+        let mut events = Vec::new();
+        let error = approved
+            .finish_with_submit(NOW, &mut |state| events.push(state), |_, _, _, _| {
+                bail!("fixture deposit error")
+            })
+            .expect_err("report a failed deposit");
+        assert_eq!(error.to_string(), "dépôt de l'approbation");
+        assert_eq!(events, [RemoteState::Prepared]);
     }
 }
