@@ -3,6 +3,14 @@
 
 use super::super::*;
 use super::fixtures::*;
+use aether::TunnelState;
+use orion_core::backend::{EventSink, VpnBackend, VpnController};
+use orion_core::events::{ClientEvent, PskKind};
+use orion_core::ClientProfile;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex as StdMutex;
+use std::time::Duration;
+use tokio::sync::Notify;
 
 /// TLS material for the interoperability test.
 ///
@@ -74,6 +82,53 @@ impl orion_core::key_negotiation::IdentityProvider for TestIdentities {
     }
 }
 
+/// Records what Orion installs and exposes a fresh handshake only when the
+/// test reports that both ends have observed one.
+#[derive(Default)]
+struct ClientDataPlane {
+    mounted: StdMutex<Option<ClientProfile>>,
+    polled_stale_handshake: Notify,
+    fresh_handshake: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl VpnBackend for ClientDataPlane {
+    async fn up(&self, profile: &ClientProfile, _sink: &EventSink) -> Result<()> {
+        profile.validate_for_data_plane()?;
+        *self.mounted.lock().unwrap() = Some(profile.duplicate());
+        Ok(())
+    }
+
+    async fn down(&self, _sink: &EventSink) -> Result<()> {
+        self.mounted.lock().unwrap().take();
+        Ok(())
+    }
+
+    async fn rekey_peer(&self, _profile: &ClientProfile, _sink: &EventSink) -> Result<()> {
+        panic!("initial negotiation must not rekey an existing session")
+    }
+
+    async fn transfer_bytes(&self) -> Option<u64> {
+        Some(0)
+    }
+
+    async fn last_handshake_age(&self) -> Option<Duration> {
+        if self.fresh_handshake.load(Ordering::SeqCst) {
+            return Some(Duration::ZERO);
+        }
+        self.polled_stale_handshake.notify_one();
+        Some(Duration::from_secs(60))
+    }
+
+    fn adapter_is_up(&self) -> bool {
+        self.mounted.lock().unwrap().is_some()
+    }
+
+    fn kind(&self) -> &'static str {
+        "interop-test"
+    }
+}
+
 /// **The interoperability test**: the real gateway handler against the
 /// real Orion client, over a real QUIC socket.
 ///
@@ -92,12 +147,22 @@ impl orion_core::key_negotiation::IdentityProvider for TestIdentities {
 /// for, and nothing below the wire would say so.
 #[tokio::test]
 async fn the_gateway_and_orion_derive_the_same_psk() {
-    end_to_end_negotiation(GatewayLeaf::SelfSigned, ClientFamily::Ipv4).await;
+    end_to_end_negotiation(
+        GatewayLeaf::SelfSigned,
+        ClientFamily::Ipv4,
+        Connection::Commit,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn the_gateway_and_orion_derive_the_same_psk_under_a_trust_domain() {
-    end_to_end_negotiation(GatewayLeaf::IssuedByCaPq, ClientFamily::Ipv4).await;
+    end_to_end_negotiation(
+        GatewayLeaf::IssuedByCaPq,
+        ClientFamily::Ipv4,
+        Connection::Commit,
+    )
+    .await;
 }
 
 /// The same exchange from an Orion that reaches the gateway over IPv6: an
@@ -106,7 +171,32 @@ async fn the_gateway_and_orion_derive_the_same_psk_under_a_trust_domain() {
 /// still answers IPv4 and this one proves it now answers IPv6 too.
 #[tokio::test]
 async fn the_gateway_and_orion_derive_the_same_psk_over_ipv6() {
-    end_to_end_negotiation(GatewayLeaf::SelfSigned, ClientFamily::Ipv6).await;
+    end_to_end_negotiation(
+        GatewayLeaf::SelfSigned,
+        ClientFamily::Ipv6,
+        Connection::Commit,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn orion_preserves_the_wireguard_endpoint_on_a_separate_host() {
+    end_to_end_negotiation(
+        GatewayLeaf::SelfSigned,
+        ClientFamily::Ipv4,
+        Connection::SeparateWireGuardHost,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn disconnecting_orion_before_a_fresh_handshake_rolls_back_the_gateway_candidate() {
+    end_to_end_negotiation(
+        GatewayLeaf::SelfSigned,
+        ClientFamily::Ipv4,
+        Connection::DisconnectBeforeHandshake,
+    )
+    .await;
 }
 
 /// The address family Orion reaches the dual-stack listener on.
@@ -133,7 +223,14 @@ enum GatewayLeaf {
     IssuedByCaPq,
 }
 
-async fn end_to_end_negotiation(leaf: GatewayLeaf, family: ClientFamily) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Connection {
+    Commit,
+    SeparateWireGuardHost,
+    DisconnectBeforeHandshake,
+}
+
+async fn end_to_end_negotiation(leaf: GatewayLeaf, family: ClientFamily, scenario: Connection) {
     use aether::key_negotiation::PqCertificateRole;
 
     let gateway_wg = aether::wg::generate_keypair().unwrap();
@@ -225,7 +322,7 @@ async fn end_to_end_negotiation(leaf: GatewayLeaf, family: ClientFamily) {
         }
     }
     let address = server.local_addr().unwrap();
-    let served = tokio::spawn(aether_key_negotiation::serve(server, handler));
+    let served = tokio::spawn(aether_key_negotiation::serve(server, handler.clone()));
 
     // From here on, everything runs through the client Orion actually
     // ships — same module, same code path as a real connection.
@@ -235,9 +332,14 @@ async fn end_to_end_negotiation(leaf: GatewayLeaf, family: ClientFamily) {
         pq_certificate: serde_json::to_vec(&client_pq_certificate).unwrap(),
         pq_private_key: client_pq_private.to_vec(),
     });
-    let profile = orion_core::ClientProfile {
+    let wireguard_endpoint = if scenario == Connection::SeparateWireGuardHost {
+        "127.0.0.2:51820".to_string()
+    } else {
+        family.endpoint(51820)
+    };
+    let profile = ClientProfile {
         name: "orion".into(),
-        endpoint: family.endpoint(address.port()),
+        endpoint: wireguard_endpoint.clone(),
         private_key: client_wg.private_key.duplicate(),
         peer_public_key: gateway_wg.public_key.clone(),
         address: Some("100.64.1.2/32".into()),
@@ -277,52 +379,114 @@ async fn end_to_end_negotiation(leaf: GatewayLeaf, family: ClientFamily) {
                 }),
             },
         }),
-        ..orion_core::ClientProfile::default()
+        ..ClientProfile::default()
     };
 
-    let negotiated = orion_core::key_negotiation::prepare_for_profile(&profile, &identities)
-        .await
-        .expect("Orion negotiates with the real gateway handler");
-
-    let client_psk = negotiated
-        .psk
-        .as_ref()
-        .map(|secret| secret.expose().to_string())
-        .expect("ML-KEM yields a PSK");
+    let backend = Arc::new(ClientDataPlane::default());
+    let controller =
+        VpnController::new(backend.clone()).with_key_negotiation_identities(Arc::new(identities));
+    let (send_event, mut events) = mpsc::unbounded_channel();
+    let sink: EventSink = Arc::new(move |event| {
+        let _ = send_event.send(event);
+    });
+    controller.connect(profile, sink.clone()).await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        backend.polled_stale_handshake.notified(),
+    )
+    .await
+    .expect("Orion installs a PSK and polls its WireGuard backend");
+    assert_eq!(controller.state(), TunnelState::Connecting);
+    assert!(controller.adapter_is_up());
+    let transaction_id = {
+        let mut state = handler.transactions.lock().await;
+        let SlotState::Preparing { transaction_id, .. } = &state.slot(&client_wg.public_key).state
+        else {
+            panic!("a stale handshake may not commit the candidate");
+        };
+        *transaction_id
+    };
 
     // The gateway installs before answering: its value is already here.
-    let gateway_psk = plane
-        .writes()
-        .await
-        .last()
-        .cloned()
-        .flatten()
-        .expect("the gateway installed a PSK before replying");
+    let writes = plane.writes().await;
+    let [Some(gateway_psk)] = writes.as_slice() else {
+        panic!("expected one gateway PSK installation before the response");
+    };
+    {
+        let mounted = backend.mounted.lock().unwrap();
+        let mounted = mounted.as_ref().expect("Orion installed a PSK");
+        assert_eq!(mounted.endpoint, wireguard_endpoint);
+        assert!(mounted.preshared_key_is_negotiated);
+        let client_psk = mounted.preshared_key.as_ref().expect("ML-KEM yields a PSK");
+        assert!(
+            client_psk.expose() == gateway_psk,
+            "both ends must derive the same PSK"
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(client_psk.expose())
+                .unwrap()
+                .len(),
+            32
+        );
+    }
 
-    assert_eq!(
-        client_psk, gateway_psk,
-        "both ends must derive the same PSK — differing values would fail every \
-             WireGuard handshake with nothing to point at the cause"
-    );
-    // A 32-byte secret, base64: anything shorter would mean a truncated
-    // derivation that still compares equal on both sides.
-    assert_eq!(
-        base64::engine::general_purpose::STANDARD
-            .decode(&client_psk)
-            .unwrap()
-            .len(),
-        32
-    );
+    if scenario == Connection::DisconnectBeforeHandshake {
+        controller.disconnect(sink).await.expect("disconnect Orion");
+        assert_eq!(controller.state(), TunnelState::Down);
+        assert!(!controller.adapter_is_up());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    &handler
+                        .transactions
+                        .lock()
+                        .await
+                        .slot(&client_wg.public_key)
+                        .state,
+                    SlotState::Empty
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dropping the pending QUIC session rolls back the gateway");
+        assert!(matches!(plane.writes().await.as_slice(), [Some(_), None]));
+        served.abort();
+        return;
+    }
 
     // What a real client does between the response and the confirmation:
     // mount the tunnel with the candidate PSK and handshake. The gateway
     // reads that handshake back and it is the only proof in the exchange
     // that involves the peer's WireGuard private key.
     plane.handshake_happens().await;
+    backend.fresh_handshake.store(true, Ordering::SeqCst);
+    let mut protection = None;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match events.recv().await.expect("Orion state event") {
+                ClientEvent::StateChanged {
+                    state: TunnelState::Up,
+                } => break,
+                ClientEvent::Protection { psk } => protection = Some(psk),
+                ClientEvent::Error { message } => panic!("Orion failed: {message}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("Orion declares the tunnel up after the gateway's commit");
+    assert_eq!(protection, Some(PskKind::MlKem));
+    assert_eq!(controller.state(), TunnelState::Up);
+    assert_eq!(controller.mounted_profile().await.as_deref(), Some("orion"));
+    let mut state = handler.transactions.lock().await;
+    let SlotState::Committed(committed) = &state.slot(&client_wg.public_key).state else {
+        panic!("the gateway commits the transaction Orion confirms");
+    };
+    assert_eq!(committed.transaction_id, transaction_id);
 
-    negotiated
-        .confirm()
-        .await
-        .expect("the gateway commits the transaction Orion confirms");
     served.abort();
 }
