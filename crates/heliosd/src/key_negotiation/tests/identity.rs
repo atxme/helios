@@ -672,3 +672,70 @@ fn development_identity_load_rejects_a_ca_leaf_and_invalid_private_key_encodings
     ));
     assert!(format!("{pq_error:#}").contains("decoding the sealed PQ private key"));
 }
+
+#[test]
+fn public_negotiation_material_is_published_only_when_both_leaves_can_be_read() {
+    let directory = tempfile::tempdir().unwrap();
+    let tls_path = directory.path().join("gateway.der");
+    let pq_path = directory.path().join("pq.json");
+    let (request, _, _, ca_private, now) = bootstrap_fixture();
+    let leaf = bootstrap_leaf(
+        &request,
+        request.ml_dsa_87_public_key.as_bytes(),
+        &ca_private,
+        now - 1,
+        now + 3_600,
+    );
+    let tls = rcgen::generate_simple_self_signed(vec![request.server_name.clone()]).unwrap();
+    let pq_json = serde_json::to_vec_pretty(&leaf).unwrap();
+
+    assert!(read_public_material(&tls_path, &pq_path).is_none());
+    std::fs::write(&tls_path, tls.cert.der()).unwrap();
+    assert!(read_public_material(&tls_path, &pq_path).is_none());
+
+    std::fs::write(&pq_path, &pq_json).unwrap();
+    let published = read_public_material(&tls_path, &pq_path).unwrap();
+    assert_eq!(published.certificate_der, tls.cert.der().to_vec());
+    assert_eq!(published.pq_certificate_json, pq_json);
+
+    std::fs::remove_file(&tls_path).unwrap();
+    assert!(read_public_material(&tls_path, &pq_path).is_none());
+}
+
+#[test]
+fn bootstrap_installation_reports_write_failure_without_altering_public_material() {
+    let directory = tempfile::tempdir().unwrap();
+    let request_path = directory.path().join("request.json");
+    let source = directory.path().join("issued.json");
+    let destination = directory.path().join("pq.json");
+    let (request, _, ca_public, ca_private, now) = bootstrap_fixture();
+    let leaf = bootstrap_leaf(
+        &request,
+        request.ml_dsa_87_public_key.as_bytes(),
+        &ca_private,
+        now - 1,
+        now + 3_600,
+    );
+    std::fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+    let issued = serde_json::to_vec(&leaf).unwrap();
+    std::fs::write(&source, &issued).unwrap();
+    std::fs::write(&destination, b"previous public material").unwrap();
+    std::fs::create_dir(destination.with_extension("tmp")).unwrap();
+
+    let error = install_gateway_bootstrap_certificate_at(
+        &request_path,
+        &source,
+        &destination,
+        &ca_public,
+        now,
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("installing the CA-PQ-issued gateway certificate"));
+    assert_eq!(std::fs::read(source).unwrap(), issued);
+    assert_eq!(
+        std::fs::read(destination).unwrap(),
+        b"previous public material"
+    );
+}

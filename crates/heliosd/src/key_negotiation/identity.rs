@@ -182,16 +182,22 @@ pub(super) fn read_served_identity(
 /// publish — that is `None`, not an error, because it is the ordinary state
 /// before `heliosd init-key-negotiation`.
 pub fn public_material() -> Result<Option<helios_api::KeyNegotiationMaterial>> {
-    let (Ok(certificate_der), Ok(pq_certificate_json)) = (
-        std::fs::read(CERTIFICATE_PATH),
-        std::fs::read(PQ_CERTIFICATE_PATH),
-    ) else {
-        return Ok(None);
-    };
-    Ok(Some(helios_api::KeyNegotiationMaterial {
+    Ok(read_public_material(
+        Path::new(CERTIFICATE_PATH),
+        Path::new(PQ_CERTIFICATE_PATH),
+    ))
+}
+
+pub(super) fn read_public_material(
+    tls_path: &Path,
+    pq_path: &Path,
+) -> Option<helios_api::KeyNegotiationMaterial> {
+    let certificate_der = std::fs::read(tls_path).ok()?;
+    let pq_certificate_json = std::fs::read(pq_path).ok()?;
+    Some(helios_api::KeyNegotiationMaterial {
         certificate_der,
         pq_certificate_json,
-    }))
+    })
 }
 
 #[derive(serde::Serialize, serde::Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
