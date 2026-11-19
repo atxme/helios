@@ -1133,6 +1133,7 @@ fn a_vault_with_a_locked_nomad_profile_relocates() {
         legacy.layout.config_dir.clone(),
         Box::new(legacy_root(&legacy.calls)),
     );
+    sealed_nomad.set_lock_watch(true);
     sealed_nomad
         .save_new_nomad_profile(
             &profile("portable"),

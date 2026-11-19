@@ -772,9 +772,13 @@ const RAW_KDF_ID: u8 = 0;
 /// that the test starts from a locked profile.
 fn enrol(store: &ProfileStore, name: &str) -> ClientProfile {
     let profile = profile(name);
+    // The gesture needs the lock watch; the caller's setting is restored.
+    let watch = store.lock_watch_active();
+    store.set_lock_watch(true);
     store
         .save_new_nomad_profile(&profile, PASSPHRASE)
         .expect("enrol nomad");
+    store.set_lock_watch(watch);
     store.forget_unlocked();
     profile
 }
@@ -1171,6 +1175,7 @@ fn back_to_service_opens_without_passphrase() {
 #[test]
 fn each_switch_raises_the_generation() {
     let (dir, store) = store("switch-generation");
+    store.set_lock_watch(true);
     store.save_profile(&profile("poste")).unwrap();
     assert_eq!(generation_of(&store, "poste"), 1);
 
@@ -1192,6 +1197,7 @@ fn each_switch_raises_the_generation() {
 #[test]
 fn a_locked_nomad_profile_cannot_switch_and_nothing_changes() {
     let (dir, store) = store("switch-locked");
+    let store = watched(store);
     enrol(&store, "portable");
     let before = snapshot(&dir);
 
@@ -1214,6 +1220,7 @@ fn a_weak_new_passphrase_is_refused_and_nothing_changes() {
     use crate::vault::passphrase::PassphraseError;
 
     let (dir, store) = store("switch-weak");
+    store.set_lock_watch(true);
     store.save_profile(&profile("poste")).unwrap();
     let before = snapshot(&dir);
 
@@ -1244,6 +1251,7 @@ fn a_weak_new_passphrase_is_refused_and_nothing_changes() {
 #[test]
 fn a_new_nomad_profile_never_touches_disk_as_service() {
     let (dir, store) = store("switch-new-nomad");
+    store.set_lock_watch(true);
     store
         .save_new_nomad_profile(&profile("portable"), PASSPHRASE)
         .unwrap();
@@ -1278,6 +1286,7 @@ fn a_new_nomad_profile_never_touches_disk_as_service() {
 #[test]
 fn a_new_passphrase_for_an_existing_name_is_refused_with_the_switch_named() {
     let (dir, store) = store("switch-exists");
+    store.set_lock_watch(true);
     store.save_profile(&profile("poste")).unwrap();
     let before = snapshot(&dir);
 
@@ -1303,6 +1312,7 @@ fn a_crash_after_each_write_leaves_an_openable_profile() {
     .enumerate()
     {
         let (dir, mut store) = store(&format!("switch-crash-{index}"));
+        store.set_lock_watch(true);
         store.save_profile(&profile("poste")).unwrap();
         let id = id_of(&store, "poste");
         store.stop_switch_after = Some(stop);
@@ -1343,10 +1353,93 @@ fn a_tightened_policy_still_opens_an_existing_profile() {
     let weak = "motdepasse";
     let salt = crate::vault::nomad::new_salt().unwrap();
     let key = PassphraseKey::derive(weak, &salt).unwrap();
-    store.create_nomad(&profile("portable"), salt, key).unwrap();
+    let epoch = store.lock_epoch.load(std::sync::atomic::Ordering::Acquire);
+    store
+        .create_nomad(&profile("portable"), salt, key, epoch)
+        .unwrap();
     store.forget_unlocked();
 
     store.unlock("portable", weak).unwrap();
     assert!(store.is_unlocked("portable"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_lock_during_a_new_nomad_enrolment_leaves_it_locked() {
+    let (dir, mut store) = store("enrol-lock-race");
+    store.set_lock_watch(true);
+    store.between_derivation_and_store = Some(Box::new(|store: &ProfileStore| {
+        store.forget_unlocked();
+    }));
+
+    store
+        .save_new_nomad_profile(&profile("portable"), PASSPHRASE)
+        .expect("the profile is written even when a lock lands");
+    assert!(!store.is_unlocked("portable"), "the lock wins");
+    assert_eq!(
+        store.mode_of("portable").unwrap().map(|m| m.is_nomad()),
+        Some(true)
+    );
+    let loaded = store.load().unwrap();
+    assert_eq!(loaded.locked.len(), 1);
+    assert!(loaded.profiles.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_lock_during_a_switch_leaves_the_profile_locked() {
+    let (dir, mut store) = store("switch-lock-race");
+    store.set_lock_watch(true);
+    store.save_profile(&profile("poste")).unwrap();
+    // The switch holds the unlocked map for its whole run, so a real lock
+    // waits for it. This hook only bumps the epoch, as a lock that already
+    // happened would have, and the switch must not keep the key.
+    store.between_derivation_and_store = Some(Box::new(|store: &ProfileStore| {
+        store
+            .lock_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }));
+
+    store
+        .make_nomad("poste", NEW_PASSPHRASE)
+        .expect("the switch is written even when a lock lands");
+    assert!(!store.is_unlocked("poste"), "the lock wins");
+    let loaded = store.load().unwrap();
+    assert_eq!(loaded.locked.len(), 1);
+    assert!(loaded.profiles.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_new_nomad_profile_without_the_lock_watch_is_refused_and_nothing_changes() {
+    let (dir, store) = store("enrol-no-watch");
+    store.save_profile(&profile("poste")).unwrap();
+    let before = snapshot(&dir);
+
+    let error = store
+        .save_new_nomad_profile(&profile("portable"), PASSPHRASE)
+        .unwrap_err();
+    assert!(
+        matches!(error, VaultError::LockWatchUnavailable),
+        "got {error}"
+    );
+    assert!(!store.is_unlocked("portable"));
+    assert_eq!(snapshot(&dir), before, "refused before any write");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_switch_without_the_lock_watch_is_refused_and_nothing_changes() {
+    let (dir, store) = store("switch-no-watch");
+    store.save_profile(&profile("poste")).unwrap();
+    let before = snapshot(&dir);
+
+    let error = store.make_nomad("poste", NEW_PASSPHRASE).unwrap_err();
+    assert!(
+        matches!(error, VaultError::LockWatchUnavailable),
+        "got {error}"
+    );
+    assert!(!store.is_unlocked("poste"));
+    assert_eq!(snapshot(&dir), before, "refused before any write");
     let _ = std::fs::remove_dir_all(&dir);
 }

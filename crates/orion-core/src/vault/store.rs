@@ -715,14 +715,32 @@ impl ProfileStore {
         profile: &ClientProfile,
         new_passphrase: &str,
     ) -> Result<(), VaultError> {
+        self.require_lock_watch()?;
         profile
             .check_kind()
             .map_err(|error| VaultError::InvalidProfileKind(error.to_string()))?;
         let accepted =
             passphrase::accept(new_passphrase).map_err(VaultError::NewPassphraseRefused)?;
         let salt = nomad::new_salt()?;
+        // Read before the derivation: a lock during it bumps the epoch, and
+        // `create_nomad` sees it before keeping the key.
+        let epoch = self.lock_epoch.load(Ordering::Acquire);
         let key = PassphraseKey::derive(&accepted, &salt)?;
-        self.create_nomad(profile, salt, key)
+        #[cfg(test)]
+        if let Some(hook) = &self.between_derivation_and_store {
+            hook(self);
+        }
+        self.create_nomad(profile, salt, key, epoch)
+    }
+
+    /// The gate `unlock` applies: a nomad key is never derived or kept while
+    /// no lock notification is registered.
+    fn require_lock_watch(&self) -> Result<(), VaultError> {
+        if self.lock_watch_active() {
+            Ok(())
+        } else {
+            Err(VaultError::LockWatchUnavailable)
+        }
     }
 
     /// Writes a profile that does not exist yet, sealed under `key`.
@@ -736,6 +754,7 @@ impl ProfileStore {
         profile: &ClientProfile,
         salt: [u8; nomad::SALT_LEN],
         key: PassphraseKey,
+        epoch: u64,
     ) -> Result<(), VaultError> {
         let root = self.root()?;
         let mut registry = self.load_registry(&root)?;
@@ -775,7 +794,12 @@ impl ProfileStore {
             registry.selected = Some(id);
         }
         self.store_registry(&root, &registry)?;
-        self.unlocked_keys().insert(id, key);
+        // A lock that landed during the derivation or the write wins: the key
+        // is dropped here and the profile stays locked.
+        let mut unlocked = self.unlocked_keys();
+        if self.lock_epoch.load(Ordering::Acquire) == epoch {
+            unlocked.insert(id, key);
+        }
         Ok(())
     }
 
@@ -784,6 +808,7 @@ impl ProfileStore {
     ///
     /// The passphrase is judged before anything is read or written.
     pub fn make_nomad(&self, name: &str, new_passphrase: &str) -> Result<(), VaultError> {
+        self.require_lock_watch()?;
         let accepted =
             passphrase::accept(new_passphrase).map_err(VaultError::NewPassphraseRefused)?;
         self.switch(name, Seal::Nomad(accepted))
@@ -824,11 +849,17 @@ impl ProfileStore {
         let generation = entry.generation.next();
         manifest.generation = generation;
 
+        // Read before the derivation, as in `unlock`.
+        let epoch = self.lock_epoch.load(Ordering::Acquire);
         let (mode, new_key) = match seal {
             Seal::Service => (ProfileMode::Service, None),
             Seal::Nomad(passphrase) => {
                 let salt = nomad::new_salt()?;
                 let key = PassphraseKey::derive(&passphrase, &salt)?;
+                #[cfg(test)]
+                if let Some(hook) = &self.between_derivation_and_store {
+                    hook(self);
+                }
                 (
                     ProfileMode::Nomad {
                         kdf: KDF_PBKDF2_HMAC_SHA512,
@@ -861,10 +892,12 @@ impl ProfileStore {
         })?;
         self.store_registry(&root, &registry)?;
         match new_key {
-            Some(key) => {
+            // A lock during the derivation wins, as in `unlock`: the profile
+            // is written as nomad and stays locked.
+            Some(key) if self.lock_epoch.load(Ordering::Acquire) == epoch => {
                 unlocked.insert(id, key);
             }
-            None => {
+            _ => {
                 unlocked.remove(&id);
             }
         }
