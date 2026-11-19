@@ -3,8 +3,12 @@
 
 use super::*;
 
+use aether::certificates::approval::AstraRenewalApproval;
 use aether_fido::authenticator::connect_owned;
-use orion_core::certificate_approval::ApprovalError;
+use orion_core::certificate_approval::{ApprovalError, ApprovalManifest, ApprovalMaterial};
+use orion_core::{
+    CertificateAction, CertificateActionState, CertificateInventory, KeyNegotiationSettings,
+};
 use orion_engine::{
     ActionOutcome, EngineCommand, EngineReply, ProfileCertificates, RenewalProgress,
     SubmittedApproval,
@@ -18,10 +22,16 @@ use zeroize::Zeroizing;
 #[tauri::command]
 pub(crate) async fn certificate_inventory(
     state: State<'_, AppState>,
-    key_negotiation: Option<orion_core::KeyNegotiationSettings>,
-) -> Result<orion_core::CertificateInventory, String> {
-    match state
-        .client
+    key_negotiation: Option<KeyNegotiationSettings>,
+) -> Result<CertificateInventory, String> {
+    certificate_inventory_from(&state.client, key_negotiation).await
+}
+
+async fn certificate_inventory_from(
+    client: &EngineClient,
+    key_negotiation: Option<KeyNegotiationSettings>,
+) -> Result<CertificateInventory, String> {
+    match client
         .call(EngineCommand::CertificateInventory { key_negotiation })
         .await?
     {
@@ -34,11 +44,13 @@ pub(crate) async fn certificate_inventory(
 pub(crate) async fn certificate_overview(
     state: State<'_, AppState>,
 ) -> Result<Vec<ProfileCertificates>, String> {
-    match state
-        .client
-        .call(EngineCommand::CertificateOverview)
-        .await?
-    {
+    certificate_overview_from(&state.client).await
+}
+
+async fn certificate_overview_from(
+    client: &EngineClient,
+) -> Result<Vec<ProfileCertificates>, String> {
+    match client.call(EngineCommand::CertificateOverview).await? {
         EngineReply::CertificateOverview(value) => Ok(value),
         _ => Err(unexpected_engine_reply()),
     }
@@ -48,10 +60,16 @@ pub(crate) async fn certificate_overview(
 #[tauri::command]
 pub(crate) async fn certificate_actions(
     state: State<'_, AppState>,
-    key_negotiation: Option<orion_core::KeyNegotiationSettings>,
-) -> Result<Vec<orion_core::CertificateActionState>, String> {
-    match state
-        .client
+    key_negotiation: Option<KeyNegotiationSettings>,
+) -> Result<Vec<CertificateActionState>, String> {
+    certificate_actions_from(&state.client, key_negotiation).await
+}
+
+async fn certificate_actions_from(
+    client: &EngineClient,
+    key_negotiation: Option<KeyNegotiationSettings>,
+) -> Result<Vec<CertificateActionState>, String> {
+    match client
         .call(EngineCommand::CertificateActions { key_negotiation })
         .await?
     {
@@ -65,10 +83,17 @@ pub(crate) async fn certificate_actions(
 pub(crate) async fn run_certificate_action(
     state: State<'_, AppState>,
     name: String,
-    action: orion_core::CertificateAction,
+    action: CertificateAction,
 ) -> Result<ActionOutcome, String> {
-    match state
-        .client
+    run_certificate_action_with(&state.client, name, action).await
+}
+
+async fn run_certificate_action_with(
+    client: &EngineClient,
+    name: String,
+    action: CertificateAction,
+) -> Result<ActionOutcome, String> {
+    match client
         .call(EngineCommand::RunCertificateAction { name, action })
         .await?
     {
@@ -83,8 +108,14 @@ pub(crate) async fn resume_certificate_recovery(
     state: State<'_, AppState>,
     operation_id: String,
 ) -> Result<ActionOutcome, String> {
-    match state
-        .client
+    resume_certificate_recovery_with(&state.client, operation_id).await
+}
+
+async fn resume_certificate_recovery_with(
+    client: &EngineClient,
+    operation_id: String,
+) -> Result<ActionOutcome, String> {
+    match client
         .call(EngineCommand::ResumeCertificateRecovery { operation_id })
         .await?
     {
@@ -100,9 +131,15 @@ pub(crate) async fn resume_certificate_recovery(
 pub(crate) async fn certificate_approval_manifest(
     state: State<'_, AppState>,
     name: String,
-) -> Result<orion_core::certificate_approval::ApprovalManifest, String> {
-    match state
-        .client
+) -> Result<ApprovalManifest, String> {
+    certificate_approval_manifest_from(&state.client, name).await
+}
+
+async fn certificate_approval_manifest_from(
+    client: &EngineClient,
+    name: String,
+) -> Result<ApprovalManifest, String> {
+    match client
         .call(EngineCommand::CertificateApprovalManifest { name })
         .await?
     {
@@ -127,8 +164,25 @@ pub(crate) async fn approve_certificate_renewal(
     pin: Option<String>,
 ) -> Result<RenewalProgress, String> {
     let owner = crate::operator::dialog_owner(ceremonies::owner_window(&window))?;
-    let material = match state
-        .client
+    approve_certificate_renewal_with(&state.client, name, pin, move |material, pin| {
+        let key = connect_owned(orion_core::certificate_approval::transport(), owner)
+            .map_err(|_| ApprovalError::NoAuthenticator.to_string())?;
+        material
+            .approve(key.as_ref(), pin, crate::operator::now_unix())
+            .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+async fn approve_certificate_renewal_with(
+    client: &EngineClient,
+    name: String,
+    pin: Option<String>,
+    approve: impl FnOnce(&ApprovalMaterial, &str) -> Result<AstraRenewalApproval, String>
+        + Send
+        + 'static,
+) -> Result<RenewalProgress, String> {
+    let material = match client
         .call(EngineCommand::CertificateApprovalMaterial { name: name.clone() })
         .await?
     {
@@ -136,17 +190,10 @@ pub(crate) async fn approve_certificate_renewal(
         _ => return Err(unexpected_engine_reply()),
     };
     let pin = Zeroizing::new(pin.unwrap_or_default());
-    let approval = tauri::async_runtime::spawn_blocking(move || {
-        let key = connect_owned(orion_core::certificate_approval::transport(), owner)
-            .map_err(|_| ApprovalError::NoAuthenticator.to_string())?;
-        material
-            .approve(key.as_ref(), &pin, crate::operator::now_unix())
-            .map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|_| "la cérémonie de la clé s'est interrompue".to_string())??;
-    match state
-        .client
+    let approval = tauri::async_runtime::spawn_blocking(move || approve(&material, &pin))
+        .await
+        .map_err(|_| "la cérémonie de la clé s'est interrompue".to_string())??;
+    match client
         .call(EngineCommand::SubmitCertificateApproval {
             name,
             approval: SubmittedApproval::new(approval),
@@ -185,8 +232,14 @@ pub(crate) async fn last_certificate_error(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<Option<String>, String> {
-    match state
-        .client
+    last_certificate_error_from(&state.client, name).await
+}
+
+async fn last_certificate_error_from(
+    client: &EngineClient,
+    name: String,
+) -> Result<Option<String>, String> {
+    match client
         .call(EngineCommand::LastCertificateError { name })
         .await?
     {
@@ -194,3 +247,6 @@ pub(crate) async fn last_certificate_error(
         _ => Err(unexpected_engine_reply()),
     }
 }
+
+#[cfg(test)]
+mod tests;
