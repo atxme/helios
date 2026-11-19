@@ -39,8 +39,6 @@ use orion_engine::EngineCommand;
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::NamedPipeClient;
 #[cfg(windows)]
-use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
-#[cfg(windows)]
 use tokio::sync::mpsc;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
@@ -54,6 +52,8 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Shell::{
     ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
 };
+#[cfg(windows)]
+use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK, SW_HIDE};
 

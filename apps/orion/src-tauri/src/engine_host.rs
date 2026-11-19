@@ -28,10 +28,14 @@ use orion_core::default_backend;
 #[cfg(windows)]
 use orion_core::protected_root::{install_is_protected, EnginePaths, RootError, REFUSED_ROOT};
 #[cfg(windows)]
+use orion_engine::events::EventQueue;
+#[cfg(windows)]
 use orion_engine::lifecycle::{
     exit_code, on_event, parent_matches, parent_open_exit_code, Action, LifecycleEvent,
     CONNECT_TIMEOUT, EXECUTABLE_DIR_WRITABLE, OTHER_ACCOUNT_ELEVATION, PROTECTED_ROOT_REFUSED,
 };
+#[cfg(windows)]
+use orion_engine::lock_watch;
 #[cfg(windows)]
 use orion_engine::pipe::{
     create_server, expected_from_launcher, observe_client, observe_process, process_user_sid,
@@ -39,10 +43,6 @@ use orion_engine::pipe::{
 };
 #[cfg(windows)]
 use orion_engine::serve::{serve_until, Engine};
-#[cfg(windows)]
-use orion_engine::events::EventQueue;
-#[cfg(windows)]
-use orion_engine::lock_watch;
 #[cfg(windows)]
 use orion_engine::service::{EngineService, LockEvent};
 #[cfg(windows)]

@@ -74,7 +74,7 @@ mod imp {
     thread_local! {
         /// Where the window procedure sends what it translates. Set on the
         /// watch's own thread, which is the only one that runs the procedure.
-        static SENDER: RefCell<Option<UnboundedSender<LockEvent>>> = RefCell::new(None);
+        static SENDER: RefCell<Option<UnboundedSender<LockEvent>>> = const { RefCell::new(None) };
     }
 
     /// Stops the watch when dropped: the thread leaves its message loop, then

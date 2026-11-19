@@ -143,7 +143,10 @@ mod protection {
     /// The API takes whole blocks only; anything else is refused before the call.
     fn check_block_length(bytes: &[u8], refusal: &'static str) -> Result<(), VaultError> {
         let block = CRYPTPROTECTMEMORY_BLOCK_SIZE as usize;
-        if bytes.is_empty() || bytes.len() % block != 0 || u32::try_from(bytes.len()).is_err() {
+        if bytes.is_empty()
+            || !bytes.len().is_multiple_of(block)
+            || u32::try_from(bytes.len()).is_err()
+        {
             return Err(VaultError::MemoryHygiene(refusal));
         }
         Ok(())
