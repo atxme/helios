@@ -255,8 +255,26 @@ fn fixture_opening(serial: u8, salt: &[u8; 32]) -> astra_operator::authenticator
         .expect("fixture key opens its slot")
 }
 
+fn fixed_primary_opening() -> astra_operator::authenticator::Opened {
+    astra_operator::authenticator::Opened {
+        credential_id: vec![1; 64],
+        secret: astra_operator::vault::SlotSecret::new(vec![1; 32]),
+    }
+}
+
 impl Domain {
     pub(super) fn new(label: &str) -> Self {
+        Self::with_primary_opening(label, |_| fixed_primary_opening())
+    }
+
+    fn new_with_test_key(label: &str) -> Self {
+        Self::with_primary_opening(label, |salt| fixture_opening(1, salt))
+    }
+
+    fn with_primary_opening(
+        label: &str,
+        open_primary: impl FnOnce(&[u8; 32]) -> astra_operator::authenticator::Opened,
+    ) -> Self {
         use aether::certificates::encoding::{generate_ml_dsa_87_keypair, TrustDomainId};
         use astra_operator::vault::{
             draw_salt, AuthoritySecrets, AuthorityVault, SlotEnrolment, SlotRole,
@@ -279,7 +297,7 @@ impl Domain {
             retained_outgoing_ca_pq: None,
         };
         let salt = draw_salt().expect("salt");
-        let opened = fixture_opening(1, &salt);
+        let opened = open_primary(&salt);
         let vault = AuthorityVault::create(
             TrustDomainId::new([3; 16]).expect("domain"),
             "astra.example",
@@ -2140,7 +2158,7 @@ fn an_export_resumed_offline_signs_the_document_orion_reads() {
     let vault = astra_operator::store::load(&domain.vault_path).expect("vault");
     // The opening the vault's key releases, as the key would: the one the vault
     // was created with.
-    let opened = fixture_opening(1, &vault.salt().expect("vault salt"));
+    let opened = fixed_primary_opening();
 
     let artifact =
         sign_artifact(&domain.registry, &vault, &opened, &accepted, draft).expect("signed");
@@ -2568,7 +2586,7 @@ fn resume_gesture(
 
 #[test]
 fn offline_resume_publishes_a_signed_profile_bound_to_the_kept_acceptance() {
-    let domain = Domain::new("resume-delivery");
+    let domain = Domain::new_with_test_key("resume-delivery");
     let accepted = kept_enrollment_for_delivery(&domain, true);
     let id = accepted.request.invitation_id;
     let before = registry_snapshot(&domain, &id);
@@ -2613,7 +2631,7 @@ fn offline_resume_publishes_a_signed_profile_bound_to_the_kept_acceptance() {
 
 #[test]
 fn offline_resume_refuses_a_kept_tls_leaf_for_a_different_key_without_delivering() {
-    let domain = Domain::new("resume-leaf-mismatch");
+    let domain = Domain::new_with_test_key("resume-leaf-mismatch");
     let accepted = kept_enrollment_for_delivery(&domain, false);
     let id = accepted.request.invitation_id;
     let before = registry_snapshot(&domain, &id);
@@ -2634,7 +2652,7 @@ fn offline_resume_refuses_a_kept_tls_leaf_for_a_different_key_without_delivering
 
 #[test]
 fn offline_resume_refuses_an_unenrolled_token_without_delivering() {
-    let domain = Domain::new("resume-key-mismatch");
+    let domain = Domain::new_with_test_key("resume-key-mismatch");
     let accepted = kept_enrollment_for_delivery(&domain, true);
     let id = accepted.request.invitation_id;
     let before = registry_snapshot(&domain, &id);
@@ -2668,7 +2686,7 @@ fn invite_gesture(domain: &Domain, allow_readmission: bool) -> EnrollmentGesture
 fn readmission_with_two_distinct_tokens_delivers_the_recorded_signed_invitation() {
     use astra_operator::vault::{SlotEnrolment, SlotRole};
 
-    let domain = Domain::new("invite-signed-readmission");
+    let domain = Domain::new_with_test_key("invite-signed-readmission");
     let mut vault = astra_operator::store::load(&domain.vault_path).expect("vault");
     let salt = vault.salt().expect("salt");
     let primary = fixture_opening(1, &salt);
@@ -2731,7 +2749,7 @@ fn readmission_with_two_distinct_tokens_delivers_the_recorded_signed_invitation(
 
 #[test]
 fn readmission_refuses_the_same_token_twice_before_signing_or_issuing() {
-    let domain = Domain::new("invite-repeated-token");
+    let domain = Domain::new_with_test_key("invite-repeated-token");
 
     let (outcome, statuses, artifacts, touched) =
         enrollment_with_keys(&domain, invite_gesture(&domain, true), &[1, 1]);
