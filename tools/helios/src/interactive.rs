@@ -25,6 +25,8 @@ use crate::{transport::Api, Cli, Cmd};
 
 mod palette;
 mod presentation;
+#[cfg(all(test, target_os = "linux"))]
+mod shell_tests;
 
 use palette::{suggestions, MenuKeys, Selection};
 use presentation::{
