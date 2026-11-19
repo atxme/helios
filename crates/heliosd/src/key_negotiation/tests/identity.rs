@@ -450,3 +450,225 @@ fn development_private_identity_requires_owner_only_permissions() {
 
     assert!(format!("{error:#}").contains("expected 0600 or stricter"));
 }
+
+#[test]
+fn bootstrap_certificate_is_installed_and_read_with_the_public_tls_material() {
+    let directory = tempfile::tempdir().unwrap();
+    let request_path = directory.path().join("request.json");
+    let source = directory.path().join("issued.json");
+    let destination = directory.path().join("active").join("pq.json");
+    let tls_path = directory.path().join("gateway.der");
+    let ca_path = directory.path().join("client-ca.der");
+    let (request, _, ca_public, ca_private, now) = bootstrap_fixture();
+    let leaf = bootstrap_leaf(
+        &request,
+        request.ml_dsa_87_public_key.as_bytes(),
+        &ca_private,
+        now - 1,
+        now + 3_600,
+    );
+    std::fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+    std::fs::write(&source, serde_json::to_vec(&leaf).unwrap()).unwrap();
+
+    let tls = rcgen::generate_simple_self_signed(vec![request.server_name.clone()]).unwrap();
+    let ca = rcgen::generate_simple_self_signed(vec!["client-ca.example".into()]).unwrap();
+    std::fs::write(&tls_path, tls.cert.der()).unwrap();
+    assert!(read_served_identity(&tls_path, &destination, &ca_path)
+        .unwrap()
+        .is_none());
+
+    let installed = install_gateway_bootstrap_certificate_at(
+        &request_path,
+        &source,
+        &destination,
+        &ca_public,
+        now,
+    )
+    .unwrap();
+    assert_eq!(installed, leaf);
+    assert!(!destination.with_extension("tmp").exists());
+    assert!(read_served_identity(&tls_path, &destination, &ca_path)
+        .unwrap()
+        .is_none());
+
+    std::fs::write(&ca_path, ca.cert.der()).unwrap();
+    let served = read_served_identity(&tls_path, &destination, &ca_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(served.pq_certificate, leaf);
+    assert_eq!(served.tls_certificate.as_bytes(), tls.cert.der().as_ref());
+    assert_eq!(served.client_tls_ca.as_bytes(), ca.cert.der().as_ref());
+}
+
+#[test]
+fn failed_bootstrap_installation_preserves_the_active_certificate() {
+    let directory = tempfile::tempdir().unwrap();
+    let request_path = directory.path().join("request.json");
+    let source = directory.path().join("issued.json");
+    let destination = directory.path().join("pq.json");
+    let active = b"existing certificate";
+    std::fs::write(&destination, active).unwrap();
+    let (request, _, ca_public, ca_private, now) = bootstrap_fixture();
+
+    let install = || {
+        install_gateway_bootstrap_certificate_at(
+            &request_path,
+            &source,
+            &destination,
+            &ca_public,
+            now,
+        )
+    };
+    assert!(format!("{:#}", install().unwrap_err()).contains("no bootstrap request"));
+    assert_eq!(std::fs::read(&destination).unwrap(), active);
+
+    std::fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+    assert!(format!("{:#}", install().unwrap_err()).contains("issued.json"));
+    std::fs::write(&source, b"{invalid").unwrap();
+    assert!(format!("{:#}", install().unwrap_err()).contains("issued.json"));
+    assert_eq!(std::fs::read(&destination).unwrap(), active);
+
+    let expired = bootstrap_leaf(
+        &request,
+        request.ml_dsa_87_public_key.as_bytes(),
+        &ca_private,
+        now - 60,
+        now - 1,
+    );
+    std::fs::write(&source, serde_json::to_vec(&expired).unwrap()).unwrap();
+    assert!(matches!(
+        install()
+            .unwrap_err()
+            .downcast_ref::<GatewayBootstrapCertificateError>(),
+        Some(GatewayBootstrapCertificateError::InvalidCertificate(_))
+    ));
+    assert_eq!(std::fs::read(&destination).unwrap(), active);
+    assert!(!destination.with_extension("tmp").exists());
+}
+
+#[test]
+fn bootstrap_request_distinguishes_absence_from_invalid_or_unreadable_data() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("request.json");
+    assert!(read_gateway_bootstrap_request(&path).unwrap().is_none());
+
+    std::fs::write(&path, b"{}").unwrap();
+    assert!(
+        format!("{:#}", read_gateway_bootstrap_request(&path).unwrap_err())
+            .contains("request.json")
+    );
+    let unreadable = read_gateway_bootstrap_request(directory.path()).unwrap_err();
+    assert!(unreadable.downcast_ref::<std::io::Error>().is_some());
+}
+
+#[test]
+fn served_identity_reports_which_public_artifact_is_invalid() {
+    let directory = tempfile::tempdir().unwrap();
+    let tls_path = directory.path().join("gateway.der");
+    let pq_path = directory.path().join("pq.json");
+    let ca_path = directory.path().join("client-ca.der");
+    let (request, _, _, ca_private, now) = bootstrap_fixture();
+    let leaf = bootstrap_leaf(
+        &request,
+        request.ml_dsa_87_public_key.as_bytes(),
+        &ca_private,
+        now - 1,
+        now + 3_600,
+    );
+    let read = || {
+        let Err(error) = read_served_identity(&tls_path, &pq_path, &ca_path) else {
+            panic!("invalid public identity must produce an error");
+        };
+        format!("{error:#}")
+    };
+    let tls = rcgen::generate_simple_self_signed(vec![request.server_name.clone()]).unwrap();
+
+    std::fs::write(&tls_path, tls.cert.der()).unwrap();
+    std::fs::write(&ca_path, []).unwrap();
+    std::fs::write(&pq_path, b"{}").unwrap();
+    assert!(read().contains("pq.json"));
+
+    std::fs::write(&pq_path, serde_json::to_vec(&leaf).unwrap()).unwrap();
+    assert!(read().contains("client-ca.der"));
+
+    std::fs::write(&tls_path, []).unwrap();
+    assert!(read().contains("gateway.der"));
+}
+
+#[test]
+fn development_identity_load_rejects_a_ca_leaf_and_invalid_private_key_encodings() {
+    use base64::engine::general_purpose::STANDARD;
+
+    let (request, gateway_private, _, ca_private, now) = bootstrap_fixture();
+    let mut unsigned = bootstrap_leaf(
+        &request,
+        request.ml_dsa_87_public_key.as_bytes(),
+        &ca_private,
+        now - 1,
+        now + 3_600,
+    );
+    let ca_leaf = unsigned.clone();
+    unsigned.issuer = request.server_name.clone();
+    let self_signed = issue_pq_certificate(unsigned, &gateway_private).unwrap();
+    let tls = rcgen::generate_simple_self_signed(vec![request.server_name.clone()]).unwrap();
+    let tls_private = tls.signing_key.serialize_der();
+    let decode = |tls_key: String, pq_key: String, leaf: PqCertificate, verify_self_signed| {
+        decode_loaded_identity(
+            StoredPrivateIdentity {
+                tls_private_key: tls_key,
+                pq_private_key: pq_key,
+            },
+            tls.cert.der().to_vec(),
+            leaf,
+            verify_self_signed,
+        )
+    };
+    let require_error = |result| {
+        let Err(error) = result else {
+            panic!("invalid identity must fail during loading");
+        };
+        error
+    };
+
+    let loaded = decode(
+        STANDARD.encode(&tls_private),
+        STANDARD.encode(&gateway_private),
+        self_signed.clone(),
+        true,
+    )
+    .expect("a valid self-signed development identity loads");
+    assert!(loaded.tls.private_key == tls_private);
+    assert!(loaded.pq_private_key.as_slice() == gateway_private.as_slice());
+    assert_eq!(loaded.pq_certificate, self_signed);
+
+    let ca_error = require_error(decode(
+        STANDARD.encode(&tls_private),
+        STANDARD.encode(&gateway_private),
+        ca_leaf.clone(),
+        true,
+    ));
+    assert!(format!("{ca_error:#}").contains("verifying the gateway PQ certificate"));
+    let loaded = decode(
+        STANDARD.encode(&tls_private),
+        STANDARD.encode(&gateway_private),
+        ca_leaf.clone(),
+        false,
+    )
+    .expect("an already verified registry leaf does not need a self-signature");
+    assert_eq!(loaded.pq_certificate, ca_leaf);
+
+    let tls_error = require_error(decode(
+        "!".into(),
+        STANDARD.encode(&gateway_private),
+        self_signed.clone(),
+        true,
+    ));
+    assert!(format!("{tls_error:#}").contains("decoding the sealed TLS private key"));
+    let pq_error = require_error(decode(
+        STANDARD.encode(&tls_private),
+        "!".into(),
+        self_signed,
+        true,
+    ));
+    assert!(format!("{pq_error:#}").contains("decoding the sealed PQ private key"));
+}
