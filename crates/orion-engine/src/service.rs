@@ -6,7 +6,7 @@
 
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{atomic::AtomicU64, Arc, Mutex as StdMutex},
 };
 
 use aether::SecretString;
@@ -24,9 +24,11 @@ mod app;
 pub mod certificates;
 mod connection;
 pub mod enrollment;
+mod lock;
 mod nomad;
 mod profiles;
 pub use app::PROFILE_EXTENSION;
+pub use lock::LockEvent;
 
 /// The tunnel-side state of the engine, held for the life of the process.
 ///
@@ -139,6 +141,10 @@ pub struct EngineService {
     /// Where a `nomade` passphrase is asked for. Never read by the engine
     /// itself: the source answers with a buffer, used once and wiped.
     passphrases: Arc<dyn PassphraseSource>,
+    /// Moves on every lock event. An unlock whose passphrase dialog was open
+    /// while one landed compares the value it read before the dialog with the
+    /// one it reads after, and refuses to keep the key when they differ.
+    lock_generation: AtomicU64,
 }
 
 impl EngineService {
@@ -345,6 +351,7 @@ impl EngineService {
             recoveries: Arc::new(Mutex::new(std::collections::HashMap::new())),
             app_version,
             passphrases,
+            lock_generation: AtomicU64::new(0),
         })
     }
 

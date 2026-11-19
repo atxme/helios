@@ -5,6 +5,8 @@
 use super::*;
 use crate::client::EngineClient;
 use crate::command::{EngineCommand, EngineReply, ProfileDraft};
+use crate::events::EventQueue;
+use crate::service::LockEvent;
 use crate::wire::{EngineFrame, PROTOCOL_VERSION};
 use aether::TunnelState;
 use orion_core::backend::dryrun::DryRunBackend;
@@ -16,7 +18,7 @@ use orion_core::{ClientEvent, ClientProfile};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::Mutex as StdMutex;
+use std::sync::{Mutex as StdMutex, Weak};
 use zeroize::Zeroizing;
 
 const PASSPHRASE: &str = "cheval agile traverse la prairie";
@@ -550,4 +552,174 @@ async fn no_frame_carries_a_passphrase() {
 #[test]
 fn the_protocol_version_is_3() {
     assert_eq!(PROTOCOL_VERSION, 3);
+}
+
+// # Lock state machine
+
+/// A source that locks the session from inside the dialog, as a session lock
+/// landing while the native prompt is open would. The lock runs on the
+/// blocking thread the prompt is asked on, through the runtime's handle.
+struct LockingSource {
+    service: StdMutex<Weak<EngineService>>,
+    events: EventQueue,
+    runtime: tokio::runtime::Handle,
+}
+
+impl PassphraseSource for LockingSource {
+    fn ask(
+        &self,
+        _profile: &str,
+        _purpose: &PromptPurpose,
+    ) -> Result<Zeroizing<String>, VaultError> {
+        let service = self
+            .service
+            .lock()
+            .expect("service slot")
+            .upgrade()
+            .expect("the service outlives the prompt");
+        self.runtime
+            .block_on(service.on_lock_event(LockEvent::SessionLock, &self.events));
+        Ok(Zeroizing::new(PASSPHRASE.to_string()))
+    }
+
+    fn is_native_dialog(&self) -> bool {
+        true
+    }
+}
+
+/// The nomad profile `name` is listed as locked, and no longer among the
+/// profiles the engine can connect.
+async fn assert_locked_and_unusable(service: &EngineService, name: &str) {
+    let config = service.config.lock().await;
+    assert!(
+        config.locked.iter().any(|locked| locked.name == name),
+        "{name} is listed as locked"
+    );
+    assert!(
+        config.profiles.iter().all(|profile| profile.name != name),
+        "{name} is no longer usable"
+    );
+}
+
+#[tokio::test]
+async fn each_event_closes_a_nomad_tunnel_and_locks() {
+    let events = [
+        LockEvent::SessionLock,
+        LockEvent::SessionLogoff,
+        LockEvent::SessionDisconnect,
+        LockEvent::Suspend,
+        LockEvent::EngineExit,
+    ];
+    for event in events {
+        let scratch = Scratch::new(&format!("lock-{event:?}"));
+        seed_nomad(scratch.path(), "poste");
+        let source = Scripted::new(vec![Answer::Give(PASSPHRASE)], false);
+        let service = service_on(scratch.path(), source);
+        let (client, mut session) = client_of(Arc::clone(&service)).await;
+        client
+            .call(EngineCommand::Connect { name: None })
+            .await
+            .expect("the tunnel starts");
+        states_until_up(&mut session).await;
+
+        let (queue, _receiver) = EventQueue::new();
+        service.on_lock_event(event, &queue).await;
+
+        assert_eq!(service.controller.state(), TunnelState::Down, "{event:?}");
+        assert!(
+            service.controller.mounted_profile().await.is_none(),
+            "{event:?}"
+        );
+        assert!(!service.store.is_unlocked("poste"), "{event:?}");
+        assert_locked_and_unusable(&service, "poste").await;
+    }
+}
+
+#[tokio::test]
+async fn a_service_tunnel_survives_a_lock() {
+    let scratch = Scratch::new("lock-service");
+    store_at(scratch.path())
+        .save_profile(&profile("bureau"))
+        .expect("a service profile is saved");
+    let service = service_on(scratch.path(), Scripted::new(Vec::new(), false));
+    let (client, mut session) = client_of(Arc::clone(&service)).await;
+    client
+        .call(EngineCommand::Connect {
+            name: Some("bureau".into()),
+        })
+        .await
+        .expect("the tunnel starts");
+    states_until_up(&mut session).await;
+
+    let (queue, _receiver) = EventQueue::new();
+    service.on_lock_event(LockEvent::SessionLock, &queue).await;
+
+    assert_eq!(service.controller.state(), TunnelState::Up);
+    assert_eq!(
+        service.controller.mounted_profile().await.as_deref(),
+        Some("bureau")
+    );
+    let config = service.config.lock().await;
+    assert!(config
+        .profiles
+        .iter()
+        .any(|profile| profile.name == "bureau"));
+    assert!(config.locked.is_empty());
+}
+
+#[tokio::test]
+async fn after_a_lock_connect_asks_again() {
+    let scratch = Scratch::new("lock-asks-again");
+    seed_nomad(scratch.path(), "poste");
+    let source = Scripted::new(
+        vec![Answer::Give(PASSPHRASE), Answer::Give(PASSPHRASE)],
+        false,
+    );
+    let service = service_on(scratch.path(), Arc::clone(&source));
+    let (client, mut session) = client_of(Arc::clone(&service)).await;
+    client
+        .call(EngineCommand::Connect { name: None })
+        .await
+        .expect("the first connection starts");
+    states_until_up(&mut session).await;
+
+    let (queue, _receiver) = EventQueue::new();
+    service.on_lock_event(LockEvent::SessionLock, &queue).await;
+    let reply = client.call(EngineCommand::Connect { name: None }).await;
+    assert!(matches!(reply, Ok(EngineReply::Unit)), "reply: {reply:?}");
+    states_until_up(&mut session).await;
+
+    assert_eq!(
+        source.purposes(),
+        vec![PromptPurpose::Unlock, PromptPurpose::Unlock]
+    );
+}
+
+#[tokio::test]
+async fn a_lock_while_the_dialog_is_open_wins() {
+    let scratch = Scratch::new("lock-in-dialog");
+    seed_nomad(scratch.path(), "poste");
+    let (events, _receiver) = EventQueue::new();
+    let source = Arc::new(LockingSource {
+        service: StdMutex::new(Weak::new()),
+        events,
+        runtime: tokio::runtime::Handle::current(),
+    });
+    let service = EngineService::on_store(
+        store_at(scratch.path()),
+        Arc::new(DryRunBackend::default()),
+        scratch.path().join("identities"),
+        Arc::clone(&source) as Arc<dyn PassphraseSource>,
+    );
+    *source.service.lock().expect("service slot") = Arc::downgrade(&service);
+    let (client, _session) = client_of(Arc::clone(&service)).await;
+
+    let reply = client.call(EngineCommand::Connect { name: None }).await;
+
+    assert_refused(
+        reply,
+        &VaultError::ProfileLocked("poste".into()).to_string(),
+    );
+    assert!(!service.store.is_unlocked("poste"));
+    assert_locked_and_unusable(&service, "poste").await;
 }

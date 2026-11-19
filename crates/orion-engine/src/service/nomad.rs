@@ -7,7 +7,7 @@
 //! `&str`, used once, and dropped; nothing here returns it, logs it or puts it
 //! in a view.
 
-use std::sync::Arc;
+use std::sync::{atomic::Ordering, Arc};
 
 use orion_core::vault::{
     passphrase, registry::ProfileMode, ProfileStore, PromptPurpose, VaultError,
@@ -94,6 +94,9 @@ impl EngineService {
         if !nomad || self.store.is_unlocked(name) {
             return Ok(());
         }
+        // Read before the dialog: a lock that lands while it is open must win,
+        // and the store only sees locks that land during its own derivation.
+        let generation = self.lock_generation.load(Ordering::Acquire);
         let passphrase = self.ask_passphrase(name, purpose).await?;
         let store = Arc::clone(&self.store);
         let profile = name.to_string();
@@ -101,6 +104,12 @@ impl EngineService {
             .await
             .map_err(interrupted)?
             .map_err(store_message)?;
+        if self.lock_generation.load(Ordering::Acquire) != generation {
+            // The store took the key after the lock had already forgotten the
+            // keys, so the key it holds now is the one to drop.
+            self.store.forget_unlocked();
+            return Err(VaultError::ProfileLocked(name.to_string()).to_string());
+        }
         if !self.store.is_unlocked(name) {
             return Err(VaultError::ProfileLocked(name.to_string()).to_string());
         }
