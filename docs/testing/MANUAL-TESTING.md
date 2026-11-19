@@ -1698,6 +1698,66 @@ action, puis état attendu. Les écrans sont nommés à chaque étape.
     d'un autre `format` que `helios-enrolment-export-v1`. Attendu : « Ce fichier n'est pas un
     export d'enrôlement de `heliosd export-enrolment`. », avant toute clé.
 
+**O. F6 : profil nomade**
+
+Le code Windows du profil `nomade` (surveillance de verrouillage, `CryptProtectMemory`,
+boîtes natives, `AllowSetForegroundWindow`) n'a jamais été compilé localement : cette
+recette est sa première exécution sur cible, **à éprouver sur cible**. Les boîtes sont
+celles de Windows ; leurs légendes sont distinctes d'un geste à l'autre. Un profil
+`service` existant sert de point de départ.
+
+145. **[cible] Les quatre gestes.** Dans *Profils* :
+    1. Nouveau profil, choix « Nomade » : l'avertissement commence par « Le profil nomade
+       protège un portable volé éteint ». Enregistrer : deux boîtes, nouvelle passphrase puis
+       confirmation. Attendu : le profil est enregistré, et la liste affiche « Nomade ».
+    2. Sur un profil `service`, « Passer en nomade » : nouvelle passphrase, confirmation.
+       Attendu : le badge passe à « Nomade ».
+    3. Sur ce profil nomade, « Changer la passphrase » : passphrase actuelle, nouvelle,
+       confirmation. Attendu : la nouvelle passphrase ouvre le profil à la connexion suivante,
+       l'ancienne est refusée.
+    4. « Repasser en service » : passphrase actuelle. Attendu : le badge repasse à
+       « Service », et la connexion ne demande plus de passphrase.
+146. **[cible] Refus de la politique et confirmation qui diffère.** Dans « Passer en nomade »,
+    saisir une passphrase refusée par la politique. Attendu : la boîte se rouvre avec la
+    raison. Puis saisir deux passphrases différentes. Attendu : « Les deux saisies
+    diffèrent », le geste est abandonné, le profil reste `service`.
+147. **[cible] Annulation.** Fermer chaque boîte, dans chacun des gestes et à la connexion.
+    Attendu : le geste s'arrête sans erreur bruyante ; à la connexion, « Saisie annulée. »
+    s'affiche en notice neutre, et le profil reste verrouillé.
+148. **[cible] Mauvaise passphrase.** Connecter un profil `nomade` verrouillé, avec une
+    passphrase fausse. Attendu : « Passphrase incorrecte, ou profil altéré. », sans
+    distinction entre les deux causes, et le profil reste verrouillé.
+149. **[cible] Première connexion après le lancement.** Lancer Orion : aucune boîte.
+    Connecter le profil `nomade` : la boîte native s'affiche au premier plan, avec la bonne
+    passphrase le tunnel monte. Une seconde connexion dans la même session ne redemande rien.
+150. **[cible] Verrouillage de session.** Tunnel `nomade` monté, Windows + L. Attendu : le
+    tunnel tombe, le profil redevient « Nomade · verrouillé » ; après la reconnexion, la
+    connexion redemande la passphrase.
+151. **[cible] Veille et hibernation.** Même vérification, une fois la veille, puis une fois
+    l'hibernation, chacune suivie d'une reprise. Attendu : tunnel fermé, profil verrouillé,
+    nouvelle saisie.
+152. **[cible] Déconnexion RDP.** Tunnel `nomade` monté sur le poste ; ouvrir une session RDP
+    sur ce poste depuis un autre, puis la fermer (ou changer d'utilisateur). Attendu : le
+    tunnel tombe, le profil est verrouillé, une nouvelle connexion redemande la passphrase.
+153. **[cible] Fermeture d'Orion.** Tunnel `nomade` monté, « Quitter » dans la zone de
+    notification. Attendu : tunnel fermé. Relancer Orion, connecter : la passphrase est
+    redemandée.
+154. **[cible] Moteur tué.** Tunnel `nomade` monté, terminer le processus moteur (élevé)
+    dans le Gestionnaire des tâches. Attendu : le tunnel tombe, et l'adaptateur WireGuard-NT
+    disparaît avec lui.
+155. **[cible] Échec simulé du verrouillage mémoire.** Aucun point d'injection n'existe dans
+    la version livrée : cette étape exige une build de test qui fait échouer `VirtualLock`,
+    à définir avant la campagne. Attendu : le déverrouillage est refusé (ADR-006 §5), et la
+    posture le dit.
+156. **[cible] Échec de déconnexion pendant un verrouillage.** Lorsque la déconnexion échoue
+    au moment d'un verrouillage, l'échec est écrit dans le journal du moteur (niveau
+    `warn`), et n'apparaît **pas** dans la fenêtre d'Orion. Attendu : la ligne est dans le
+    journal du moteur ; la fenêtre ne l'affiche pas, c'est la limite connue d'ADR-006.
+157. **[cible] Passphrase absente des commandes et de la mémoire JavaScript.** Dans une build
+    de test, ouvrir les outils de développement de la WebView pendant chacun des gestes, et
+    observer les commandes Tauri et les charges JSON. Attendu : aucune passphrase, ni clé qui
+    en dérive, n'apparaît dans une commande, une charge ou une chaîne JavaScript.
+
 ### Le chemin manuel
 
 Dans un autre terminal, générer deux identités de test :

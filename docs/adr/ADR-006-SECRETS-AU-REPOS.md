@@ -519,12 +519,11 @@ un root sur la gateway lit déjà cette mémoire. Voir aussi le durcissement §6
 est ce qui la protège aujourd'hui.
 
 **Limite connue — `CryptProtectMemory` et le verrouillage de pages.**
-`aether::locked::LockedSecret` existe, verrouille (`VirtualLock` / `mlock`),
-efface au `Drop` et **rapporte** son échec dans la posture. Aucun secret réel n'y
-vit encore : il ne sert que de sonde de privilège pour le panneau. Chiffrer les
-pages résidentes inutilisées avec `CryptProtectMemory` n'est pas implémenté.
-Les deux relèvent du même lot que le profil `nomade`, et ne sont éprouvables que
-sur cible Windows.
+`aether::locked::LockedSecret` verrouille (`VirtualLock` / `mlock`), efface au
+`Drop` et **rapporte** son échec dans la posture. `CryptProtectMemory` est
+**appliqué à la clé de passphrase gardée, pas encore aux autres secrets** : les
+pages résidentes inutilisées des autres secrets ne sont pas chiffrées. Ce chemin Windows n'est compilé que par la CI et reste
+**à éprouver sur cible**.
 
 `WerRegisterExcludedMemoryBlock` et `CryptProtectMemory` sont des défenses en
 profondeur, pas une frontière contre un débogueur, une injection ou un malware du
@@ -773,14 +772,21 @@ remplace pas.
   du propriétaire : le profil devient définitivement illisible et doit être
   ré-enrôlé. DPAPI ne constitue pas une récupération. C'est affiché avant
   activation et dans la posture.
-* **Le profil `nomade` n'est pas câblé.** La politique de passphrase
-  (`vault::passphrase`), la boîte de saisie native (`vault::windows::prompt`) et
-  le `Unlock::Passphrase` du conteneur existent et sont testés, mais aucun
-  `ProfileMode` ne les relie : pas de `IKM = profile_root_key ‖ passphrase_key`,
-  pas de sel de passphrase dans le key-slot, pas de re-saisie après veille ou
-  verrouillage de session. Tant que ce lot n'est pas fait, **le seul mode servi
-  est `service`** et le tableau des deux profils décrit une cible, pas l'état
-  livré.
+* **Le profil `nomade` est livré sur la branche `feat/f6-profil-nomade`, à éprouver
+  sur cible.** Le mode par profil, la dérivation `IKM = profile_root_key ‖
+  passphrase_key` (PBKDF2-HMAC-SHA-512, 600 000 itérations, sel de 16 octets,
+  KDF `2`), le verrouillage à la session, à la veille, à la déconnexion et à la
+  fermeture, et les gestes de l'onglet *Profils* sont en place. Le protocole
+  moteur ↔ IHM est en version 3. Le registre passe en version 3 : une version 2
+  se lit comme ne contenant que des profils `service`, et une version 1 est
+  refusée.
+  Le code Windows (surveillance de verrouillage, `CryptProtectMemory`, boîtes
+  natives, `AllowSetForegroundWindow`) n'a **jamais été compilé localement** : il
+  n'est validé que par la CI Windows puis sur cible. Tout ce qui le touche est
+  **à éprouver sur cible** (recette : [MANUAL-TESTING](../testing/MANUAL-TESTING.md), « O. F6 »).
+  Un échec de déconnexion pendant un verrouillage est écrit dans le journal du
+  moteur, mais n'est pas encore affiché dans la fenêtre d'Orion : l'utilisateur ne
+  le voit pas sans consulter ce journal.
 * **Orion Linux reste sans stockage protégé.** Câbler Secret Service
   (`libsecret`) relève d'un lot distinct ; le refus explicite actuel reste le bon
   comportement en attendant. macOS est hors périmètre : Orion ne le cible pas.

@@ -306,6 +306,22 @@ alors signalé, pas élargi). Un `preshared_key` importé est traité comme un P
 statique et désactive la négociation ML-KEM automatique ; il ne doit être
 fourni que si les deux pairs portent déjà exactement la même valeur.
 
+## Profil nomade (Windows)
+
+Chaque profil porte un mode, « Service » ou « Nomade », affiché dans l'onglet
+*Profils*. Un profil `nomade` ne monte son tunnel qu'avec sa passphrase, saisie
+dans la boîte native de Windows, et il se verrouille de nouveau à la fermeture
+de la session, à la veille, à la déconnexion RDP et à la fermeture d'Orion : le
+tunnel tombe, et la passphrase est redemandée à la connexion suivante. Le
+passage d'un mode à l'autre (« Passer en nomade », « Changer la passphrase »,
+« Repasser en service ») se fait depuis le profil. Le profil `nomade` protège un
+portable volé éteint ; il ne protège ni d'un logiciel malveillant ni d'un
+enregistreur de frappe présent à la saisie.
+
+Sous Linux, le mode « Nomade » reste refusé : il n'y a pas de boîte protégée.
+Le code Windows de ce mode n'a été compilé que par la CI ; sa recette est dans
+`docs/testing/MANUAL-TESTING.md` (« O. F6 »), **à éprouver sur cible**.
+
 ## Cycle de vie et protection anti-fuite
 
 L’état `up` est inféré à partir d’un handshake de moins de 150 secondes.
