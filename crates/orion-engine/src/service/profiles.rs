@@ -571,7 +571,10 @@ impl EngineService {
     async fn save_new_nomad(&self, draft: ProfileDraft) -> Result<ConfigView, String> {
         self.require_protected_volume()?;
         let name = draft.name.clone();
+        let generation = self.generation();
         let passphrase = self.new_passphrase(&name).await?;
+        // Held across the store call: a lock that lands after the check below
+        // reads the configuration only after this upsert, and replaces it.
         let mut cfg = self.config.lock().await;
         let pending = self.pending_imports.lock().await.remove(&name);
         let stored = profile_edit_base(pending.as_ref(), cfg.find(&name));
@@ -583,13 +586,18 @@ impl EngineService {
             .key_negotiation
             .as_ref()
             .map(|block| block.identity.clone());
-        let profile = self
+        let saved = self
             .in_store(move |store| {
                 store
                     .save_new_nomad_profile(&profile, passphrase.as_str())
                     .map(|()| profile)
             })
-            .await?;
+            .await;
+        if self.lock_landed_since(generation) {
+            drop(cfg);
+            return Err(self.refuse_locked(&name).await);
+        }
+        let profile = saved?;
         if let Some(identity) = identity {
             settle_saved_enrollment(&self.identities, &identity);
         }

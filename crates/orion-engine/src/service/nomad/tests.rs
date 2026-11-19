@@ -695,10 +695,8 @@ async fn after_a_lock_connect_asks_again() {
     );
 }
 
-#[tokio::test]
-async fn a_lock_while_the_dialog_is_open_wins() {
-    let scratch = Scratch::new("lock-in-dialog");
-    seed_nomad(scratch.path(), "poste");
+/// A service whose passphrase source locks the session from inside every prompt.
+fn locking_service(dir: &Path) -> (Arc<EngineService>, Arc<LockingSource>) {
     let (events, _receiver) = EventQueue::new();
     let source = Arc::new(LockingSource {
         service: StdMutex::new(Weak::new()),
@@ -706,12 +704,20 @@ async fn a_lock_while_the_dialog_is_open_wins() {
         runtime: tokio::runtime::Handle::current(),
     });
     let service = EngineService::on_store(
-        store_at(scratch.path()),
+        store_at(dir),
         Arc::new(DryRunBackend::default()),
-        scratch.path().join("identities"),
+        dir.join("identities"),
         Arc::clone(&source) as Arc<dyn PassphraseSource>,
     );
     *source.service.lock().expect("service slot") = Arc::downgrade(&service);
+    (service, source)
+}
+
+#[tokio::test]
+async fn a_lock_while_the_dialog_is_open_wins() {
+    let scratch = Scratch::new("lock-in-dialog");
+    seed_nomad(scratch.path(), "poste");
+    let (service, _source) = locking_service(scratch.path());
     let (client, _session) = client_of(Arc::clone(&service)).await;
 
     let reply = client.call(EngineCommand::Connect { name: None }).await;
@@ -722,4 +728,66 @@ async fn a_lock_while_the_dialog_is_open_wins() {
     );
     assert!(!service.store.is_unlocked("poste"));
     assert_locked_and_unusable(&service, "poste").await;
+}
+
+#[tokio::test]
+async fn a_lock_during_make_nomad_leaves_the_profile_locked() {
+    let scratch = Scratch::new("lock-make-nomad");
+    store_at(scratch.path())
+        .save_profile(&profile("bureau"))
+        .expect("a service profile is saved");
+    let (service, _source) = locking_service(scratch.path());
+    let (client, _session) = client_of(Arc::clone(&service)).await;
+
+    let reply = client
+        .call(EngineCommand::MakeNomad {
+            name: "bureau".into(),
+        })
+        .await;
+
+    assert_refused(
+        reply,
+        &VaultError::ProfileLocked("bureau".into()).to_string(),
+    );
+    assert!(!service.store.is_unlocked("bureau"));
+    assert_locked_and_unusable(&service, "bureau").await;
+    // The seal itself was written: the profile is nomad, and locked.
+    assert!(matches!(
+        store_at(scratch.path()).mode_of("bureau"),
+        Ok(Some(ProfileMode::Nomad { .. }))
+    ));
+}
+
+#[tokio::test]
+async fn a_lock_during_save_new_nomad_leaves_the_profile_locked() {
+    let scratch = Scratch::new("lock-save-nomad");
+    let (service, _source) = locking_service(scratch.path());
+    let (client, _session) = client_of(Arc::clone(&service)).await;
+    client
+        .call(EngineCommand::GeneratePrivateKey)
+        .await
+        .expect("a key is generated");
+    let draft: ProfileDraft = serde_json::from_value(serde_json::json!({
+        "name": "poste",
+        "endpoint": "203.0.113.10:51820",
+        "peer_public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "allowed_ips": "0.0.0.0/0",
+        "persistent_keepalive": 25,
+        "useStagedKey": true,
+        "nomad": true,
+    }))
+    .expect("a draft deserialises");
+
+    let reply = client.call(EngineCommand::SaveProfile { draft }).await;
+
+    assert_refused(
+        reply,
+        &VaultError::ProfileLocked("poste".into()).to_string(),
+    );
+    assert!(!service.store.is_unlocked("poste"));
+    assert_locked_and_unusable(&service, "poste").await;
+    assert!(matches!(
+        store_at(scratch.path()).mode_of("poste"),
+        Ok(Some(ProfileMode::Nomad { .. }))
+    ));
 }

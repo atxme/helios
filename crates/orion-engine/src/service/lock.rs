@@ -6,7 +6,10 @@
 
 use std::sync::atomic::Ordering;
 
-use orion_core::{vault::registry::ProfileMode, ClientConfig};
+use orion_core::{
+    vault::{registry::ProfileMode, VaultError},
+    ClientConfig,
+};
 
 use super::EngineService;
 use crate::events::EventQueue;
@@ -36,6 +39,16 @@ impl EngineService {
             // controller reports it there. The keys are forgotten either way.
             let _ = self.stop_connection(events.sink()).await;
         }
+        self.drop_unlocked_keys().await;
+        tracing::info!(event = ?event, "nomad profiles locked");
+    }
+
+    /// Forgets every unlocked key, and reads the configuration again.
+    ///
+    /// Forgetting the keys leaves the profiles in memory, and a profile the
+    /// engine still holds is one it could connect without asking. Callers must
+    /// not hold the configuration lock.
+    pub(super) async fn drop_unlocked_keys(&self) {
         self.store.forget_unlocked();
         if self.reload_config().await.is_err() {
             // The store cannot be read without its root, and the profiles it
@@ -43,7 +56,41 @@ impl EngineService {
             // keeps a nomad key out of memory; the next reload restores them.
             *self.config.lock().await = ClientConfig::default();
         }
-        tracing::info!(event = ?event, "nomad profiles locked");
+    }
+
+    /// The lock generation now. Read before a passphrase dialog, then checked
+    /// with [`Self::lock_landed_since`] once the store has been written.
+    pub(super) fn generation(&self) -> u64 {
+        self.lock_generation.load(Ordering::Acquire)
+    }
+
+    /// Whether a lock event has landed since `generation` was read.
+    pub(super) fn lock_landed_since(&self, generation: u64) -> bool {
+        self.generation() != generation
+    }
+
+    /// Drops the keys a gesture took after a lock, and returns the refusal.
+    ///
+    /// The store took its key after the lock had already forgotten the keys,
+    /// so the one it holds now is the one to drop.
+    pub(super) async fn refuse_locked(&self, name: &str) -> String {
+        self.drop_unlocked_keys().await;
+        VaultError::ProfileLocked(name.to_string()).to_string()
+    }
+
+    /// Settles a gesture that asked for a passphrase: a lock that landed in the
+    /// meantime wins, whatever the gesture's own outcome. Callers must not hold
+    /// the configuration lock.
+    pub(super) async fn settle_gesture<T>(
+        &self,
+        name: &str,
+        generation: u64,
+        outcome: Result<T, String>,
+    ) -> Result<T, String> {
+        if self.lock_landed_since(generation) {
+            return Err(self.refuse_locked(name).await);
+        }
+        outcome
     }
 
     /// Turns the store's lock watch on or off. Off, an unlock is refused.

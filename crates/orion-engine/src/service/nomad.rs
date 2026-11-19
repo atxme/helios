@@ -7,7 +7,7 @@
 //! `&str`, used once, and dropped; nothing here returns it, logs it or puts it
 //! in a view.
 
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::Arc;
 
 use orion_core::vault::{
     passphrase, registry::ProfileMode, ProfileStore, PromptPurpose, VaultError,
@@ -96,20 +96,16 @@ impl EngineService {
         }
         // Read before the dialog: a lock that lands while it is open must win,
         // and the store only sees locks that land during its own derivation.
-        let generation = self.lock_generation.load(Ordering::Acquire);
+        let generation = self.generation();
         let passphrase = self.ask_passphrase(name, purpose).await?;
         let store = Arc::clone(&self.store);
         let profile = name.to_string();
-        tokio::task::spawn_blocking(move || store.unlock(&profile, passphrase.as_str()))
-            .await
-            .map_err(interrupted)?
-            .map_err(store_message)?;
-        if self.lock_generation.load(Ordering::Acquire) != generation {
-            // The store took the key after the lock had already forgotten the
-            // keys, so the key it holds now is the one to drop.
-            self.store.forget_unlocked();
-            return Err(VaultError::ProfileLocked(name.to_string()).to_string());
-        }
+        let unlocked =
+            tokio::task::spawn_blocking(move || store.unlock(&profile, passphrase.as_str()))
+                .await
+                .map_err(interrupted)?
+                .map_err(store_message);
+        self.settle_gesture(name, generation, unlocked).await?;
         if !self.store.is_unlocked(name) {
             return Err(VaultError::ProfileLocked(name.to_string()).to_string());
         }
@@ -148,9 +144,13 @@ impl EngineService {
     /// Seals a `service` profile under a new passphrase (spec §5.7).
     pub async fn make_nomad(&self, name: String) -> Result<ConfigView, String> {
         self.require_known(&name)?;
+        let generation = self.generation();
         let passphrase = self.new_passphrase(&name).await?;
-        self.in_store(move |store| store.make_nomad(&name, passphrase.as_str()))
-            .await?;
+        let target = name.clone();
+        let sealed = self
+            .in_store(move |store| store.make_nomad(&target, passphrase.as_str()))
+            .await;
+        self.settle_gesture(&name, generation, sealed).await?;
         self.reload_config().await?;
         Ok(self.config_view_now().await)
     }
