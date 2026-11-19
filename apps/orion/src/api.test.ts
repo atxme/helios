@@ -24,8 +24,11 @@ import {
   getState,
   importProfile,
   importProfilePath,
+  changePassphrase,
   keyNegotiationSupport,
   lastCertificateError,
+  makeNomad,
+  makeService,
   onConfigChanged,
   onEvent,
   onProfilePath,
@@ -185,5 +188,22 @@ describe('Orion Tauri bridge', () => {
     await expect(onConfigChanged(callback)).resolves.toBe(unlisten)
     expect(mocks.listen).toHaveBeenCalledWith('helios://config-changed', callback)
     expect(callback).toHaveBeenCalledOnce()
+  })
+})
+
+describe('nomad profile commands', () => {
+  it('sends only the profile name to each passphrase gesture', async () => {
+    mocks.invoke.mockReset()
+    mocks.invoke.mockResolvedValue({ profiles: [], selected: null, locked: [] })
+
+    await makeNomad('portable')
+    await changePassphrase('portable')
+    await makeService('portable')
+
+    expect(mocks.invoke.mock.calls).toEqual([
+      ['make_nomad', { name: 'portable' }],
+      ['change_passphrase', { name: 'portable' }],
+      ['make_service', { name: 'portable' }],
+    ])
   })
 })

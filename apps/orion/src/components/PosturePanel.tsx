@@ -16,13 +16,19 @@ import { GUTTER } from '../theme'
  * fact that needs a paragraph to be worth reading does not belong on a screen
  * whose whole job is to be scanned in two seconds.
  *
- * **The vault block is alerts only.** Rows that describe a healthy vault —
- * secrets sealed to the TPM, volume encrypted, memory locked — told the user
- * nothing they could act on, and pushed the rows that *do* matter below the
- * fold. What is nominal is silent; what is degraded appears.
+ * **The vault block is alerts only**, with one exception: the nomad lock watch.
+ * Rows that describe a healthy vault — secrets sealed to the TPM, volume
+ * encrypted, memory locked — told the user nothing they could act on, and
+ * pushed the rows that *do* matter below the fold. What is nominal is silent;
+ * what is degraded appears. The lock watch is stated either way, because
+ * without it no `nomade` profile can be opened again once it locks.
  */
 
 const AMBER = '#A16207'
+
+const LOCK_WATCH_ACTIVE = 'Verrouillage des profils nomades : actif'
+const LOCK_WATCH_UNAVAILABLE =
+  'Verrouillage des profils nomades : indisponible — aucun profil nomade ne peut être déverrouillé'
 
 interface Props {
   /** The chip. `null` closes the panel. */
@@ -64,15 +70,6 @@ export function PosturePanel({
   const traffic = trafficFact(profile, capture)
   const address = addressFact(profile, capture)
   const negotiation = profile?.key_negotiation
-  // Nominal is silent: the block only exists when it has something to report.
-  const degraded =
-    vault !== null &&
-    (!vault.hardwareBacked ||
-      !vault.volumeProtected ||
-      !vault.memoryLocked ||
-      !vault.dumpsExcluded ||
-      vault.legacyPresent ||
-      vault.rotationRequired.length > 0)
 
   return (
     <Popover
@@ -126,10 +123,24 @@ export function PosturePanel({
         <Row label="trafic via le tunnel" value={traffic.value} tone={traffic.tone} />
       </Box>
 
-      {degraded && vault && (
+      {vault && (
         <>
           <Divider />
           <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, px: GUTTER, py: 1.5 }}>
+            {/* Blocking when the watch is missing: the profiles it would
+                re-lock cannot be opened, and that is stated in the same words
+                as the rest of the panel, without a tooltip. */}
+            <Typography
+              role={vault.lockWatchActive ? undefined : 'alert'}
+              sx={{
+                fontFamily: 'monospace',
+                fontSize: 11,
+                overflowWrap: 'anywhere',
+                color: vault.lockWatchActive ? 'text.secondary' : 'error.main',
+              }}
+            >
+              {vault.lockWatchActive ? LOCK_WATCH_ACTIVE : LOCK_WATCH_UNAVAILABLE}
+            </Typography>
             {!vault.hardwareBacked && (
               <Row label="secrets" value="scellés au compte uniquement" tone={AMBER} />
             )}

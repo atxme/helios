@@ -6,6 +6,7 @@ import type {
   ClientConfig,
   ClientProfile,
   LogLine,
+  PassphraseGesture,
   ProfileDraft,
   PskKind,
   TelemetrySample,
@@ -13,11 +14,13 @@ import type {
 } from '../types'
 
 const MAX_LOGS = 80
+/** The engine's answer when the user closes the passphrase dialog. */
+const PASSPHRASE_CANCELLED = 'Saisie annulée.'
 /** Throughput curve window. At one sample per second, ~1 minute. */
 const MAX_SAMPLES = 60
 
 export function useClient() {
-  const [config, setConfig] = useState<ClientConfig>({ profiles: [], selected: null })
+  const [config, setConfig] = useState<ClientConfig>({ profiles: [], selected: null, locked: [] })
   const [state, setState] = useState<TunnelState>('down')
   const [backend, setBackend] = useState<string>('')
   const [adapterUp, setAdapterUp] = useState(false)
@@ -240,6 +243,40 @@ export function useClient() {
     }
   }, [])
 
+  /**
+   * Runs a passphrase gesture and applies the configuration it returns.
+   *
+   * A closed dialog resolves as `cancelled`, not as an error: the user chose to
+   * stop, and the configuration is left as it was.
+   */
+  const passphraseGesture = useCallback(
+    async (run: () => Promise<ClientConfig>): Promise<PassphraseGesture> => {
+      setError(null)
+      try {
+        setConfig(await run())
+        return 'done'
+      } catch (cause) {
+        if (String(cause) === PASSPHRASE_CANCELLED) return 'cancelled'
+        setError(String(cause))
+        throw cause
+      }
+    },
+    [],
+  )
+
+  const makeNomad = useCallback(
+    (name: string) => passphraseGesture(() => api.makeNomad(name)),
+    [passphraseGesture],
+  )
+  const changePassphrase = useCallback(
+    (name: string) => passphraseGesture(() => api.changePassphrase(name)),
+    [passphraseGesture],
+  )
+  const makeService = useCallback(
+    (name: string) => passphraseGesture(() => api.makeService(name)),
+    [passphraseGesture],
+  )
+
   const select = useCallback(async (name: string) => {
     try {
       setError(null)
@@ -278,6 +315,9 @@ export function useClient() {
     saveProfile,
     removeProfile,
     select,
+    makeNomad,
+    changePassphrase,
+    makeService,
     clearPathImportedProfile,
     clearError: () => setError(null),
   }

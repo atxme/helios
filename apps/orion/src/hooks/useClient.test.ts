@@ -20,6 +20,9 @@ const api = vi.hoisted(() => ({
   onProfilePath: vi.fn(),
   saveProfile: vi.fn(),
   selectProfile: vi.fn(),
+  makeNomad: vi.fn(),
+  changePassphrase: vi.fn(),
+  makeService: vi.fn(),
 }))
 
 vi.mock('../api', () => api)
@@ -30,6 +33,7 @@ const portable: ClientProfile = {
   name: 'portable',
   endpoint: '203.0.113.10:51820',
   peer_public_key: 'gateway-public',
+  mode: 'service',
   profile_type: 'classic',
   public_key: 'client-public',
   has_private_key: true,
@@ -44,7 +48,7 @@ const portable: ClientProfile = {
   key_negotiation: null,
 }
 
-const config: ClientConfig = { profiles: [portable], selected: 'portable' }
+const config: ClientConfig = { profiles: [portable], selected: 'portable', locked: [] }
 const imported = (overrides: Partial<ImportOutcome> = {}): ImportOutcome => ({
   profile: { ...portable, name: 'imported' },
   identity_sealed: false,
@@ -221,7 +225,7 @@ describe('useClient', () => {
   })
 
   it('updates configuration through successful actions', async () => {
-    const saved = { profiles: [{ ...portable, name: 'saved' }], selected: 'saved' }
+    const saved = { profiles: [{ ...portable, name: 'saved' }], selected: 'saved', locked: [] }
     api.connect.mockResolvedValue(undefined)
     api.disconnect.mockResolvedValue(undefined)
     api.importProfile.mockResolvedValue(imported())
@@ -277,5 +281,29 @@ describe('useClient', () => {
 
     act(() => result.current.clearError())
     expect(result.current.error).toBeNull()
+  })
+
+  /// The dialog the user closed is an answer, not a failure: nothing is shown
+  /// as an error and the configuration is left as it was.
+  it('reports a cancelled passphrase dialog as neutral, and a refusal as an error', async () => {
+    api.getConfig.mockResolvedValue(config)
+    const { result } = renderHook(() => useClient())
+    await waitFor(() => expect(result.current.selectedProfile?.name).toBe('portable'))
+
+    api.makeNomad.mockRejectedValueOnce('Saisie annulée.')
+    let outcome: string | undefined
+    await act(async () => {
+      outcome = await result.current.makeNomad('portable')
+    })
+    expect(outcome).toBe('cancelled')
+    expect(result.current.error).toBeNull()
+
+    api.changePassphrase.mockRejectedValueOnce('profil « portable » introuvable')
+    await act(async () => {
+      await expect(result.current.changePassphrase('portable')).rejects.toBe(
+        'profil « portable » introuvable',
+      )
+    })
+    expect(result.current.error).toBe('profil « portable » introuvable')
   })
 })

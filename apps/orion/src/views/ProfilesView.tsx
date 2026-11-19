@@ -48,9 +48,12 @@ import type {
   ImportOutcome,
   KeyNegotiationSettings,
   KeyNegotiationSupport,
+  PassphraseGesture,
   ProfileDraft,
   ProfileIssues,
+  ProfileMode,
   ProtectionMode,
+  VaultPosture,
 } from '../types'
 
 /**
@@ -120,6 +123,14 @@ interface Props {
   onSave: (draft: ProfileDraft) => Promise<void>
   onDelete: (name: string) => Promise<void>
   onSelect: (name: string) => Promise<void>
+  /** Moves a `service` profile to `nomade`. Resolves `cancelled` when the dialog is closed. */
+  onMakeNomad: (name: string) => Promise<PassphraseGesture>
+  /** Sets a new passphrase on a `nomade` profile. Resolves `cancelled` when the dialog is closed. */
+  onChangePassphrase: (name: string) => Promise<PassphraseGesture>
+  /** Moves a `nomade` profile back to `service`. Resolves `cancelled` when the dialog is closed. */
+  onMakeService: (name: string) => Promise<PassphraseGesture>
+  /** Connects to a profile. A locked one is opened by the engine's own prompt. */
+  onConnect: (name: string) => Promise<void>
 }
 
 function blankProfile(): ClientProfile {
@@ -148,6 +159,8 @@ function blankProfile(): ClientProfile {
     // block full of empty certificates would report itself faulty from the
     // first render. Adding one is one click away in the block below.
     key_negotiation: null,
+    // A new profile is service until the form says otherwise.
+    mode: 'service',
   }
 }
 
@@ -159,7 +172,20 @@ function blankProfile(): ClientProfile {
  * confirmation states a *fact* already true — leaving it on screen would soon
  * describe a draft that has since moved on.
  */
-type Notice = { tone: 'success' | 'error'; message: string; transient?: boolean }
+type Notice = { tone: 'success' | 'error' | 'info'; message: string; transient?: boolean }
+
+/**
+ * The sentences of the nomad profile, as the product states them. Copied
+ * verbatim: a passphrase is only as safe as the reader's understanding of what
+ * this mode does and does not protect, so none of them is paraphrased.
+ */
+const NOMAD_WARNING =
+  "Le profil nomade protège un portable volé éteint : sans la passphrase, le tunnel ne monte pas. Il ne protège pas d'un logiciel malveillant ni d'un enregistreur de frappe présent à la saisie. Passphrase oubliée : supprimez le profil et faites-le ré-enrôler."
+const NOMAD_SERVICE_WARNING =
+  "Les copies de ce profil faites avant ce changement (sauvegardes, profil itinérant) s'ouvrent encore sans passphrase sur ce poste."
+const NOMAD_UNAVAILABLE =
+  'Le profil nomade exige la boîte de saisie protégée de Windows.'
+const NOMAD_LOCKED_LABEL = 'Nomade · verrouillé'
 
 /** Action waiting for the user's informed bare-volume decision. */
 type VolumeWarningAction = 'import' | 'save'
@@ -279,6 +305,10 @@ export function ProfilesView({
   onSave,
   onDelete,
   onSelect,
+  onMakeNomad,
+  onChangePassphrase,
+  onMakeService,
+  onConnect,
 }: Props) {
   const initial =
     config.profiles.find((profile) => profile.name === config.selected) ??
@@ -327,6 +357,14 @@ export function ProfilesView({
   const [volumeWarningBusy, setVolumeWarningBusy] = useState(false)
   const [advanced, setAdvanced] = useState(false)
   const [support, setSupport] = useState<KeyNegotiationSupport | null>(null)
+  /** The mode a new profile is created with. Read only for a name not yet stored. */
+  const [nomadChoice, setNomadChoice] = useState(false)
+  /** A locked `nomade` profile picked in the list, instead of the editor. */
+  const [lockedFocus, setLockedFocus] = useState<string | null>(null)
+  /** A passphrase gesture is open: the native dialog belongs to it, so nothing else may start. */
+  const [gestureBusy, setGestureBusy] = useState(false)
+  /** What the vault can claim, for the nomad choice. `null` while it is read. */
+  const [posture, setPosture] = useState<VaultPosture | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
   /** Focus target of «Personnalisé»: the list is typed, not chosen. */
   const allowedIpsInput = useRef<HTMLInputElement>(null)
@@ -369,6 +407,22 @@ export function ProfilesView({
     allowedIpsInput.current?.focus()
   }, [caretRequest])
 
+  // The platform dialog is a fact of this machine, read once.
+  useEffect(() => {
+    let cancelled = false
+    api
+      .vaultPosture()
+      .then((found) => {
+        if (!cancelled) setPosture(found)
+      })
+      .catch(() => {
+        if (!cancelled) setPosture(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
   // A build fact, not a profile one: asked once.
   useEffect(() => {
     let cancelled = false
@@ -407,8 +461,12 @@ export function ProfilesView({
       useStagedKey: stagedPublicKey !== null,
       clearPresharedKey: clearPsk,
       useStagedPsk: stagedPsk,
+      // Read only for a name not yet stored: an existing profile keeps its
+      // mode, and switching it is a gesture of its own.
+      nomad:
+        nomadChoice && !config.profiles.some((stored) => stored.name === profile.name),
     }),
-    [clearPsk, stagedPsk, stagedPublicKey],
+    [clearPsk, config.profiles, nomadChoice, stagedPsk, stagedPublicKey],
   )
 
   // A staged key wins over the stored one: it is what a save is about to
@@ -457,6 +515,7 @@ export function ProfilesView({
     // is what must light up.
     setManualPrefixes(false)
     setWantsStaticPsk(false)
+    setNomadChoice(false)
     setPasting(false)
     setPasted('')
     void api.discardStagedKey().catch(() => {})
@@ -478,6 +537,7 @@ export function ProfilesView({
     if (!pathImport) return
     const replaces = config.profiles.some((candidate) => candidate.name === pathImport.name)
     loadDraft(pathImport)
+    setLockedFocus(null)
     setDirty(true)
     setNotice({
       tone: 'success',
@@ -803,13 +863,53 @@ export function ProfilesView({
     }
   }
 
+  /** The profile the delete dialog is about: the locked one picked, else the draft. */
+  const deleteTarget = lockedFocus ?? draft.name
+
   const remove = async () => {
     try {
-      await onDelete(draft.name)
+      await onDelete(deleteTarget)
       setDeleteOpen(false)
-      setDirty(false)
+      if (lockedFocus === null) setDirty(false)
+      setLockedFocus(null)
     } catch {
       // The global error explains the failure and the dialog stays open.
+    }
+  }
+
+  /**
+   * Runs a passphrase gesture and says what it ended with.
+   *
+   * The name is the only thing sent: the engine opens the platform dialog and
+   * the passphrase never reaches this window. A closed dialog is stated as
+   * such; a refusal is already on the global error line, so nothing is added.
+   * What the list shows afterwards is the configuration's word: a row that is
+   * no longer locked stops being shown as one.
+   */
+  const runPassphraseGesture = async (run: () => Promise<PassphraseGesture>) => {
+    setGestureBusy(true)
+    try {
+      const outcome = await run()
+      if (outcome === 'cancelled') {
+        setNotice({ tone: 'info', message: 'Saisie annulée.', transient: true })
+      } else {
+        setNotice(null)
+      }
+    } catch {
+      // The global error explains the refusal.
+    } finally {
+      setGestureBusy(false)
+    }
+  }
+
+  const connectLocked = async (name: string) => {
+    setGestureBusy(true)
+    try {
+      await onConnect(name)
+    } catch {
+      // The global error explains the refusal.
+    } finally {
+      setGestureBusy(false)
     }
   }
 
@@ -821,6 +921,7 @@ export function ProfilesView({
    * as loaded while the backend will still connect another one.
    */
   const selectProfile = async (profile: ClientProfile) => {
+    setLockedFocus(null)
     if (profile.name === draft.name && profile.name === config.selected) return
     try {
       await onSelect(profile.name)
@@ -836,6 +937,7 @@ export function ProfilesView({
   const importFile = async (file: File | undefined) => {
     if (!file) return
     setNotice(null)
+    setLockedFocus(null)
     if (file.size > MAX_IMPORT_BYTES) {
       setNotice({ tone: 'error', message: 'Fichier trop volumineux (maximum 64 Kio).' })
       if (fileInput.current) fileInput.current.value = ''
@@ -888,6 +990,14 @@ export function ProfilesView({
   }
 
   const exists = config.profiles.some((profile) => profile.name === draft.name)
+  const storedProfile = config.profiles.find((profile) => profile.name === draft.name) ?? null
+  // Known false only: while the posture is being read, the choice stays
+  // available and the engine refuses it if it must.
+  const nomadBlocked = posture?.nomadAvailable === false
+  // The locked profile picked in the list, while the configuration still says
+  // it is locked. Once it is not, the editor takes the place back.
+  const lockedView =
+    lockedFocus === null ? undefined : config.locked.find((locked) => locked.name === lockedFocus)
   const storedKind = config.profiles.find((profile) => profile.name === draft.name)?.profile_type
   const draftKind: ClientProfile['profile_type'] = draft.key_negotiation
     ? 'helios_key_negotiation'
@@ -1128,7 +1238,7 @@ export function ProfilesView({
             sx={{ m: 0, p: 0, listStyle: 'none', overflow: 'hidden' }}
           >
             {config.profiles.map((profile) => {
-              const active = profile.name === draft.name
+              const active = lockedView === undefined && profile.name === draft.name
               return (
                 <Box component="li" key={profile.name}>
                   <ButtonBase
@@ -1194,6 +1304,41 @@ export function ProfilesView({
                 </Box>
               )
             })}
+            {/* A locked profile has no endpoint to show: its row says what it is,
+                and picking it opens the four gestures that do not need its secrets. */}
+            {config.locked.map((locked) => {
+              const active = lockedFocus === locked.name
+              return (
+                <Box component="li" key={`locked-${locked.name}`}>
+                  <ButtonBase
+                    onClick={() => setLockedFocus(locked.name)}
+                    aria-label={locked.name}
+                    aria-current={active ? 'true' : undefined}
+                    sx={{
+                      position: 'relative',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 0.75,
+                      width: '100%',
+                      px: GUTTER,
+                      py: 1,
+                      textAlign: 'left',
+                      bgcolor: active ? 'action.selected' : 'transparent',
+                      '&:hover': { bgcolor: 'action.hover' },
+                    }}
+                  >
+                    <Box sx={{ minWidth: 0, flex: 1 }}>
+                      <Typography noWrap sx={{ fontSize: 12.5, fontWeight: active ? 650 : 500 }}>
+                        {locked.name}
+                      </Typography>
+                      <Typography noWrap color="text.secondary" sx={{ fontSize: 10 }}>
+                        {NOMAD_LOCKED_LABEL}
+                      </Typography>
+                    </Box>
+                  </ButtonBase>
+                </Box>
+              )
+            })}
           </Box>
 
           <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, mt: 'auto', p: 1 }}>
@@ -1232,6 +1377,7 @@ export function ProfilesView({
               startIcon={<Plus size={15} aria-hidden />}
               onClick={() => {
                 loadDraft(blankProfile())
+                setLockedFocus(null)
                 setDirty(true)
                 setNotice(null)
               }}
@@ -1246,6 +1392,20 @@ export function ProfilesView({
             Vertical scrolling is allowed here, and only here: a clipped
             certificate warning would be worse than a scrollbar. */}
         <Box sx={{ minWidth: 0, overflowX: 'hidden', overflowY: 'auto', px: GUTTER, py: 1.5 }}>
+          {lockedView ? (
+            <LockedProfile
+              name={lockedView.name}
+              notice={notice}
+              busy={gestureBusy}
+              onConnect={() => void connectLocked(lockedView.name)}
+              onChangePassphrase={() =>
+                void runPassphraseGesture(() => onChangePassphrase(lockedView.name))
+              }
+              onMakeService={() => void runPassphraseGesture(() => onMakeService(lockedView.name))}
+              onDelete={() => setDeleteOpen(true)}
+            />
+          ) : (
+          <>
           {/* The vault did not open: the list is empty because nothing was
               read, and the cause says so — after a failed migration, that the
               legacy vault was kept. */}
@@ -1268,6 +1428,89 @@ export function ProfilesView({
             >
               {notice.message}
             </Alert>
+          )}
+
+          {/* ── Mode ─────────────────────────────────────────────────────
+              A new profile is asked for its mode here. An existing one shows
+              its mode and the gesture that switches it: switching is never a
+              field of the form, because it touches the passphrase. */}
+          {!exists ? (
+            <Box sx={{ mb: 1.5, display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+              <Typography
+                id="profile-mode-label"
+                color="text.secondary"
+                sx={{ fontSize: 11.5, fontWeight: 600 }}
+              >
+                Mode
+              </Typography>
+              <ToggleButtonGroup
+                exclusive
+                size="small"
+                value={nomadChoice ? 'nomade' : 'service'}
+                aria-labelledby="profile-mode-label"
+                onChange={(_event, next: ProfileMode | null) => {
+                  if (next) setNomadChoice(next === 'nomade')
+                }}
+                sx={{ '& .MuiToggleButton-root': SEGMENT_BUTTON }}
+              >
+                <ToggleButton value="service">Service</ToggleButton>
+                <ToggleButton value="nomade" disabled={nomadBlocked}>
+                  Nomade
+                </ToggleButton>
+              </ToggleButtonGroup>
+              {nomadChoice && <ModeWarning text={NOMAD_WARNING} />}
+              {nomadBlocked && <ModeWarning text={NOMAD_UNAVAILABLE} />}
+            </Box>
+          ) : storedProfile && (
+            <Box sx={{ mb: 1.5, display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
+                <ModeBadge mode={storedProfile.mode} />
+                {storedProfile.mode === 'service' ? (
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    color="inherit"
+                    disabled={dirty || gestureBusy || nomadBlocked}
+                    onClick={() => void runPassphraseGesture(() => onMakeNomad(draft.name))}
+                    sx={{ fontSize: 11.5, textTransform: 'none' }}
+                  >
+                    Passer en nomade
+                  </Button>
+                ) : (
+                  <>
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      color="inherit"
+                      disabled={dirty || gestureBusy}
+                      onClick={() =>
+                        void runPassphraseGesture(() => onChangePassphrase(draft.name))
+                      }
+                      sx={{ fontSize: 11.5, textTransform: 'none' }}
+                    >
+                      Changer la passphrase
+                    </Button>
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      color="inherit"
+                      disabled={dirty || gestureBusy}
+                      onClick={() => void runPassphraseGesture(() => onMakeService(draft.name))}
+                      sx={{ fontSize: 11.5, textTransform: 'none' }}
+                    >
+                      Repasser en service
+                    </Button>
+                  </>
+                )}
+              </Box>
+              {storedProfile.mode === 'service' && (
+                <>
+                  <ModeWarning text={NOMAD_WARNING} />
+                  <ModeWarning text={NOMAD_SERVICE_WARNING} />
+                  {nomadBlocked && <ModeWarning text={NOMAD_UNAVAILABLE} />}
+                </>
+              )}
+            </Box>
           )}
 
           {/* ── Identity ─────────────────────────────────────────────────
@@ -1661,10 +1904,13 @@ export function ProfilesView({
               />
             </Box>
           )}
-
+          </>
+          )}
         </Box>
       </Box>
 
+      {!lockedView && (
+      <>
       <Divider />
       <Box sx={{ display: 'flex', flexShrink: 0, alignItems: 'center', gap: 1, px: GUTTER, py: 1.25 }}>
         <Typography
@@ -1712,9 +1958,11 @@ export function ProfilesView({
           </Tooltip>
         )}
       </Box>
+      </>
+      )}
 
       <Dialog open={deleteOpen} onClose={() => setDeleteOpen(false)} aria-labelledby="delete-profile-title">
-        <DialogTitle id="delete-profile-title">Supprimer « {draft.name} » ?</DialogTitle>
+        <DialogTitle id="delete-profile-title">Supprimer « {deleteTarget} » ?</DialogTitle>
         <DialogContent>
           <DialogContentText>
             Le profil et ses secrets locaux seront supprimés d’Orion. Cette action ne révoque pas
@@ -1774,6 +2022,121 @@ export function ProfilesView({
           </Button>
         </DialogActions>
       </Dialog>
+    </Box>
+  )
+}
+
+/** Where a profile is sealed, as a small label beside its controls. */
+function ModeBadge({ mode }: { mode: ProfileMode }) {
+  return (
+    <Typography
+      component="span"
+      sx={{
+        px: 0.75,
+        py: 0.125,
+        border: 1,
+        borderColor: 'divider',
+        borderRadius: 0.5,
+        fontSize: 10.5,
+        fontWeight: 650,
+        color: mode === 'nomade' ? 'primary.main' : 'text.secondary',
+      }}
+    >
+      {mode === 'nomade' ? 'Nomade' : 'Service'}
+    </Typography>
+  )
+}
+
+/** A sentence about the mode: a warning, or the reason a choice is closed. */
+function ModeWarning({ text }: { text: string }) {
+  return (
+    <Typography color="text.secondary" sx={{ fontSize: 11, lineHeight: 1.5 }}>
+      {text}
+    </Typography>
+  )
+}
+
+/**
+ * A locked `nomade` profile: its name, its state and the four gestures that do
+ * not need its secrets. No endpoint, no settings — they are sealed.
+ */
+function LockedProfile({
+  name,
+  notice,
+  busy,
+  onConnect,
+  onChangePassphrase,
+  onMakeService,
+  onDelete,
+}: {
+  name: string
+  notice: Notice | null
+  busy: boolean
+  onConnect: () => void
+  onChangePassphrase: () => void
+  onMakeService: () => void
+  onDelete: () => void
+}) {
+  return (
+    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+      {notice && (
+        <Alert
+          severity={notice.tone}
+          variant="outlined"
+          role={notice.tone === 'error' ? 'alert' : 'status'}
+          sx={{ py: 0, fontSize: 12 }}
+        >
+          {notice.message}
+        </Alert>
+      )}
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+        <Typography component="h3" sx={{ fontSize: 12.5, fontWeight: 650 }}>
+          {name}
+        </Typography>
+        <Typography sx={{ fontSize: 10.5, color: 'text.secondary' }}>{NOMAD_LOCKED_LABEL}</Typography>
+      </Box>
+      <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
+        <Button
+          size="small"
+          variant="contained"
+          disableElevation
+          disabled={busy}
+          onClick={onConnect}
+          sx={{ fontSize: 11.5, textTransform: 'none' }}
+        >
+          Se connecter
+        </Button>
+        <Button
+          size="small"
+          variant="outlined"
+          color="inherit"
+          disabled={busy}
+          onClick={onChangePassphrase}
+          sx={{ fontSize: 11.5, textTransform: 'none' }}
+        >
+          Changer la passphrase
+        </Button>
+        <Button
+          size="small"
+          variant="outlined"
+          color="inherit"
+          disabled={busy}
+          onClick={onMakeService}
+          sx={{ fontSize: 11.5, textTransform: 'none' }}
+        >
+          Repasser en service
+        </Button>
+        <Button
+          size="small"
+          variant="text"
+          color="error"
+          disabled={busy}
+          onClick={onDelete}
+          sx={{ fontSize: 11.5, textTransform: 'none' }}
+        >
+          Supprimer
+        </Button>
+      </Box>
     </Box>
   )
 }

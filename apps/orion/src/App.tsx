@@ -457,6 +457,10 @@ export default function App() {
                 onSave={c.saveProfile}
                 onDelete={c.removeProfile}
                 onSelect={c.select}
+                onMakeNomad={c.makeNomad}
+                onChangePassphrase={c.changePassphrase}
+                onMakeService={c.makeService}
+                onConnect={c.connect}
               />
             </Box>
           )}

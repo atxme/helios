@@ -322,6 +322,71 @@ pub(crate) async fn save_profile(
     Ok(view)
 }
 
+/// Moves a `service` profile to `nomade`.
+///
+/// The engine opens the platform's protected dialog for the new passphrase. The
+/// name is the only thing this command carries: the passphrase never reaches the
+/// WebView, and a closed dialog comes back as the engine's `Saisie annulée.`.
+#[tauri::command]
+pub(crate) async fn make_nomad(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<ConfigView, String> {
+    allow_engine_foreground(&state);
+    let view = match state.client.call(EngineCommand::MakeNomad { name }).await? {
+        EngineReply::Config(value) => value,
+        _ => return Err(unexpected_engine_reply()),
+    };
+    tray::refresh(&app);
+    Ok(view)
+}
+
+/// Sets a new passphrase on a `nomade` profile, unlocking it first if needed.
+///
+/// The current and the new passphrase are both typed in the engine's dialogs.
+#[tauri::command]
+pub(crate) async fn change_passphrase(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<ConfigView, String> {
+    allow_engine_foreground(&state);
+    let view = match state
+        .client
+        .call(EngineCommand::ChangePassphrase { name })
+        .await?
+    {
+        EngineReply::Config(value) => value,
+        _ => return Err(unexpected_engine_reply()),
+    };
+    tray::refresh(&app);
+    Ok(view)
+}
+
+/// Moves a `nomade` profile back to `service`, unlocking it first if needed.
+///
+/// The one gesture that seals a nomad profile without its passphrase: the engine
+/// asks for the current passphrase before it does.
+#[tauri::command]
+pub(crate) async fn make_service(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<ConfigView, String> {
+    allow_engine_foreground(&state);
+    let view = match state
+        .client
+        .call(EngineCommand::MakeService { name })
+        .await?
+    {
+        EngineReply::Config(value) => value,
+        _ => return Err(unexpected_engine_reply()),
+    };
+    tray::refresh(&app);
+    Ok(view)
+}
+
 /// Removes a profile, unmounting its tunnel first if that tunnel is the one up.
 ///
 /// The order is the whole point (spec §12.2). The signed `release` that frees

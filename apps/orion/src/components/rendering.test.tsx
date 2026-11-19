@@ -19,6 +19,7 @@ const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => ({
   name: 'portable',
   endpoint: '203.0.113.10:51820',
   peer_public_key: 'gateway-public',
+  mode: 'service',
   profile_type: 'classic',
   public_key: 'client-public',
   has_private_key: true,
@@ -168,15 +169,19 @@ describe('Orion presentational branches', () => {
       onSave: vi.fn(),
       onDelete: vi.fn(),
       onSelect: vi.fn(),
+      onMakeNomad: vi.fn(),
+      onChangePassphrase: vi.fn(),
+      onMakeService: vi.fn(),
+      onConnect: vi.fn(),
     }
     const empty = renderToStaticMarkup(
-      <ProfilesView config={{ profiles: [], selected: null }} pathImport={null} {...callbacks} />,
+      <ProfilesView config={{ profiles: [], selected: null, locked: [] }} pathImport={null} {...callbacks} />,
     )
     expect(empty).toContain('Profils')
 
     const populated = renderToStaticMarkup(
       <ProfilesView
-        config={{ profiles: [profile()], selected: 'portable' }}
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
         pathImport={profile({ name: 'imported' })}
         {...callbacks}
       />,
@@ -325,6 +330,8 @@ describe('Orion presentational branches', () => {
       dumps: 'Exclusion des rapports d’erreur refusée.',
       rotationRequired: ['portable'],
       legacyPresent: true,
+      lockWatchActive: true,
+      nomadAvailable: true,
     }
     const html = postureHtml(profile(), degraded)
 
@@ -351,6 +358,8 @@ describe('Orion presentational branches', () => {
       dumps: '',
       rotationRequired: [],
       legacyPresent: false,
+      lockWatchActive: true,
+      nomadAvailable: true,
     }
 
     const refused = postureHtml(profile(), base)
@@ -380,6 +389,8 @@ describe('Orion presentational branches', () => {
       dumps: 'Pages secrètes exclues.',
       rotationRequired: [],
       legacyPresent: false,
+      lockWatchActive: true,
+      nomadAvailable: true,
     }
     const html = postureHtml(profile(), clean)
 
@@ -387,6 +398,39 @@ describe('Orion presentational branches', () => {
     expect(html).not.toContain('verrouillée')
     expect(html).not.toContain('non couvert')
     expect(html).not.toContain('fichier en clair présent')
+  })
+
+  /// The session and power watch is part of the vault's claim: without it no
+  /// nomad profile can be opened again once locked, and the panel says so.
+  it('states whether the nomad lock watch is active', () => {
+    const base: VaultPosture = {
+      hardwareBacked: true,
+      softwareKeystore: false,
+      volume: 'Volume chiffré.',
+      volumeProtected: true,
+      unencryptedVolumeWaived: false,
+      memoryLocked: true,
+      memory: '',
+      dumpsExcluded: true,
+      dumps: '',
+      rotationRequired: [],
+      legacyPresent: false,
+      lockWatchActive: true,
+      nomadAvailable: true,
+    }
+    expect(postureHtml(profile(), base)).toContain(
+      'Verrouillage des profils nomades : actif',
+    )
+
+    const unwatched = postureHtml(profile(), { ...base, lockWatchActive: false })
+    expect(unwatched).toContain(
+      'Verrouillage des profils nomades : indisponible — aucun profil nomade ne peut être déverrouillé',
+    )
+    expect(unwatched).not.toContain(': actif')
+  })
+
+  it('shows no lock watch line when the posture is unknown', () => {
+    expect(postureHtml(profile(), null)).not.toContain('Verrouillage des profils nomades')
   })
 
   /// A posture that could not be read shows nothing rather than reassuring.
