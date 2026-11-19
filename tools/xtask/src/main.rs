@@ -741,6 +741,196 @@ mod tests {
         );
     }
 
+    fn archive_fixture(directory: &TestDirectory) -> PathBuf {
+        use helios_update::bundle;
+
+        let root = directory.path().join("helios-1.2.3-test");
+        std::fs::create_dir_all(root.join("systemd")).expect("create bundle directory");
+        let binary = directory.path().join("test-binary");
+        std::fs::write(&binary, b"test binary").expect("write binary fixture");
+        copy_executable(&binary, &root.join("heliosd")).expect("stage binary");
+        std::fs::write(root.join("systemd/heliosd.service"), b"[Unit]\n").expect("stage unit");
+        // Pack checks the manifest inventory and preserves the envelope as
+        // provided. The installer verifies the signatures against its keyring.
+        let manifest = serde_json::json!({
+            "payload": {
+                "product": bundle::BUNDLE_PRODUCT,
+                "channel": "testing",
+                "release_sequence": 7,
+                "version": "1.2.3",
+                "git_commit": "abcdef0123456789",
+                "target": helios_update::BUILD_TARGET,
+                "minimum_installer_version": helios_update::INSTALLER_VERSION,
+                "files": bundle::collect(&root).expect("inventory the fixture"),
+            },
+            "key_epoch": 1,
+            "signatures": [
+                { "alg": "ed25519", "sig": "dGVzdC1lZDI1NTE5" },
+                { "alg": "ml-dsa-65", "sig": "dGVzdC1tbC1kc2EtNjU=" },
+            ],
+        });
+        let mut document = serde_json::to_vec_pretty(&manifest).expect("encode manifest");
+        document.push(b'\n');
+        std::fs::write(root.join(bundle::BUNDLE_MANIFEST_FILE), document).expect("write manifest");
+        root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pack_preserves_the_manifest_and_inventory_through_extraction() {
+        use helios_update::bundle;
+
+        let directory = TestDirectory::new("archive-roundtrip");
+        let root = archive_fixture(&directory);
+        let original =
+            std::fs::read(root.join(bundle::BUNDLE_MANIFEST_FILE)).expect("original manifest");
+        let expected = archive_path(&root).expect("default archive path");
+        pack(&root, None).expect("archive the bundle");
+        assert!(expected.is_file());
+
+        let unpacked = directory.path().join("unpacked");
+        std::fs::create_dir(&unpacked).expect("create an extraction directory");
+        run(
+            &unpacked,
+            "tar",
+            &["-xzf", expected.to_str().expect("archive path")],
+        )
+        .expect("extract the new archive");
+        let extracted = unpacked.join(root.file_name().expect("bundle name"));
+        let manifest = bundle::read_manifest(&extracted).expect("read archived manifest");
+        assert_eq!(
+            std::fs::read(extracted.join(bundle::BUNDLE_MANIFEST_FILE)).expect("archived manifest"),
+            original
+        );
+        bundle::verify_contents(&extracted, &manifest.payload).expect("verify extracted contents");
+        assert_eq!(
+            std::fs::read(extracted.join("heliosd")).expect("extracted binary"),
+            b"test binary"
+        );
+        assert_eq!(
+            std::fs::read(extracted.join("systemd/heliosd.service")).expect("extracted unit"),
+            b"[Unit]\n"
+        );
+        assert!(
+            manifest
+                .payload
+                .entry("heliosd")
+                .expect("manifest entry")
+                .executable
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pack_uses_the_explicit_output_path() {
+        let directory = TestDirectory::new("archive-output");
+        let root = archive_fixture(&directory);
+        let output = directory.path().join("exports");
+        std::fs::create_dir(&output).expect("create archive output directory");
+        let archive = output.join("custom archive.tar.gz");
+        pack(&root, Some(archive.clone())).expect("archive to the requested location");
+
+        let listing = output_of("tar", &["-tzf", archive.to_str().expect("archive path")])
+            .expect("list the produced archive");
+        let bundle = root
+            .file_name()
+            .expect("bundle name")
+            .to_str()
+            .expect("UTF-8 name");
+        assert!(listing
+            .lines()
+            .any(|line| line == format!("{bundle}/manifest.json")));
+        assert!(listing
+            .lines()
+            .any(|line| line == format!("{bundle}/heliosd")));
+        assert!(!archive_path(&root).expect("default path").exists());
+    }
+
+    #[test]
+    fn pack_refuses_changed_or_missing_files_and_unsigned_additions() {
+        let directory = TestDirectory::new("archive-mismatch");
+        let root = archive_fixture(&directory);
+        let unit = root.join("systemd/heliosd.service");
+        let output = directory.path().join("existing.tar.gz");
+        std::fs::write(&output, b"prior archive").expect("preserve an existing destination");
+
+        std::fs::write(&unit, b"[Bad]\n").expect("alter the signed unit");
+        let changed = pack(&root, Some(output.clone())).expect_err("digest mismatch");
+        assert!(format!("{changed:#}").contains("digest mismatch for systemd/heliosd.service"));
+
+        std::fs::remove_file(&unit).expect("remove the signed unit");
+        let missing = pack(&root, Some(output.clone())).expect_err("required unit missing");
+        assert!(format!("{missing:#}")
+            .contains("file missing from the bundle: systemd/heliosd.service"));
+
+        std::fs::write(&unit, b"[Unit]\n").expect("restore the signed unit");
+        std::fs::write(root.join("systemd/extra.service"), b"[Unit]\n").expect("add unsigned unit");
+        let extra = pack(&root, Some(output.clone())).expect_err("unsigned addition");
+        assert!(format!("{extra:#}")
+            .contains("unsigned file present in the bundle: systemd/extra.service"));
+        assert_eq!(
+            std::fs::read(output).expect("prior archive"),
+            b"prior archive"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pack_refuses_changed_executable_permissions_or_symbolic_links() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = TestDirectory::new("archive-permissions");
+        let root = archive_fixture(&directory);
+        let binary = root.join("heliosd");
+        let archive = archive_path(&root).expect("default archive path");
+
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o644))
+            .expect("remove signed executable permission");
+        let mode = pack(&root, None).expect_err("executable permission is signed");
+        assert!(format!("{mode:#}").contains("execute permission mismatch for heliosd"));
+
+        std::fs::remove_file(&binary).expect("remove the regular file");
+        symlink(directory.path().join("test-binary"), &binary)
+            .expect("create a symbolic link to identical bytes");
+        let link = pack(&root, None).expect_err("symlinks are forbidden in bundle contents");
+        assert!(format!("{link:#}").contains("symbolic link"));
+        assert!(!archive.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pack_reports_tar_failure_instead_of_claiming_a_fingerprint() {
+        let directory = TestDirectory::new("archive-tar-error");
+        let root = archive_fixture(&directory);
+        let archive = directory.path().join("absent").join("bundle.tar.gz");
+
+        let error = pack(&root, Some(archive.clone())).expect_err("unwritable output destination");
+        let message = format!("{error:#}");
+        assert!(message.contains("tar -czf"), "{message}");
+        assert!(message.contains("failed"), "{message}");
+        assert!(!archive.exists());
+        assert!(!archive_path(&root).expect("default archive path").exists());
+    }
+
+    #[test]
+    fn pack_reports_an_unreadable_manifest_before_creating_an_archive() {
+        use helios_update::bundle::BUNDLE_MANIFEST_FILE;
+
+        let directory = TestDirectory::new("archive-invalid-manifest");
+        let root = archive_fixture(&directory);
+        std::fs::write(root.join(BUNDLE_MANIFEST_FILE), b"{not-json")
+            .expect("replace the manifest with malformed JSON");
+
+        let error = pack(&root, None).expect_err("malformed manifest cannot ship");
+        let message = format!("{error:#}");
+        assert!(message.contains("invalid bundle manifest"), "{message}");
+        assert!(
+            message.contains("Sign the bundle before archiving it"),
+            "{message}"
+        );
+        assert!(!archive_path(&root).expect("default archive path").exists());
+    }
+
     #[test]
     fn pack_refuses_unsigned_bundle_before_creating_an_archive() {
         let directory = TestDirectory::new("unsigned-bundle");
