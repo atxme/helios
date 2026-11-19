@@ -48,9 +48,9 @@ use std::sync::{
 use zeroize::Zeroizing;
 
 use super::{
-    nomad::PassphraseKey,
-    open_manifest,
-    registry::{entry_digest, ProfileMode, Registry, RegistryEntry},
+    nomad::{self, PassphraseKey},
+    open_manifest, passphrase,
+    registry::{entry_digest, ProfileMode, Registry, RegistryEntry, KDF_PBKDF2_HMAC_SHA512},
     seal_manifest, DeviceRootKey, ManifestKey, ProfileId, ProfileManifest, RootKeyProvider,
     SecurityGeneration, VaultError, DOMAIN_REGISTRY,
 };
@@ -133,11 +133,35 @@ pub struct ProfileStore {
     /// storage, to stage a lock that lands in that window.
     #[cfg(test)]
     between_derivation_and_store: Option<LockHook>,
+    /// Test seam: stops a mode switch right after this step, as a power cut
+    /// would (spec §5.7).
+    #[cfg(test)]
+    pub(crate) stop_switch_after: Option<SwitchStep>,
 }
 
 /// The shape of [`ProfileStore::between_derivation_and_store`].
 #[cfg(test)]
 type LockHook = Box<dyn Fn(&ProfileStore) + Send + Sync>;
+
+/// The writes of a mode switch, in the order spec §5.7 requires. A crash after
+/// any of them must leave the profile openable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwitchStep {
+    /// The new manifest is written beside the current one, as `.next`.
+    Staged,
+    /// The registry records the new mode and the new generation.
+    Registered,
+    /// The `.next` file has replaced the current manifest.
+    Renamed,
+}
+
+/// What a switch seals the manifest under.
+enum Seal {
+    /// The installation root alone: the `service` mode.
+    Service,
+    /// A new passphrase, already judged by `passphrase::accept`.
+    Nomad(Zeroizing<String>),
+}
 
 impl ProfileStore {
     pub fn new(dir: impl Into<std::path::PathBuf>, provider: Box<dyn RootKeyProvider>) -> Self {
@@ -153,6 +177,8 @@ impl ProfileStore {
             lock_watch: AtomicBool::new(false),
             #[cfg(test)]
             between_derivation_and_store: None,
+            #[cfg(test)]
+            stop_switch_after: None,
         }
     }
 
@@ -679,20 +705,48 @@ impl ProfileStore {
         Ok(self.load_registry(&root)?.entries.len())
     }
 
-    /// Test seam: creates a `nomade` profile the way the enrolment gesture will,
-    /// sealed under `passphrase` with a fresh salt. No key is left held.
-    #[cfg(test)]
-    pub(crate) fn enrol_nomad_for_test(
+    /// Enrolment gesture (spec §5.7): creates a profile that does not exist yet,
+    /// sealed as `nomade` under `new_passphrase`, with a fresh salt.
+    ///
+    /// The passphrase is judged before anything is read or written, so a
+    /// refusal leaves the store byte-identical. The key stays held.
+    pub fn save_new_nomad_profile(
         &self,
         profile: &ClientProfile,
-        passphrase: &str,
+        new_passphrase: &str,
+    ) -> Result<(), VaultError> {
+        profile
+            .check_kind()
+            .map_err(|error| VaultError::InvalidProfileKind(error.to_string()))?;
+        let accepted =
+            passphrase::accept(new_passphrase).map_err(VaultError::NewPassphraseRefused)?;
+        let salt = nomad::new_salt()?;
+        let key = PassphraseKey::derive(&accepted, &salt)?;
+        self.create_nomad(profile, salt, key)
+    }
+
+    /// Writes a profile that does not exist yet, sealed under `key`.
+    ///
+    /// The only writer of a new `nomade` manifest, and it never seals a service
+    /// one. There is no previous manifest for a `.next` step to replace, so the
+    /// manifest is written in place: an orphan blob with no registry entry is
+    /// unreachable (ADR-006 §2), and that is the only state a crash can leave.
+    fn create_nomad(
+        &self,
+        profile: &ClientProfile,
+        salt: [u8; nomad::SALT_LEN],
+        key: PassphraseKey,
     ) -> Result<(), VaultError> {
         let root = self.root()?;
         let mut registry = self.load_registry(&root)?;
+        if let Some(entry) = registry.find_by_name(&profile.name) {
+            // A locked profile is reported as such; an existing one is not
+            // replaced here, whatever its mode.
+            key_for(entry, &self.unlocked_keys())?;
+            return Err(VaultError::ProfileExists(profile.name.clone()));
+        }
         let client_public_key = aether::wg::public_from_private(profile.private_key.expose())
             .map_err(|_| VaultError::ContextDisagrees)?;
-        let salt = super::nomad::new_salt()?;
-        let key = PassphraseKey::derive(passphrase, &salt)?;
         let id = ProfileId::generate()?;
         let manifest = ProfileManifest::from_profile(profile, SecurityGeneration(1));
         let blob = seal_manifest(
@@ -704,7 +758,7 @@ impl ProfileStore {
         )?;
         self.write(&self.manifest_path(id), &blob)?;
         let mode = ProfileMode::Nomad {
-            kdf: super::registry::KDF_PBKDF2_HMAC_SHA512,
+            kdf: KDF_PBKDF2_HMAC_SHA512,
             salt,
         };
         registry.upsert(RegistryEntry {
@@ -720,7 +774,124 @@ impl ProfileStore {
         if registry.selected.is_none() {
             registry.selected = Some(id);
         }
-        self.store_registry(&root, &registry)
+        self.store_registry(&root, &registry)?;
+        self.unlocked_keys().insert(id, key);
+        Ok(())
+    }
+
+    /// Switch gesture (spec §5.7): moves a `service` profile to `nomade`, or
+    /// changes the passphrase of an unlocked `nomade` one (a new salt).
+    ///
+    /// The passphrase is judged before anything is read or written.
+    pub fn make_nomad(&self, name: &str, new_passphrase: &str) -> Result<(), VaultError> {
+        let accepted =
+            passphrase::accept(new_passphrase).map_err(VaultError::NewPassphraseRefused)?;
+        self.switch(name, Seal::Nomad(accepted))
+    }
+
+    /// Switch gesture (spec §5.7): moves an unlocked `nomade` profile back to
+    /// `service`, and forgets its key. A `service` profile is left as it is.
+    pub fn make_service(&self, name: &str) -> Result<(), VaultError> {
+        self.switch(name, Seal::Service)
+    }
+
+    /// Re-seals a profile under a new mode, in the three writes of spec §5.7:
+    ///
+    /// 1. the manifest at generation + 1 is written as `.next`;
+    /// 2. the registry records the new mode and generation;
+    /// 3. the `.next` file is renamed over `<id>.hvlt`.
+    ///
+    /// The held key follows the registry: it is replaced, or forgotten, only
+    /// after the registry write. The unlocked map stays locked for the whole
+    /// switch, so a lock cannot land between the reads and the writes.
+    fn switch(&self, name: &str, seal: Seal) -> Result<(), VaultError> {
+        let root = self.root()?;
+        let mut registry = self.load_registry(&root)?;
+        let entry = registry
+            .find_by_name(name)
+            .cloned()
+            .ok_or_else(|| VaultError::UnknownProfile(name.to_string()))?;
+        if matches!(seal, Seal::Service) && !entry.mode.is_nomad() {
+            return Ok(());
+        }
+        let id = entry.id;
+        let mut unlocked = self.unlocked_keys();
+
+        let mut manifest = {
+            let key = key_for(&entry, &unlocked)?;
+            self.load_manifest(&root, &entry, key)?
+        };
+        let generation = entry.generation.next();
+        manifest.generation = generation;
+
+        let (mode, new_key) = match seal {
+            Seal::Service => (ProfileMode::Service, None),
+            Seal::Nomad(passphrase) => {
+                let salt = nomad::new_salt()?;
+                let key = PassphraseKey::derive(&passphrase, &salt)?;
+                (
+                    ProfileMode::Nomad {
+                        kdf: KDF_PBKDF2_HMAC_SHA512,
+                        salt,
+                    },
+                    Some(key),
+                )
+            }
+        };
+        let blob = seal_manifest(
+            &root,
+            id,
+            &manifest,
+            &entry.client_public_key,
+            new_key
+                .as_ref()
+                .map_or(ManifestKey::Service, ManifestKey::Nomad),
+        )?;
+        let digest = entry_digest(manifest.security_digest(), &mode);
+
+        let staged = self.next_manifest_path(id, generation);
+        self.write(&staged, &blob)?;
+        self.checkpoint(SwitchStep::Staged)?;
+
+        registry.upsert(RegistryEntry {
+            generation,
+            security_digest: digest,
+            mode,
+            ..entry
+        })?;
+        self.store_registry(&root, &registry)?;
+        match new_key {
+            Some(key) => {
+                unlocked.insert(id, key);
+            }
+            None => {
+                unlocked.remove(&id);
+            }
+        }
+        self.checkpoint(SwitchStep::Registered)?;
+
+        std::fs::rename(&staged, self.manifest_path(id)).map_err(|error| VaultError::Io {
+            path: staged,
+            cause: error.to_string(),
+        })?;
+        self.checkpoint(SwitchStep::Renamed)
+    }
+
+    #[cfg(not(test))]
+    fn checkpoint(&self, _step: SwitchStep) -> Result<(), VaultError> {
+        Ok(())
+    }
+
+    /// Stops a switch after `step` when a test asks for it.
+    #[cfg(test)]
+    fn checkpoint(&self, step: SwitchStep) -> Result<(), VaultError> {
+        if self.stop_switch_after == Some(step) {
+            return Err(VaultError::Io {
+                path: self.dir.clone(),
+                cause: format!("injected crash after {step:?}"),
+            });
+        }
+        Ok(())
     }
 
     /// Names of the profiles blocked until their key is rotated.

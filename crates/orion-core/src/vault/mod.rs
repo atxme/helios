@@ -314,6 +314,13 @@ pub enum VaultError {
     MemoryHygiene(&'static str),
     #[error("le profil « {0} » est verrouillé : sa passphrase est demandée à la connexion")]
     ProfileLocked(String),
+    #[error(
+        "le profil « {0} » existe déjà : « Passer en nomade » ou « Changer la passphrase » le \
+         modifie"
+    )]
+    ProfileExists(String),
+    #[error("le profil « {0} » n'existe pas")]
+    UnknownProfile(String),
     #[error("Passphrase incorrecte, ou profil altéré.")]
     WrongPassphrase,
     #[error("Les deux saisies diffèrent.")]

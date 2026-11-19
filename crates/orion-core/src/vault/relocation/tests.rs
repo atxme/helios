@@ -1134,7 +1134,7 @@ fn a_vault_with_a_locked_nomad_profile_relocates() {
         Box::new(legacy_root(&legacy.calls)),
     );
     sealed_nomad
-        .enrol_nomad_for_test(
+        .save_new_nomad_profile(
             &profile("portable"),
             "cheval agrafe batterie correcte orion",
         )
