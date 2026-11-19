@@ -10,6 +10,7 @@ pub mod command;
 pub mod events;
 pub mod legacy_cleanup;
 pub mod lifecycle;
+pub mod lock_watch;
 pub mod pipe;
 pub mod serve;
 pub mod service;

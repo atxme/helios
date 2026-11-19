@@ -11,6 +11,7 @@ pub(crate) async fn connect(
     state: State<'_, AppState>,
     name: Option<String>,
 ) -> Result<(), String> {
+    allow_engine_foreground(&state);
     match state.client.call(EngineCommand::Connect { name }).await? {
         EngineReply::Unit => Ok(()),
         _ => Err(unexpected_engine_reply()),
@@ -42,6 +43,7 @@ pub(crate) async fn select_and_connect(app: &AppHandle, name: &str) -> Result<()
     // The window may be open behind the menu: it reads its profile list from
     // Rust, and nothing else would tell it the selection just moved.
     let _ = app.emit("helios://config-changed", ());
+    allow_engine_foreground(&state);
     match state
         .client
         .call(EngineCommand::Connect {

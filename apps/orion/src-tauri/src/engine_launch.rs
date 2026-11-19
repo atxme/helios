@@ -39,6 +39,8 @@ use orion_engine::EngineCommand;
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::NamedPipeClient;
 #[cfg(windows)]
+use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
+#[cfg(windows)]
 use tokio::sync::mpsc;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
@@ -204,6 +206,20 @@ fn log_failed_wait() {
 /// The engine's process is waited on from another thread, and shared.
 #[cfg(windows)]
 const _: fn() = assert_send_and_sync::<EngineProcess>;
+
+/// Lets the engine take the foreground for a passphrase dialog it may open.
+///
+/// Windows keeps the foreground with the process the user last activated, and
+/// a dialog the engine opens from behind would sit unseen. The UI allows it
+/// before each command that may ask for a passphrase (ADR-006 §5). A refusal
+/// changes nothing else: the dialog then opens behind, and the gesture still
+/// fails closed.
+#[cfg(windows)]
+pub(crate) fn allow_foreground(process: &EngineProcess) {
+    // SAFETY: takes a process id and no pointer. The result only says whether
+    // the grant held, and a refused grant is the behaviour described above.
+    unsafe { AllowSetForegroundWindow(process.pid()) };
+}
 
 #[cfg(windows)]
 fn assert_send_and_sync<T: Send + Sync>() {}

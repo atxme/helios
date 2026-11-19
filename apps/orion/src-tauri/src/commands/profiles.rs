@@ -309,6 +309,7 @@ pub(crate) async fn save_profile(
     state: State<'_, AppState>,
     draft: ProfileDraft,
 ) -> Result<ConfigView, String> {
+    allow_engine_foreground(&state);
     let view = match state
         .client
         .call(EngineCommand::SaveProfile { draft })

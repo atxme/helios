@@ -176,11 +176,11 @@ pub enum ManifestKey<'a> {
 fn nomad_ikm(
     root_key: &[u8; KEY_LEN],
     passphrase: &nomad::PassphraseKey,
-) -> Zeroizing<[u8; 2 * KEY_LEN]> {
+) -> Result<Zeroizing<[u8; 2 * KEY_LEN]>, VaultError> {
     let mut ikm = Zeroizing::new([0u8; 2 * KEY_LEN]);
     ikm[..KEY_LEN].copy_from_slice(root_key);
-    passphrase.with_exposed(|bytes| ikm[KEY_LEN..].copy_from_slice(bytes));
-    ikm
+    passphrase.with_exposed(|bytes| ikm[KEY_LEN..].copy_from_slice(bytes))?;
+    Ok(ikm)
 }
 
 /// Runs `operation` with the unlock that `key` selects.
@@ -194,7 +194,7 @@ fn with_unlock<R>(
     match key {
         ManifestKey::Service => operation(&aether_vault::Unlock::Key(root_key)),
         ManifestKey::Nomad(passphrase) => {
-            let ikm = nomad_ikm(root_key, passphrase);
+            let ikm = nomad_ikm(root_key, passphrase)?;
             operation(&aether_vault::Unlock::Derived {
                 ikm: ikm.as_ref(),
                 info: nomad::NOMAD_INFO,

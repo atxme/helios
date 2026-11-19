@@ -34,6 +34,10 @@ const LOCK_REFUSED: &str =
 /// Not `Clone`, not `Serialize`, not `Display`: it must not be copied out of
 /// its buffer or sent anywhere. [`PassphraseKey::with_exposed`] is the only
 /// read access, so a platform wrapper can sit around it.
+///
+/// On Windows the bytes held are **protected** with `CryptProtectMemory` for
+/// this process: a debugger or a memory dump that reads the buffer sees
+/// ciphertext, and the plaintext exists only inside [`PassphraseKey::with_exposed`].
 #[derive(Debug)]
 pub struct PassphraseKey(LockedSecret);
 
@@ -58,6 +62,8 @@ impl PassphraseKey {
             normalised.as_bytes(),
             derived.as_mut(),
         );
+        // The copy kept is the protected one. `derived` is wiped on drop.
+        protection::protect(derived.as_mut())?;
         secret
             .set(derived.as_ref())
             .map_err(|_| VaultError::Derive)?;
@@ -65,13 +71,96 @@ impl PassphraseKey {
     }
 
     /// Runs `f` on the key bytes. The only read access to the key.
-    pub fn with_exposed<R>(&self, f: impl FnOnce(&[u8; KEY_LEN]) -> R) -> R {
-        let bytes: &[u8; KEY_LEN] = self
+    ///
+    /// The plaintext lives in a wiped buffer for the duration of `f` only. A
+    /// failure to read it back is an error: `f` never runs on bytes that did
+    /// not come back as the key.
+    pub fn with_exposed<R>(&self, f: impl FnOnce(&[u8; KEY_LEN]) -> R) -> Result<R, VaultError> {
+        let stored: &[u8; KEY_LEN] = self
             .0
             .expose()
             .try_into()
             .expect("a passphrase key is always KEY_LEN bytes");
-        f(bytes)
+        let mut plain = Zeroizing::new([0u8; KEY_LEN]);
+        plain.copy_from_slice(stored);
+        protection::unprotect(plain.as_mut())?;
+        Ok(f(&plain))
+    }
+}
+
+/// Process-local protection of the derived key bytes.
+#[cfg(windows)]
+mod protection {
+    use super::VaultError;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptProtectMemory, CryptUnprotectMemory, CRYPTPROTECTMEMORY_BLOCK_SIZE,
+        CRYPTPROTECTMEMORY_SAME_PROCESS,
+    };
+
+    /// Refusal shown when the derived key cannot be protected in RAM.
+    const PROTECT_REFUSED: &str =
+        "protection mémoire refusée : la clé de passphrase n'a pas été protégée";
+
+    /// Refusal shown when the protected key cannot be read back for use.
+    const UNPROTECT_REFUSED: &str =
+        "protection mémoire refusée : la clé de passphrase n'a pas pu être relue";
+
+    /// Protects `bytes` in place, for this process only.
+    pub fn protect(bytes: &mut [u8]) -> Result<(), VaultError> {
+        check_block_length(bytes, PROTECT_REFUSED)?;
+        // SAFETY: `bytes` is a live, writable buffer of the length passed, and
+        // its length is a whole number of blocks, as the call requires.
+        let ok = unsafe {
+            CryptProtectMemory(
+                bytes.as_mut_ptr().cast(),
+                bytes.len() as u32,
+                CRYPTPROTECTMEMORY_SAME_PROCESS,
+            )
+        };
+        if ok == 0 {
+            return Err(VaultError::MemoryHygiene(PROTECT_REFUSED));
+        }
+        Ok(())
+    }
+
+    /// Reverses [`protect`] in place, for the same process.
+    pub fn unprotect(bytes: &mut [u8]) -> Result<(), VaultError> {
+        check_block_length(bytes, UNPROTECT_REFUSED)?;
+        // SAFETY: as in `protect`, on a buffer protected by it.
+        let ok = unsafe {
+            CryptUnprotectMemory(
+                bytes.as_mut_ptr().cast(),
+                bytes.len() as u32,
+                CRYPTPROTECTMEMORY_SAME_PROCESS,
+            )
+        };
+        if ok == 0 {
+            return Err(VaultError::MemoryHygiene(UNPROTECT_REFUSED));
+        }
+        Ok(())
+    }
+
+    /// The API takes whole blocks only; anything else is refused before the call.
+    fn check_block_length(bytes: &[u8], refusal: &'static str) -> Result<(), VaultError> {
+        let block = CRYPTPROTECTMEMORY_BLOCK_SIZE as usize;
+        if bytes.is_empty() || bytes.len() % block != 0 || u32::try_from(bytes.len()).is_err() {
+            return Err(VaultError::MemoryHygiene(refusal));
+        }
+        Ok(())
+    }
+}
+
+/// Off Windows nothing protects the key: the bytes pass through unchanged.
+#[cfg(not(windows))]
+mod protection {
+    use super::VaultError;
+
+    pub fn protect(_bytes: &mut [u8]) -> Result<(), VaultError> {
+        Ok(())
+    }
+
+    pub fn unprotect(_bytes: &mut [u8]) -> Result<(), VaultError> {
+        Ok(())
     }
 }
 
@@ -131,7 +220,8 @@ mod tests {
                 hex(bytes),
                 "040228c878145844af777e8ff6f99aa97d22ee190289607864e6785e2ac9d93b"
             )
-        });
+        })
+        .expect("exposed");
     }
 
     #[test]
@@ -144,7 +234,8 @@ mod tests {
                 hex(bytes),
                 "fbef8869e778136c3d04a0a45dfc148d5ad21085e192faeeae1885817d529e12"
             )
-        });
+        })
+        .expect("exposed");
     }
 
     #[test]
@@ -153,8 +244,10 @@ mod tests {
         let reference = PassphraseKey::derive("rivière calme montagne bleue vingt", &salt).unwrap();
         let typed =
             PassphraseKey::derive("  rivie\u{0300}re calme montagne bleue vingt  ", &salt).unwrap();
-        let reference = reference.with_exposed(|bytes| *bytes);
-        typed.with_exposed(|bytes| assert_eq!(bytes, &reference));
+        let reference = reference.with_exposed(|bytes| *bytes).expect("exposed");
+        typed
+            .with_exposed(|bytes| assert_eq!(bytes, &reference))
+            .expect("exposed");
     }
 
     #[test]
@@ -234,6 +327,7 @@ mod tests {
     fn the_debug_output_names_no_byte() {
         let key = PassphraseKey::derive(PASSPHRASE, &[9u8; SALT_LEN]).unwrap();
         let rendered = format!("{key:?}");
-        key.with_exposed(|bytes| assert!(!rendered.contains(&hex(bytes))));
+        key.with_exposed(|bytes| assert!(!rendered.contains(&hex(bytes))))
+            .expect("exposed");
     }
 }

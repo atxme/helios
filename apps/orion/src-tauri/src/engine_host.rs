@@ -40,7 +40,11 @@ use orion_engine::pipe::{
 #[cfg(windows)]
 use orion_engine::serve::{serve_until, Engine};
 #[cfg(windows)]
-use orion_engine::service::EngineService;
+use orion_engine::events::EventQueue;
+#[cfg(windows)]
+use orion_engine::lock_watch;
+#[cfg(windows)]
+use orion_engine::service::{EngineService, LockEvent};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
 #[cfg(all(windows, feature = "wireguard"))]
@@ -172,7 +176,7 @@ pub fn run(args: EngineArgs) -> i32 {
         backend,
         log_path,
         env!("CARGO_PKG_VERSION"),
-        Arc::new(orion_core::vault::UnavailablePassphraseSource),
+        Arc::new(orion_core::vault::windows::prompt::NativePassphraseSource),
     ) {
         Ok(engine) => engine,
         Err(error) => return startup_failed(error),
@@ -185,7 +189,26 @@ pub fn run(args: EngineArgs) -> i32 {
         Err(error) => return startup_failed(error),
     };
 
-    let event = runtime.block_on(session(&args, &expected, &sid, engine, parent));
+    // The watch's window runs on its own thread and only sends. The lock is
+    // enabled once it is registered: without it, a nomad unlock is refused.
+    let (lock_sender, lock_events) = tokio::sync::mpsc::unbounded_channel();
+    let watch = match lock_watch::start(lock_sender) {
+        Ok(watch) => {
+            engine.set_lock_watch(true);
+            runtime.spawn(relay_lock_events(Arc::clone(&engine), lock_events));
+            Some(watch)
+        }
+        Err(error) => {
+            tracing::error!(%error, "session watch unavailable: nomad profiles stay locked");
+            None
+        }
+    };
+
+    let event = runtime.block_on(session(&args, &expected, &sid, Arc::clone(&engine), parent));
+    // The engine's own exit locks the nomad profiles last, once the tunnel is down.
+    let (exit_queue, _exit_events) = EventQueue::new();
+    runtime.block_on(engine.on_lock_event(LockEvent::EngineExit, &exit_queue));
+    drop(watch);
     // The thread waiting on the UI's handle cannot be cancelled: do not let the
     // runtime's drop wait for it.
     runtime.shutdown_background();
@@ -323,6 +346,26 @@ fn add_dll_directory(directory: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Locks the nomad profiles for each lock event the watch reports, in order.
+///
+/// No UI session is attached to the watch, so what a lock pushes has nowhere
+/// to go: it is logged, rather than dropped without a trace.
+#[cfg(windows)]
+async fn relay_lock_events(
+    engine: Arc<EngineService>,
+    mut locks: tokio::sync::mpsc::UnboundedReceiver<LockEvent>,
+) {
+    let (queue, mut raised) = EventQueue::new();
+    tokio::spawn(async move {
+        while let Some(event) = raised.recv().await {
+            tracing::warn!(event = ?event, "event raised while locking nomad profiles");
+        }
+    });
+    while let Some(event) = locks.recv().await {
+        engine.on_lock_event(event, &queue).await;
+    }
 }
 
 /// Serves the one UI until the session ends, then tears the engine down.

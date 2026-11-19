@@ -24,3 +24,12 @@ pub(crate) use certificates::*;
 pub(crate) use connection::*;
 pub(crate) use enrollment::*;
 pub(crate) use profiles::*;
+
+/// Lets the elevated engine take the foreground before a command that may open
+/// its passphrase dialog: see [`crate::engine_launch::allow_foreground`].
+pub(crate) fn allow_engine_foreground(state: &AppState) {
+    #[cfg(windows)]
+    crate::engine_launch::allow_foreground(&state.engine);
+    #[cfg(not(windows))]
+    let _ = state;
+}
