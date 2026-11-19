@@ -150,7 +150,14 @@ export function useClient() {
     }
   }, [consumeProfilePath, pushLog])
 
-  const connect = useCallback(async (name?: string) => {
+  /**
+   * Connects, and says whether the user stopped the unlock dialog.
+   *
+   * Resolves `cancelled` when the engine answers `Saisie annulée.`: a choice,
+   * shown as a neutral notice by the caller and never on the error line. Any
+   * other refusal lands on the error line and resolves `done`.
+   */
+  const connect = useCallback(async (name?: string): Promise<PassphraseGesture> => {
     setError(null)
     // New session, new negotiation: we start over from "unknown". Resetting
     // it here rather than on the `connecting` transition is deliberate — a
@@ -162,8 +169,11 @@ export function useClient() {
     setCapture(null)
     try {
       await api.connect(name)
+      return 'done'
     } catch (e) {
+      if (String(e) === PASSPHRASE_CANCELLED) return 'cancelled'
       setError(String(e))
+      return 'done'
     }
   }, [])
 

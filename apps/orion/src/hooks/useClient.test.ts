@@ -306,4 +306,28 @@ describe('useClient', () => {
     })
     expect(result.current.error).toBe('profil « portable » introuvable')
   })
+
+  /// Closing the unlock dialog from «Se connecter» is a choice, not a refusal:
+  /// it resolves as cancelled and leaves the global error line empty. The
+  /// header connect and the locked-row connect both reach this path.
+  it('reports a closed unlock dialog on connect as cancelled, not as an error', async () => {
+    api.getConfig.mockResolvedValue(config)
+    const { result } = renderHook(() => useClient())
+    await waitFor(() => expect(result.current.selectedProfile?.name).toBe('portable'))
+
+    api.connect.mockRejectedValueOnce('Saisie annulée.')
+    let outcome: string | undefined
+    await act(async () => {
+      outcome = await result.current.connect('coffre')
+    })
+    expect(outcome).toBe('cancelled')
+    expect(result.current.error).toBeNull()
+
+    api.connect.mockRejectedValueOnce('profil « coffre » introuvable')
+    await act(async () => {
+      outcome = await result.current.connect('coffre')
+    })
+    expect(outcome).toBe('done')
+    expect(result.current.error).toBe('profil « coffre » introuvable')
+  })
 })

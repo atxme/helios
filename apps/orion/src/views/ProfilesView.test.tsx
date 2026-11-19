@@ -1308,6 +1308,24 @@ describe('ProfilesView nomad profile', () => {
     expect(screen.queryByLabelText('Endpoint')).toBeNull()
   })
 
+  /// The locked-row connect goes through the same unlock dialog: a closed
+  /// dialog is a neutral notice on the profile screen, never an error.
+  it('shows a closed unlock dialog from the locked row as a neutral notice', async () => {
+    const handlers = callbacks()
+    handlers.onConnect.mockResolvedValue('cancelled')
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', locked: [locked] }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'coffre' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Se connecter' }))
+    await waitFor(() => expect(screen.getByText('Saisie annulée.')).toBeTruthy())
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
   it('passes a stored service profile to nomad with its name alone', async () => {
     const handlers = callbacks()
     render(

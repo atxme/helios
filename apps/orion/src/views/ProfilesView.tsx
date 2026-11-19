@@ -129,8 +129,11 @@ interface Props {
   onChangePassphrase: (name: string) => Promise<PassphraseGesture>
   /** Moves a `nomade` profile back to `service`. Resolves `cancelled` when the dialog is closed. */
   onMakeService: (name: string) => Promise<PassphraseGesture>
-  /** Connects to a profile. A locked one is opened by the engine's own prompt. */
-  onConnect: (name: string) => Promise<void>
+  /**
+   * Connects to a profile. A locked one is opened by the engine's own prompt;
+   * resolves `cancelled` when that prompt is closed.
+   */
+  onConnect: (name: string) => Promise<PassphraseGesture>
 }
 
 function blankProfile(): ClientProfile {
@@ -905,7 +908,10 @@ export function ProfilesView({
   const connectLocked = async (name: string) => {
     setGestureBusy(true)
     try {
-      await onConnect(name)
+      const outcome = await onConnect(name)
+      if (outcome === 'cancelled') {
+        setNotice({ tone: 'info', message: 'Saisie annulée.', transient: true })
+      }
     } catch {
       // The global error explains the refusal.
     } finally {
