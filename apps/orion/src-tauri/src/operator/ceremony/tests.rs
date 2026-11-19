@@ -243,11 +243,23 @@ pub(super) struct Domain {
 
 const SERVER_NAME: &str = "gateway.example";
 
+fn enrolled_test_key(serial: u8) -> astra_operator::operations::fixtures::TestKey {
+    let key = astra_operator::operations::fixtures::TestKey::new(serial);
+    key.registered.set(true);
+    key
+}
+
+fn fixture_opening(serial: u8, salt: &[u8; 32]) -> astra_operator::authenticator::Opened {
+    let key = enrolled_test_key(serial);
+    key.derive("astra.example", &[key.credential_id()], salt, "")
+        .expect("fixture key opens its slot")
+}
+
 impl Domain {
     pub(super) fn new(label: &str) -> Self {
         use aether::certificates::encoding::{generate_ml_dsa_87_keypair, TrustDomainId};
         use astra_operator::vault::{
-            draw_salt, AuthoritySecrets, AuthorityVault, SlotEnrolment, SlotRole, SlotSecret,
+            draw_salt, AuthoritySecrets, AuthorityVault, SlotEnrolment, SlotRole,
         };
 
         let directory = std::env::temp_dir().join(format!(
@@ -266,20 +278,22 @@ impl Domain {
             retained_ca_tls: None,
             retained_outgoing_ca_pq: None,
         };
+        let salt = draw_salt().expect("salt");
+        let opened = fixture_opening(1, &salt);
         let vault = AuthorityVault::create(
             TrustDomainId::new([3; 16]).expect("domain"),
             "astra.example",
-            draw_salt().expect("salt"),
+            salt,
             &secrets,
             SlotEnrolment {
                 role: SlotRole::Primary,
                 label: "quotidienne".into(),
-                credential_id: vec![1; 64],
+                credential_id: opened.credential_id,
                 credential_public_key: vec![0xa5, 1],
                 aaguid: [1; 16],
                 enrolled_at: 2_000,
             },
-            &SlotSecret::new(vec![1; 32]),
+            &opened.secret,
             1_000,
         )
         .expect("vault");
@@ -388,6 +402,7 @@ impl Domain {
             &mut |artifact| artifacts.push(artifact),
             &self.vault_path,
             &self.registry,
+            &connect_key,
         );
         (outcome, published, artifacts)
     }
@@ -585,6 +600,7 @@ fn an_unreachable_gateway_falls_back_to_the_supplied_leaf_and_it_is_verified() {
             &mut |_| {},
             &domain.vault_path,
             &domain.registry,
+            &connect_key,
         );
         (outcome, published)
     };
@@ -628,22 +644,27 @@ impl Domain {
     /// the same DER.
     pub(super) fn with_ca_tls(self) -> Self {
         let ca_tls = aether::certificates::test_x509::certificate_authority("helios-client-ca-tls");
-        let vault = astra_operator::store::load(&self.vault_path).expect("vault");
-        let mut relay = astra_operator::handoff::DomainHandoff::beside(&self.vault_path, &vault)
-            .expect("relay");
-        relay.ca_tls_certificate = Some(ca_tls.to_base64());
-        astra_operator::handoff::save(
-            &astra_operator::handoff::path_beside(&self.vault_path),
-            &relay,
-        )
-        .expect("save relay");
+        self.set_ca_tls(&ca_tls);
         self
+    }
+
+    fn set_ca_tls(&self, ca_tls: &DerCertificate) {
+        let mut relay = self.relay();
+        relay.ca_tls_certificate = Some(ca_tls.to_base64());
+        self.save_relay(&relay);
     }
 
     /// An invitation this domain signed, recorded as issued, and the request a
     /// device makes for it. `recorded` is false for an invitation the registry
     /// has never seen.
     fn enrolment(&self, name: &str, recorded: bool) -> Enrolment {
+        let csr = aether::certificates::x509::client_rotation_csr(name)
+            .expect("csr")
+            .csr;
+        self.enrolment_with_csr(name, recorded, csr)
+    }
+
+    fn enrolment_with_csr(&self, name: &str, recorded: bool, csr: DerCertificate) -> Enrolment {
         use aether::certificates::encoding::{MlDsa87Signature, WireGuardKey};
         use aether::key_negotiation::{
             wireguard_proof, EnrollmentInvitation, EnrollmentRequest, ProtectionMode,
@@ -693,9 +714,7 @@ impl Domain {
             timestamp_unix: now,
             requested_name: name.into(),
             client_wg_public_key: WireGuardKey::parse(&device.public_key).expect("device"),
-            tls_csr: aether::certificates::x509::client_rotation_csr(name)
-                .expect("csr")
-                .csr,
+            tls_csr: csr,
             client_ml_dsa_87_public_key: ml_dsa_public,
             wireguard_proof: [0; 32],
             client_signature: MlDsa87Signature::placeholder(),
@@ -736,6 +755,7 @@ impl Domain {
             &mut |artifact| artifacts.push(artifact),
             &self.vault_path,
             &self.registry,
+            &connect_key,
         );
         (outcome, published, artifacts)
     }
@@ -1151,6 +1171,15 @@ fn issued_leaves(
     domain: &Domain,
     enrolment: &Enrolment,
 ) -> astra_operator::enrollment::AcceptedEnrollment {
+    // The older tests do not parse TLS leaves and only need a stable fingerprint.
+    issued_leaves_with_tls(domain, enrolment, enrolment.request.tls_csr.clone())
+}
+
+fn issued_leaves_with_tls(
+    domain: &Domain,
+    enrolment: &Enrolment,
+    tls_certificate: DerCertificate,
+) -> astra_operator::enrollment::AcceptedEnrollment {
     use aether::key_negotiation::{PqCertificate, PqCertificateRole, PQ_CERTIFICATE_VERSION};
 
     let request = &enrolment.request;
@@ -1175,10 +1204,9 @@ fn issued_leaves(
         &domain.ca_private_key,
     )
     .expect("pq leaf");
-    // The CSR stands in for the TLS leaf: these tests do not parse it.
     let accepted = astra_operator::enrollment::AcceptedEnrollment {
         request: request.clone(),
-        tls_certificate: request.tls_csr.clone(),
+        tls_certificate,
         pq_certificate,
     };
     domain
@@ -1523,6 +1551,7 @@ fn the_acceptance_manifest_shows_the_signed_routes() {
         },
         &|_| answer(SERVER_NAME, &domain.gateway_key),
         &|_| Ok(vec![device.clone()]),
+        &connect_key,
     );
     let asked = published
         .iter()
@@ -1660,6 +1689,7 @@ fn run_resume_of(
         resume_with,
         read,
         admitted,
+        &connect_key,
     );
     (outcome, published, artifacts)
 }
@@ -1701,6 +1731,7 @@ fn a_resumed_enrollment_never_reissues_leaves() {
             &mut |artifact| artifacts.push(artifact),
             &domain.vault_path,
             &domain.registry,
+            &connect_key,
         );
         (outcome, published, artifacts)
     };
@@ -2109,10 +2140,7 @@ fn an_export_resumed_offline_signs_the_document_orion_reads() {
     let vault = astra_operator::store::load(&domain.vault_path).expect("vault");
     // The opening the vault's key releases, as the key would: the one the vault
     // was created with.
-    let opened = astra_operator::authenticator::Opened {
-        credential_id: vec![1; 64],
-        secret: astra_operator::vault::SlotSecret::new(vec![1; 32]),
-    };
+    let opened = fixture_opening(1, &vault.salt().expect("vault salt"));
 
     let artifact =
         sign_artifact(&domain.registry, &vault, &opened, &accepted, draft).expect("signed");
@@ -2442,4 +2470,281 @@ fn admission_artifact_names_the_export_command() {
         lines[2],
         "Ajouter --admin à la première ligne pour le premier administrateur, puis « Reprendre » avec ce fichier."
     );
+}
+
+/// Drives the same versioned buttons the UI uses, with the window handle
+/// standing in for the fixture token the operator presents at each prompt.
+fn enrollment_with_keys(
+    domain: &Domain,
+    gesture: EnrollmentGesture,
+    keys: &[u8],
+) -> (
+    Result<(), String>,
+    Vec<OperatorStatus>,
+    Vec<OperatorArtifact>,
+    Vec<u8>,
+) {
+    let (send, receive) = std::sync::mpsc::channel::<Press>();
+    let mut published = Vec::new();
+    let mut artifacts = Vec::new();
+    let delivered = std::cell::Cell::new(false);
+    let touched = std::cell::RefCell::new(Vec::new());
+    let outcome = run_enrollment_with(
+        Id16::new([2; 16]).expect("session id"),
+        gesture,
+        None,
+        receive,
+        &mut |status| {
+            if let GestureState::AwaitingKey { index, .. } = status.gesture {
+                let serial = keys.get(usize::from(index - 1)).copied();
+                send.send(Press {
+                    action: if serial.is_some() {
+                        OperatorAction::Continue
+                    } else {
+                        OperatorAction::Cancel
+                    },
+                    revision: status.revision,
+                    owner: serial.map_or(0, isize::from),
+                    terms: None,
+                })
+                .expect("answer the key prompt");
+            }
+            if status.gesture == GestureState::Done {
+                assert!(delivered.get(), "the artifact must precede completion");
+            }
+            published.push(status);
+        },
+        &mut |artifact| {
+            artifacts.push(artifact);
+            delivered.set(true);
+        },
+        &domain.vault_path,
+        &domain.registry,
+        &|owner| {
+            let serial = u8::try_from(owner).expect("window names the simulated token");
+            touched.borrow_mut().push(serial);
+            Ok(Box::new(enrolled_test_key(serial)))
+        },
+    );
+    (outcome, published, artifacts, touched.into_inner())
+}
+
+/// Matches the CSR to a real TLS leaf or deliberately uses a valid leaf from
+/// another key. Both fixtures keep the matching registry fingerprints.
+fn kept_enrollment_for_delivery(
+    domain: &Domain,
+    matching_leaf: bool,
+) -> astra_operator::enrollment::AcceptedEnrollment {
+    use aether::certificates::test_x509::client_material;
+
+    let tls = client_material("laptop");
+    domain.set_ca_tls(&tls.authority);
+    let enrolment = if matching_leaf {
+        domain.enrolment_with_csr("laptop", true, tls.csr)
+    } else {
+        domain.enrolment("laptop", true)
+    };
+    let accepted = issued_leaves_with_tls(domain, &enrolment, tls.leaf);
+    domain
+        .registry
+        .store_accepted(&accepted.request.invitation_id, &accepted)
+        .expect("keep the acceptance");
+    accepted
+}
+
+fn resume_gesture(
+    domain: &Domain,
+    accepted: &astra_operator::enrollment::AcceptedEnrollment,
+) -> EnrollmentGesture {
+    let device = accepted.request.client_wg_public_key.to_base64();
+    EnrollmentGesture::Resume {
+        invitation_id: accepted.request.invitation_id,
+        endpoint: "198.51.100.7:51820".into(),
+        allowed_ips: Some("10.0.0.0/24".into()),
+        ssh_target: None,
+        enrolment_export: Some(export_text(domain, &device, |_| {})),
+    }
+}
+
+#[test]
+fn offline_resume_publishes_a_signed_profile_bound_to_the_kept_acceptance() {
+    let domain = Domain::new("resume-delivery");
+    let accepted = kept_enrollment_for_delivery(&domain, true);
+    let id = accepted.request.invitation_id;
+    let before = registry_snapshot(&domain, &id);
+
+    let (outcome, statuses, artifacts, touched) =
+        enrollment_with_keys(&domain, resume_gesture(&domain, &accepted), &[1]);
+
+    outcome.expect("offline delivery succeeds");
+    assert_eq!(touched, [1]);
+    let offered = statuses
+        .iter()
+        .find(|status| matches!(status.gesture, GestureState::AwaitingKey { .. }))
+        .expect("key is requested for the prepared document");
+    let Some(AstraManifest::EnrollmentAcceptance(manifest)) = &offered.manifest else {
+        panic!("expected the acceptance manifest before opening the vault");
+    };
+    assert_eq!(manifest.invitation_id, id);
+    assert_eq!(manifest.request_fingerprint, accepted.request.fingerprint());
+
+    let last = statuses.last().expect("complete status");
+    assert_eq!(last.gesture, GestureState::Done);
+    assert_eq!(last.keys[0].label, "quotidienne");
+    let [artifact] = artifacts.as_slice() else {
+        panic!("offline resume should deliver exactly one document");
+    };
+    assert_eq!(artifact.file_name, "laptop.orion");
+    let signed = aether::key_negotiation::EnrollmentDocument::parse(&artifact.contents)
+        .expect("signed profile");
+    signed
+        .verify(&domain.ca_public_key)
+        .expect("CA-PQ signature");
+    assert_eq!(signed.invitation_id, id);
+    assert_eq!(signed.request_id, accepted.request.request_id);
+    assert_eq!(signed.request_fingerprint, manifest.request_fingerprint);
+    assert_eq!(signed.client_tls_certificate, accepted.tls_certificate);
+    let imported = orion_core::parse_profile_import(&artifact.contents, &artifact.file_name)
+        .expect("Orion accepts the delivered document");
+    assert_eq!(imported.profile.allowed_ips, "10.0.0.0/24");
+    assert!(imported.profile.private_key.is_empty());
+    assert_eq!(registry_snapshot(&domain, &id), before);
+}
+
+#[test]
+fn offline_resume_refuses_a_kept_tls_leaf_for_a_different_key_without_delivering() {
+    let domain = Domain::new("resume-leaf-mismatch");
+    let accepted = kept_enrollment_for_delivery(&domain, false);
+    let id = accepted.request.invitation_id;
+    let before = registry_snapshot(&domain, &id);
+
+    let (outcome, statuses, artifacts, touched) =
+        enrollment_with_keys(&domain, resume_gesture(&domain, &accepted), &[1]);
+
+    let error = outcome.expect_err("a TLS leaf must certify the original request");
+    assert!(error.contains("the TLS leaf does not certify the request"));
+    assert_eq!(touched, [1]);
+    assert_eq!(
+        statuses.last().expect("failure status").refusal,
+        Some(Refusal::ManifestMismatch)
+    );
+    assert!(artifacts.is_empty());
+    assert_eq!(registry_snapshot(&domain, &id), before);
+}
+
+#[test]
+fn offline_resume_refuses_an_unenrolled_token_without_delivering() {
+    let domain = Domain::new("resume-key-mismatch");
+    let accepted = kept_enrollment_for_delivery(&domain, true);
+    let id = accepted.request.invitation_id;
+    let before = registry_snapshot(&domain, &id);
+
+    let (outcome, statuses, artifacts, touched) =
+        enrollment_with_keys(&domain, resume_gesture(&domain, &accepted), &[2]);
+
+    outcome.expect_err("the given credential is absent from the vault");
+    assert_eq!(touched, [2]);
+    assert_eq!(
+        statuses.last().expect("failure status").refusal,
+        Some(Refusal::KeyNotEnrolled)
+    );
+    assert!(!statuses
+        .iter()
+        .any(|status| status.gesture == GestureState::Signing));
+    assert!(artifacts.is_empty());
+    assert_eq!(registry_snapshot(&domain, &id), before);
+}
+
+fn invite_gesture(domain: &Domain, allow_readmission: bool) -> EnrollmentGesture {
+    EnrollmentGesture::Invite {
+        valid_for_hours: 2,
+        allow_readmission,
+        name: "laptop".into(),
+        gateway_pq_certificate: Some(domain.gateway_leaf.clone()),
+    }
+}
+
+#[test]
+fn readmission_with_two_distinct_tokens_delivers_the_recorded_signed_invitation() {
+    use astra_operator::vault::{SlotEnrolment, SlotRole};
+
+    let domain = Domain::new("invite-signed-readmission");
+    let mut vault = astra_operator::store::load(&domain.vault_path).expect("vault");
+    let salt = vault.salt().expect("salt");
+    let primary = fixture_opening(1, &salt);
+    let recovery = fixture_opening(2, &salt);
+    vault
+        .add_slot(
+            &primary.credential_id,
+            &primary.secret,
+            SlotEnrolment {
+                role: SlotRole::Recovery,
+                label: "secours".into(),
+                credential_id: recovery.credential_id,
+                credential_public_key: vec![0xa5, 2],
+                aaguid: [2; 16],
+                enrolled_at: 3_000,
+            },
+            &recovery.secret,
+        )
+        .expect("second credential");
+    astra_operator::store::save(&domain.vault_path, &vault).expect("vault with two keys");
+
+    let (outcome, statuses, artifacts, touched) =
+        enrollment_with_keys(&domain, invite_gesture(&domain, true), &[1, 2]);
+
+    outcome.expect("issue the invitation");
+    assert_eq!(touched, [1, 2]);
+    let last = statuses.last().expect("complete status");
+    assert_eq!(last.gesture, GestureState::Done);
+    assert_eq!(
+        last.keys
+            .iter()
+            .map(|key| key.label.as_str())
+            .collect::<Vec<_>>(),
+        ["quotidienne", "secours"]
+    );
+    let [artifact] = artifacts.as_slice() else {
+        panic!("one invitation artifact");
+    };
+    assert_eq!(artifact.file_name, "laptop.helios-invite");
+    let invitation = aether::key_negotiation::decode_invitation_file(&artifact.contents)
+        .expect("delivered invitation");
+    invitation
+        .verify(&domain.ca_public_key, now_unix())
+        .expect("CA-PQ signature");
+    assert!(invitation.allow_readmission);
+    assert_eq!(
+        invitation.gateway_certificate_fingerprint,
+        domain.gateway_leaf_fingerprint()
+    );
+    let record = domain
+        .registry
+        .load(&invitation.invitation_id)
+        .expect("invitation is kept");
+    assert_eq!(
+        record.state,
+        astra_operator::enrollment::InvitationState::Issued
+    );
+    assert_eq!(record.invitation.fingerprint(), invitation.fingerprint());
+}
+
+#[test]
+fn readmission_refuses_the_same_token_twice_before_signing_or_issuing() {
+    let domain = Domain::new("invite-repeated-token");
+
+    let (outcome, statuses, artifacts, touched) =
+        enrollment_with_keys(&domain, invite_gesture(&domain, true), &[1, 1]);
+
+    outcome.expect_err("readmission requires two different credentials");
+    assert_eq!(touched, [1, 1]);
+    assert_eq!(
+        statuses.last().expect("failure status").refusal,
+        Some(Refusal::KeyRepeated)
+    );
+    assert!(!statuses
+        .iter()
+        .any(|status| status.gesture == GestureState::Signing));
+    assert!(artifacts.is_empty());
+    assert!(domain.registry_is_empty());
 }

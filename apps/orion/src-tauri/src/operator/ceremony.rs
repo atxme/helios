@@ -151,7 +151,15 @@ pub fn run_enrollment(
         }
     };
     run_enrollment_with(
-        session_id, gesture, gateway, presses, publish, deposit, vault_path, &registry,
+        session_id,
+        gesture,
+        gateway,
+        presses,
+        publish,
+        deposit,
+        vault_path,
+        &registry,
+        &connect_key,
     )
 }
 
@@ -162,8 +170,7 @@ fn enrollment_locator(gesture: &EnrollmentGesture) -> OperationLocator {
     }
 }
 
-/// [`run_enrollment`], with the registry named, so a test can point it at a
-/// directory of its own.
+/// [`run_enrollment`] with its registry and authenticator connection supplied.
 #[allow(clippy::too_many_arguments)]
 fn run_enrollment_with(
     session_id: Id16,
@@ -174,6 +181,7 @@ fn run_enrollment_with(
     deposit: &mut dyn FnMut(OperatorArtifact),
     vault_path: &Path,
     registry: &InvitationRegistry,
+    connect: KeyConnector<'_>,
 ) -> Result<(), String> {
     let mut ceremony = Ceremony::new(session_id, enrollment_locator(&gesture));
     publish(ceremony.status());
@@ -198,6 +206,7 @@ fn run_enrollment_with(
                 gateway: gateway.as_deref(),
                 sheet: gateway_pq_certificate.as_deref(),
             },
+            connect,
         ),
         EnrollmentGesture::Accept {
             request,
@@ -220,6 +229,7 @@ fn run_enrollment_with(
                 ssh_target: ssh_target.as_deref(),
                 gateway: gateway.as_deref(),
             },
+            connect,
         ),
         EnrollmentGesture::Resume {
             invitation_id,
@@ -246,6 +256,7 @@ fn run_enrollment_with(
             },
             &read_negotiation,
             &read_admitted_keys,
+            connect,
         ),
     }
 }
@@ -278,6 +289,7 @@ fn invitation_key_purpose(index: u8) -> KeyPurpose {
 /// and the manifest is shown, before a key is asked for anything; and the
 /// registry is written by the signing and by nothing earlier, so a ceremony
 /// abandoned or refused before it leaves no record behind.
+#[allow(clippy::too_many_arguments)]
 fn invite(
     ceremony: &mut Ceremony,
     presses: &Receiver<Press>,
@@ -286,6 +298,7 @@ fn invite(
     vault_path: &Path,
     registry: &InvitationRegistry,
     invite: Invite<'_>,
+    connect: KeyConnector<'_>,
 ) -> Result<(), String> {
     let now = now_unix();
     let not_after = now + u64::from(invite.valid_for_hours) * 3_600;
@@ -331,7 +344,7 @@ fn invite(
         let offered = ceremony.status();
         publish(offered.clone());
 
-        let Some(key) = open_key(ceremony, presses, publish, &offered)? else {
+        let Some(key) = open_key_with(ceremony, presses, publish, &offered, connect)? else {
             return Ok(());
         };
         let opened =
@@ -543,6 +556,7 @@ fn gateway_refusal(error: &orion_core::gateway_admin::GatewayAdminError) -> Refu
 /// From the consumption on, the invitation stays consumed whatever happens: a
 /// failure is published, the leaves are kept for the resumption, and no leaf
 /// is ever issued twice.
+#[allow(clippy::too_many_arguments)]
 fn accept(
     ceremony: &mut Ceremony,
     presses: &Receiver<Press>,
@@ -551,6 +565,7 @@ fn accept(
     vault_path: &Path,
     registry: &InvitationRegistry,
     accept: Accept<'_>,
+    connect: KeyConnector<'_>,
 ) -> Result<(), String> {
     let now = now_unix();
     let accepting = match prepare_acceptance(vault_path, registry, &accept, now, &read_negotiation)
@@ -580,7 +595,8 @@ fn accept(
         allowed_ips: accept.allowed_ips.map(str::to_string),
         ssh_target: accept.ssh_target.map(str::to_string),
     };
-    let Some(opened) = open_for_delivery(ceremony, presses, publish, &vault, manifest)? else {
+    let Some(opened) = open_for_delivery(ceremony, presses, publish, &vault, manifest, connect)?
+    else {
         return Ok(());
     };
 
@@ -638,6 +654,7 @@ fn open_for_delivery(
     publish: &mut dyn FnMut(OperatorStatus),
     vault: &AuthorityVault,
     manifest: AcceptanceManifest,
+    connect: KeyConnector<'_>,
 ) -> Result<Option<astra_operator::authenticator::Opened>, String> {
     // Shown before any key is asked for anything, and it states what the
     // consumption and the leaves will be.
@@ -651,7 +668,7 @@ fn open_for_delivery(
     let offered = ceremony.status();
     publish(offered.clone());
 
-    let Some(key) = open_key(ceremony, presses, publish, &offered)? else {
+    let Some(key) = open_key_with(ceremony, presses, publish, &offered, connect)? else {
         return Ok(None);
     };
     let opened = match astra_operator::gestures::open_with_authorized_key(key.as_ref(), vault, "") {
@@ -793,6 +810,7 @@ fn resume(
     resume: Resume<'_>,
     read: GatewayReader<'_>,
     admitted: AdmittedReader<'_>,
+    connect: KeyConnector<'_>,
 ) -> Result<(), String> {
     let resuming = match prepare_resumption(vault_path, registry, &resume, read, admitted) {
         Ok(resuming) => resuming,
@@ -826,7 +844,8 @@ fn resume(
         allowed_ips: resume.delivery.allowed_ips.map(str::to_string),
         ssh_target: resume.delivery.ssh_target.map(str::to_string),
     };
-    let Some(opened) = open_for_delivery(ceremony, presses, publish, &vault, manifest)? else {
+    let Some(opened) = open_for_delivery(ceremony, presses, publish, &vault, manifest, connect)?
+    else {
         return Ok(());
     };
     deliver(
@@ -1915,6 +1934,17 @@ fn prove_key_opens(key: &dyn Authenticator, vault: &AuthorityVault) -> anyhow::R
         .clone())
 }
 
+type KeyConnector<'a> = &'a dyn Fn(isize) -> Result<Box<dyn Authenticator>, (Refusal, String)>;
+
+fn open_key(
+    ceremony: &mut Ceremony,
+    presses: &Receiver<Press>,
+    publish: &mut dyn FnMut(OperatorStatus),
+    offered: &OperatorStatus,
+) -> Result<Option<Box<dyn Authenticator>>, String> {
+    open_key_with(ceremony, presses, publish, offered, &connect_key)
+}
+
 /// Waits for the operator's Continue, then connects the key it asks for.
 ///
 /// The one copy of the sequence every key-asking ceremony shares: wait for the
@@ -1925,11 +1955,12 @@ fn prove_key_opens(key: &dyn Authenticator, vault: &AuthorityVault) -> anyhow::R
 ///
 /// The position of the key (`index` of `of`) is read from the gesture the
 /// ceremony is waiting in, so the caller sets it before offering.
-fn open_key(
+fn open_key_with(
     ceremony: &mut Ceremony,
     presses: &Receiver<Press>,
     publish: &mut dyn FnMut(OperatorStatus),
     offered: &OperatorStatus,
+    connect: KeyConnector<'_>,
 ) -> Result<Option<Box<dyn Authenticator>>, String> {
     let GestureState::AwaitingKey { index, of, .. } = ceremony.gesture else {
         ceremony.refuse(Refusal::Internal);
@@ -1947,7 +1978,7 @@ fn open_key(
 
     ceremony.gesture = GestureState::ProcessingKey { index, of };
     publish(ceremony.status());
-    match connect_key(press.owner) {
+    match connect(press.owner) {
         Ok(key) => Ok(Some(key)),
         Err((refusal, message)) => {
             ceremony.refuse(refusal);
