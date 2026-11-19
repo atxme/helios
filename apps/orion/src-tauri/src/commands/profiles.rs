@@ -2,7 +2,7 @@
 //! volume, the SSH terminal, and validation.
 
 use super::*;
-use orion_core::{read_profile_document, ProfileIssues};
+use orion_core::{read_profile_document, vault::VaultPosture, ProfileIssues};
 use orion_engine::client::EngineClient;
 use orion_engine::{
     ConfigView, EngineCommand, EngineReply, ImportOutcome, ProfileDraft, SecretInput,
@@ -86,13 +86,8 @@ async fn import_profile_document(
 /// memory-lock privilege can change while Orion runs, and a posture panel that
 /// showed a stale "protected" would be worse than one that showed nothing.
 #[tauri::command]
-pub(crate) async fn vault_posture(
-    state: State<'_, AppState>,
-) -> Result<orion_core::vault::VaultPosture, String> {
-    match state.client.call(EngineCommand::VaultPosture).await? {
-        EngineReply::VaultPosture(value) => Ok(value),
-        _ => Err(unexpected_engine_reply()),
-    }
+pub(crate) async fn vault_posture(state: State<'_, AppState>) -> Result<VaultPosture, String> {
+    vault_posture_reply(&state.client, EngineCommand::VaultPosture).await
 }
 
 /// Persists the user's informed choice to keep profiles on a bare volume.
@@ -103,12 +98,15 @@ pub(crate) async fn vault_posture(
 #[tauri::command]
 pub(crate) async fn allow_unencrypted_volume(
     state: State<'_, AppState>,
-) -> Result<orion_core::vault::VaultPosture, String> {
-    match state
-        .client
-        .call(EngineCommand::AllowUnencryptedVolume)
-        .await?
-    {
+) -> Result<VaultPosture, String> {
+    vault_posture_reply(&state.client, EngineCommand::AllowUnencryptedVolume).await
+}
+
+async fn vault_posture_reply(
+    client: &EngineClient,
+    command: EngineCommand,
+) -> Result<VaultPosture, String> {
+    match client.call(command).await? {
         EngineReply::VaultPosture(value) => Ok(value),
         _ => Err(unexpected_engine_reply()),
     }
@@ -124,10 +122,7 @@ pub(crate) async fn allow_unencrypted_volume(
 /// comes into existence when the form is submitted.
 #[tauri::command]
 pub(crate) async fn generate_private_key(state: State<'_, AppState>) -> Result<String, String> {
-    match state.client.call(EngineCommand::GeneratePrivateKey).await? {
-        EngineReply::PublicKey(value) => Ok(value),
-        _ => Err(unexpected_engine_reply()),
-    }
+    public_key_reply(&state.client, EngineCommand::GeneratePrivateKey).await
 }
 
 /// Adopts a private key the user supplies, and returns its public half.
@@ -156,11 +151,15 @@ pub(crate) async fn adopt_private_key(
 ) -> Result<String, String> {
     // Zeroizing from the first instruction: the engine receives it as a secret.
     let private_key = SecretInput::from(private_key);
-    match state
-        .client
-        .call(EngineCommand::AdoptPrivateKey { private_key })
-        .await?
-    {
+    public_key_reply(
+        &state.client,
+        EngineCommand::AdoptPrivateKey { private_key },
+    )
+    .await
+}
+
+async fn public_key_reply(client: &EngineClient, command: EngineCommand) -> Result<String, String> {
+    match client.call(command).await? {
         EngineReply::PublicKey(value) => Ok(value),
         _ => Err(unexpected_engine_reply()),
     }
@@ -169,10 +168,7 @@ pub(crate) async fn adopt_private_key(
 /// Drops the staged key without saving it.
 #[tauri::command]
 pub(crate) async fn discard_staged_key(state: State<'_, AppState>) -> Result<(), String> {
-    match state.client.call(EngineCommand::DiscardStagedKey).await? {
-        EngineReply::Unit => Ok(()),
-        _ => Err(unexpected_engine_reply()),
-    }
+    staging_reply(&state.client, EngineCommand::DiscardStagedKey).await
 }
 
 /// Holds a static PSK the user supplies, until the profile is saved.
@@ -192,20 +188,21 @@ pub(crate) async fn adopt_preshared_key(
     preshared_key: String,
 ) -> Result<(), String> {
     let preshared_key = SecretInput::from(preshared_key);
-    match state
-        .client
-        .call(EngineCommand::AdoptPresharedKey { preshared_key })
-        .await?
-    {
-        EngineReply::Unit => Ok(()),
-        _ => Err(unexpected_engine_reply()),
-    }
+    staging_reply(
+        &state.client,
+        EngineCommand::AdoptPresharedKey { preshared_key },
+    )
+    .await
 }
 
 /// Drops the staged PSK without saving it.
 #[tauri::command]
 pub(crate) async fn discard_staged_psk(state: State<'_, AppState>) -> Result<(), String> {
-    match state.client.call(EngineCommand::DiscardStagedPsk).await? {
+    staging_reply(&state.client, EngineCommand::DiscardStagedPsk).await
+}
+
+async fn staging_reply(client: &EngineClient, command: EngineCommand) -> Result<(), String> {
+    match client.call(command).await? {
         EngineReply::Unit => Ok(()),
         _ => Err(unexpected_engine_reply()),
     }

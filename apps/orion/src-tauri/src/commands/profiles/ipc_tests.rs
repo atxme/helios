@@ -304,3 +304,239 @@ async fn profile_change_refused_by_the_engine_leaves_the_tray_untouched() {
         assert_eq!(result.expect_err("refuse profile change"), expected);
     }
 }
+
+fn posture(protected: bool, waived: bool) -> EngineReply {
+    EngineReply::VaultPosture(VaultPosture {
+        hardware_backed: true,
+        software_keystore: false,
+        volume: if protected {
+            "BitLocker"
+        } else {
+            "non chiffré"
+        }
+        .into(),
+        volume_protected: protected,
+        unencrypted_volume_waived: waived,
+        memory_locked: true,
+        memory: "pages verrouillées".into(),
+        dumps_excluded: true,
+        dumps: "exclus".into(),
+        rotation_required: vec![],
+        legacy_present: false,
+    })
+}
+
+#[tokio::test]
+async fn vault_posture_tracks_the_volume_and_explicit_consent_separately() {
+    let (client, mut engine) = scripted_engine().await;
+    tokio::join!(
+        async {
+            let initial = vault_posture_reply(&client, EngineCommand::VaultPosture)
+                .await
+                .expect("get initial posture");
+            assert!(initial.volume_protected);
+            assert!(!initial.unencrypted_volume_waived);
+
+            let suspended = vault_posture_reply(&client, EngineCommand::VaultPosture)
+                .await
+                .expect("reread suspended volume");
+            assert!(!suspended.volume_protected);
+            assert!(!suspended.unencrypted_volume_waived);
+
+            let accepted = vault_posture_reply(&client, EngineCommand::AllowUnencryptedVolume)
+                .await
+                .expect("acknowledge the explicit waiver");
+            assert!(!accepted.volume_protected);
+            assert!(accepted.unencrypted_volume_waived);
+        },
+        async move {
+            for protected in [true, false] {
+                engine
+                    .reply(|command| {
+                        assert!(matches!(command, EngineCommand::VaultPosture));
+                        Ok(posture(protected, false))
+                    })
+                    .await;
+            }
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::AllowUnencryptedVolume));
+                    Ok(posture(false, true))
+                })
+                .await;
+        }
+    );
+}
+
+#[tokio::test]
+async fn vault_posture_and_waiver_surface_failures() {
+    let (client, mut engine) = scripted_engine().await;
+    tokio::join!(
+        async {
+            assert_eq!(
+                vault_posture_reply(&client, EngineCommand::VaultPosture)
+                    .await
+                    .expect_err("only a posture reply can attest the volume"),
+                unexpected_engine_reply()
+            );
+            assert_eq!(
+                vault_posture_reply(&client, EngineCommand::AllowUnencryptedVolume)
+                    .await
+                    .expect_err("show failure to save the waiver"),
+                "unable to save volume settings"
+            );
+        },
+        async move {
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::VaultPosture));
+                    Ok(EngineReply::Unit)
+                })
+                .await;
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::AllowUnencryptedVolume));
+                    Err("unable to save volume settings".into())
+                })
+                .await;
+        }
+    );
+}
+
+#[tokio::test]
+async fn staged_private_key_commands_return_public_keys_and_discard_by_acknowledgement() {
+    let (client, mut engine) = scripted_engine().await;
+    let private = "fixture private key";
+    tokio::join!(
+        async {
+            let generated = public_key_reply(&client, EngineCommand::GeneratePrivateKey)
+                .await
+                .expect("generate a new staged key");
+            assert_eq!(generated, "generated public key");
+
+            let adopted = public_key_reply(
+                &client,
+                EngineCommand::AdoptPrivateKey {
+                    private_key: SecretInput::from(private.to_string()),
+                },
+            )
+            .await
+            .expect("stage a supplied key");
+            assert_eq!(adopted, "adopted public key");
+
+            staging_reply(&client, EngineCommand::DiscardStagedKey)
+                .await
+                .expect("discard the staged private key");
+        },
+        async move {
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::GeneratePrivateKey));
+                    Ok(EngineReply::PublicKey("generated public key".into()))
+                })
+                .await;
+            engine
+                .reply(|command| {
+                    let EngineCommand::AdoptPrivateKey { private_key } = command else {
+                        panic!("expected the private-key staging command");
+                    };
+                    assert_eq!(private_key.expose(), private);
+                    assert!(!format!("{private_key:?}").contains(private));
+                    Ok(EngineReply::PublicKey("adopted public key".into()))
+                })
+                .await;
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::DiscardStagedKey));
+                    Ok(EngineReply::Unit)
+                })
+                .await;
+        }
+    );
+}
+
+#[tokio::test]
+async fn staged_psk_commands_acknowledge_secret_entry_and_discard_without_returning_a_key() {
+    let (client, mut engine) = scripted_engine().await;
+    let psk = "fixture preshared key";
+    tokio::join!(
+        async {
+            staging_reply(
+                &client,
+                EngineCommand::AdoptPresharedKey {
+                    preshared_key: SecretInput::from(psk.to_string()),
+                },
+            )
+            .await
+            .expect("stage the static PSK");
+            staging_reply(&client, EngineCommand::DiscardStagedPsk)
+                .await
+                .expect("discard the staged PSK");
+        },
+        async move {
+            engine
+                .reply(|command| {
+                    let EngineCommand::AdoptPresharedKey { preshared_key } = command else {
+                        panic!("expected the PSK staging command");
+                    };
+                    assert_eq!(preshared_key.expose(), psk);
+                    assert!(!format!("{preshared_key:?}").contains(psk));
+                    Ok(EngineReply::Unit)
+                })
+                .await;
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::DiscardStagedPsk));
+                    Ok(EngineReply::Unit)
+                })
+                .await;
+        }
+    );
+}
+
+#[tokio::test]
+async fn staging_refuses_mismatched_replies_and_preserves_validation_errors() {
+    let (client, mut engine) = scripted_engine().await;
+    tokio::join!(
+        async {
+            assert_eq!(
+                public_key_reply(&client, EngineCommand::GeneratePrivateKey).await,
+                Err(unexpected_engine_reply())
+            );
+            assert_eq!(
+                staging_reply(&client, EngineCommand::DiscardStagedPsk).await,
+                Err(unexpected_engine_reply())
+            );
+            assert_eq!(
+                staging_reply(
+                    &client,
+                    EngineCommand::AdoptPresharedKey {
+                        preshared_key: SecretInput::from("invalid fixture PSK".to_string()),
+                    },
+                )
+                .await,
+                Err("invalid WireGuard PSK".into())
+            );
+        },
+        async move {
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::GeneratePrivateKey));
+                    Ok(EngineReply::Unit)
+                })
+                .await;
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::DiscardStagedPsk));
+                    Ok(EngineReply::PublicKey("unrelated public key".into()))
+                })
+                .await;
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::AdoptPresharedKey { .. }));
+                    Err("invalid WireGuard PSK".into())
+                })
+                .await;
+        }
+    );
+}
