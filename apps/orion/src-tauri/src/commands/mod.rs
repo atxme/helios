@@ -12,6 +12,8 @@ mod certificates;
 mod connection;
 mod enrollment;
 mod profiles;
+#[cfg(test)]
+mod test_support;
 
 /// What the shell answers when the engine replies with another family's variant.
 pub(crate) fn unexpected_engine_reply() -> String {

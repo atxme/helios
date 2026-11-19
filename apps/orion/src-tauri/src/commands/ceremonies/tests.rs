@@ -270,49 +270,23 @@ enum Query {
 async fn engine_replies(
     replies: impl IntoIterator<Item = (Query, Result<EngineReply, String>)>,
 ) -> (EngineClient, tokio::task::JoinHandle<()>) {
-    use orion_engine::session::{accept_hello, SessionToken};
-    use orion_engine::{limits, read_frame, write_frame, ClientFrame, EngineFrame};
+    use crate::commands::test_support::scripted_engine;
 
-    let token = SessionToken::parse(&"a".repeat(64)).expect("fixture session token");
-    let (client, fake) = tokio::io::duplex(8192);
-    let (client, _events) = orion_engine::client::connect(client, &token)
-        .await
-        .expect("start IPC client");
+    let (client, mut engine) = scripted_engine().await;
     let replies: Vec<_> = replies.into_iter().collect();
     let engine = tokio::spawn(async move {
-        let (reader, mut writer) = tokio::io::split(fake);
-        let mut reader = tokio::io::BufReader::new(reader);
-        accept_hello(&mut reader, &token)
-            .await
-            .expect("client hello");
         for (query, reply) in replies {
-            let frame = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                read_frame::<_, ClientFrame>(&mut reader, limits::REQUEST_BYTES),
-            )
-            .await
-            .expect("command arrives within test deadline")
-            .expect("read command")
-            .expect("client still connected");
-            let ClientFrame::Request { id, command } = frame else {
-                panic!("expected a command after the initial hello");
-            };
-            let command = match *command {
-                EngineCommand::GetState => Query::State,
-                EngineCommand::GetConfig => Query::Config,
-                _ => panic!("unexpected command"),
-            };
-            assert_eq!(command, query);
-            write_frame(
-                &mut writer,
-                &EngineFrame::Reply {
-                    id,
-                    result: reply.map(Box::new),
-                },
-                limits::REPLY_BYTES,
-            )
-            .await
-            .expect("send reply");
+            engine
+                .reply(|command| {
+                    let command = match command {
+                        EngineCommand::GetState => Query::State,
+                        EngineCommand::GetConfig => Query::Config,
+                        _ => panic!("unexpected command"),
+                    };
+                    assert_eq!(command, query);
+                    reply
+                })
+                .await;
         }
     });
     (client, engine)
