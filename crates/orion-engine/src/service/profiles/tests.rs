@@ -36,6 +36,7 @@ fn draft(name: &str) -> ProfileDraft {
         clear_preshared_key: false,
         use_staged_psk: false,
         ssh_target: None,
+        nomad: false,
     }
 }
 

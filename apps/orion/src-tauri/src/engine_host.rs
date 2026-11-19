@@ -167,7 +167,13 @@ pub fn run(args: EngineArgs) -> i32 {
         Ok(backend) => backend,
         Err(error) => return startup_failed(error),
     };
-    let engine = match EngineService::open(paths, backend, log_path, env!("CARGO_PKG_VERSION")) {
+    let engine = match EngineService::open(
+        paths,
+        backend,
+        log_path,
+        env!("CARGO_PKG_VERSION"),
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
+    ) {
         Ok(engine) => engine,
         Err(error) => return startup_failed(error),
     };

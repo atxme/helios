@@ -34,6 +34,7 @@ pub mod keys;
 pub mod manifest;
 pub mod nomad;
 pub mod passphrase;
+pub mod prompt_source;
 pub mod registry;
 pub mod relocation;
 pub mod settings;
@@ -42,6 +43,7 @@ pub mod windows;
 
 pub use keys::{DeviceRootKey, KEY_LEN};
 pub use manifest::{ProfileManifest, SecurityGeneration, MAX_MANIFEST_BYTES};
+pub use prompt_source::{PassphraseSource, PromptPurpose, UnavailablePassphraseSource};
 pub use registry::{Registry, RegistryEntry};
 pub use settings::LocalSettings;
 pub use store::{Bootstrap, MigrationReport, ProfileStore};
@@ -587,6 +589,13 @@ pub struct VaultPosture {
     pub rotation_required: Vec<String>,
     /// A plaintext `profiles.toml` is still present and not yet migrated.
     pub legacy_present: bool,
+    /// The engine receives the session and power notifications that lock a
+    /// `nomade` profile again. Without them no such profile can be opened.
+    pub lock_watch_active: bool,
+    /// The passphrase of a `nomade` profile is typed in the platform's
+    /// protected dialog. Decided by the engine's passphrase source, never by
+    /// the configuration.
+    pub nomad_available: bool,
 }
 
 impl VaultPosture {
@@ -621,6 +630,8 @@ mod posture_tests {
             dumps: String::new(),
             rotation_required: Vec::new(),
             legacy_present: false,
+            lock_watch_active: true,
+            nomad_available: true,
         }
     }
 

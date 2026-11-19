@@ -650,7 +650,7 @@ fn main() {
                 tracing::error!(%error, "emplacements d'Orion introuvables — Orion refuse de démarrer");
                 std::process::exit(1)
             });
-        EngineService::open(paths, backend, log_path, env!("CARGO_PKG_VERSION")).unwrap_or_else(
+        EngineService::open(paths, backend, log_path, env!("CARGO_PKG_VERSION"), Arc::new(orion_core::vault::UnavailablePassphraseSource)).unwrap_or_else(
             |error| {
                 tracing::error!(%error, "moteur d'Orion impossible à construire — Orion refuse de démarrer");
                 std::process::exit(1)

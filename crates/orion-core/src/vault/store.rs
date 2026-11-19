@@ -1083,6 +1083,9 @@ impl ProfileStore {
             dumps: exclusion.detail().to_string(),
             rotation_required: self.rotation_required().unwrap_or_default(),
             legacy_present: self.legacy_present(),
+            lock_watch_active: self.lock_watch_active(),
+            // Known only to the engine, which holds the passphrase source.
+            nomad_available: false,
         }
     }
 

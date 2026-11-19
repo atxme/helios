@@ -8,7 +8,9 @@
 use std::sync::Arc;
 
 use aether::TunnelState;
-use orion_core::{backend::EventSink, ClientConfig, ClientEvent, ClientProfile};
+use orion_core::{
+    backend::EventSink, vault::PromptPurpose, ClientConfig, ClientEvent, ClientProfile,
+};
 use tokio::sync::Mutex;
 
 use super::certificates::{spawn_automatic_certificate_renewal, spawn_trust_refresh};
@@ -39,6 +41,20 @@ impl EngineService {
         events: &EventQueue,
         name: Option<String>,
     ) -> Result<(), String> {
+        // A locked `nomade` profile is not in the configuration, and is opened
+        // here, with its passphrase, when it is the one to mount. Only a name the
+        // configuration lists as locked is asked for: a profile already open in
+        // this session asks nothing, and a plain one never reaches the vault.
+        let locked_target = {
+            let cfg = self.config.lock().await;
+            name.clone()
+                .or_else(|| cfg.selected.clone())
+                .filter(|target| cfg.locked.iter().any(|locked| &locked.name == target))
+        };
+        if let Some(target) = locked_target {
+            self.unlock_if_nomad(&target, PromptPurpose::Unlock).await?;
+        }
+
         let profile = {
             let cfg = self.config.lock().await;
             match name {

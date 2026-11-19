@@ -153,17 +153,41 @@ fn settle_saved_enrollment(identities: &Path, identity: &str) {
 
 impl EngineService {
     /// The configuration as the screen sees it, with why the vault could not
-    /// be opened, when it could not. Every view carries it, so a reply that
-    /// replaces the screen's configuration never drops the cause.
-    fn config_view(&self, config: &orion_core::ClientConfig) -> ConfigView {
-        ConfigView {
+    /// be opened, when it could not, and where each profile is sealed. Every
+    /// view carries it, so a reply that replaces the screen's configuration
+    /// never drops the cause.
+    pub(super) fn config_view(&self, config: &orion_core::ClientConfig) -> ConfigView {
+        let mut view = ConfigView {
             vault_error: self.vault_error.clone(),
             ..ConfigView::from(config)
+        };
+        for profile in &mut view.profiles {
+            profile.mode = self.mode_label(&profile.name);
+        }
+        view
+    }
+
+    /// The configuration as it stands now, for a reply after a change.
+    pub(super) async fn config_view_now(&self) -> ConfigView {
+        self.config_view(&*self.config.lock().await)
+    }
+
+    /// `"nomade"` or `"service"`, from the registry. A profile whose mode
+    /// cannot be read is shown as `nomade`: the stricter label, and the one
+    /// that does not promise a profile opens without a passphrase.
+    fn mode_label(&self, name: &str) -> String {
+        match self.store.mode_of(name) {
+            Ok(Some(mode)) => mode.as_str().to_string(),
+            Ok(None) => "service".to_string(),
+            Err(error) => {
+                tracing::warn!(profil = %name, %error, "profile mode unreadable");
+                "nomade".to_string()
+            }
         }
     }
 
     pub async fn get_config(&self) -> Result<ConfigView, String> {
-        Ok(self.config_view(&*self.config.lock().await))
+        Ok(self.config_view_now().await)
     }
 
     /// Decodes a document chosen by the user without persisting it.
@@ -273,7 +297,16 @@ impl EngineService {
     /// memory-lock privilege can change while Orion runs, and a posture panel that
     /// showed a stale "protected" would be worse than one that showed nothing.
     pub fn vault_posture(&self) -> Result<VaultPosture, String> {
-        Ok(self.store.posture())
+        Ok(self.posture())
+    }
+
+    /// The store's posture, completed with what only the engine knows: whether
+    /// a `nomade` passphrase can be typed in a protected dialog at all.
+    fn posture(&self) -> VaultPosture {
+        VaultPosture {
+            nomad_available: self.passphrases.is_native_dialog(),
+            ..self.store.posture()
+        }
     }
 
     /// Persists the user's informed choice to keep profiles on a bare volume.
@@ -282,7 +315,7 @@ impl EngineService {
     /// first state the guarantees being withdrawn, and an ordinary write must
     /// never turn a missing BitLocker posture into consent by itself.
     pub fn allow_unencrypted_volume(&self) -> Result<VaultPosture, String> {
-        let posture = self.store.posture();
+        let posture = self.posture();
         if posture.volume_protected || posture.unencrypted_volume_waived {
             return Ok(posture);
         }
@@ -292,7 +325,7 @@ impl EngineService {
         tracing::warn!(
             "CHIFFREMENT DE VOLUME NON EXIGÉ après confirmation dans Orion — les anciens blocs disque, le fichier d'échange et celui d'hibernation ne sont pas couverts"
         );
-        Ok(self.store.posture())
+        Ok(self.posture())
     }
 
     /// Reports the faulty fields of a profile being edited.
@@ -485,6 +518,12 @@ impl EngineService {
     /// **verified prerequisite**, not a recommendation, because application
     /// encryption reaches neither the old SSD blocks nor the hibernation file.
     pub async fn save_profile(&self, draft: ProfileDraft) -> Result<ConfigView, String> {
+        // A nomad flag on a name the vault does not hold seals a new profile
+        // under a passphrase. On a known name it is ignored: switching is its
+        // own gesture, and a save must never re-seal a profile by side effect.
+        if draft.nomad && !self.holds_profile(&draft.name).await {
+            return self.save_new_nomad(draft).await;
+        }
         let mut cfg = self.config.lock().await;
         self.require_protected_volume()?;
         // A pending import wins over the stored profile of the same name. An
@@ -513,6 +552,46 @@ impl EngineService {
             .map_err(|e| e.to_string())?;
         if let Some(block) = &profile.key_negotiation {
             settle_saved_enrollment(&self.identities, &block.identity);
+        }
+        cfg.upsert(profile).map_err(|error| error.to_string())?;
+        cfg.selected = Some(selected.clone());
+        self.store.select(&selected).map_err(|e| e.to_string())?;
+        Ok(self.config_view(&cfg))
+    }
+
+    /// Whether the configuration holds the name, sealed or locked.
+    async fn holds_profile(&self, name: &str) -> bool {
+        let cfg = self.config.lock().await;
+        cfg.find(name).is_some() || cfg.locked.iter().any(|locked| locked.name == name)
+    }
+
+    /// Seals a profile that does not exist yet as `nomade`, under a passphrase
+    /// asked for now. The passphrase is asked before the configuration is
+    /// locked, so a dialog left open does not stall the other commands.
+    async fn save_new_nomad(&self, draft: ProfileDraft) -> Result<ConfigView, String> {
+        self.require_protected_volume()?;
+        let name = draft.name.clone();
+        let passphrase = self.new_passphrase(&name).await?;
+        let mut cfg = self.config.lock().await;
+        let pending = self.pending_imports.lock().await.remove(&name);
+        let stored = profile_edit_base(pending.as_ref(), cfg.find(&name));
+        let staged = self.staged_key.lock().await.take();
+        let staged_psk = self.staged_psk.lock().await.take();
+        let profile = merge_draft(draft, stored, staged.as_ref(), staged_psk.as_ref())?;
+        let selected = profile.name.clone();
+        let identity = profile
+            .key_negotiation
+            .as_ref()
+            .map(|block| block.identity.clone());
+        let profile = self
+            .in_store(move |store| {
+                store
+                    .save_new_nomad_profile(&profile, passphrase.as_str())
+                    .map(|()| profile)
+            })
+            .await?;
+        if let Some(identity) = identity {
+            settle_saved_enrollment(&self.identities, &identity);
         }
         cfg.upsert(profile).map_err(|error| error.to_string())?;
         cfg.selected = Some(selected.clone());
