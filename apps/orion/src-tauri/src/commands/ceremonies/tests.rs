@@ -362,6 +362,71 @@ async fn loopback_gateway(
     (address, server)
 }
 
+async fn pending_gateway(status: u16, body: &str) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("ephemeral loopback listener");
+    let address = format!(
+        "http://{}",
+        listener.local_addr().expect("listener address")
+    );
+    let body = body.to_string();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                .await
+                .expect("pending request arrives")
+                .expect("accept pending request");
+        let mut request = Vec::new();
+        let mut chunk = [0; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream.read(&mut chunk).await.expect("request headers");
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..count]);
+        }
+        assert!(String::from_utf8_lossy(&request)
+            .lines()
+            .next()
+            .is_some_and(|line| line.starts_with("GET /api/certificates/operator/pending ")));
+        let reason = match status {
+            200 => "OK",
+            403 => "Forbidden",
+            503 => "Unavailable",
+            _ => "Test",
+        };
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("pending response");
+        drop(stream);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "a gateway must be read only once per list refresh"
+        );
+    });
+    (address, server)
+}
+
+fn pending_operation(reason: &str, byte: char) -> String {
+    format!(
+        r#"{{"operation_id":"{byte}0000000000000000000000000000000","scope":"fleet_leafs","reason":"{reason}","requested_by":"operator","target_count":2,"required_credentials":1,"campaign_fingerprint":"{}","created_at":10,"expires_at":20}}"#,
+        "a".repeat(64)
+    )
+}
+
 fn selected_profile() -> ConfigView {
     let mut primary = profile("primary", Some(" http://127.0.0.1:1 "));
     primary.peer_public_key = " gateway-key ".into();
@@ -405,6 +470,157 @@ async fn wrong_engine_reply_cannot_supply_a_gateway_target() {
         assert_eq!(error, unexpected_engine_reply());
         engine.await.expect("scripted engine");
     }
+}
+
+#[tokio::test]
+async fn domain_defaults_use_only_the_selected_profile_and_refuse_wrong_replies() {
+    let mut selected = profile("selected", None);
+    selected.endpoint = "VPN.Example.net:443".into();
+    let mut other = profile("other", None);
+    other.endpoint = "other.example.org".into();
+    let (client, engine) = engine_replies([(
+        Query::Config,
+        Ok(EngineReply::Config(view(
+            Some("selected"),
+            vec![other, selected],
+        ))),
+    )])
+    .await;
+
+    let defaults = operator_domain_defaults_from(&client)
+        .await
+        .expect("selected profile defaults");
+    assert_eq!(defaults.rp_id.as_deref(), Some("vpn.example.net"));
+    engine.await.expect("scripted engine");
+
+    let (client, engine) =
+        engine_replies([(Query::Config, Ok(EngineReply::State("up".into())))]).await;
+    let error = operator_domain_defaults_from(&client)
+        .await
+        .expect_err("mismatched engine reply is refused");
+    assert_eq!(error, unexpected_engine_reply());
+    engine.await.expect("scripted engine");
+}
+
+#[tokio::test]
+async fn pending_operations_deduplicate_gateway_urls_and_return_their_campaigns() {
+    let first = pending_operation("first campaign", '1');
+    let first_body = format!(r#"{{"operations":[{first}]}}"#);
+    let (gateway, server) = pending_gateway(200, &first_body).await;
+    let primary = profile("primary", Some(&gateway));
+    let duplicate = profile("duplicate", Some(&gateway));
+    let (client, engine) = engine_replies([(
+        Query::Config,
+        Ok(EngineReply::Config(view(None, vec![primary, duplicate]))),
+    )])
+    .await;
+
+    let pending = operator_pending_operations_from(&client)
+        .await
+        .expect("deduplicated pending campaigns");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].reason, "first campaign");
+    engine.await.expect("scripted engine");
+    server.await.expect("one gateway request");
+}
+
+#[tokio::test]
+async fn pending_operations_aggregate_campaigns_across_gateways_in_profile_order() {
+    let first_body = format!(r#"{{"operations":[{}]}}"#, pending_operation("first", '1'));
+    let second_body = format!(r#"{{"operations":[{}]}}"#, pending_operation("second", '2'));
+    let (first, first_server) = pending_gateway(200, &first_body).await;
+    let (second, second_server) = pending_gateway(200, &second_body).await;
+    let (client, engine) = engine_replies([(
+        Query::Config,
+        Ok(EngineReply::Config(view(
+            None,
+            vec![
+                profile("first", Some(&first)),
+                profile("second", Some(&second)),
+            ],
+        ))),
+    )])
+    .await;
+
+    let pending = operator_pending_operations_from(&client)
+        .await
+        .expect("campaigns from both gateways");
+    assert_eq!(
+        pending
+            .iter()
+            .map(|item| item.reason.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+    engine.await.expect("scripted engine");
+    first_server.await.expect("first gateway request");
+    second_server.await.expect("second gateway request");
+}
+
+#[tokio::test]
+async fn pending_operations_keep_reachable_campaigns_when_another_gateway_refuses() {
+    let success_body = format!(
+        r#"{{"operations":[{}]}}"#,
+        pending_operation("available", '3')
+    );
+    let (refusing, refusing_server) = pending_gateway(403, "{}").await;
+    let (available, available_server) = pending_gateway(200, &success_body).await;
+    let (client, engine) = engine_replies([(
+        Query::Config,
+        Ok(EngineReply::Config(view(
+            None,
+            vec![
+                profile("refusing", Some(&refusing)),
+                profile("available", Some(&available)),
+            ],
+        ))),
+    )])
+    .await;
+
+    let pending = operator_pending_operations_from(&client)
+        .await
+        .expect("partial results are still readable");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].reason, "available");
+    engine.await.expect("scripted engine");
+    refusing_server.await.expect("refusal response");
+    available_server.await.expect("successful response");
+}
+
+#[tokio::test]
+async fn pending_operations_return_empty_when_all_gateways_refuse_or_are_unreachable() {
+    let (refusing, refusing_server) = pending_gateway(503, "{}").await;
+    let (offline, offline_server) = loopback_gateway(1, false).await;
+    let (client, engine) = engine_replies([(
+        Query::Config,
+        Ok(EngineReply::Config(view(
+            None,
+            vec![
+                profile("refusing", Some(&refusing)),
+                profile("offline", Some(&offline)),
+            ],
+        ))),
+    )])
+    .await;
+
+    let pending = operator_pending_operations_from(&client)
+        .await
+        .expect("unreachable gateways mean nothing pending");
+    assert!(pending.is_empty());
+    engine.await.expect("scripted engine");
+    refusing_server.await.expect("refusal response");
+    offline_server.await.expect("dropped gateway connection");
+}
+
+#[tokio::test]
+async fn pending_operations_refuse_a_mismatched_engine_reply() {
+    let (client, engine) =
+        engine_replies([(Query::Config, Ok(EngineReply::State("up".into())))]).await;
+    let error = operator_pending_operations_from(&client)
+        .await
+        .expect_err("wrong reply is refused");
+    assert_eq!(error, unexpected_engine_reply());
+    engine.await.expect("scripted engine");
 }
 
 #[tokio::test]

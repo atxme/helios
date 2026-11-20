@@ -82,8 +82,14 @@ pub(crate) async fn dismiss_operator_ceremony(
 pub(crate) async fn operator_pending_operations(
     state: State<'_, AppState>,
 ) -> Result<Vec<orion_core::operator_pending::OperatorPendingOperation>, String> {
+    operator_pending_operations_from(&state.client).await
+}
+
+async fn operator_pending_operations_from(
+    client: &EngineClient,
+) -> Result<Vec<orion_core::operator_pending::OperatorPendingOperation>, String> {
     let gateways: Vec<String> = {
-        let view = match state.client.call(EngineCommand::GetConfig).await? {
+        let view = match client.call(EngineCommand::GetConfig).await? {
             EngineReply::Config(view) => view,
             _ => return Err(unexpected_engine_reply()),
         };
@@ -350,7 +356,13 @@ where
 pub(crate) async fn operator_domain_defaults(
     state: State<'_, AppState>,
 ) -> Result<crate::operator::DomainDefaults, String> {
-    let view = match state.client.call(EngineCommand::GetConfig).await? {
+    operator_domain_defaults_from(&state.client).await
+}
+
+async fn operator_domain_defaults_from(
+    client: &EngineClient,
+) -> Result<crate::operator::DomainDefaults, String> {
+    let view = match client.call(EngineCommand::GetConfig).await? {
         EngineReply::Config(value) => value,
         _ => return Err(unexpected_engine_reply()),
     };
