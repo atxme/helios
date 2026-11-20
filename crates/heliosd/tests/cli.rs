@@ -13,6 +13,7 @@ fn heliosd(root: &Path, arguments: &[&str]) -> Output {
         .args(arguments)
         .env("HELIOS_NETWORK_CONFIG", root.join("network.toml"))
         .env("HELIOS_UPDATE_STAGING", root.join("updates"))
+        .env("HELIOS_ASTRA_CHANNEL", root.join("astra-channel.json"))
         .env("HELIOS_UPDATE_CHANNEL", "cli-test")
         .env("RUST_LOG", "info,tss_esapi=warn")
         .output()
@@ -237,4 +238,168 @@ minimum_key_negotiation_mode = "classic"
     assert!(!migrated.contains("classic"));
     assert_eq!(migrated.matches("minimum_key_negotiation_mode").count(), 1);
     assert!(migrated.contains("minimum_key_negotiation_mode = \"ml_kem\""));
+}
+
+fn astra_pin(
+    root: &Path,
+    file: &str,
+    name: &str,
+    usage: rcgen::ExtendedKeyUsagePurpose,
+) -> std::path::PathBuf {
+    let mut params = rcgen::CertificateParams::new(vec![name.into()]).unwrap();
+    params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![usage];
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = params.self_signed(&key).unwrap();
+    let destination = root.join(file);
+    fs::write(&destination, cert.der().as_ref()).unwrap();
+    destination
+}
+
+fn channel_init(pin: &Path) -> Vec<&str> {
+    vec![
+        "init-astra-channel",
+        "--bind",
+        "10.88.0.1:8444",
+        "--astra-certificate",
+        pin.to_str().unwrap(),
+    ]
+}
+
+fn channel_fields(output: &str) -> std::collections::BTreeMap<&str, &str> {
+    output
+        .lines()
+        .take_while(|line| !line.is_empty())
+        .map(|line| line.split_once('=').unwrap())
+        .collect()
+}
+
+fn assert_public_channel_certificate(
+    fields: &std::collections::BTreeMap<&str, &str>,
+    prefix: &str,
+) {
+    use aether::certificates::encoding::DerCertificate;
+
+    let certificate = DerCertificate::parse(fields[format!("{prefix}_certificate").as_str()])
+        .expect("public certificate encoded in stdout");
+    assert_eq!(
+        fields[format!("{prefix}_fingerprint").as_str()],
+        certificate.fingerprint().to_hex(),
+    );
+}
+
+#[test]
+fn astra_channel_init_prints_the_public_server_certificate_and_resumes_idempotently() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let pin = astra_pin(
+        root,
+        "astra-client.der",
+        "astra.internal",
+        rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+    );
+    let args = channel_init(&pin);
+
+    let output = stdout(heliosd(root, &args));
+    let fields = channel_fields(&output);
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields["bind"], "10.88.0.1:8444");
+    assert_public_channel_certificate(&fields, "gateway_channel");
+
+    let state_path = root.join("astra-channel.json");
+    let originally_written = fs::read(&state_path).unwrap();
+    let document: serde_json::Value = serde_json::from_slice(&originally_written).unwrap();
+    assert_eq!(
+        document["certificate"],
+        fields["gateway_channel_certificate"]
+    );
+    let key = document["private_key"]
+        .as_str()
+        .expect("test transport key");
+    assert!(!key.is_empty());
+    assert!(!output.contains(key));
+    assert_eq!(stdout(heliosd(root, &args)), output);
+    assert!(
+        fs::read(&state_path).unwrap() == originally_written,
+        "repeat changed the channel state"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(state_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
+fn astra_channel_init_prints_distinct_certificates_for_the_two_directions() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let pin = astra_pin(
+        root,
+        "astra-client.der",
+        "astra.internal",
+        rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+    );
+    let authority = astra_pin(
+        root,
+        "astra-authority.der",
+        astra_channel::ASTRA_INTERNAL_SERVER_NAME,
+        rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+    );
+    let mut args = channel_init(&pin);
+    args.extend([
+        "--authority",
+        "10.88.0.2:8444",
+        "--astra-authority-certificate",
+        authority.to_str().unwrap(),
+    ]);
+
+    let output = stdout(heliosd(root, &args));
+    let fields = channel_fields(&output);
+    assert_eq!(fields.len(), 5);
+    assert_public_channel_certificate(&fields, "gateway_channel");
+    assert_public_channel_certificate(&fields, "gateway_client");
+    assert_ne!(
+        fields["gateway_channel_certificate"],
+        fields["gateway_client_certificate"]
+    );
+
+    let stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("astra-channel.json")).unwrap()).unwrap();
+    assert_eq!(stored["authority"], "10.88.0.2:8444");
+    assert_eq!(
+        stored["client_certificate"],
+        fields["gateway_client_certificate"]
+    );
+    assert!(!output.contains(stored["client_private_key"].as_str().unwrap()));
+}
+
+#[test]
+fn astra_channel_init_refuses_incomplete_pairing_or_wildcard_binding() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let missing = root.join("pin-not-read.der");
+    let mut partial = channel_init(&missing);
+    partial.extend(["--authority", "10.88.0.2:8444"]);
+    let mut wildcard = channel_init(&missing);
+    wildcard[2] = "0.0.0.0:8444";
+
+    for (args, reason) in [
+        (partial, "dialling half needs both"),
+        (
+            wildcard,
+            "private lifecycle API belongs on the gateway's veth address",
+        ),
+    ] {
+        let output = heliosd(root, &args);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(diagnostic.contains(reason), "{diagnostic}");
+        assert!(!root.join("astra-channel.json").exists());
+    }
 }
