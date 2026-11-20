@@ -331,32 +331,28 @@ fn an_expired_rollback_says_a_restart_is_due_rather_than_going_quiet() {
 }
 
 #[test]
-fn promotion_composes_only_the_halves_named_by_the_transition() {
-    let active = StoredPrivateIdentity {
-        tls_private_key: "active-tls".into(),
-        pq_private_key: "active-pq".into(),
-    };
-    let candidate = StoredCandidateIdentity {
-        tls_private_key: Some("candidate-tls".into()),
-        pq_private_key: "candidate-pq".into(),
-    };
-    let promoted =
-        compose_private_identity(active, candidate, true, false).expect("TLS-only rotation");
-    assert_eq!(promoted.tls_private_key, "candidate-tls");
-    assert_eq!(promoted.pq_private_key, "active-pq");
+fn promotion_composes_every_tls_and_pq_rotation_combination() {
+    for (rotate_tls, rotate_pq, expected_tls, expected_pq) in [
+        (false, false, "active-tls", "active-pq"),
+        (true, false, "candidate-tls", "active-pq"),
+        (false, true, "active-tls", "candidate-pq"),
+        (true, true, "candidate-tls", "candidate-pq"),
+    ] {
+        let active = StoredPrivateIdentity {
+            tls_private_key: "active-tls".into(),
+            pq_private_key: "active-pq".into(),
+        };
+        let candidate = StoredCandidateIdentity {
+            tls_private_key: rotate_tls.then(|| "candidate-tls".into()),
+            pq_private_key: "candidate-pq".into(),
+        };
 
-    let active = StoredPrivateIdentity {
-        tls_private_key: "active-tls".into(),
-        pq_private_key: "active-pq".into(),
-    };
-    let candidate = StoredCandidateIdentity {
-        tls_private_key: None,
-        pq_private_key: "candidate-pq".into(),
-    };
-    let promoted =
-        compose_private_identity(active, candidate, false, true).expect("PQ-only rotation");
-    assert_eq!(promoted.tls_private_key, "active-tls");
-    assert_eq!(promoted.pq_private_key, "candidate-pq");
+        let promoted = compose_private_identity(active, candidate, rotate_tls, rotate_pq)
+            .expect("the selected key halves are present");
+
+        assert_eq!(promoted.tls_private_key, expected_tls);
+        assert_eq!(promoted.pq_private_key, expected_pq);
+    }
 }
 
 #[test]

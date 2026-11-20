@@ -82,7 +82,7 @@ struct UnsupportedMssFirewall {
 
 struct TransitionFirewall {
     states: std::sync::Mutex<Vec<TunnelState>>,
-    refuse: bool,
+    refuse_state: Option<TunnelState>,
 }
 
 #[async_trait::async_trait]
@@ -96,7 +96,7 @@ impl FirewallBackend for TransitionFirewall {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .push(state);
-        if self.refuse {
+        if self.refuse_state == Some(state) {
             Err(aether::HeliosError::Firewall("test refusal".into()))
         } else {
             Ok(())
@@ -114,7 +114,7 @@ async fn transition_updates_state_broadcasts_and_applies_the_matching_policy_sta
     let (event_tx, mut events) = broadcast::channel(4);
     let firewall = TransitionFirewall {
         states: std::sync::Mutex::new(Vec::new()),
-        refuse: false,
+        refuse_state: None,
     };
     let policy = configured_network().firewall_policy();
 
@@ -144,7 +144,7 @@ async fn transition_propagates_firewall_refusal() {
     let (event_tx, _events) = broadcast::channel(4);
     let firewall = TransitionFirewall {
         states: std::sync::Mutex::new(Vec::new()),
-        refuse: true,
+        refuse_state: Some(TunnelState::Up),
     };
     let policy = configured_network().firewall_policy();
 
@@ -273,7 +273,7 @@ async fn shutdown_applies_the_down_posture_before_removing_wireguard_even_on_err
         let (event_tx, mut events) = broadcast::channel(4);
         let firewall = TransitionFirewall {
             states: std::sync::Mutex::new(Vec::new()),
-            refuse: refuse_firewall,
+            refuse_state: refuse_firewall.then_some(TunnelState::Down),
         };
         let wg = TeardownProbe {
             firewall: &firewall,
@@ -1089,6 +1089,60 @@ async fn dry_run_connection_stays_blocked_until_handshake() {
 }
 
 #[tokio::test]
+async fn startup_firewall_refusal_prevents_wireguard_bring_up() {
+    let network = configured_network();
+    let state = Arc::new(RwLock::new(TunnelState::Down));
+    let (events, _) = broadcast::channel(8);
+    let firewall = TransitionFirewall {
+        states: std::sync::Mutex::new(Vec::new()),
+        refuse_state: Some(TunnelState::Connecting),
+    };
+    let wireguard = helios_wireguard::DryRunBackend::new();
+    let policy = network.firewall_policy();
+
+    // `run` establishes the fail-closed Down posture before it attempts the
+    // tunnel bring-up. Refuse the subsequent Connecting rules to prove the
+    // wireguard backend is not touched when that policy cannot be installed.
+    transition(&state, &events, TunnelState::Down, &firewall, &policy)
+        .await
+        .expect("the initial kill-switch posture is accepted");
+    let error = do_connect(
+        &network,
+        &wireguard,
+        &state,
+        &events,
+        &firewall,
+        &policy,
+        true,
+        &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
+    )
+    .await
+    .expect_err("startup must fail when the Connecting firewall posture is refused");
+
+    assert!(format!("{error:#}").contains("test refusal"));
+    assert_eq!(
+        *firewall
+            .states
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        [TunnelState::Down, TunnelState::Connecting]
+    );
+    assert!(
+        !wireguard.is_up(),
+        "WireGuard must not start without policy"
+    );
+    assert!(
+        state.read().await.kill_switch_engaged(),
+        "the refusal must not expose an Up state"
+    );
+    assert!(wireguard
+        .peers()
+        .await
+        .expect("backend peer snapshot")
+        .is_empty());
+}
+
+#[tokio::test]
 async fn disconnection_tears_down_wireguard_and_re_engages_the_kill_switch() {
     let network = configured_network();
     let shared_network = Arc::new(RwLock::new(network.duplicate()));
@@ -1824,7 +1878,7 @@ async fn connect_command_applies_connecting_firewall_state_while_wireguard_start
     let shared_policy = Arc::new(RwLock::new(policy.clone()));
     let firewall = TransitionFirewall {
         states: std::sync::Mutex::new(Vec::new()),
-        refuse: false,
+        refuse_state: None,
     };
 
     let (result, events, state, wireguard) = run_observed_command(
