@@ -26,6 +26,9 @@ use std::path::Path;
 use aether::certificates::client::ExpiredCertificateRecoveryRequest;
 use aether::certificates::encoding::{DerCertificate, Id16, MlDsa87PublicKey};
 use aether::certificates::operator_session::{RecoveryManifest, RemoteState};
+use aether::certificates::transport::{
+    ExpiredRecoveryAuthorizationDeposit, ExpiredRecoveryGrantDeposit, ExpiredRecoveryOperationView,
+};
 use aether::certificates::window::TransitionWindow;
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
@@ -117,6 +120,24 @@ pub fn begin(
     offered_webauthn_origin: Option<&str>,
     now: u64,
 ) -> Result<Verified> {
+    begin_with_fetch(
+        vault_path,
+        operation,
+        offered_authority_url,
+        offered_webauthn_origin,
+        now,
+        origin::Origin::recovery,
+    )
+}
+
+fn begin_with_fetch(
+    vault_path: &Path,
+    operation: Id16,
+    offered_authority_url: Option<&str>,
+    offered_webauthn_origin: Option<&str>,
+    now: u64,
+    fetch: impl FnOnce(&origin::Origin, &Id16) -> Result<ExpiredRecoveryOperationView>,
+) -> Result<Verified> {
     let vault = store::load(vault_path)?;
     let handoff = handoff::DomainHandoff::beside(vault_path, &vault)?;
     let identity = handoff::identity_of(&handoff)?;
@@ -143,7 +164,7 @@ pub fn begin(
         offered_authority_url,
     )?;
     let client = origin::Origin::new(&authority_url)?;
-    let view = client.recovery(&operation)?;
+    let view = fetch(&client, &operation)?;
     let request = view
         .request
         .clone()
@@ -216,6 +237,31 @@ impl Verified {
         pin: &str,
         progress: &mut dyn FnMut(RemoteState),
     ) -> Result<()> {
+        self.approve_with_transport(
+            key,
+            pin,
+            progress,
+            origin::Origin::deposit_recovery_authorization,
+            origin::Origin::deposit_recovery_grant,
+        )
+    }
+
+    fn approve_with_transport(
+        self,
+        key: &dyn Authenticator,
+        pin: &str,
+        progress: &mut dyn FnMut(RemoteState),
+        deposit_authorization: impl FnOnce(
+            &origin::Origin,
+            &Id16,
+            &ExpiredRecoveryAuthorizationDeposit,
+        ) -> Result<ExpiredRecoveryOperationView>,
+        deposit_grant: impl FnOnce(
+            &origin::Origin,
+            &Id16,
+            &ExpiredRecoveryGrantDeposit,
+        ) -> Result<ExpiredRecoveryOperationView>,
+    ) -> Result<()> {
         let produced = signing::recover_expired_identity(
             &self.vault,
             key,
@@ -236,9 +282,10 @@ impl Verified {
         progress(RemoteState::Prepared);
         let authorization = produced.authorization;
 
-        let staged = self.client.deposit_recovery_authorization(
+        let staged = deposit_authorization(
+            &self.client,
             &self.operation,
-            &aether::certificates::transport::ExpiredRecoveryAuthorizationDeposit {
+            &ExpiredRecoveryAuthorizationDeposit {
                 authorization: Box::new(authorization.clone()),
                 evidence: Box::new(produced.evidence),
             },
@@ -274,9 +321,10 @@ impl Verified {
             &gateway_pq_public_key,
             &gateway_fingerprint,
         )?;
-        self.client.deposit_recovery_grant(
+        deposit_grant(
+            &self.client,
             &self.operation,
-            &aether::certificates::transport::ExpiredRecoveryGrantDeposit {
+            &ExpiredRecoveryGrantDeposit {
                 grant: Box::new(grant),
             },
         )?;
@@ -335,3 +383,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod ceremony_tests;

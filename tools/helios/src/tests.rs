@@ -1,4 +1,5 @@
 use super::*;
+mod operator;
 
 async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
     use tokio::io::AsyncReadExt as _;
@@ -35,10 +36,24 @@ async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
     String::from_utf8_lossy(&request).into_owned()
 }
 
-async fn one_response_server(
+pub(super) async fn one_response_server(
     status: &'static str,
-    body: &'static str,
+    body: impl Into<String>,
 ) -> (String, tokio::task::JoinHandle<String>) {
+    let (base, responses) = http_response_sequence([(status, body.into())]).await;
+    let request = tokio::spawn(async move {
+        responses
+            .await
+            .expect("mock HTTP server")
+            .pop()
+            .expect("one request")
+    });
+    (base, request)
+}
+
+pub(super) async fn http_response_sequence<const N: usize>(
+    responses: [(&'static str, String); N],
+) -> (String, tokio::task::JoinHandle<Vec<String>>) {
     use tokio::io::AsyncWriteExt as _;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -46,21 +61,27 @@ async fn one_response_server(
         .expect("local HTTP listener");
     let address = listener.local_addr().expect("listener address");
     let task = tokio::spawn(async move {
-        let (mut stream, _) =
-            tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
-                .await
-                .expect("HTTP client connects within the test deadline")
-                .expect("HTTP request");
-        let request = read_http_request(&mut stream).await;
-        let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream
-            .write_all(response.as_bytes())
+        let mut requests = Vec::with_capacity(N);
+        for (status, body) in responses {
+            let (mut stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
+                    .await
+                    .expect("HTTP client connects within the test deadline")
+                    .expect("HTTP request");
+            requests.push(read_http_request(&mut stream).await);
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                stream.write_all(response.as_bytes()),
+            )
             .await
+            .expect("HTTP response is sent within the test deadline")
             .expect("write HTTP response");
-        request
+        }
+        requests
     });
     (format!("http://{address}"), task)
 }

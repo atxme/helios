@@ -262,3 +262,170 @@ fn own_key_comes_from_the_domain_profile() {
         None
     );
 }
+
+#[derive(Debug, PartialEq, Eq)]
+enum Query {
+    State,
+    Config,
+}
+
+async fn engine_replies(
+    replies: impl IntoIterator<Item = (Query, Result<EngineReply, String>)>,
+) -> (EngineClient, tokio::task::JoinHandle<()>) {
+    use crate::commands::test_support::scripted_engine;
+
+    let (client, mut engine) = scripted_engine().await;
+    let replies: Vec<_> = replies.into_iter().collect();
+    let engine = tokio::spawn(async move {
+        for (query, reply) in replies {
+            engine
+                .reply(|command| {
+                    let command = match command {
+                        EngineCommand::GetState => Query::State,
+                        EngineCommand::GetConfig => Query::Config,
+                        _ => panic!("unexpected command"),
+                    };
+                    assert_eq!(command, query);
+                    reply
+                })
+                .await;
+        }
+    });
+    (client, engine)
+}
+
+fn selected_profile() -> ConfigView {
+    let mut primary = profile("primary", Some(" http://127.0.0.1:1 "));
+    primary.peer_public_key = " gateway-key ".into();
+    primary.public_key = Some(" workstation-key ".into());
+    let mut other = profile("unselected", Some("http://127.0.0.1:2"));
+    other.peer_public_key = "another-gateway".into();
+    other.public_key = Some("another-workstation".into());
+    view(Some("primary"), vec![other, primary])
+}
+
+#[tokio::test]
+async fn connected_target_resolves_gateway_and_workstation_from_the_same_profile() {
+    let (client, engine) = engine_replies([
+        (Query::State, Ok(EngineReply::State("up".into()))),
+        (Query::Config, Ok(EngineReply::Config(selected_profile()))),
+    ])
+    .await;
+
+    let target = connected_target_from(&client)
+        .await
+        .expect("connected target");
+    assert_eq!(target.address, "http://127.0.0.1:1");
+    assert_eq!(target.peer_key, "gateway-key");
+    assert_eq!(target.own_key.as_deref(), Some("workstation-key"));
+    engine.await.expect("scripted engine");
+}
+
+#[tokio::test]
+async fn wrong_engine_reply_cannot_supply_a_gateway_target() {
+    for replies in [
+        vec![(Query::State, Ok(EngineReply::Config(selected_profile())))],
+        vec![
+            (Query::State, Ok(EngineReply::State("up".into()))),
+            (Query::Config, Ok(EngineReply::State("up".into()))),
+        ],
+    ] {
+        let (client, engine) = engine_replies(replies).await;
+        let error = connected_target_from(&client)
+            .await
+            .expect_err("fail closed on mismatched reply");
+        assert_eq!(error, unexpected_engine_reply());
+        engine.await.expect("scripted engine");
+    }
+}
+
+#[tokio::test]
+async fn rotations_still_report_the_local_vault_when_the_gateway_is_offline() {
+    use orion_core::operator_rotations::Reach;
+
+    let domain = astra_operator::operations::fixtures::domain();
+    let vault_bytes = std::fs::read(&domain.path).expect("fixture vault");
+    let (client, engine) = engine_replies([
+        (Query::State, Ok(EngineReply::State("down".into()))),
+        (Query::Config, Ok(EngineReply::Config(selected_profile()))),
+    ])
+    .await;
+    let overview = rotations_overview(&client, Ok(domain.path.clone()))
+        .await
+        .expect("offline overview");
+
+    assert!(!overview.tunnel);
+    assert!(matches!(overview.pending, Reach::Unreachable));
+    assert!(matches!(overview.authority, Reach::Unreachable));
+    assert!(matches!(overview.domain, Reach::Unreachable));
+    assert!(overview.vault_error.is_none());
+    let vault = overview.vault.expect("public vault overview");
+    assert!(vault.bootstrapped);
+    assert!(vault.credentials_complete);
+    assert_eq!(vault.slots.len(), domain.keys.len());
+    assert_eq!(domain.touches(), 0);
+    assert_eq!(
+        std::fs::read(&domain.path).expect("unchanged vault"),
+        vault_bytes
+    );
+    engine.await.expect("scripted engine");
+}
+
+#[tokio::test]
+async fn rotations_preserve_an_invalid_vault_location_as_a_separate_error() {
+    let (client, engine) = engine_replies([(Query::State, Err("engine unavailable".into()))]).await;
+    let overview = rotations_overview(&client, Err("invalid path".into()))
+        .await
+        .expect("partial overview");
+
+    assert!(!overview.tunnel);
+    assert!(overview.vault.is_none());
+    assert_eq!(overview.vault_error, Some("emplacement"));
+    engine.await.expect("scripted engine");
+}
+
+#[tokio::test]
+async fn peers_without_a_tunnel_show_neither_gateway_data_nor_a_workstation_key() {
+    use orion_core::operator_rotations::Reach;
+
+    let fixture = selected_profile();
+    let (client, engine) = engine_replies([
+        (Query::State, Ok(EngineReply::State("down".into()))),
+        (Query::Config, Ok(EngineReply::Config(fixture.clone()))),
+    ])
+    .await;
+    let overview = peers_overview(&client, &fixture, Err("invalid path".into()))
+        .await
+        .expect("partial overview");
+
+    assert!(matches!(overview.certificates, Reach::Unreachable));
+    assert!(matches!(overview.admitted, Reach::Unreachable));
+    assert!(matches!(overview.astra_revoked, Reach::Unreachable));
+    assert!(matches!(overview.pending_revocations, Reach::Unreachable));
+    assert!(overview.local_pending.is_none());
+    assert!(overview.own_key.is_none());
+    assert!(overview.now_unix.is_none());
+    engine.await.expect("scripted engine");
+}
+
+#[tokio::test]
+async fn reading_peers_offline_does_not_create_a_missing_vault_directory() {
+    let domain = astra_operator::operations::fixtures::domain();
+    let directory = domain.path.with_file_name("missing");
+    let missing = directory.join("authority-vault.json");
+    let fixture = selected_profile();
+    let (client, engine) = engine_replies([
+        (Query::State, Ok(EngineReply::State("down".into()))),
+        (Query::Config, Ok(EngineReply::Config(fixture.clone()))),
+    ])
+    .await;
+
+    let overview = peers_overview(&client, &fixture, Ok(missing))
+        .await
+        .expect("offline overview");
+
+    assert!(overview.local_pending.is_none());
+    assert!(overview.own_key.is_none());
+    assert!(!directory.exists());
+    engine.await.expect("scripted engine");
+}

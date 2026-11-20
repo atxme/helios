@@ -589,3 +589,5 @@ mod lifecycle {
         assert!(service.recoveries.lock().await.is_empty());
     }
 }
+
+mod automatic;

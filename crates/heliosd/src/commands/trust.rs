@@ -671,6 +671,9 @@ fn initial_trust_domain_state(
 }
 
 #[cfg(test)]
+mod command_tests;
+
+#[cfg(test)]
 mod trust_domain_seeding_tests {
     use super::{
         domain_client_tls_ca, enrolment_export, initial_trust_domain_state, load_trust_domain,
@@ -692,7 +695,7 @@ mod trust_domain_seeding_tests {
         DerCertificate::new(vec![0x30, 0x03, 0x02, 0x01, byte]).expect("certificate")
     }
 
-    fn gateway_identity(wg_public_key: &str) -> super::ServedIdentityMaterials {
+    pub(super) fn gateway_identity(wg_public_key: &str) -> super::ServedIdentityMaterials {
         use aether::key_negotiation::{issue_pq_certificate, PqCertificate, PqCertificateRole};
         use base64::{engine::general_purpose::STANDARD, Engine as _};
 
@@ -721,7 +724,7 @@ mod trust_domain_seeding_tests {
         }
     }
 
-    fn initial_state(
+    pub(super) fn initial_state(
         served: super::ServedIdentityMaterials,
     ) -> helios_provisioning::certificates::RegistryState {
         let (_, ca_public) = generate_ml_dsa_87_keypair().expect("CA keypair");
@@ -769,7 +772,7 @@ mod trust_domain_seeding_tests {
         (registry, directory, peer_key)
     }
 
-    fn key(seed: u8) -> WireGuardKey {
+    pub(super) fn key(seed: u8) -> WireGuardKey {
         WireGuardKey::from_bytes([seed; 32])
     }
 

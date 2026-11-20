@@ -15,8 +15,14 @@ pub(crate) async fn preview_enrollment_invitation(
     state: State<'_, AppState>,
     contents: String,
 ) -> Result<InvitationPreviewView, String> {
-    match state
-        .client
+    preview_enrollment_invitation_from(&state.client, contents).await
+}
+
+async fn preview_enrollment_invitation_from(
+    client: &EngineClient,
+    contents: String,
+) -> Result<InvitationPreviewView, String> {
+    match client
         .call(EngineCommand::PreviewEnrollmentInvitation { contents })
         .await?
     {
@@ -34,8 +40,22 @@ pub(crate) async fn begin_enrollment(
     confirmed_ca_fingerprint: String,
     requested_name: String,
 ) -> Result<String, String> {
-    match state
-        .client
+    begin_enrollment_from(
+        &state.client,
+        invitation,
+        confirmed_ca_fingerprint,
+        requested_name,
+    )
+    .await
+}
+
+async fn begin_enrollment_from(
+    client: &EngineClient,
+    invitation: String,
+    confirmed_ca_fingerprint: String,
+    requested_name: String,
+) -> Result<String, String> {
+    match client
         .call(EngineCommand::BeginEnrollment {
             invitation,
             confirmed_ca_fingerprint,
@@ -52,11 +72,13 @@ pub(crate) async fn begin_enrollment(
 pub(crate) async fn list_pending_enrollments(
     state: State<'_, AppState>,
 ) -> Result<Vec<PendingEnrollment>, String> {
-    match state
-        .client
-        .call(EngineCommand::ListPendingEnrollments)
-        .await?
-    {
+    list_pending_enrollments_from(&state.client).await
+}
+
+async fn list_pending_enrollments_from(
+    client: &EngineClient,
+) -> Result<Vec<PendingEnrollment>, String> {
+    match client.call(EngineCommand::ListPendingEnrollments).await? {
         EngineReply::PendingEnrollments(value) => Ok(value),
         _ => Err(unexpected_engine_reply()),
     }
@@ -69,8 +91,14 @@ pub(crate) async fn export_pending_request(
     state: State<'_, AppState>,
     request_id: String,
 ) -> Result<String, String> {
-    match state
-        .client
+    export_pending_request_from(&state.client, request_id).await
+}
+
+async fn export_pending_request_from(
+    client: &EngineClient,
+    request_id: String,
+) -> Result<String, String> {
+    match client
         .call(EngineCommand::ExportPendingRequest { request_id })
         .await?
     {
@@ -85,8 +113,14 @@ pub(crate) async fn discard_pending_enrollment(
     state: State<'_, AppState>,
     request_id: String,
 ) -> Result<(), String> {
-    match state
-        .client
+    discard_pending_enrollment_from(&state.client, request_id).await
+}
+
+async fn discard_pending_enrollment_from(
+    client: &EngineClient,
+    request_id: String,
+) -> Result<(), String> {
+    match client
         .call(EngineCommand::DiscardPendingEnrollment { request_id })
         .await?
     {
@@ -94,3 +128,6 @@ pub(crate) async fn discard_pending_enrollment(
         _ => Err(unexpected_engine_reply()),
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -87,3 +87,6 @@ impl EngineService {
             .map_err(|error| format!("{error:#}"))
     }
 }
+
+#[cfg(test)]
+pub(super) mod tests;

@@ -6,7 +6,11 @@ use orion_engine::{AboutView, EngineCommand, EngineReply, KeyNegotiationSupport}
 
 #[tauri::command]
 pub(crate) async fn get_state(state: State<'_, AppState>) -> Result<String, String> {
-    match state.client.call(EngineCommand::GetState).await? {
+    get_state_from(&state.client).await
+}
+
+async fn get_state_from(client: &EngineClient) -> Result<String, String> {
+    match client.call(EngineCommand::GetState).await? {
         EngineReply::State(value) => Ok(value),
         _ => Err(unexpected_engine_reply()),
     }
@@ -14,7 +18,11 @@ pub(crate) async fn get_state(state: State<'_, AppState>) -> Result<String, Stri
 
 #[tauri::command]
 pub(crate) async fn backend_kind(state: State<'_, AppState>) -> Result<String, String> {
-    match state.client.call(EngineCommand::BackendKind).await? {
+    backend_kind_from(&state.client).await
+}
+
+async fn backend_kind_from(client: &EngineClient) -> Result<String, String> {
+    match client.call(EngineCommand::BackendKind).await? {
         EngineReply::Backend(value) => Ok(value),
         _ => Err(unexpected_engine_reply()),
     }
@@ -24,7 +32,11 @@ pub(crate) async fn backend_kind(state: State<'_, AppState>) -> Result<String, S
 /// must remain up to capture routes and prevent a clear-text leak.
 #[tauri::command]
 pub(crate) async fn adapter_is_up(state: State<'_, AppState>) -> Result<bool, String> {
-    match state.client.call(EngineCommand::AdapterIsUp).await? {
+    adapter_is_up_from(&state.client).await
+}
+
+async fn adapter_is_up_from(client: &EngineClient) -> Result<bool, String> {
+    match client.call(EngineCommand::AdapterIsUp).await? {
         EngineReply::Flag(value) => Ok(value),
         _ => Err(unexpected_engine_reply()),
     }
@@ -32,7 +44,11 @@ pub(crate) async fn adapter_is_up(state: State<'_, AppState>) -> Result<bool, St
 
 #[tauri::command]
 pub(crate) async fn about_orion(state: State<'_, AppState>) -> Result<AboutView, String> {
-    match state.client.call(EngineCommand::AboutOrion).await? {
+    about_orion_from(&state.client).await
+}
+
+async fn about_orion_from(client: &EngineClient) -> Result<AboutView, String> {
+    match client.call(EngineCommand::AboutOrion).await? {
         EngineReply::About(value) => Ok(value),
         _ => Err(unexpected_engine_reply()),
     }
@@ -42,11 +58,13 @@ pub(crate) async fn about_orion(state: State<'_, AppState>) -> Result<AboutView,
 pub(crate) async fn key_negotiation_support(
     state: State<'_, AppState>,
 ) -> Result<KeyNegotiationSupport, String> {
-    match state
-        .client
-        .call(EngineCommand::KeyNegotiationSupport)
-        .await?
-    {
+    key_negotiation_support_from(&state.client).await
+}
+
+async fn key_negotiation_support_from(
+    client: &EngineClient,
+) -> Result<KeyNegotiationSupport, String> {
+    match client.call(EngineCommand::KeyNegotiationSupport).await? {
         EngineReply::KeyNegotiation(value) => Ok(value),
         _ => Err(unexpected_engine_reply()),
     }
@@ -59,11 +77,14 @@ pub(crate) async fn run_speed_test(
     state: State<'_, AppState>,
     mode: String,
 ) -> Result<orion_core::SpeedTestResult, String> {
-    match state
-        .client
-        .call(EngineCommand::RunSpeedTest { mode })
-        .await?
-    {
+    run_speed_test_from(&state.client, mode).await
+}
+
+async fn run_speed_test_from(
+    client: &EngineClient,
+    mode: String,
+) -> Result<orion_core::SpeedTestResult, String> {
+    match client.call(EngineCommand::RunSpeedTest { mode }).await? {
         EngineReply::SpeedTest(result) => Ok(result),
         _ => Err(unexpected_engine_reply()),
     }
@@ -264,3 +285,6 @@ mod tests {
         assert!(error.starts_with("création de "));
     }
 }
+
+#[cfg(test)]
+mod ipc_tests;

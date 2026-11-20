@@ -245,8 +245,11 @@ fn a_malformed_pending_request_is_not_treated_as_absent() {
 }
 
 fn leaf_for(public_key: &MlDsa87PublicKey) -> PqCertificate {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
     let (ca_private, _) = generate_ml_dsa_87_keypair().expect("keygen");
+    leaf_for_ca(public_key, &ca_private)
+}
+
+fn leaf_for_ca(public_key: &MlDsa87PublicKey, ca_private: &[u8]) -> PqCertificate {
     issue_pq_certificate(
         PqCertificate {
             version: PQ_CERTIFICATE_VERSION,
@@ -255,12 +258,12 @@ fn leaf_for(public_key: &MlDsa87PublicKey) -> PqCertificate {
             issuer: "CA-PQ".into(),
             role: PqCertificateRole::Gateway,
             wireguard_public_key: WireGuardKey::from_bytes([9; 32]).to_base64(),
-            ml_dsa_87_public_key: STANDARD.encode(public_key.as_bytes()),
+            ml_dsa_87_public_key: public_key.to_base64(),
             not_before_unix: 0,
             not_after_unix: NOW + 1_000_000,
             ml_dsa_87_signature: String::new(),
         },
-        &ca_private,
+        ca_private,
     )
     .expect("issue")
 }
@@ -455,6 +458,421 @@ fn staged_transition(epoch: u64) -> GatewayIdentityTransition {
         reason: aether::certificates::authority::RotationReason::Scheduled,
         ca_signature: MlDsa87Signature::placeholder(),
     }
+}
+
+struct InstallationFixture {
+    directory: tempfile::TempDir,
+    registry: CertificateRegistry,
+    documents: IdentityDocuments,
+    request: GatewayCertificateRequest,
+    transition: GatewayIdentityTransition,
+    rollback: CertificateServiceRollbackAuthorization,
+}
+
+impl InstallationFixture {
+    fn new() -> Self {
+        let directory = tempfile::tempdir().expect("temporary installation directory");
+        let documents = documents_in(directory.path());
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("CA keypair");
+        let mut gateway = gateway();
+        let active_public =
+            MlDsa87PublicKey::parse(&gateway.active_gateway_certificate.ml_dsa_87_public_key)
+                .expect("active gateway public key");
+        gateway.active_gateway_certificate = leaf_for_ca(&active_public, &ca_private);
+        gateway.current_ca_public_key = ca_public;
+        let registry = registry_in(directory.path(), gateway);
+        let registry = CertificateRegistry::bootstrap(
+            directory.path().join("certificates.json"),
+            registry.state().clone(),
+        )
+        .expect("persist initial registry");
+
+        let gateway = &registry.state().gateway;
+        let request = request(gateway.gateway_decision_epoch + 1, NOW + 3_600);
+        let candidate = leaf_for_ca(&request.new_ml_dsa_87_public_key, &ca_private);
+        let mut transition = transition(request.gateway_identity_epoch, Some(candidate), None);
+        transition.active_gateway_tls_certificate_fingerprint = gateway.active_tls_fingerprint();
+        transition.active_gateway_certificate_fingerprint = gateway
+            .active_pq_fingerprint()
+            .expect("active PQ fingerprint");
+        let transition = transition.sign(&ca_private).expect("sign transition");
+        let rollback = CertificateServiceRollbackAuthorization {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: gateway.trust_domain_id,
+            ca_epoch: gateway.ca_epoch,
+            gateway_wg_public_key: gateway.gateway_wg_public_key,
+            server_name: gateway.server_name.clone(),
+            transition_fingerprint: transition.fingerprint().expect("transition fingerprint"),
+            selected_certificate_fingerprint: gateway.active_tls_fingerprint(),
+            campaign_fingerprint: Fingerprint::of(b"operator campaign"),
+            expires_at: transition.window.not_after,
+            ca_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&ca_private)
+        .expect("sign rollback");
+
+        Self {
+            directory,
+            registry,
+            documents,
+            request,
+            transition,
+            rollback,
+        }
+    }
+
+    fn install(&mut self) -> Result<StagedTransition> {
+        install_transition_at(
+            &mut self.registry,
+            self.transition.clone(),
+            NOW,
+            Some(&self.request),
+            None,
+            self.documents.transition.clone(),
+        )
+    }
+
+    fn registry_path(&self) -> std::path::PathBuf {
+        self.directory.path().join("certificates.json")
+    }
+}
+
+#[test]
+fn installing_a_signed_transition_keeps_the_outgoing_identity_and_restores_its_document_on_replay()
+{
+    let mut fixture = InstallationFixture::new();
+    let outgoing = fixture.registry.state().gateway.clone();
+
+    let staged = fixture.install().expect("stage signed transition");
+    assert!(!staged.already_present);
+    assert_eq!(staged.path, fixture.documents.transition);
+    assert_eq!(staged.transition, fixture.transition);
+    let registry_path = fixture.registry_path();
+    let persisted = std::fs::read(&registry_path).expect("read staged registry");
+    let reloaded = CertificateRegistry::load(&registry_path)
+        .expect("reload registry")
+        .expect("registry exists");
+    let gateway = &reloaded.state().gateway;
+    assert_eq!(
+        gateway.active_gateway_identity_epoch,
+        outgoing.active_gateway_identity_epoch
+    );
+    assert_eq!(
+        gateway.active_pq_fingerprint().expect("active PQ"),
+        outgoing.active_pq_fingerprint().expect("outgoing PQ")
+    );
+    assert_eq!(
+        gateway.active_tls_fingerprint(),
+        outgoing.active_tls_fingerprint()
+    );
+    assert_eq!(
+        gateway.next_gateway_identity_epoch,
+        Some(staged.transition.gateway_identity_epoch)
+    );
+    assert_eq!(
+        gateway.next_transition_fingerprint,
+        Some(staged.transition.fingerprint().expect("fingerprint"))
+    );
+    assert!(!gateway.published);
+
+    std::fs::remove_file(&staged.path).expect("simulate a missing staged document");
+    let replay = fixture.install().expect("replay signed transition");
+    assert!(replay.already_present);
+    assert_eq!(
+        read_staged_transition(&replay.path).expect("read restored document"),
+        Some(fixture.transition)
+    );
+    assert_eq!(
+        std::fs::read(registry_path).expect("read registry again"),
+        persisted
+    );
+}
+
+#[test]
+fn a_candidate_mismatch_cannot_overwrite_a_staged_document() {
+    let mut fixture = InstallationFixture::new();
+    let staged = fixture.install().expect("stage signed transition");
+    let previous_document = std::fs::read(&staged.path).expect("read staged document");
+    let registry_path = fixture.registry_path();
+    let previous_registry = std::fs::read(&registry_path).expect("read staged registry");
+
+    fixture.request = request(fixture.transition.gateway_identity_epoch, NOW + 3_600);
+    let Err(error) = fixture.install() else {
+        panic!("a different local candidate must be refused");
+    };
+    assert!(
+        error.to_string().contains("key this gateway did not seal"),
+        "{error:#}"
+    );
+    assert_eq!(
+        std::fs::read(staged.path).expect("read staged document again"),
+        previous_document
+    );
+    assert_eq!(
+        std::fs::read(registry_path).expect("read registry again"),
+        previous_registry
+    );
+}
+
+#[test]
+fn a_transition_signed_by_another_ca_cannot_overwrite_the_retained_document() {
+    let mut fixture = InstallationFixture::new();
+    let document = &fixture.documents.transition;
+    std::fs::write(document, b"retained transition").expect("write retained document");
+    let registry_path = fixture.registry_path();
+    let previous_registry = std::fs::read(&registry_path).expect("read original registry");
+    let (wrong_ca, _) = generate_ml_dsa_87_keypair().expect("other CA keypair");
+    fixture.transition = fixture
+        .transition
+        .sign(&wrong_ca)
+        .expect("sign with other CA");
+
+    let Err(error) = fixture.install() else {
+        panic!("the registry must refuse an untrusted signature");
+    };
+    assert!(
+        error.to_string().contains("verifying the transition"),
+        "{error:#}"
+    );
+    assert_eq!(
+        std::fs::read(&fixture.documents.transition).expect("read retained document"),
+        b"retained transition"
+    );
+    assert_eq!(
+        std::fs::read(registry_path).expect("read registry again"),
+        previous_registry
+    );
+    assert!(fixture
+        .registry
+        .state()
+        .gateway
+        .next_gateway_identity_epoch
+        .is_none());
+}
+
+#[test]
+fn a_blocked_transition_document_leaves_the_registry_unchanged() {
+    let mut fixture = InstallationFixture::new();
+    let registry_path = fixture.registry_path();
+    let previous_registry = std::fs::read(&registry_path).expect("read original registry");
+    std::fs::create_dir(&fixture.documents.transition).expect("block atomic replacement");
+
+    let Err(error) = fixture.install() else {
+        panic!("staging must require the transition document to reach disk");
+    };
+    assert!(
+        error.to_string().contains("atomically replacing"),
+        "{error:#}"
+    );
+    assert_eq!(
+        std::fs::read(registry_path).expect("read registry again"),
+        previous_registry
+    );
+    assert!(fixture
+        .registry
+        .state()
+        .gateway
+        .next_gateway_identity_epoch
+        .is_none());
+}
+
+#[test]
+fn a_rollback_is_refused_without_a_published_overlap() {
+    let mut fixture = InstallationFixture::new();
+    let now = fixture.transition.window.activation_at;
+    let Err(error) = install_rollback(&mut fixture.registry, fixture.rollback.clone(), now) else {
+        panic!("rollback requires a staged transition");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("no gateway transition is staged"),
+        "{error:#}"
+    );
+
+    fixture.install().expect("stage signed transition");
+    let registry_path = fixture.registry_path();
+    let previous_registry = std::fs::read(&registry_path).expect("read staged registry");
+    let Err(error) = install_rollback(&mut fixture.registry, fixture.rollback, now) else {
+        panic!("rollback requires publication");
+    };
+    assert!(
+        matches!(
+            error.downcast_ref::<helios_provisioning::certificates::RegistryError>(),
+            Some(
+                helios_provisioning::certificates::RegistryError::Certificate(
+                    aether::certificates::CertificateError::RollbackUnavailable
+                )
+            )
+        ),
+        "{error:#}"
+    );
+    assert_eq!(
+        std::fs::read(registry_path).expect("read registry again"),
+        previous_registry
+    );
+}
+
+#[test]
+fn an_installed_rollback_persists_the_old_leaf_selection_without_losing_the_candidate() {
+    let mut fixture = InstallationFixture::new();
+    let staged = fixture.install().expect("stage signed transition");
+    let epoch = staged.transition.gateway_identity_epoch;
+    fixture
+        .registry
+        .publish_gateway_transition(
+            epoch,
+            &staged.transition.fingerprint().expect("fingerprint"),
+        )
+        .expect("publish staged transition");
+    let now = staged.transition.window.activation_at;
+    let old_epoch = fixture
+        .registry
+        .state()
+        .gateway
+        .active_gateway_identity_epoch;
+    let selected = install_rollback(&mut fixture.registry, fixture.rollback.clone(), now)
+        .expect("install rollback within overlap");
+    assert!(!selected.already_present);
+    assert_eq!(selected.gateway_identity_epoch, epoch);
+    assert_eq!(
+        selected.selected_certificate_fingerprint,
+        fixture.rollback.selected_certificate_fingerprint
+    );
+    assert_eq!(selected.expires_at, staged.transition.window.not_after);
+
+    let registry_path = fixture.registry_path();
+    let persisted = std::fs::read(&registry_path).expect("read rollback registry");
+    let reloaded = CertificateRegistry::load(&registry_path)
+        .expect("reload")
+        .expect("registry exists");
+    assert!(reloaded.active_gateway_rollback(now).is_some());
+    assert!(reloaded
+        .active_gateway_rollback(selected.expires_at)
+        .is_none());
+    let gateway = &reloaded.state().gateway;
+    assert_eq!(gateway.active_gateway_identity_epoch, old_epoch);
+    assert_eq!(gateway.next_gateway_identity_epoch, Some(epoch));
+    assert_eq!(
+        read_staged_transition(&staged.path).expect("read retained document"),
+        Some(staged.transition)
+    );
+
+    let replay = install_rollback(&mut fixture.registry, fixture.rollback, now)
+        .expect("repeat the same rollback");
+    assert!(replay.already_present);
+    assert_eq!(
+        std::fs::read(registry_path).expect("read registry again"),
+        persisted
+    );
+}
+
+fn promoted_registry_and_transition(
+    mut gateway: GatewayCertificateState,
+    rotate_tls: bool,
+    rotate_pq: bool,
+) -> (GatewayCertificateState, GatewayIdentityTransition) {
+    let mut transition = staged_transition(gateway.active_gateway_identity_epoch + 1);
+    transition.active_gateway_tls_certificate_fingerprint = gateway.active_tls_fingerprint();
+    transition.active_gateway_certificate_fingerprint = gateway
+        .active_pq_fingerprint()
+        .expect("outgoing PQ fingerprint");
+
+    if rotate_tls {
+        let new_leaf = aether::certificates::encoding::DerCertificate::new(vec![2; 64])
+            .expect("candidate TLS leaf");
+        transition.next_gateway_tls_certificate = Some(new_leaf.clone());
+        gateway.active_gateway_tls_certificate = new_leaf;
+    }
+    if rotate_pq {
+        let new_leaf = gateway_leaf();
+        transition.next_gateway_certificate = Some(new_leaf.clone());
+        gateway.active_gateway_certificate = new_leaf;
+    }
+    gateway.active_gateway_identity_epoch = transition.gateway_identity_epoch;
+    gateway.gateway_decision_epoch = transition.gateway_identity_epoch;
+    (gateway, transition)
+}
+
+#[test]
+fn promotion_guard_accepts_partial_and_full_leaf_rotations() {
+    for (rotate_tls, rotate_pq) in [(true, false), (false, true), (true, true)] {
+        let (gateway, transition) =
+            promoted_registry_and_transition(gateway(), rotate_tls, rotate_pq);
+        crate::key_negotiation::validate_promoted_gateway_identity(&gateway, &transition)
+            .expect("the registry agrees with the promoted transition");
+    }
+}
+
+#[test]
+fn promotion_guard_rejects_a_registry_still_at_the_outgoing_epoch() {
+    let (mut gateway, transition) = promoted_registry_and_transition(gateway(), true, true);
+    gateway.active_gateway_identity_epoch -= 1;
+
+    let error = crate::key_negotiation::validate_promoted_gateway_identity(&gateway, &transition)
+        .expect_err("wrong active epoch");
+    assert!(error.to_string().contains("registry is at gateway epoch 3"));
+}
+
+#[test]
+fn promotion_guard_rejects_a_transition_for_another_gateway() {
+    let (gateway, mut transition) = promoted_registry_and_transition(gateway(), true, true);
+    transition.gateway_wg_public_key = WireGuardKey::from_bytes([10; 32]);
+
+    let error = crate::key_negotiation::validate_promoted_gateway_identity(&gateway, &transition)
+        .expect_err("wrong gateway");
+    assert_eq!(
+        error.to_string(),
+        "the retained transition belongs to another gateway identity"
+    );
+}
+
+#[test]
+fn promotion_guard_rejects_the_outgoing_tls_leaf_when_tls_was_rotated() {
+    let outgoing = gateway();
+    let outgoing_tls = outgoing.active_gateway_tls_certificate.clone();
+    let (mut gateway, transition) = promoted_registry_and_transition(outgoing, true, false);
+    gateway.active_gateway_tls_certificate = outgoing_tls;
+
+    let error = crate::key_negotiation::validate_promoted_gateway_identity(&gateway, &transition)
+        .expect_err("the outgoing TLS leaf is still active");
+    assert_eq!(
+        error.to_string(),
+        "the promoted TLS leaf does not match the retained transition"
+    );
+}
+
+#[test]
+fn promotion_guard_rejects_the_outgoing_pq_leaf_when_pq_was_rotated() {
+    let outgoing = gateway();
+    let outgoing_pq = outgoing.active_gateway_certificate.clone();
+    let (mut gateway, transition) = promoted_registry_and_transition(outgoing, false, true);
+    gateway.active_gateway_certificate = outgoing_pq;
+
+    let error = crate::key_negotiation::validate_promoted_gateway_identity(&gateway, &transition)
+        .expect_err("the outgoing PQ leaf is still active");
+    assert_eq!(
+        error.to_string(),
+        "the promoted PQ leaf does not match the retained transition"
+    );
+}
+
+#[test]
+fn promotion_guard_rejects_a_candidate_pq_leaf_with_no_canonical_fingerprint() {
+    let (gateway, mut transition) = promoted_registry_and_transition(gateway(), false, true);
+    transition
+        .next_gateway_certificate
+        .as_mut()
+        .expect("candidate PQ certificate")
+        .ml_dsa_87_signature
+        .clear();
+
+    let error = crate::key_negotiation::validate_promoted_gateway_identity(&gateway, &transition)
+        .expect_err("the candidate no longer contains a well-formed signature");
+    assert_eq!(
+        error.to_string(),
+        "fingerprinting the retained candidate PQ leaf"
+    );
 }
 
 #[test]

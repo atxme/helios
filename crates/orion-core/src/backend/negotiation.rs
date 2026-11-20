@@ -493,3 +493,6 @@ pub(super) async fn wait_for_new_handshake(
     }
     false
 }
+
+#[cfg(test)]
+mod tests;

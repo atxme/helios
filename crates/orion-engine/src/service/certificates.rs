@@ -3,6 +3,7 @@
 //! renewal step both share. The actions the user asks for drive the same
 //! renewal map.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use aether::certificates::approval::AstraRenewalApproval;
@@ -93,60 +94,79 @@ pub(super) fn spawn_automatic_certificate_renewal(
         let _ = prerequisite.await;
         let now = now_unix();
         let inventory = orion_core::certificate_inventory::inventory(Some(&settings), now);
-        let Some(client) = inventory.client_pq else {
-            tracing::warn!(profile = %profile_name, "automatic renewal skipped: client PQ certificate is unavailable");
-            return;
-        };
-        if client.phase == orion_core::certificate_inventory::CertificatePhase::Expired {
+        run_automatic_certificate_renewal(
+            &controller,
+            &profile_name,
+            inventory.client_pq,
+            now,
+            &sink,
+            drive_renewal_in_map(&renewals, &profile_name, settings, heliosd_url),
+        )
+        .await;
+    })
+}
+
+async fn run_automatic_certificate_renewal(
+    controller: &VpnController,
+    profile_name: &str,
+    client: Option<orion_core::CertificateFacts>,
+    now: u64,
+    sink: &EventSink,
+    renewal: impl Future<Output = Result<RenewalProgress, String>>,
+) {
+    let Some(client) = client else {
+        tracing::warn!(profile = %profile_name, "automatic renewal skipped: client PQ certificate is unavailable");
+        return;
+    };
+    if client.phase == orion_core::certificate_inventory::CertificatePhase::Expired {
+        sink(ClientEvent::log(
+            "warn",
+            format!(
+                "certificat du profil « {profile_name} » expiré : le renouvellement automatique ne peut plus prouver une identité active ; utiliser la récupération YubiKey"
+            ),
+        ));
+        return;
+    }
+
+    let wait = client.renewal_at.saturating_sub(now);
+    if wait > 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+    }
+    if controller.state() != TunnelState::Up
+        || controller.mounted_profile().await.as_deref() != Some(profile_name)
+    {
+        return;
+    }
+
+    match renewal.await {
+        Ok(RenewalProgress::Committed { generation }) => {
+            tracing::info!(profile = %profile_name, generation, "automatic certificate renewal committed");
+            sink(ClientEvent::log(
+                "info",
+                format!(
+                    "certificats du profil « {profile_name} » renouvelés automatiquement ; génération {generation} prête pour le chevauchement"
+                ),
+            ));
+        }
+        Ok(progress) => {
+            tracing::warn!(profile = %profile_name, ?progress, "automatic certificate renewal remains in progress");
             sink(ClientEvent::log(
                 "warn",
                 format!(
-                    "certificat du profil « {profile_name} » expiré : le renouvellement automatique ne peut plus prouver une identité active ; utiliser la récupération YubiKey"
+                    "renouvellement automatique du profil « {profile_name} » incomplet ; Orion réessaiera à la prochaine connexion"
                 ),
             ));
-            return;
         }
-
-        let wait = client.renewal_at.saturating_sub(now);
-        if wait > 0 {
-            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        Err(error) => {
+            tracing::warn!(profile = %profile_name, %error, "automatic certificate renewal failed");
+            sink(ClientEvent::log(
+                "warn",
+                format!(
+                    "renouvellement automatique du profil « {profile_name} » impossible : {error}. Orion réessaiera à la prochaine connexion"
+                ),
+            ));
         }
-        if controller.state() != TunnelState::Up
-            || controller.mounted_profile().await.as_deref() != Some(profile_name.as_str())
-        {
-            return;
-        }
-
-        match drive_renewal_in_map(&renewals, &profile_name, settings, heliosd_url).await {
-            Ok(RenewalProgress::Committed { generation }) => {
-                tracing::info!(profile = %profile_name, generation, "automatic certificate renewal committed");
-                sink(ClientEvent::log(
-                    "info",
-                    format!(
-                        "certificats du profil « {profile_name} » renouvelés automatiquement ; génération {generation} prête pour le chevauchement"
-                    ),
-                ));
-            }
-            Ok(progress) => {
-                tracing::warn!(profile = %profile_name, ?progress, "automatic certificate renewal remains in progress");
-                sink(ClientEvent::log(
-                    "warn",
-                    format!(
-                        "renouvellement automatique du profil « {profile_name} » incomplet ; Orion réessaiera à la prochaine connexion"
-                    ),
-                ));
-            }
-            Err(error) => {
-                tracing::warn!(profile = %profile_name, %error, "automatic certificate renewal failed");
-                sink(ClientEvent::log(
-                    "warn",
-                    format!(
-                        "renouvellement automatique du profil « {profile_name} » impossible : {error}. Orion réessaiera à la prochaine connexion"
-                    ),
-                ));
-            }
-        }
-    })
+    }
 }
 
 /// Advances the renewal of `name` by one step, opening it if none is in flight.

@@ -380,11 +380,27 @@ pub(crate) fn install_transition(
     transition: GatewayIdentityTransition,
     now_unix: u64,
 ) -> Result<StagedTransition> {
-    candidate_is_held(
-        &transition,
-        read_pending(&pending_request_path())?.as_ref(),
-        crate::key_negotiation::candidate_tls_certificate()?.as_ref(),
-    )?;
+    let request = read_pending(&pending_request_path())?;
+    let candidate_tls = crate::key_negotiation::candidate_tls_certificate()?;
+    install_transition_at(
+        registry,
+        transition,
+        now_unix,
+        request.as_ref(),
+        candidate_tls.as_ref(),
+        staged_transition_path(),
+    )
+}
+
+fn install_transition_at(
+    registry: &mut CertificateRegistry,
+    transition: GatewayIdentityTransition,
+    now_unix: u64,
+    request: Option<&GatewayCertificateRequest>,
+    candidate_tls: Option<&DerCertificate>,
+    path: std::path::PathBuf,
+) -> Result<StagedTransition> {
+    candidate_is_held(&transition, request, candidate_tls)?;
 
     // Verified on a copy before the document is written, so the two orders
     // that could go wrong both stay safe. A document written for a transition
@@ -399,7 +415,6 @@ pub(crate) fn install_transition(
         .install_transition(&transition, &registry.state().ledger, now_unix)
         .context("verifying the transition against the anchors this gateway pins")?;
 
-    let path = staged_transition_path();
     write_document(&path, &transition, "gateway identity transition")?;
     let outcome = registry
         .install_gateway_transition(&transition, now_unix)

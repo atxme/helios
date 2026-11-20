@@ -42,15 +42,19 @@ pub enum GatewayBootstrapCertificateError {
 /// Reads the proof exported by `init-key-negotiation`, if that gesture ran.
 pub fn gateway_bootstrap_request(
 ) -> Result<Option<aether::certificates::gateway::GatewayBootstrapRequest>> {
-    let encoded = match std::fs::read(GATEWAY_BOOTSTRAP_REQUEST_PATH) {
+    read_gateway_bootstrap_request(Path::new(GATEWAY_BOOTSTRAP_REQUEST_PATH))
+}
+
+pub(super) fn read_gateway_bootstrap_request(
+    path: &Path,
+) -> Result<Option<aether::certificates::gateway::GatewayBootstrapRequest>> {
+    let encoded = match std::fs::read(path) {
         Ok(encoded) => encoded,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("reading {GATEWAY_BOOTSTRAP_REQUEST_PATH}"))
-        }
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
     };
     serde_json::from_slice(&encoded)
-        .with_context(|| format!("reading {GATEWAY_BOOTSTRAP_REQUEST_PATH}"))
+        .with_context(|| format!("reading {}", path.display()))
         .map(Some)
 }
 
@@ -104,7 +108,23 @@ pub fn install_gateway_bootstrap_certificate(
     ca_public_key: &aether::certificates::encoding::MlDsa87PublicKey,
     now_unix: u64,
 ) -> Result<PqCertificate> {
-    let request = gateway_bootstrap_request()?.context(
+    install_gateway_bootstrap_certificate_at(
+        Path::new(GATEWAY_BOOTSTRAP_REQUEST_PATH),
+        source,
+        Path::new(PQ_CERTIFICATE_PATH),
+        ca_public_key,
+        now_unix,
+    )
+}
+
+pub(super) fn install_gateway_bootstrap_certificate_at(
+    request_path: &Path,
+    source: &Path,
+    destination: &Path,
+    ca_public_key: &aether::certificates::encoding::MlDsa87PublicKey,
+    now_unix: u64,
+) -> Result<PqCertificate> {
+    let request = read_gateway_bootstrap_request(request_path)?.context(
         "the gateway has no bootstrap request: run `heliosd init-key-negotiation` first",
     )?;
     let encoded = std::fs::read(source)
@@ -114,7 +134,7 @@ pub fn install_gateway_bootstrap_certificate(
     verify_gateway_bootstrap_certificate(&request, &certificate, ca_public_key, now_unix)
         .context("verifying the initial gateway certificate under CA-PQ")?;
     write_public_atomic(
-        Path::new(PQ_CERTIFICATE_PATH),
+        destination,
         &serde_json::to_vec_pretty(&certificate).context("encoding the gateway PQ certificate")?,
     )
     .context("installing the CA-PQ-issued gateway certificate")?;
@@ -122,23 +142,35 @@ pub fn install_gateway_bootstrap_certificate(
 }
 
 pub fn served_identity() -> Result<Option<ServedIdentity>> {
+    read_served_identity(
+        Path::new(CERTIFICATE_PATH),
+        Path::new(PQ_CERTIFICATE_PATH),
+        Path::new(CLIENT_CA_PATH),
+    )
+}
+
+pub(super) fn read_served_identity(
+    tls_path: &Path,
+    pq_path: &Path,
+    client_ca_path: &Path,
+) -> Result<Option<ServedIdentity>> {
     use aether::certificates::encoding::DerCertificate;
 
     let (Ok(tls_der), Ok(pq_json), Ok(client_ca_der)) = (
-        std::fs::read(CERTIFICATE_PATH),
-        std::fs::read(PQ_CERTIFICATE_PATH),
-        std::fs::read(CLIENT_CA_PATH),
+        std::fs::read(tls_path),
+        std::fs::read(pq_path),
+        std::fs::read(client_ca_path),
     ) else {
         return Ok(None);
     };
     let pq_certificate: PqCertificate = serde_json::from_slice(&pq_json)
-        .with_context(|| format!("reading {PQ_CERTIFICATE_PATH}"))?;
+        .with_context(|| format!("reading {}", pq_path.display()))?;
     Ok(Some(ServedIdentity {
         tls_certificate: DerCertificate::new(tls_der)
-            .with_context(|| format!("reading {CERTIFICATE_PATH}"))?,
+            .with_context(|| format!("reading {}", tls_path.display()))?,
         pq_certificate,
         client_tls_ca: DerCertificate::new(client_ca_der)
-            .with_context(|| format!("reading {CLIENT_CA_PATH}"))?,
+            .with_context(|| format!("reading {}", client_ca_path.display()))?,
     }))
 }
 
@@ -150,16 +182,22 @@ pub fn served_identity() -> Result<Option<ServedIdentity>> {
 /// publish — that is `None`, not an error, because it is the ordinary state
 /// before `heliosd init-key-negotiation`.
 pub fn public_material() -> Result<Option<helios_api::KeyNegotiationMaterial>> {
-    let (Ok(certificate_der), Ok(pq_certificate_json)) = (
-        std::fs::read(CERTIFICATE_PATH),
-        std::fs::read(PQ_CERTIFICATE_PATH),
-    ) else {
-        return Ok(None);
-    };
-    Ok(Some(helios_api::KeyNegotiationMaterial {
+    Ok(read_public_material(
+        Path::new(CERTIFICATE_PATH),
+        Path::new(PQ_CERTIFICATE_PATH),
+    ))
+}
+
+pub(super) fn read_public_material(
+    tls_path: &Path,
+    pq_path: &Path,
+) -> Option<helios_api::KeyNegotiationMaterial> {
+    let certificate_der = std::fs::read(tls_path).ok()?;
+    let pq_certificate_json = std::fs::read(pq_path).ok()?;
+    Some(helios_api::KeyNegotiationMaterial {
         certificate_der,
         pq_certificate_json,
-    }))
+    })
 }
 
 #[derive(serde::Serialize, serde::Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
@@ -481,7 +519,7 @@ pub(super) fn compose_private_identity(
     })
 }
 
-fn decode_loaded_identity(
+pub(super) fn decode_loaded_identity(
     private_identity: StoredPrivateIdentity,
     tls_certificate: Vec<u8>,
     pq_certificate: PqCertificate,

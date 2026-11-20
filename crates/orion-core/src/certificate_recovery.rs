@@ -275,12 +275,19 @@ pub async fn begin(
         &bundle,
     )?;
 
-    let expired_pq = crate::certificate_renewal::client_pq_leaf(&bundle)?;
-    let expired_tls = leaf_of(&bundle)?;
+    begin_with_material(&bundle, store.state(), now_unix).await
+}
+
+async fn begin_with_material(
+    bundle: &ClientIdentityBundle,
+    state: &crate::certificates::TrustState,
+    now_unix: u64,
+) -> Result<(RecoverySession, RecoveryStep), RecoveryError> {
+    let expired_pq = crate::certificate_renewal::client_pq_leaf(bundle)?;
+    let expired_tls = leaf_of(bundle)?;
     let expired_pq_private_key =
         decode_secret(bundle.pq_private_key.expose(), "clé privée PQ expirée")?;
 
-    let state = store.state();
     let authority = state.astra.authority_url.trim_end_matches('/').to_string();
     if authority.is_empty() {
         return Err(RecoveryError::TrustMaterialMissing);
@@ -1148,6 +1155,8 @@ mod tests {
                 serde_json::to_vec(view).expect("serialize operation view"),
             )
         }
+
+        mod opening;
 
         #[test]
         fn step_of_maps_each_authority_state_and_refuses_a_different_identity() {

@@ -2,17 +2,15 @@
 //! volume, the SSH terminal, and validation.
 
 use super::*;
-use orion_core::{read_profile_document, ProfileIssues};
+use orion_core::{read_profile_document, vault::VaultPosture, ProfileIssues};
+use orion_engine::client::EngineClient;
 use orion_engine::{
     ConfigView, EngineCommand, EngineReply, ImportOutcome, ProfileDraft, SecretInput,
 };
 
 #[tauri::command]
 pub(crate) async fn get_config(state: State<'_, AppState>) -> Result<ConfigView, String> {
-    match state.client.call(EngineCommand::GetConfig).await? {
-        EngineReply::Config(value) => Ok(value),
-        _ => Err(unexpected_engine_reply()),
-    }
+    profile_config(&state.client, EngineCommand::GetConfig).await
 }
 
 /// Decodes a document chosen by the user without persisting it.
@@ -27,17 +25,7 @@ pub(crate) async fn import_profile(
     contents: String,
     file_name: String,
 ) -> Result<ImportOutcome, String> {
-    match state
-        .client
-        .call(EngineCommand::ImportProfile {
-            contents: SecretInput::from(contents),
-            file_name,
-        })
-        .await?
-    {
-        EngineReply::Imported(value) => Ok(value),
-        _ => Err(unexpected_engine_reply()),
-    }
+    import_profile_document(&state.client, contents, file_name).await
 }
 
 /// Rereads a profile whose path comes from the system association.
@@ -51,22 +39,38 @@ pub(crate) async fn import_profile_path(
     state: State<'_, AppState>,
     path: Option<String>,
 ) -> Result<Option<ImportOutcome>, String> {
-    let path = match resolve_import_path(&state.pending_profile_paths, path) {
-        Some(path) => path,
-        None => return Ok(None),
+    import_associated_profile(&state.client, &state.pending_profile_paths, path).await
+}
+
+async fn import_associated_profile(
+    client: &EngineClient,
+    pending: &std::sync::Mutex<std::collections::VecDeque<PathBuf>>,
+    path: Option<String>,
+) -> Result<Option<ImportOutcome>, String> {
+    let Some(path) = resolve_import_path(pending, path) else {
+        return Ok(None);
     };
     // Read here, by the process the user is in: the engine parses the text it
     // is sent and never opens a path the UI chose.
     let (contents, file_name) = read_associated_profile(&path)?;
-    match state
-        .client
+    import_profile_document(client, contents, file_name)
+        .await
+        .map(Some)
+}
+
+async fn import_profile_document(
+    client: &EngineClient,
+    contents: String,
+    file_name: String,
+) -> Result<ImportOutcome, String> {
+    match client
         .call(EngineCommand::ImportProfile {
             contents: SecretInput::from(contents),
             file_name,
         })
         .await?
     {
-        EngineReply::Imported(value) => Ok(Some(value)),
+        EngineReply::Imported(value) => Ok(value),
         _ => Err(unexpected_engine_reply()),
     }
 }
@@ -82,13 +86,8 @@ pub(crate) async fn import_profile_path(
 /// memory-lock privilege can change while Orion runs, and a posture panel that
 /// showed a stale "protected" would be worse than one that showed nothing.
 #[tauri::command]
-pub(crate) async fn vault_posture(
-    state: State<'_, AppState>,
-) -> Result<orion_core::vault::VaultPosture, String> {
-    match state.client.call(EngineCommand::VaultPosture).await? {
-        EngineReply::VaultPosture(value) => Ok(value),
-        _ => Err(unexpected_engine_reply()),
-    }
+pub(crate) async fn vault_posture(state: State<'_, AppState>) -> Result<VaultPosture, String> {
+    vault_posture_reply(&state.client, EngineCommand::VaultPosture).await
 }
 
 /// Persists the user's informed choice to keep profiles on a bare volume.
@@ -99,12 +98,15 @@ pub(crate) async fn vault_posture(
 #[tauri::command]
 pub(crate) async fn allow_unencrypted_volume(
     state: State<'_, AppState>,
-) -> Result<orion_core::vault::VaultPosture, String> {
-    match state
-        .client
-        .call(EngineCommand::AllowUnencryptedVolume)
-        .await?
-    {
+) -> Result<VaultPosture, String> {
+    vault_posture_reply(&state.client, EngineCommand::AllowUnencryptedVolume).await
+}
+
+async fn vault_posture_reply(
+    client: &EngineClient,
+    command: EngineCommand,
+) -> Result<VaultPosture, String> {
+    match client.call(command).await? {
         EngineReply::VaultPosture(value) => Ok(value),
         _ => Err(unexpected_engine_reply()),
     }
@@ -120,10 +122,7 @@ pub(crate) async fn allow_unencrypted_volume(
 /// comes into existence when the form is submitted.
 #[tauri::command]
 pub(crate) async fn generate_private_key(state: State<'_, AppState>) -> Result<String, String> {
-    match state.client.call(EngineCommand::GeneratePrivateKey).await? {
-        EngineReply::PublicKey(value) => Ok(value),
-        _ => Err(unexpected_engine_reply()),
-    }
+    public_key_reply(&state.client, EngineCommand::GeneratePrivateKey).await
 }
 
 /// Adopts a private key the user supplies, and returns its public half.
@@ -152,11 +151,15 @@ pub(crate) async fn adopt_private_key(
 ) -> Result<String, String> {
     // Zeroizing from the first instruction: the engine receives it as a secret.
     let private_key = SecretInput::from(private_key);
-    match state
-        .client
-        .call(EngineCommand::AdoptPrivateKey { private_key })
-        .await?
-    {
+    public_key_reply(
+        &state.client,
+        EngineCommand::AdoptPrivateKey { private_key },
+    )
+    .await
+}
+
+async fn public_key_reply(client: &EngineClient, command: EngineCommand) -> Result<String, String> {
+    match client.call(command).await? {
         EngineReply::PublicKey(value) => Ok(value),
         _ => Err(unexpected_engine_reply()),
     }
@@ -165,10 +168,7 @@ pub(crate) async fn adopt_private_key(
 /// Drops the staged key without saving it.
 #[tauri::command]
 pub(crate) async fn discard_staged_key(state: State<'_, AppState>) -> Result<(), String> {
-    match state.client.call(EngineCommand::DiscardStagedKey).await? {
-        EngineReply::Unit => Ok(()),
-        _ => Err(unexpected_engine_reply()),
-    }
+    staging_reply(&state.client, EngineCommand::DiscardStagedKey).await
 }
 
 /// Holds a static PSK the user supplies, until the profile is saved.
@@ -188,20 +188,21 @@ pub(crate) async fn adopt_preshared_key(
     preshared_key: String,
 ) -> Result<(), String> {
     let preshared_key = SecretInput::from(preshared_key);
-    match state
-        .client
-        .call(EngineCommand::AdoptPresharedKey { preshared_key })
-        .await?
-    {
-        EngineReply::Unit => Ok(()),
-        _ => Err(unexpected_engine_reply()),
-    }
+    staging_reply(
+        &state.client,
+        EngineCommand::AdoptPresharedKey { preshared_key },
+    )
+    .await
 }
 
 /// Drops the staged PSK without saving it.
 #[tauri::command]
 pub(crate) async fn discard_staged_psk(state: State<'_, AppState>) -> Result<(), String> {
-    match state.client.call(EngineCommand::DiscardStagedPsk).await? {
+    staging_reply(&state.client, EngineCommand::DiscardStagedPsk).await
+}
+
+async fn staging_reply(client: &EngineClient, command: EngineCommand) -> Result<(), String> {
+    match client.call(command).await? {
         EngineReply::Unit => Ok(()),
         _ => Err(unexpected_engine_reply()),
     }
@@ -231,20 +232,21 @@ pub(crate) async fn open_ssh_terminal(
     state: State<'_, AppState>,
     name: Option<String>,
 ) -> Result<(), String> {
-    let command = match state
-        .client
-        .call(EngineCommand::SshCommand { name })
-        .await?
-    {
-        EngineReply::SshCommand(value) => value,
-        _ => return Err(unexpected_engine_reply()),
-    };
+    open_ssh_with(&state.client, name, spawn_ssh_terminal).await
+}
+
+async fn open_ssh_with(
+    client: &EngineClient,
+    name: Option<String>,
+    launch: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let command = get_ssh_command(client, name).await?;
     // The engine answers with the line `ssh <cible>`; only the target is launched.
     // Checked again here, by the process that builds the command line: the
     // engine validated the profile, but this is where a string becomes a
     // shell invocation, and the allow-list costs nothing.
     let target = validated_ssh_target(&command)?;
-    spawn_ssh_terminal(target)
+    launch(target)
 }
 
 fn resolve_import_path(
@@ -285,11 +287,11 @@ pub(crate) async fn ssh_command(
     state: State<'_, AppState>,
     name: Option<String>,
 ) -> Result<String, String> {
-    match state
-        .client
-        .call(EngineCommand::SshCommand { name })
-        .await?
-    {
+    get_ssh_command(&state.client, name).await
+}
+
+async fn get_ssh_command(client: &EngineClient, name: Option<String>) -> Result<String, String> {
+    match client.call(EngineCommand::SshCommand { name }).await? {
         EngineReply::SshCommand(value) => Ok(value),
         _ => Err(unexpected_engine_reply()),
     }
@@ -310,16 +312,10 @@ pub(crate) async fn save_profile(
     draft: ProfileDraft,
 ) -> Result<ConfigView, String> {
     allow_engine_foreground(&state);
-    let view = match state
-        .client
-        .call(EngineCommand::SaveProfile { draft })
-        .await?
-    {
-        EngineReply::Config(value) => value,
-        _ => return Err(unexpected_engine_reply()),
-    };
-    tray::refresh(&app);
-    Ok(view)
+    change_profile(&state.client, EngineCommand::SaveProfile { draft }, || {
+        tray::refresh(&app)
+    })
+    .await
 }
 
 /// Moves a `service` profile to `nomade`.
@@ -401,16 +397,10 @@ pub(crate) async fn delete_profile(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<ConfigView, String> {
-    let view = match state
-        .client
-        .call(EngineCommand::DeleteProfile { name })
-        .await?
-    {
-        EngineReply::Config(value) => value,
-        _ => return Err(unexpected_engine_reply()),
-    };
-    tray::refresh(&app);
-    Ok(view)
+    change_profile(&state.client, EngineCommand::DeleteProfile { name }, || {
+        tray::refresh(&app)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -419,15 +409,29 @@ pub(crate) async fn select_profile(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<ConfigView, String> {
-    let view = match state
-        .client
-        .call(EngineCommand::SelectProfile { name })
-        .await?
-    {
-        EngineReply::Config(value) => value,
-        _ => return Err(unexpected_engine_reply()),
-    };
-    tray::refresh(&app);
+    change_profile(&state.client, EngineCommand::SelectProfile { name }, || {
+        tray::refresh(&app)
+    })
+    .await
+}
+
+async fn profile_config(
+    client: &EngineClient,
+    command: EngineCommand,
+) -> Result<ConfigView, String> {
+    match client.call(command).await? {
+        EngineReply::Config(value) => Ok(value),
+        _ => Err(unexpected_engine_reply()),
+    }
+}
+
+async fn change_profile(
+    client: &EngineClient,
+    command: EngineCommand,
+    refresh_tray: impl FnOnce(),
+) -> Result<ConfigView, String> {
+    let view = profile_config(client, command).await?;
+    refresh_tray();
     Ok(view)
 }
 
@@ -441,8 +445,14 @@ pub(crate) async fn validate_profile(
     state: State<'_, AppState>,
     draft: ProfileDraft,
 ) -> Result<ProfileIssues, String> {
-    match state
-        .client
+    profile_issues(&state.client, draft).await
+}
+
+async fn profile_issues(
+    client: &EngineClient,
+    draft: ProfileDraft,
+) -> Result<ProfileIssues, String> {
+    match client
         .call(EngineCommand::ValidateProfile { draft })
         .await?
     {
@@ -450,6 +460,9 @@ pub(crate) async fn validate_profile(
         _ => Err(unexpected_engine_reply()),
     }
 }
+
+#[cfg(test)]
+mod ipc_tests;
 
 #[cfg(test)]
 mod tests {
@@ -465,10 +478,10 @@ mod tests {
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
-    struct Scratch(PathBuf);
+    pub(super) struct Scratch(pub(super) PathBuf);
 
     impl Scratch {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             loop {
                 let path = std::env::temp_dir().join(format!(
                     "orion-profile-command-tests-{}-{}",

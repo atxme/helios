@@ -66,6 +66,58 @@ where
     anyhow::bail!("API startup retry loop ended unexpectedly")
 }
 
+/// It never gives up, and that is the point. The tunnel address appears
+/// when WireGuard comes up, so the first binds legitimately fail — that
+/// is what the fast burst is for. But the port can also be held by
+/// **another program**, and that is not transient: `iperf3` listening on
+/// a wildcard listener wins the port and keeps it, and a gateway that
+/// stopped trying after ten seconds served no speedtest until someone
+/// restarted the daemon. Worse, it said so once, in a line long gone by
+/// the time a client reports « connexion fermée par l'hôte ».
+///
+/// So after the burst it keeps retrying slowly, and logs only when the
+/// situation *changes* — a conflict that persists for a day is one line,
+/// not a hundred and seventy thousand.
+async fn serve_raw_speedtest_with_retry<F, Fut>(bind: std::net::SocketAddr, mut serve: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let mut attempt: u32 = 0;
+    let mut reported: Option<String> = None;
+    loop {
+        attempt = attempt.saturating_add(1);
+        match serve().await {
+            Ok(()) => return,
+            Err(error) => {
+                let reason = format!("{error:#}");
+                if attempt < API_BIND_ATTEMPTS {
+                    warn!(
+                        "raw speedtest unavailable (attempt {attempt}/{API_BIND_ATTEMPTS}), \
+                         retrying: {reason}"
+                    );
+                    tokio::time::sleep(API_BIND_DELAY).await;
+                    continue;
+                }
+                if reported.as_deref() != Some(reason.as_str()) {
+                    tracing::error!(
+                        bind = %bind,
+                        "raw speedtest still unavailable after {attempt} attempts: {reason}. \
+                         A client asking for a speedtest will be told the service is absent. \
+                         If the address is in use, another program holds this port — \
+                         `ss -lntup | grep {port}` names it, iperf3 on 0.0.0.0 being the \
+                         usual one. Retrying every {retry}s.",
+                        port = aether::speedtest::SPEEDTEST_PORT,
+                        retry = RAW_SPEEDTEST_RETRY.as_secs(),
+                    );
+                    reported = Some(reason);
+                }
+                tokio::time::sleep(RAW_SPEEDTEST_RETRY).await;
+            }
+        }
+    }
+}
+
 pub(crate) async fn run(
     mut network: NetworkConfig,
     dry_run: bool,
@@ -390,57 +442,14 @@ pub(crate) async fn run(
     let raw_speedtest_shutdown = Arc::new(AtomicBool::new(false));
     let raw_speedtest_task_shutdown = Arc::clone(&raw_speedtest_shutdown);
     tokio::spawn(async move {
-        // It never gives up, and that is the point. The tunnel address appears
-        // when WireGuard comes up, so the first binds legitimately fail — that
-        // is what the fast burst is for. But the port can also be held by
-        // **another program**, and that is not transient: `iperf3` listening on
-        // a wildcard listener wins the port and keeps it, and a gateway that
-        // stopped trying after ten seconds served no speedtest until someone
-        // restarted the daemon. Worse, it said so once, in a line long gone by
-        // the time a client reports « connexion fermée par l'hôte ».
-        //
-        // So after the burst it keeps retrying slowly, and logs only when the
-        // situation *changes* — a conflict that persists for a day is one line,
-        // not a hundred and seventy thousand.
-        let mut attempt: u32 = 0;
-        let mut reported: Option<String> = None;
-        loop {
-            attempt = attempt.saturating_add(1);
-            match helios_api::speedtest::serve_raw(
+        serve_raw_speedtest_with_retry(raw_speedtest_bind, || {
+            helios_api::speedtest::serve_raw(
                 raw_speedtest_state.clone(),
                 raw_speedtest_bind,
                 Arc::clone(&raw_speedtest_task_shutdown),
             )
-            .await
-            {
-                Ok(()) => return,
-                Err(error) => {
-                    let reason = format!("{error:#}");
-                    if attempt < API_BIND_ATTEMPTS {
-                        warn!(
-                            "raw speedtest unavailable (attempt {attempt}/{API_BIND_ATTEMPTS}), \
-                             retrying: {reason}"
-                        );
-                        tokio::time::sleep(API_BIND_DELAY).await;
-                        continue;
-                    }
-                    if reported.as_deref() != Some(reason.as_str()) {
-                        tracing::error!(
-                            bind = %raw_speedtest_bind,
-                            "raw speedtest still unavailable after {attempt} attempts: {reason}. \
-                             A client asking for a speedtest will be told the service is absent. \
-                             If the address is in use, another program holds this port — \
-                             `ss -lntup | grep {port}` names it, iperf3 on 0.0.0.0 being the \
-                             usual one. Retrying every {retry}s.",
-                            port = aether::speedtest::SPEEDTEST_PORT,
-                            retry = RAW_SPEEDTEST_RETRY.as_secs(),
-                        );
-                        reported = Some(reason);
-                    }
-                    tokio::time::sleep(RAW_SPEEDTEST_RETRY).await;
-                }
-            }
-        }
+        })
+        .await;
     });
 
     let result = orchestrator::run(
@@ -466,7 +475,11 @@ pub(crate) async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::serve_api_with_retry;
+    use super::{
+        serve_api_with_retry, serve_raw_speedtest_with_retry, API_BIND_ATTEMPTS, API_BIND_DELAY,
+        RAW_SPEEDTEST_RETRY,
+    };
+    use aether::SPEEDTEST_BIND_LOOPBACK;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -527,5 +540,49 @@ mod tests {
 
         assert!(format!("{error:#}").contains("at least one attempt"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn raw_speedtest_keeps_retrying_after_the_fast_burst_and_recovers() {
+        let mut attempts = Vec::new();
+        let start = tokio::time::Instant::now();
+        serve_raw_speedtest_with_retry(SPEEDTEST_BIND_LOOPBACK, || {
+            attempts.push(start.elapsed());
+            let attempt = attempts.len() as u32;
+            std::future::ready(match attempt {
+                n if n <= API_BIND_ATTEMPTS + 1 => Err(anyhow::anyhow!("port in use")),
+                n if n == API_BIND_ATTEMPTS + 2 => Err(anyhow::anyhow!("interface unavailable")),
+                n if n == API_BIND_ATTEMPTS + 3 => Ok(()),
+                _ => panic!("the service must stop after a successful exit"),
+            })
+        })
+        .await;
+
+        let mut expected: Vec<_> = (0..API_BIND_ATTEMPTS).map(|n| API_BIND_DELAY * n).collect();
+        let end_of_burst = *expected.last().expect("at least one startup attempt");
+        expected.extend((1..=3).map(|n| end_of_burst + RAW_SPEEDTEST_RETRY * n));
+        assert_eq!(attempts, expected);
+        assert_eq!(
+            start.elapsed(),
+            *expected.last().expect("successful attempt")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn raw_speedtest_service_exit_does_not_restart_it() {
+        let mut attempts = 0;
+        let start = tokio::time::Instant::now();
+        serve_raw_speedtest_with_retry(SPEEDTEST_BIND_LOOPBACK, || {
+            attempts += 1;
+            assert_eq!(
+                attempts, 1,
+                "a successfully exited service must not restart"
+            );
+            std::future::ready(Ok(()))
+        })
+        .await;
+
+        assert_eq!(attempts, 1);
+        assert_eq!(start.elapsed(), Duration::ZERO);
     }
 }
