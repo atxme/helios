@@ -48,31 +48,42 @@ pub fn spawn_trust_refresh(
     sink: EventSink,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        match orion_core::trust_update::refresh(&settings, &heliosd_url, now_unix()).await {
-            Ok(orion_core::trust_update::TrustUpdateOutcome::UpToDate) => {
-                tracing::debug!("mise à jour de confiance : rien à récupérer");
-            }
-            Ok(orion_core::trust_update::TrustUpdateOutcome::Applied { objects }) => {
-                let message = format!(
-                    "confiance mise à jour : {objects} objet(s) signé(s) appliqué(s) depuis la \
-                     gateway"
-                );
-                tracing::info!(objects, "mise à jour de confiance appliquée");
-                sink(ClientEvent::log("info", message));
-            }
-            Err(error) => {
-                // Not fatal, and deliberately not silent. The tunnel works;
-                // what may not is a future renewal, and that is worth a line
-                // now rather than a refusal nobody can explain later.
-                let message = format!(
-                    "mise à jour de confiance impossible : {error}. Le tunnel n'est pas \
-                             affecté."
-                );
-                tracing::warn!(%error, "mise à jour de confiance refusée");
-                sink(ClientEvent::log("warn", message));
-            }
-        }
+        let outcome = orion_core::trust_update::refresh(&settings, &heliosd_url, now_unix()).await;
+        report_trust_refresh(outcome, &sink);
     })
+}
+
+fn report_trust_refresh(
+    outcome: Result<
+        orion_core::trust_update::TrustUpdateOutcome,
+        orion_core::trust_update::TrustUpdateError,
+    >,
+    sink: &EventSink,
+) {
+    match outcome {
+        Ok(orion_core::trust_update::TrustUpdateOutcome::UpToDate) => {
+            tracing::debug!("mise à jour de confiance : rien à récupérer");
+        }
+        Ok(orion_core::trust_update::TrustUpdateOutcome::Applied { objects }) => {
+            let message = format!(
+                "confiance mise à jour : {objects} objet(s) signé(s) appliqué(s) depuis la \
+                 gateway"
+            );
+            tracing::info!(objects, "mise à jour de confiance appliquée");
+            sink(ClientEvent::log("info", message));
+        }
+        Err(error) => {
+            // Not fatal, and deliberately not silent. The tunnel works;
+            // what may not is a future renewal, and that is worth a line
+            // now rather than a refusal nobody can explain later.
+            let message = format!(
+                "mise à jour de confiance impossible : {error}. Le tunnel n'est pas \
+                         affecté."
+            );
+            tracing::warn!(%error, "mise à jour de confiance refusée");
+            sink(ClientEvent::log("warn", message));
+        }
+    }
 }
 
 /// Runs the ordinary client renewal at the fixed 80 % threshold.

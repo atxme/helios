@@ -73,6 +73,9 @@ fn a_deposited_approval_consumes_the_request() {
 
 #[cfg(not(target_os = "windows"))]
 mod lifecycle {
+    mod approval;
+    mod refresh;
+
     use super::super::*;
 
     use crate::service::EnginePaths;
