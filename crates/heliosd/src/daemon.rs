@@ -41,6 +41,33 @@ const API_BIND_DELAY: std::time::Duration = std::time::Duration::from_millis(500
 /// finished reading why it was gone.
 const RAW_SPEEDTEST_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Resolves operator-selected startup inputs before the daemon touches TPM or
+/// networking. An explicit uplink keeps this preflight independent of the host.
+fn prepare_startup_network(network: &mut NetworkConfig) -> anyhow::Result<bool> {
+    let wan_auto = network.wan_iface_is_auto();
+    resolve_uplink(network)?;
+    orchestrator::check_startup_policy(network)?;
+    Ok(wan_auto)
+}
+
+/// Chooses listener addresses after preflight. Simulation has no tunnel
+/// address, so its services remain bound to loopback.
+fn service_binds(
+    network: &NetworkConfig,
+    dry_run: bool,
+) -> anyhow::Result<(std::net::SocketAddr, std::net::SocketAddr)> {
+    if dry_run {
+        Ok((API_BIND_LOOPBACK, SPEEDTEST_BIND_LOOPBACK))
+    } else {
+        Ok((
+            network.api_bind().context("API listen address")?,
+            network
+                .speedtest_bind()
+                .context("raw speedtest listen address")?,
+        ))
+    }
+}
+
 /// Keeps API startup bounded while allowing the WireGuard address to appear.
 /// The final failure is returned to the caller so it can be logged once.
 async fn serve_api_with_retry<F, Fut>(
@@ -129,11 +156,9 @@ pub(crate) async fn run(
     // The uplink, before any ruleset is built: every egress rule and the
     // masquerade are bound to this name, and resolving it later would mean
     // building the kill-switch around an interface we had not chosen yet.
-    let wan_auto = network.wan_iface_is_auto();
-    resolve_uplink(&mut network)?;
     // Once the uplink names are known, since the policy is built from them,
     // and still before the TPM unseal and any networking.
-    orchestrator::check_startup_policy(&network)?;
+    let wan_auto = prepare_startup_network(&mut network)?;
 
     // The guard that used to stand here — refusing to start when
     // `key_negotiation_port` was set on a binary built without the feature —
@@ -236,16 +261,9 @@ pub(crate) async fn run(
     // A configured gateway whose `wg_address` names no IPv4 host stops the
     // start here, before any networking: its tunnel could come up with the
     // API out of every client's reach.
-    let (api_bind, raw_speedtest_bind) = if dry_run {
-        (API_BIND_LOOPBACK, SPEEDTEST_BIND_LOOPBACK)
-    } else {
+    let (api_bind, raw_speedtest_bind) = {
         let network = shared_network.read().await;
-        (
-            network.api_bind().context("API listen address")?,
-            network
-                .speedtest_bind()
-                .context("raw speedtest listen address")?,
-        )
+        service_binds(&network, dry_run)?
     };
     info!("web interface on http://{api_bind}");
     info!("raw speedtest on {raw_speedtest_bind} (WireGuard TCP/UDP)");
@@ -476,15 +494,94 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
     use super::{
-        serve_api_with_retry, serve_raw_speedtest_with_retry, API_BIND_ATTEMPTS, API_BIND_DELAY,
-        RAW_SPEEDTEST_RETRY,
+        prepare_startup_network, serve_api_with_retry, serve_raw_speedtest_with_retry,
+        service_binds, API_BIND_ATTEMPTS, API_BIND_DELAY, RAW_SPEEDTEST_RETRY,
     };
-    use aether::SPEEDTEST_BIND_LOOPBACK;
+    use aether::{NetworkConfig, API_BIND_LOOPBACK, SPEEDTEST_BIND_LOOPBACK};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
     use std::time::Duration;
+
+    #[test]
+    fn startup_preflight_refuses_invalid_policy_without_resolving_named_uplink() {
+        let mut network = NetworkConfig {
+            wan_ifaces: vec!["eth9".into()],
+            split_tunnel_cidrs: vec!["10.0.0.0/33".into()],
+            ..NetworkConfig::default()
+        };
+
+        let error = prepare_startup_network(&mut network)
+            .expect_err("invalid policy must stop daemon startup");
+
+        assert!(format!("{error:#}").contains("10.0.0.0/33"));
+        assert_eq!(network.wan_ifaces, ["eth9"]);
+    }
+
+    #[test]
+    fn startup_preflight_preserves_explicit_multi_uplink_configuration() {
+        let mut network = NetworkConfig {
+            wan_ifaces: vec!["eth0".into(), "wlan0".into()],
+            ..NetworkConfig::default()
+        };
+
+        assert!(!prepare_startup_network(&mut network).unwrap());
+        assert_eq!(network.wan_ifaces, ["eth0", "wlan0"]);
+    }
+
+    #[test]
+    fn dry_run_services_bind_only_to_loopback() {
+        let network = NetworkConfig {
+            wg_private_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".into(),
+            wg_address: "not an address".into(),
+            ..NetworkConfig::default()
+        };
+
+        assert_eq!(
+            service_binds(&network, true).unwrap(),
+            (API_BIND_LOOPBACK, SPEEDTEST_BIND_LOOPBACK)
+        );
+    }
+
+    #[test]
+    fn real_service_bind_refuses_a_missing_tunnel_address() {
+        let network = NetworkConfig {
+            wg_private_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".into(),
+            wg_address: "not an address".into(),
+            ..NetworkConfig::default()
+        };
+
+        let error = service_binds(&network, false)
+            .expect_err("real mode must not start an unreachable API");
+
+        assert!(format!("{error:#}").contains("API listen address"));
+    }
+
+    #[test]
+    fn real_service_binds_share_the_configured_ipv4_host_and_keep_distinct_ports() {
+        let network = NetworkConfig {
+            wg_private_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".into(),
+            wg_address: "100.64.0.1/10".into(),
+            ..NetworkConfig::default()
+        };
+
+        let (api, speedtest) = service_binds(&network, false).unwrap();
+
+        assert_eq!(api.ip(), "100.64.0.1".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(speedtest.ip(), api.ip());
+        assert_eq!(api.port(), API_BIND_LOOPBACK.port());
+        assert_eq!(speedtest.port(), SPEEDTEST_BIND_LOOPBACK.port());
+        assert_ne!(api.port(), speedtest.port());
+    }
+
+    #[test]
+    fn an_unconfigured_gateway_keeps_real_service_addresses_on_loopback() {
+        assert_eq!(
+            service_binds(&NetworkConfig::default(), false).unwrap(),
+            (API_BIND_LOOPBACK, SPEEDTEST_BIND_LOOPBACK)
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn api_retries_transient_bind_failure_and_returns_after_success() {
