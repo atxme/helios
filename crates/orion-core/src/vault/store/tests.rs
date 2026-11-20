@@ -1443,3 +1443,60 @@ fn a_switch_without_the_lock_watch_is_refused_and_nothing_changes() {
     assert_eq!(snapshot(&dir), before, "refused before any write");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A selection that runs while a switch is under way must not be lost, nor
+/// must it put the switched profile back to its old mode. The hook runs inside
+/// the switch, after the registry was read; the selection starts there on its
+/// own thread. Unserialised, it wrote its registry copy at once and the
+/// switch then overwrote it from an older one.
+#[test]
+fn a_selection_during_a_switch_waits_and_loses_nothing() {
+    let (dir, mut store) = store("switch-select-race");
+    store.set_lock_watch(true);
+    store.save_profile(&profile("poste")).unwrap();
+    store.save_profile(&profile("autre")).unwrap();
+    store.select("poste").unwrap();
+
+    let slot: Arc<Mutex<Option<std::sync::Weak<ProfileStore>>>> = Arc::new(Mutex::new(None));
+    let selector: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+    let (hook_slot, hook_selector) = (Arc::clone(&slot), Arc::clone(&selector));
+    store.between_derivation_and_store = Some(Box::new(move |_store: &ProfileStore| {
+        let shared = hook_slot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .expect("the store is alive");
+        *hook_selector.lock().unwrap() = Some(std::thread::spawn(move || {
+            shared.select("autre").expect("the selection is written");
+        }));
+        // Long enough for an unserialised selection to finish first.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }));
+    let store = Arc::new(store);
+    *slot.lock().unwrap() = Some(Arc::downgrade(&store));
+
+    store
+        .make_nomad("poste", NEW_PASSPHRASE)
+        .expect("the switch is written");
+    selector
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the selection started")
+        .join()
+        .unwrap();
+
+    let root = store.root().unwrap();
+    let registry = store.load_registry(&root).unwrap();
+    let poste = registry.find_by_name("poste").unwrap();
+    assert!(poste.mode.is_nomad(), "the switch is not undone");
+    assert_eq!(
+        registry.selected,
+        Some(registry.find_by_name("autre").unwrap().id),
+        "the selection is not lost"
+    );
+    store.forget_unlocked();
+    assert_eq!(store.load().expect("the vault still loads").locked.len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}

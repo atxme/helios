@@ -122,6 +122,14 @@ pub struct ProfileStore {
     /// Passphrase keys of the `nomade` profiles unlocked in this session, by
     /// identifier. Emptied by [`ProfileStore::forget_unlocked`].
     unlocked: Mutex<HashMap<ProfileId, PassphraseKey>>,
+    /// Serialises every read-modify-write of the registry and the manifests, and
+    /// the crash recovery in `load`. Without it two commands could each write
+    /// the registry from a copy the other had already replaced, leaving a
+    /// manifest sealed in one mode and its entry describing the other.
+    ///
+    /// Taken before `unlocked`, never after: the order is the only thing that
+    /// keeps the two from deadlocking.
+    write_lock: Mutex<()>,
     /// Bumped, under `unlocked`, by every [`ProfileStore::forget_unlocked`].
     /// An unlock that began before a bump must not keep its key.
     lock_epoch: AtomicU64,
@@ -173,6 +181,7 @@ impl ProfileStore {
             unencrypted_volume: AtomicBool::new(false),
             root_cache: Mutex::new(None),
             unlocked: Mutex::new(HashMap::new()),
+            write_lock: Mutex::new(()),
             lock_epoch: AtomicU64::new(0),
             lock_watch: AtomicBool::new(false),
             #[cfg(test)]
@@ -307,6 +316,14 @@ impl ProfileStore {
 
     fn unlocked_keys(&self) -> MutexGuard<'_, HashMap<ProfileId, PassphraseKey>> {
         self.unlocked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The store-wide write lock. Held for a whole read-modify-write, from the
+    /// registry read to the last write, so no other writer interleaves.
+    fn writing(&self) -> MutexGuard<'_, ()> {
+        self.write_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -558,6 +575,10 @@ impl ProfileStore {
     /// public keys come from the registry alone, and it is listed as locked.
     pub fn load(&self) -> Result<ClientConfig, VaultError> {
         let root = self.root()?;
+        // Recovery decides from the registry and the file names, so both must
+        // be read under the lock: a switch between its `.next` write and its
+        // registry write would look like a step to delete.
+        let _writing = self.writing();
         let registry = self.load_registry(&root)?;
         self.recover_manifest_steps(&registry)?;
         tracing::info!(
@@ -638,9 +659,22 @@ impl ProfileStore {
             return Err(VaultError::LockWatchUnavailable);
         }
         let root = self.root()?;
-        let registry = self.load_registry(&root)?;
-        let Some(entry) = registry.find_by_name(name).cloned() else {
-            return Ok(());
+        // The entry and the blob are read together, under the write lock: a
+        // switch between its registry write and its rename would pair the new
+        // mode with the old blob. The lock is released before the derivation,
+        // which takes about a second.
+        let (entry, blob) = {
+            let _writing = self.writing();
+            let registry = self.load_registry(&root)?;
+            let Some(entry) = registry.find_by_name(name).cloned() else {
+                return Ok(());
+            };
+            if !entry.mode.is_nomad() {
+                return Ok(());
+            }
+            let blob = aether_vault::read_file_bounded(&self.manifest_path(entry.id))
+                .map_err(VaultError::Container)?;
+            (entry, blob)
         };
         let ProfileMode::Nomad { salt, .. } = entry.mode else {
             return Ok(());
@@ -649,8 +683,6 @@ impl ProfileStore {
         // seen by the check below.
         let epoch = self.lock_epoch.load(Ordering::Acquire);
         let key = PassphraseKey::derive(passphrase, &salt)?;
-        let blob = aether_vault::read_file_bounded(&self.manifest_path(entry.id))
-            .map_err(VaultError::Container)?;
         Self::open_entry(&root, &entry, &blob, ManifestKey::Nomad(&key)).map_err(|error| {
             match error {
                 // The AEAD and the container cannot tell a wrong passphrase
@@ -757,6 +789,7 @@ impl ProfileStore {
         epoch: u64,
     ) -> Result<(), VaultError> {
         let root = self.root()?;
+        let _writing = self.writing();
         let mut registry = self.load_registry(&root)?;
         if let Some(entry) = registry.find_by_name(&profile.name) {
             // A locked profile is reported as such; an existing one is not
@@ -827,10 +860,13 @@ impl ProfileStore {
     /// 3. the `.next` file is renamed over `<id>.hvlt`.
     ///
     /// The held key follows the registry: it is replaced, or forgotten, only
-    /// after the registry write. The unlocked map stays locked for the whole
-    /// switch, so a lock cannot land between the reads and the writes.
+    /// after the registry write. The write lock is taken before the registry is
+    /// read, so no other writer interleaves with the three writes. The unlocked
+    /// map stays locked from the key read to the end, so a lock waits for the
+    /// switch rather than landing between its writes.
     fn switch(&self, name: &str, seal: Seal) -> Result<(), VaultError> {
         let root = self.root()?;
+        let _writing = self.writing();
         let mut registry = self.load_registry(&root)?;
         let entry = registry
             .find_by_name(name)
@@ -949,6 +985,7 @@ impl ProfileStore {
             .check_kind()
             .map_err(|error| VaultError::InvalidProfileKind(error.to_string()))?;
         let root = self.root()?;
+        let _writing = self.writing();
         let mut registry = self.load_registry(&root)?;
         let client_public_key = aether::wg::public_from_private(profile.private_key.expose())
             .map_err(|_| VaultError::ContextDisagrees)?;
@@ -1027,6 +1064,7 @@ impl ProfileStore {
 
     pub fn remove_profile(&self, name: &str) -> Result<(), VaultError> {
         let root = self.root()?;
+        let _writing = self.writing();
         let mut registry = self.load_registry(&root)?;
         let Some(entry) = registry.find_by_name(name).cloned() else {
             return Ok(());
@@ -1041,6 +1079,7 @@ impl ProfileStore {
 
     pub fn select(&self, name: &str) -> Result<(), VaultError> {
         let root = self.root()?;
+        let _writing = self.writing();
         let mut registry = self.load_registry(&root)?;
         let Some(entry) = registry.find_by_name(name).cloned() else {
             return Ok(());
@@ -1114,6 +1153,7 @@ impl ProfileStore {
         })?;
 
         let root = self.root()?;
+        let _writing = self.writing();
         let mut registry = self.load_registry(&root)?;
         let mut report = MigrationReport {
             migrated: Vec::new(),
