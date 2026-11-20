@@ -61,6 +61,7 @@ fn config_view_keeps_selection_and_profile_order_and_starts_without_vault_error(
     let config = ClientConfig {
         profiles: vec![first, second],
         selected: Some("secours".into()),
+        locked: Vec::new(),
     };
 
     let view = ConfigView::from(&config);

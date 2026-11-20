@@ -10,6 +10,7 @@ pub mod command;
 pub mod events;
 pub mod legacy_cleanup;
 pub mod lifecycle;
+pub mod lock_watch;
 pub mod pipe;
 pub mod serve;
 pub mod service;
@@ -18,9 +19,10 @@ pub mod view;
 pub mod wire;
 
 pub use command::{EngineCommand, EngineReply, ProfileDraft, SecretInput, SubmittedApproval};
+pub use orion_core::vault::{PassphraseSource, PromptPurpose};
 pub use view::{
     AboutView, ActionOutcome, ConfigView, ImportOutcome, InvitationPreviewView,
-    KeyNegotiationSupport, ProfileCertificates, ProfileView, RenewalProgress,
+    KeyNegotiationSupport, LockedProfileView, ProfileCertificates, ProfileView, RenewalProgress,
 };
 pub use wire::{
     limits, read_frame, write_frame, ClientFrame, EngineFrame, Hello, WireError, PROTOCOL_VERSION,

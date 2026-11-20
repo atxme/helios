@@ -6,13 +6,13 @@
 
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{atomic::AtomicU64, Arc, Mutex as StdMutex},
 };
 
 use aether::SecretString;
 use orion_core::{
-    backend::EventSink, protected_root::EnginePaths, telemetry, ClientConfig, ClientProfile,
-    ProtectedIdentityStore, VpnBackend, VpnController,
+    backend::EventSink, protected_root::EnginePaths, telemetry, vault::PassphraseSource,
+    ClientConfig, ClientProfile, ProtectedIdentityStore, VpnBackend, VpnController,
 };
 use tokio::sync::{watch, Mutex};
 
@@ -24,8 +24,11 @@ mod app;
 pub mod certificates;
 mod connection;
 pub mod enrollment;
+mod lock;
+mod nomad;
 mod profiles;
 pub use app::PROFILE_EXTENSION;
+pub use lock::LockEvent;
 
 /// The tunnel-side state of the engine, held for the life of the process.
 ///
@@ -135,6 +138,21 @@ pub struct EngineService {
     /// Passed in by the shell: a crate-level `CARGO_PKG_VERSION` here would
     /// report the engine's own version, not the one the user installed.
     app_version: &'static str,
+    /// Where a `nomade` passphrase is asked for. Never read by the engine
+    /// itself: the source answers with a buffer, used once and wiped.
+    passphrases: Arc<dyn PassphraseSource>,
+    /// Moves on every lock event. An unlock whose passphrase dialog was open
+    /// while one landed compares the value it read before the dialog with the
+    /// one it reads after, and refuses to keep the key when they differ.
+    lock_generation: AtomicU64,
+    /// The event queue of the UI session being served, when there is one. A
+    /// lock event raises its consequences there: they reach the window the
+    /// same way every other event does.
+    session_events: StdMutex<Option<EventQueue>>,
+    /// Test seam: runs just before the controller mounts a tunnel, to stage a
+    /// lock that lands between the unlock and the mount.
+    #[cfg(test)]
+    before_mount: StdMutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl EngineService {
@@ -150,11 +168,19 @@ impl EngineService {
         backend: Arc<dyn VpnBackend>,
         log_path: Option<PathBuf>,
         app_version: &'static str,
+        passphrases: Arc<dyn PassphraseSource>,
     ) -> Result<Arc<Self>, String> {
         // Before anything reads the vault: an existing vault in the per-user
         // folder is moved under the protected root first (F11, task 12).
         let relocation_failure = relocate_legacy_vault(&paths)?;
-        Self::assemble(paths, backend, log_path, app_version, relocation_failure)
+        Self::assemble(
+            paths,
+            backend,
+            log_path,
+            app_version,
+            relocation_failure,
+            passphrases,
+        )
     }
 
     /// Builds the service once the legacy vault has been dealt with.
@@ -167,6 +193,7 @@ impl EngineService {
         log_path: Option<PathBuf>,
         app_version: &'static str,
         relocation_failure: Option<String>,
+        passphrases: Arc<dyn PassphraseSource>,
     ) -> Result<Arc<Self>, String> {
         let relocation_refused = relocation_failure.is_some();
         let controller = VpnController::new(backend);
@@ -281,11 +308,31 @@ impl EngineService {
                 Err(error) => tracing::error!(%error, "migration du fichier hérité impossible"),
             }
         }
-        // A vault that would not open leaves Orion running on an **empty** profile
-        // list, and every later message then reasons from that emptiness: an import
-        // reports that no key of this machine matches the admitted one, when the
-        // truth is that the machine's keys were never read. The cause is recorded
-        // so those messages can name it instead of blaming the document.
+        Ok(Self::build(
+            controller,
+            store,
+            identities,
+            log_path,
+            app_version,
+            passphrases,
+        ))
+    }
+
+    /// Builds the service around an open store, and reads its configuration.
+    ///
+    /// A vault that would not open leaves Orion running on an **empty** profile
+    /// list, and every later message then reasons from that emptiness: an import
+    /// reports that no key of this machine matches the admitted one, when the
+    /// truth is that the machine's keys were never read. The cause is recorded
+    /// so those messages can name it instead of blaming the document.
+    fn build(
+        controller: Arc<VpnController>,
+        store: Arc<orion_core::vault::ProfileStore>,
+        identities: PathBuf,
+        log_path: Option<PathBuf>,
+        app_version: &'static str,
+        passphrases: Arc<dyn PassphraseSource>,
+    ) -> Arc<Self> {
         let mut vault_error = None;
         let config = store.load().unwrap_or_else(|error| {
             tracing::error!(%error, "coffre illisible — aucun profil chargé");
@@ -293,7 +340,7 @@ impl EngineService {
             ClientConfig::default()
         });
 
-        Ok(Arc::new(Self {
+        Arc::new(Self {
             controller,
             store,
             config: Arc::new(Mutex::new(config)),
@@ -311,7 +358,34 @@ impl EngineService {
             certificate_renewal_task: Arc::new(StdMutex::new(None)),
             recoveries: Arc::new(Mutex::new(std::collections::HashMap::new())),
             app_version,
-        }))
+            passphrases,
+            lock_generation: AtomicU64::new(0),
+            session_events: StdMutex::new(None),
+            #[cfg(test)]
+            before_mount: StdMutex::new(None),
+        })
+    }
+
+    /// A service on a store the test prepared: its lock watch, its root and
+    /// its profiles are the test's to set.
+    #[cfg(test)]
+    pub(crate) fn on_store(
+        store: Arc<orion_core::vault::ProfileStore>,
+        backend: Arc<dyn VpnBackend>,
+        identities: PathBuf,
+        passphrases: Arc<dyn PassphraseSource>,
+    ) -> Arc<Self> {
+        let controller = VpnController::new(backend).with_key_negotiation_identities(Arc::new(
+            ProtectedIdentityStore::at(identities.clone()),
+        ));
+        Self::build(
+            Arc::new(controller),
+            store,
+            identities,
+            None,
+            "0.0.0-test",
+            passphrases,
+        )
     }
 }
 
@@ -589,6 +663,15 @@ impl Engine for EngineService {
             EngineCommand::SaveProfile { draft } => {
                 self.save_profile(draft).await.map(EngineReply::Config)
             }
+            EngineCommand::MakeNomad { name } => {
+                self.make_nomad(name).await.map(EngineReply::Config)
+            }
+            EngineCommand::ChangePassphrase { name } => {
+                self.change_passphrase(name).await.map(EngineReply::Config)
+            }
+            EngineCommand::MakeService { name } => {
+                self.make_service(name).await.map(EngineReply::Config)
+            }
             EngineCommand::DeleteProfile { name } => self
                 .delete_profile(name, events)
                 .await
@@ -655,7 +738,18 @@ impl Engine for EngineService {
 
     /// Disconnects and stops what the connection started. The event side is
     /// discarded: the UI that would have listened has gone. Idempotent.
+    fn session_opened(&self, events: &EventQueue) {
+        *self
+            .session_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(events.clone());
+    }
+
     async fn teardown(&self) {
+        self.session_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         let discard: EventSink = Arc::new(|_| {});
         if let Err(error) = self.stop_connection(discard).await {
             tracing::warn!(%error, "déconnexion à la fermeture du moteur");

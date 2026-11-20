@@ -8,6 +8,8 @@
 //!   device-root               DPAPI(TPM(device_root_key))
 //!   registry.hvlt             sealed registry: names, public keys, selection
 //!   profiles/<id>.hvlt        sealed manifest, one per profile
+//!   profiles/<id>.g<n>.next.hvlt
+//!                             a manifest step waiting to replace the one above
 //!   profiles.toml             LEGACY plaintext, removed once migrated
 //! ```
 //!
@@ -36,20 +38,23 @@
 //! oversteps what a client arbitrates — revoking an admission belongs to the
 //! operator, who alone has the means (ADR-006 §3, arbitrage du 2 août 2026).
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex, MutexGuard,
 };
 
 use zeroize::Zeroizing;
 
 use super::{
-    open_manifest,
-    registry::{Registry, RegistryEntry},
-    seal_manifest, DeviceRootKey, ProfileId, ProfileManifest, RootKeyProvider, SecurityGeneration,
-    VaultError, DOMAIN_REGISTRY,
+    nomad::{self, PassphraseKey},
+    open_manifest, passphrase,
+    registry::{entry_digest, ProfileMode, Registry, RegistryEntry, KDF_PBKDF2_HMAC_SHA512},
+    seal_manifest, DeviceRootKey, ManifestKey, ProfileId, ProfileManifest, RootKeyProvider,
+    SecurityGeneration, VaultError, DOMAIN_REGISTRY,
 };
-use crate::config::{ClientConfig, ClientProfile};
+use crate::config::{ClientConfig, ClientProfile, LockedProfile};
 
 /// Bootstrap format version. An unknown one is refused, never guessed.
 const BOOTSTRAP_VERSION: u32 = 1;
@@ -113,7 +118,57 @@ pub struct ProfileStore {
     /// a refusal, and only this flag turns it into a stated choice.
     unencrypted_volume: AtomicBool,
     /// Installation root, unwrapped once. See [`ProfileStore::root`].
-    root_cache: std::sync::Mutex<Option<Arc<DeviceRootKey>>>,
+    root_cache: Mutex<Option<Arc<DeviceRootKey>>>,
+    /// Passphrase keys of the `nomade` profiles unlocked in this session, by
+    /// identifier. Emptied by [`ProfileStore::forget_unlocked`].
+    unlocked: Mutex<HashMap<ProfileId, PassphraseKey>>,
+    /// Serialises every read-modify-write of the registry and the manifests, and
+    /// the crash recovery in `load`. Without it two commands could each write
+    /// the registry from a copy the other had already replaced, leaving a
+    /// manifest sealed in one mode and its entry describing the other.
+    ///
+    /// Taken before `unlocked`, never after: the order is the only thing that
+    /// keeps the two from deadlocking.
+    write_lock: Mutex<()>,
+    /// Bumped, under `unlocked`, by every [`ProfileStore::forget_unlocked`].
+    /// An unlock that began before a bump must not keep its key.
+    lock_epoch: AtomicU64,
+    /// The engine receives the lock and suspend notifications (spec §5.5).
+    /// Without them a nomad profile could stay open after the session locked,
+    /// so unlocking is refused.
+    lock_watch: AtomicBool,
+    /// Test seam: runs between the derivation of a passphrase key and its
+    /// storage, to stage a lock that lands in that window.
+    #[cfg(test)]
+    between_derivation_and_store: Option<LockHook>,
+    /// Test seam: stops a mode switch right after this step, as a power cut
+    /// would (spec §5.7).
+    #[cfg(test)]
+    pub(crate) stop_switch_after: Option<SwitchStep>,
+}
+
+/// The shape of [`ProfileStore::between_derivation_and_store`].
+#[cfg(test)]
+type LockHook = Box<dyn Fn(&ProfileStore) + Send + Sync>;
+
+/// The writes of a mode switch, in the order spec §5.7 requires. A crash after
+/// any of them must leave the profile openable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwitchStep {
+    /// The new manifest is written beside the current one, as `.next`.
+    Staged,
+    /// The registry records the new mode and the new generation.
+    Registered,
+    /// The `.next` file has replaced the current manifest.
+    Renamed,
+}
+
+/// What a switch seals the manifest under.
+enum Seal {
+    /// The installation root alone: the `service` mode.
+    Service,
+    /// A new passphrase, already judged by `passphrase::accept`.
+    Nomad(Zeroizing<String>),
 }
 
 impl ProfileStore {
@@ -124,7 +179,15 @@ impl ProfileStore {
             software_keystore: false,
             key_slot: super::windows::tpm::KEY_NAME.to_string(),
             unencrypted_volume: AtomicBool::new(false),
-            root_cache: std::sync::Mutex::new(None),
+            root_cache: Mutex::new(None),
+            unlocked: Mutex::new(HashMap::new()),
+            write_lock: Mutex::new(()),
+            lock_epoch: AtomicU64::new(0),
+            lock_watch: AtomicBool::new(false),
+            #[cfg(test)]
+            between_derivation_and_store: None,
+            #[cfg(test)]
+            stop_switch_after: None,
         }
     }
 
@@ -239,6 +302,32 @@ impl ProfileStore {
             .join(format!("{}.hvlt", id.to_hex()))
     }
 
+    /// Where a manifest step waits before it replaces the current manifest
+    /// (spec §5.7). The only place this name is built.
+    pub(crate) fn next_manifest_path(
+        &self,
+        id: ProfileId,
+        generation: SecurityGeneration,
+    ) -> PathBuf {
+        self.dir
+            .join(PROFILES_DIR)
+            .join(format!("{}.g{}.next.hvlt", id.to_hex(), generation.0))
+    }
+
+    fn unlocked_keys(&self) -> MutexGuard<'_, HashMap<ProfileId, PassphraseKey>> {
+        self.unlocked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The store-wide write lock. Held for a whole read-modify-write, from the
+    /// registry read to the last write, so no other writer interleaves.
+    fn writing(&self) -> MutexGuard<'_, ()> {
+        self.write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn device_root_path(&self) -> std::path::PathBuf {
         self.dir.join(DEVICE_ROOT_FILE)
     }
@@ -332,9 +421,9 @@ impl ProfileStore {
     ///
     /// # Limite connue
     ///
-    /// There is no way to drop it before the process ends. The `nomade` profile
-    /// will need one — locking the session must forget the root — and that is
-    /// part of the lot which is not built (ADR-006 §3, limites connues).
+    /// Locking the session forgets it ([`ProfileStore::forget_unlocked`]): the
+    /// next operation unwraps it again, which is what a `nomade` profile needs
+    /// after a lock.
     fn root(&self) -> Result<Arc<DeviceRootKey>, VaultError> {
         let mut cache = self
             .root_cache
@@ -378,7 +467,7 @@ impl ProfileStore {
         self.write(&self.registry_path(), &blob)
     }
 
-    /// Opens one manifest, with the expectations taken from the **registry**.
+    /// Opens one manifest with `key`, the expectations taken from the **registry**.
     ///
     /// Not from anything stored beside the blob: that is the indirection
     /// ADR-006 §2 requires, and what stops a swap of the pair record + blob.
@@ -386,6 +475,7 @@ impl ProfileStore {
         &self,
         root: &DeviceRootKey,
         entry: &RegistryEntry,
+        key: ManifestKey<'_>,
     ) -> Result<ProfileManifest, VaultError> {
         // `read_file_bounded` and not `std::fs::read`: ADR-006 §2 requires the
         // size to be checked before the blob is allocated, and says in as many
@@ -393,12 +483,23 @@ impl ProfileStore {
         // already lost. A sparse manifest file costs an attacker nothing.
         let blob = aether_vault::read_file_bounded(&self.manifest_path(entry.id))
             .map_err(VaultError::Container)?;
+        Self::open_entry(root, entry, &blob, key)
+    }
+
+    /// Opens a manifest blob already read, then checks its generation.
+    fn open_entry(
+        root: &DeviceRootKey,
+        entry: &RegistryEntry,
+        blob: &[u8],
+        key: ManifestKey<'_>,
+    ) -> Result<ProfileManifest, VaultError> {
         let manifest = open_manifest(
             root,
             entry.id,
             &entry.client_public_key,
             &entry.gateway_public_key,
-            &blob,
+            blob,
+            key,
         )?;
         // The registry records the highest generation ever seen. A blob below
         // it was put back from an older copy.
@@ -411,21 +512,102 @@ impl ProfileStore {
         Ok(manifest)
     }
 
+    /// Settles a manifest step that a crash interrupted (spec §5.7).
+    ///
+    /// Decided from file names and the registry alone: nothing is decrypted
+    /// here. A step above the registry's generation never became authoritative
+    /// and is deleted; one at the registry's generation was already recorded,
+    /// so its rename was the only step left and it is promoted. The normal open
+    /// still checks the authenticated generation afterwards.
+    fn recover_manifest_steps(&self, registry: &Registry) -> Result<(), VaultError> {
+        let dir = self.dir.join(PROFILES_DIR);
+        let listing = match std::fs::read_dir(&dir) {
+            Ok(listing) => listing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(VaultError::Io {
+                    path: dir,
+                    cause: error.to_string(),
+                })
+            }
+        };
+        for item in listing.flatten() {
+            let path = item.path();
+            let Some((id, generation)) = self.parse_manifest_step(&path) else {
+                continue;
+            };
+            let io = |cause: std::io::Error| VaultError::Io {
+                path: path.clone(),
+                cause: cause.to_string(),
+            };
+            match registry.find(id) {
+                Some(entry) if entry.generation == generation => {
+                    tracing::warn!(
+                        profil = %entry.name,
+                        "étape de manifeste interrompue : promue"
+                    );
+                    std::fs::rename(&path, self.manifest_path(id)).map_err(io)?;
+                }
+                _ => {
+                    tracing::warn!("étape de manifeste sans entrée valide : supprimée");
+                    std::fs::remove_file(&path).map_err(io)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads the identifier and generation from a step's file name. Only the
+    /// exact name [`Self::next_manifest_path`] builds counts as a step.
+    fn parse_manifest_step(&self, path: &Path) -> Option<(ProfileId, SecurityGeneration)> {
+        let name = path.file_name()?.to_str()?;
+        let stem = name.strip_suffix(".next.hvlt")?;
+        let (hex, generation) = stem.rsplit_once(".g")?;
+        let bytes: [u8; 16] = hex_to_bytes(hex)?.try_into().ok()?;
+        let id = ProfileId::from_bytes(bytes);
+        let generation = SecurityGeneration(generation.parse().ok()?);
+        (self.next_manifest_path(id, generation) == path).then_some((id, generation))
+    }
+
     /// Loads every profile, in the shape the rest of the client works with.
+    ///
+    /// A `nomade` profile whose key is not held is **not opened**: its name and
+    /// public keys come from the registry alone, and it is listed as locked.
     pub fn load(&self) -> Result<ClientConfig, VaultError> {
         let root = self.root()?;
+        // Recovery decides from the registry and the file names, so both must
+        // be read under the lock: a switch between its `.next` write and its
+        // registry write would look like a step to delete.
+        let _writing = self.writing();
         let registry = self.load_registry(&root)?;
+        self.recover_manifest_steps(&registry)?;
         tracing::info!(
             profils = registry.entries.len(),
             repertoire = %self.dir.display(),
             "registre du coffre ouvert"
         );
+        let unlocked = self.unlocked_keys();
         let mut profiles = Vec::with_capacity(registry.entries.len());
+        let mut locked = Vec::new();
         for entry in &registry.entries {
+            let key = match entry.mode {
+                ProfileMode::Service => ManifestKey::Service,
+                ProfileMode::Nomad { .. } => match unlocked.get(&entry.id) {
+                    Some(key) => ManifestKey::Nomad(key),
+                    None => {
+                        locked.push(LockedProfile {
+                            name: entry.name.clone(),
+                            client_public_key: entry.client_public_key.clone(),
+                            gateway_public_key: entry.gateway_public_key.clone(),
+                        });
+                        continue;
+                    }
+                },
+            };
             // Named one by one: a single failure aborts the load, and knowing
             // *which* profile refused is the difference between a fix and a
             // reinstall.
-            let manifest = self.load_manifest(&root, entry).inspect_err(|error| {
+            let manifest = self.load_manifest(&root, entry, key).inspect_err(|error| {
                 tracing::warn!(profil = %entry.name, %error, "manifeste illisible");
             })?;
             tracing::info!(
@@ -440,7 +622,112 @@ impl ProfileStore {
             .selected
             .and_then(|id| registry.find(id))
             .map(|entry| entry.name.clone());
-        Ok(ClientConfig { profiles, selected })
+        Ok(ClientConfig {
+            profiles,
+            selected,
+            locked,
+        })
+    }
+
+    /// Turns the lock watch on or off. Off by default: an unlock is refused
+    /// until the engine has the notifications that will lock the session again.
+    pub fn set_lock_watch(&self, active: bool) {
+        self.lock_watch.store(active, Ordering::Release);
+    }
+
+    pub fn lock_watch_active(&self) -> bool {
+        self.lock_watch.load(Ordering::Acquire)
+    }
+
+    /// The mode of a profile, read from the registry. No key is needed.
+    pub fn mode_of(&self, name: &str) -> Result<Option<ProfileMode>, VaultError> {
+        let root = self.root()?;
+        Ok(self
+            .load_registry(&root)?
+            .find_by_name(name)
+            .map(|entry| entry.mode))
+    }
+
+    /// Opens a `nomade` profile with its passphrase, and keeps the key.
+    ///
+    /// Refused without the lock watch. A wrong passphrase, or a manifest that
+    /// does not open under it, leaves the profile locked and says so. A lock
+    /// that lands during the unlock discards the key. Unlocking a `service`
+    /// profile, or a name that does not exist, does nothing.
+    pub fn unlock(&self, name: &str, passphrase: &str) -> Result<(), VaultError> {
+        if !self.lock_watch_active() {
+            return Err(VaultError::LockWatchUnavailable);
+        }
+        let root = self.root()?;
+        // The entry and the blob are read together, under the write lock: a
+        // switch between its registry write and its rename would pair the new
+        // mode with the old blob. The lock is released before the derivation,
+        // which takes about a second.
+        let (entry, blob) = {
+            let _writing = self.writing();
+            let registry = self.load_registry(&root)?;
+            let Some(entry) = registry.find_by_name(name).cloned() else {
+                return Ok(());
+            };
+            if !entry.mode.is_nomad() {
+                return Ok(());
+            }
+            let blob = aether_vault::read_file_bounded(&self.manifest_path(entry.id))
+                .map_err(VaultError::Container)?;
+            (entry, blob)
+        };
+        let ProfileMode::Nomad { salt, .. } = entry.mode else {
+            return Ok(());
+        };
+        // Read before the derivation: a lock during it bumps the epoch, and is
+        // seen by the check below.
+        let epoch = self.lock_epoch.load(Ordering::Acquire);
+        let key = PassphraseKey::derive(passphrase, &salt)?;
+        Self::open_entry(&root, &entry, &blob, ManifestKey::Nomad(&key)).map_err(|error| {
+            match error {
+                // The AEAD and the container cannot tell a wrong passphrase
+                // from an altered profile, and neither does the message.
+                VaultError::Container(_) => VaultError::WrongPassphrase,
+                other => other,
+            }
+        })?;
+        #[cfg(test)]
+        if let Some(hook) = &self.between_derivation_and_store {
+            hook(self);
+        }
+        let mut unlocked = self.unlocked_keys();
+        if self.lock_epoch.load(Ordering::Acquire) != epoch {
+            // The key is dropped with `key` here, never stored.
+            return Err(VaultError::ProfileLocked(name.to_string()));
+        }
+        unlocked.insert(entry.id, key);
+        Ok(())
+    }
+
+    /// Whether a `nomade` profile's key is held in this session.
+    pub fn is_unlocked(&self, name: &str) -> bool {
+        let Ok(root) = self.root() else {
+            return false;
+        };
+        let Ok(registry) = self.load_registry(&root) else {
+            return false;
+        };
+        registry
+            .find_by_name(name)
+            .is_some_and(|entry| self.unlocked_keys().contains_key(&entry.id))
+    }
+
+    /// Locks every `nomade` profile again, and forgets the installation root
+    /// with them. Called on session lock, sleep, disconnect and engine exit.
+    pub fn forget_unlocked(&self) {
+        let mut unlocked = self.unlocked_keys();
+        self.lock_epoch.fetch_add(1, Ordering::AcqRel);
+        unlocked.clear();
+        drop(unlocked);
+        *self
+            .root_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     /// Number of entries in the registry. A migration checks the loaded
@@ -448,6 +735,232 @@ impl ProfileStore {
     pub(crate) fn registered_count(&self) -> Result<usize, VaultError> {
         let root = self.root()?;
         Ok(self.load_registry(&root)?.entries.len())
+    }
+
+    /// Enrolment gesture (spec §5.7): creates a profile that does not exist yet,
+    /// sealed as `nomade` under `new_passphrase`, with a fresh salt.
+    ///
+    /// The passphrase is judged before anything is read or written, so a
+    /// refusal leaves the store byte-identical. The key stays held.
+    pub fn save_new_nomad_profile(
+        &self,
+        profile: &ClientProfile,
+        new_passphrase: &str,
+    ) -> Result<(), VaultError> {
+        self.require_lock_watch()?;
+        profile
+            .check_kind()
+            .map_err(|error| VaultError::InvalidProfileKind(error.to_string()))?;
+        let accepted =
+            passphrase::accept(new_passphrase).map_err(VaultError::NewPassphraseRefused)?;
+        let salt = nomad::new_salt()?;
+        // Read before the derivation: a lock during it bumps the epoch, and
+        // `create_nomad` sees it before keeping the key.
+        let epoch = self.lock_epoch.load(Ordering::Acquire);
+        let key = PassphraseKey::derive(&accepted, &salt)?;
+        #[cfg(test)]
+        if let Some(hook) = &self.between_derivation_and_store {
+            hook(self);
+        }
+        self.create_nomad(profile, salt, key, epoch)
+    }
+
+    /// The gate `unlock` applies: a nomad key is never derived or kept while
+    /// no lock notification is registered.
+    fn require_lock_watch(&self) -> Result<(), VaultError> {
+        if self.lock_watch_active() {
+            Ok(())
+        } else {
+            Err(VaultError::LockWatchUnavailable)
+        }
+    }
+
+    /// Writes a profile that does not exist yet, sealed under `key`.
+    ///
+    /// The only writer of a new `nomade` manifest, and it never seals a service
+    /// one. There is no previous manifest for a `.next` step to replace, so the
+    /// manifest is written in place: an orphan blob with no registry entry is
+    /// unreachable (ADR-006 §2), and that is the only state a crash can leave.
+    fn create_nomad(
+        &self,
+        profile: &ClientProfile,
+        salt: [u8; nomad::SALT_LEN],
+        key: PassphraseKey,
+        epoch: u64,
+    ) -> Result<(), VaultError> {
+        let root = self.root()?;
+        let _writing = self.writing();
+        let mut registry = self.load_registry(&root)?;
+        if let Some(entry) = registry.find_by_name(&profile.name) {
+            // A locked profile is reported as such; an existing one is not
+            // replaced here, whatever its mode.
+            key_for(entry, &self.unlocked_keys())?;
+            return Err(VaultError::ProfileExists(profile.name.clone()));
+        }
+        let client_public_key = aether::wg::public_from_private(profile.private_key.expose())
+            .map_err(|_| VaultError::ContextDisagrees)?;
+        let id = ProfileId::generate()?;
+        let manifest = ProfileManifest::from_profile(profile, SecurityGeneration(1));
+        let blob = seal_manifest(
+            &root,
+            id,
+            &manifest,
+            &client_public_key,
+            ManifestKey::Nomad(&key),
+        )?;
+        self.write(&self.manifest_path(id), &blob)?;
+        let mode = ProfileMode::Nomad {
+            kdf: KDF_PBKDF2_HMAC_SHA512,
+            salt,
+        };
+        registry.upsert(RegistryEntry {
+            id,
+            name: profile.name.clone(),
+            client_public_key,
+            gateway_public_key: profile.peer_public_key.clone(),
+            generation: SecurityGeneration(1),
+            security_digest: entry_digest(manifest.security_digest(), &mode),
+            rotation_required: false,
+            mode,
+        })?;
+        if registry.selected.is_none() {
+            registry.selected = Some(id);
+        }
+        self.store_registry(&root, &registry)?;
+        // A lock that landed during the derivation or the write wins: the key
+        // is dropped here and the profile stays locked.
+        let mut unlocked = self.unlocked_keys();
+        if self.lock_epoch.load(Ordering::Acquire) == epoch {
+            unlocked.insert(id, key);
+        }
+        Ok(())
+    }
+
+    /// Switch gesture (spec §5.7): moves a `service` profile to `nomade`, or
+    /// changes the passphrase of an unlocked `nomade` one (a new salt).
+    ///
+    /// The passphrase is judged before anything is read or written.
+    pub fn make_nomad(&self, name: &str, new_passphrase: &str) -> Result<(), VaultError> {
+        self.require_lock_watch()?;
+        let accepted =
+            passphrase::accept(new_passphrase).map_err(VaultError::NewPassphraseRefused)?;
+        self.switch(name, Seal::Nomad(accepted))
+    }
+
+    /// Switch gesture (spec §5.7): moves an unlocked `nomade` profile back to
+    /// `service`, and forgets its key. A `service` profile is left as it is.
+    pub fn make_service(&self, name: &str) -> Result<(), VaultError> {
+        self.switch(name, Seal::Service)
+    }
+
+    /// Re-seals a profile under a new mode, in the three writes of spec §5.7:
+    ///
+    /// 1. the manifest at generation + 1 is written as `.next`;
+    /// 2. the registry records the new mode and generation;
+    /// 3. the `.next` file is renamed over `<id>.hvlt`.
+    ///
+    /// The held key follows the registry: it is replaced, or forgotten, only
+    /// after the registry write. The write lock is taken before the registry is
+    /// read, so no other writer interleaves with the three writes. The unlocked
+    /// map stays locked from the key read to the end, so a lock waits for the
+    /// switch rather than landing between its writes.
+    fn switch(&self, name: &str, seal: Seal) -> Result<(), VaultError> {
+        let root = self.root()?;
+        let _writing = self.writing();
+        let mut registry = self.load_registry(&root)?;
+        let entry = registry
+            .find_by_name(name)
+            .cloned()
+            .ok_or_else(|| VaultError::UnknownProfile(name.to_string()))?;
+        if matches!(seal, Seal::Service) && !entry.mode.is_nomad() {
+            return Ok(());
+        }
+        let id = entry.id;
+        let mut unlocked = self.unlocked_keys();
+
+        let mut manifest = {
+            let key = key_for(&entry, &unlocked)?;
+            self.load_manifest(&root, &entry, key)?
+        };
+        let generation = entry.generation.next();
+        manifest.generation = generation;
+
+        // Read before the derivation, as in `unlock`.
+        let epoch = self.lock_epoch.load(Ordering::Acquire);
+        let (mode, new_key) = match seal {
+            Seal::Service => (ProfileMode::Service, None),
+            Seal::Nomad(passphrase) => {
+                let salt = nomad::new_salt()?;
+                let key = PassphraseKey::derive(&passphrase, &salt)?;
+                #[cfg(test)]
+                if let Some(hook) = &self.between_derivation_and_store {
+                    hook(self);
+                }
+                (
+                    ProfileMode::Nomad {
+                        kdf: KDF_PBKDF2_HMAC_SHA512,
+                        salt,
+                    },
+                    Some(key),
+                )
+            }
+        };
+        let blob = seal_manifest(
+            &root,
+            id,
+            &manifest,
+            &entry.client_public_key,
+            new_key
+                .as_ref()
+                .map_or(ManifestKey::Service, ManifestKey::Nomad),
+        )?;
+        let digest = entry_digest(manifest.security_digest(), &mode);
+
+        let staged = self.next_manifest_path(id, generation);
+        self.write(&staged, &blob)?;
+        self.checkpoint(SwitchStep::Staged)?;
+
+        registry.upsert(RegistryEntry {
+            generation,
+            security_digest: digest,
+            mode,
+            ..entry
+        })?;
+        self.store_registry(&root, &registry)?;
+        match new_key {
+            // A lock during the derivation wins, as in `unlock`: the profile
+            // is written as nomad and stays locked.
+            Some(key) if self.lock_epoch.load(Ordering::Acquire) == epoch => {
+                unlocked.insert(id, key);
+            }
+            _ => {
+                unlocked.remove(&id);
+            }
+        }
+        self.checkpoint(SwitchStep::Registered)?;
+
+        std::fs::rename(&staged, self.manifest_path(id)).map_err(|error| VaultError::Io {
+            path: staged,
+            cause: error.to_string(),
+        })?;
+        self.checkpoint(SwitchStep::Renamed)
+    }
+
+    #[cfg(not(test))]
+    fn checkpoint(&self, _step: SwitchStep) -> Result<(), VaultError> {
+        Ok(())
+    }
+
+    /// Stops a switch after `step` when a test asks for it.
+    #[cfg(test)]
+    fn checkpoint(&self, step: SwitchStep) -> Result<(), VaultError> {
+        if self.stop_switch_after == Some(step) {
+            return Err(VaultError::Io {
+                path: self.dir.clone(),
+                cause: format!("injected crash after {step:?}"),
+            });
+        }
+        Ok(())
     }
 
     /// Names of the profiles blocked until their key is rotated.
@@ -472,13 +985,22 @@ impl ProfileStore {
             .check_kind()
             .map_err(|error| VaultError::InvalidProfileKind(error.to_string()))?;
         let root = self.root()?;
+        let _writing = self.writing();
         let mut registry = self.load_registry(&root)?;
         let client_public_key = aether::wg::public_from_private(profile.private_key.expose())
             .map_err(|_| VaultError::ContextDisagrees)?;
 
         let previous = registry.find_by_name(&profile.name).cloned();
+        // The key is decided before anything is read or sealed: a nomad profile
+        // whose passphrase key is not held is refused here, and never falls
+        // back to a service seal.
+        let unlocked = self.unlocked_keys();
+        let key = match previous.as_ref() {
+            Some(entry) => key_for(entry, &unlocked)?,
+            None => ManifestKey::Service,
+        };
         if let Some(entry) = previous.as_ref() {
-            let known = self.load_manifest(&root, entry)?;
+            let known = self.load_manifest(&root, entry, key)?;
             if known.kind() != profile.kind() {
                 return Err(VaultError::ProfileKindChanged {
                     known: known.kind().as_str(),
@@ -486,11 +1008,15 @@ impl ProfileStore {
                 });
             }
         }
-        let id = previous.as_ref().map(|entry| entry.id);
-        let id = match id {
-            Some(id) => id,
+        let id = match previous.as_ref() {
+            Some(entry) => entry.id,
             None => ProfileId::generate()?,
         };
+        // An existing profile keeps its mode: a save never changes it, and
+        // only the explicit gesture does (spec §5.6).
+        let mode = previous
+            .as_ref()
+            .map_or(ProfileMode::Service, |entry| entry.mode);
         let rotated = previous
             .as_ref()
             .is_some_and(|entry| entry.client_public_key != client_public_key);
@@ -500,8 +1026,9 @@ impl ProfileStore {
         // change. Only the first was tracked before, so swapping the pinned CA
         // or lowering the stored floor left the counter still — and a restored
         // older manifest with the old anchor passed the registry check.
-        let digest =
+        let manifest_digest =
             ProfileManifest::from_profile(profile, SecurityGeneration(0)).security_digest();
+        let digest = entry_digest(manifest_digest, &mode);
         let security_changed = previous
             .as_ref()
             .is_some_and(|entry| entry.security_digest != digest);
@@ -512,7 +1039,7 @@ impl ProfileStore {
         };
 
         let manifest = ProfileManifest::from_profile(profile, generation);
-        let blob = seal_manifest(&root, id, &manifest, &client_public_key)?;
+        let blob = seal_manifest(&root, id, &manifest, &client_public_key, key)?;
         self.write(&self.manifest_path(id), &blob)?;
 
         registry.upsert(RegistryEntry {
@@ -527,6 +1054,7 @@ impl ProfileStore {
             rotation_required: previous
                 .map(|entry| entry.rotation_required && !rotated)
                 .unwrap_or(false),
+            mode,
         })?;
         if registry.selected.is_none() {
             registry.selected = Some(id);
@@ -536,6 +1064,7 @@ impl ProfileStore {
 
     pub fn remove_profile(&self, name: &str) -> Result<(), VaultError> {
         let root = self.root()?;
+        let _writing = self.writing();
         let mut registry = self.load_registry(&root)?;
         let Some(entry) = registry.find_by_name(name).cloned() else {
             return Ok(());
@@ -550,6 +1079,7 @@ impl ProfileStore {
 
     pub fn select(&self, name: &str) -> Result<(), VaultError> {
         let root = self.root()?;
+        let _writing = self.writing();
         let mut registry = self.load_registry(&root)?;
         let Some(entry) = registry.find_by_name(name).cloned() else {
             return Ok(());
@@ -592,6 +1122,9 @@ impl ProfileStore {
             dumps: exclusion.detail().to_string(),
             rotation_required: self.rotation_required().unwrap_or_default(),
             legacy_present: self.legacy_present(),
+            lock_watch_active: self.lock_watch_active(),
+            // Known only to the engine, which holds the passphrase source.
+            nomad_available: false,
         }
     }
 
@@ -620,6 +1153,7 @@ impl ProfileStore {
         })?;
 
         let root = self.root()?;
+        let _writing = self.writing();
         let mut registry = self.load_registry(&root)?;
         let mut report = MigrationReport {
             migrated: Vec::new(),
@@ -639,12 +1173,26 @@ impl ProfileStore {
                 );
                 continue;
             };
+            if registry
+                .find_by_name(&profile.name)
+                .is_some_and(|entry| entry.mode.is_nomad())
+            {
+                // A migration seals service manifests. Over a nomad profile it
+                // would drop the passphrase silently, so it is refused.
+                return Err(VaultError::ProfileLocked(profile.name.clone()));
+            }
             let id = registry
                 .find_by_name(&profile.name)
                 .map(|entry| entry.id)
                 .map_or_else(ProfileId::generate, Ok)?;
             let manifest = ProfileManifest::from_profile(profile, SecurityGeneration(1));
-            let blob = seal_manifest(&root, id, &manifest, &client_public_key)?;
+            let blob = seal_manifest(
+                &root,
+                id,
+                &manifest,
+                &client_public_key,
+                ManifestKey::Service,
+            )?;
             self.write(&self.manifest_path(id), &blob)?;
 
             // Reopen and verify **before** publishing anything (ADR-006 §3).
@@ -658,6 +1206,7 @@ impl ProfileStore {
                 &client_public_key,
                 &profile.peer_public_key,
                 &written,
+                ManifestKey::Service,
             )?;
             if reopened.generation != SecurityGeneration(1) {
                 return Err(VaultError::ContextDisagrees);
@@ -673,6 +1222,7 @@ impl ProfileStore {
                 // The key lived in plaintext. Sealing it does not recall the
                 // copies already in backups and roaming profiles.
                 rotation_required: true,
+                mode: ProfileMode::Service,
             })?;
             report.migrated.push(profile.name.clone());
             report.rotation_required.push(profile.name.clone());
@@ -733,6 +1283,23 @@ pub(crate) fn set_key_slot(dir: &std::path::Path, slot: &str) -> Result<(), Vaul
             cause: e.to_string(),
         }
     })
+}
+
+/// The key that opens and seals `entry`'s manifest: the installation root alone
+/// for a `service` profile, the held passphrase key for a `nomade` one. A
+/// `nomade` profile whose key is not held is `ProfileLocked`, never a service
+/// seal.
+fn key_for<'a>(
+    entry: &RegistryEntry,
+    unlocked: &'a HashMap<ProfileId, PassphraseKey>,
+) -> Result<ManifestKey<'a>, VaultError> {
+    match entry.mode {
+        ProfileMode::Service => Ok(ManifestKey::Service),
+        ProfileMode::Nomad { .. } => unlocked
+            .get(&entry.id)
+            .map(ManifestKey::Nomad)
+            .ok_or_else(|| VaultError::ProfileLocked(entry.name.clone())),
+    }
 }
 
 fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {

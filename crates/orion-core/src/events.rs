@@ -91,6 +91,10 @@ pub enum ClientEvent {
     SpeedTest { progress: SpeedTestProgress },
     /// Non-fatal error surfaced to the user.
     Error { message: String },
+    /// The profile list moved without a command of the UI: a lock turned the
+    /// `nomade` profiles back to locked. It carries nothing: the UI reads the
+    /// configuration again, and what it gets has no secret in it.
+    ConfigChanged,
 }
 
 impl ClientEvent {

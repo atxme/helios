@@ -16,6 +16,7 @@ fn profile(name: &str, heliosd_url: Option<&str>) -> ProfileView {
         heliosd_url: heliosd_url.map(str::to_string),
         ssh_target: None,
         key_negotiation: None,
+        mode: "service".into(),
         profile_type: "classic".into(),
         public_key: None,
         has_private_key: false,
@@ -32,6 +33,7 @@ fn view(selected: Option<&str>, profiles: Vec<ProfileView>) -> ConfigView {
     ConfigView {
         profiles,
         selected: selected.map(str::to_string),
+        locked: Vec::new(),
         vault_error: None,
     }
 }

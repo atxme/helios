@@ -28,16 +28,82 @@
 //! is the full offline rollback ADR-006 declares unsolved; nothing here claims
 //! to catch it.
 
+use super::nomad::SALT_LEN;
 use super::{codec, ProfileId, SecurityGeneration, VaultError};
 
 /// Registry encoding version. Any other value is refused, never guessed.
 ///
-/// Raised to 2 when `security_digest` entered the entry. Version 1 is refused
-/// rather than read with a zero digest: a zero would mean "no security state
-/// ever observed", which would let the first save after an update look like a
-/// change and raise every generation — or, worse, look like no change when one
-/// had happened.
-const REGISTRY_VERSION: u8 = 2;
+/// Raised to 3 when the profile mode entered the entry. Version 2, the layout
+/// with `security_digest` and without a mode, is still read: every entry it
+/// holds is a `service` profile, and the next write produces version 3.
+///
+/// Version 1 is refused rather than read with a zero digest: a zero would mean
+/// "no security state ever observed", which would let the first save after an
+/// update look like a change and raise every generation — or, worse, look like
+/// no change when one had happened.
+const REGISTRY_VERSION: u8 = 3;
+
+/// The layout before the profile mode, read as all-`service`.
+const LEGACY_VERSION: u8 = 2;
+
+/// Mode byte of a `service` entry.
+const MODE_SERVICE: u8 = 0;
+
+/// Mode byte of a `nomade` entry; `kdf` and the salt follow it.
+const MODE_NOMAD: u8 = 1;
+
+/// The only passphrase KDF identifier accepted. `1` is burned.
+pub(crate) const KDF_PBKDF2_HMAC_SHA512: u8 = 2;
+
+/// The KDF identifier that was used before it was burned.
+const KDF_BURNED: u8 = 1;
+
+/// How a profile's manifest is sealed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileMode {
+    /// Sealed under the installation root alone, opened without a prompt.
+    Service,
+    /// Sealed under the profile root key and a passphrase key. `kdf` names the
+    /// passphrase derivation; `salt` is the random salt it was derived with.
+    Nomad { kdf: u8, salt: [u8; SALT_LEN] },
+}
+
+impl ProfileMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Service => "service",
+            Self::Nomad { .. } => "nomade",
+        }
+    }
+
+    pub fn is_nomad(&self) -> bool {
+        matches!(self, Self::Nomad { .. })
+    }
+}
+
+/// The registry's digest of one profile: its manifest's security digest, with
+/// the mode mixed in when the mode is `nomade`.
+///
+/// A `service` entry keeps the manifest digest unchanged, so every digest
+/// recorded before the mode existed still matches. A `nomade` entry binds its
+/// mode and salt as well: switching modes, or re-salting, is then a security
+/// change and raises the generation like the three others ADR-006 §2 lists.
+pub fn entry_digest(manifest_digest: [u8; 32], mode: &ProfileMode) -> [u8; 32] {
+    match mode {
+        ProfileMode::Service => manifest_digest,
+        ProfileMode::Nomad { kdf, salt } => {
+            let mut input = Vec::with_capacity(32 + 2 + SALT_LEN);
+            input.extend_from_slice(&manifest_digest);
+            input.push(MODE_NOMAD);
+            input.push(*kdf);
+            input.extend_from_slice(salt);
+            let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &input);
+            let mut out = [0u8; 32];
+            out.copy_from_slice(digest.as_ref());
+            out
+        }
+    }
+}
 
 /// Bound on a decoded registry, checked before allocation.
 pub const MAX_REGISTRY_BYTES: usize = 256 * 1024;
@@ -68,6 +134,8 @@ pub struct RegistryEntry {
     /// compromised. It stays unconnectable until a new key is admitted
     /// (ADR-006 §3, migration).
     pub rotation_required: bool,
+    /// How the manifest is sealed. Decides which secrets a write needs.
+    pub mode: ProfileMode,
 }
 
 /// The installation's profile table.
@@ -127,6 +195,14 @@ impl Registry {
             out.extend_from_slice(&entry.generation.0.to_be_bytes());
             out.extend_from_slice(&entry.security_digest);
             out.push(u8::from(entry.rotation_required));
+            match entry.mode {
+                ProfileMode::Service => out.push(MODE_SERVICE),
+                ProfileMode::Nomad { kdf, salt } => {
+                    out.push(MODE_NOMAD);
+                    out.push(kdf);
+                    out.extend_from_slice(&salt);
+                }
+            }
         }
         match self.selected {
             None => out.push(0),
@@ -147,28 +223,41 @@ impl Registry {
         }
         let mut cursor = codec::Cursor::new(bytes);
         let version = cursor.byte()?;
-        if version != REGISTRY_VERSION {
+        if version != REGISTRY_VERSION && version != LEGACY_VERSION {
             return Err(VaultError::UnsupportedManifest(version));
         }
         let count = u16::from_be_bytes(cursor.array::<2>()?) as usize;
         let mut entries = Vec::with_capacity(count.min(64));
         for _ in 0..count {
+            let id = ProfileId::from_bytes(cursor.array::<16>()?);
+            let name = cursor.text()?;
+            let client_public_key = cursor.text()?;
+            let gateway_public_key = cursor.text()?;
+            let generation = SecurityGeneration(u64::from_be_bytes(cursor.array::<8>()?));
+            let security_digest = cursor.array::<32>()?;
+            let rotation_required = match cursor.byte()? {
+                0 => false,
+                1 => true,
+                other => {
+                    return Err(VaultError::ManifestEncoding(format!(
+                        "invalid rotation flag {other}"
+                    )))
+                }
+            };
+            let mode = if version == LEGACY_VERSION {
+                ProfileMode::Service
+            } else {
+                decode_mode(&mut cursor)?
+            };
             entries.push(RegistryEntry {
-                id: ProfileId::from_bytes(cursor.array::<16>()?),
-                name: cursor.text()?,
-                client_public_key: cursor.text()?,
-                gateway_public_key: cursor.text()?,
-                generation: SecurityGeneration(u64::from_be_bytes(cursor.array::<8>()?)),
-                security_digest: cursor.array::<32>()?,
-                rotation_required: match cursor.byte()? {
-                    0 => false,
-                    1 => true,
-                    other => {
-                        return Err(VaultError::ManifestEncoding(format!(
-                            "invalid rotation flag {other}"
-                        )))
-                    }
-                },
+                id,
+                name,
+                client_public_key,
+                gateway_public_key,
+                generation,
+                security_digest,
+                rotation_required,
+                mode,
             });
         }
         let selected = match cursor.byte()? {
@@ -185,9 +274,41 @@ impl Registry {
     }
 }
 
+/// Reads the mode of one version 3 entry. A burned or unknown KDF is refused
+/// by name, before any salt is consumed.
+fn decode_mode(cursor: &mut codec::Cursor<'_>) -> Result<ProfileMode, VaultError> {
+    match cursor.byte()? {
+        MODE_SERVICE => Ok(ProfileMode::Service),
+        MODE_NOMAD => {
+            let kdf = cursor.byte()?;
+            match kdf {
+                KDF_PBKDF2_HMAC_SHA512 => {}
+                KDF_BURNED => {
+                    return Err(VaultError::Container(aether_vault::VaultError::BurnedKdf(
+                        kdf,
+                    )))
+                }
+                other => {
+                    return Err(VaultError::Container(
+                        aether_vault::VaultError::UnsupportedKdf(other),
+                    ))
+                }
+            }
+            Ok(ProfileMode::Nomad {
+                kdf,
+                salt: cursor.array::<SALT_LEN>()?,
+            })
+        }
+        other => Err(VaultError::ManifestEncoding(format!(
+            "invalid profile mode {other}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vault::nomad::SALT_LEN;
 
     fn entry(name: &str, id: u8, generation: u64) -> RegistryEntry {
         RegistryEntry {
@@ -198,7 +319,134 @@ mod tests {
             generation: SecurityGeneration(generation),
             security_digest: [id; 32],
             rotation_required: false,
+            mode: ProfileMode::Service,
         }
+    }
+
+    /// Hand-built registry bytes: one entry named `poste`, then the selection
+    /// byte `0`. `mode_tail` is what follows `rotation_required`; `None` means
+    /// the version 2 layout, which has no mode at all.
+    fn single_entry_bytes(version: u8, mode_tail: Option<&[u8]>) -> Vec<u8> {
+        let mut out = vec![version];
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.extend_from_slice(&[1u8; 16]);
+        codec::put(&mut out, b"poste").unwrap();
+        codec::put(&mut out, b"client-poste").unwrap();
+        codec::put(&mut out, b"gateway-poste").unwrap();
+        out.extend_from_slice(&4u64.to_be_bytes());
+        out.extend_from_slice(&[1u8; 32]);
+        out.push(0);
+        if let Some(tail) = mode_tail {
+            out.extend_from_slice(tail);
+        }
+        out.push(0);
+        out
+    }
+
+    #[test]
+    fn a_v3_registry_round_trips_both_modes() {
+        let salt = [5u8; SALT_LEN];
+        let mut nomad = entry("portable", 2, 1);
+        nomad.mode = ProfileMode::Nomad { kdf: 2, salt };
+        let mut registry = Registry::default();
+        registry.upsert(entry("poste", 1, 3)).unwrap();
+        registry.upsert(nomad).unwrap();
+        registry.selected = Some(ProfileId::from_bytes([2; 16]));
+
+        let encoded = registry.encode().unwrap();
+        assert_eq!(encoded[0], 3, "encode always writes the current version");
+        let decoded = Registry::decode(&encoded).unwrap();
+        assert_eq!(decoded, registry);
+        let portable = decoded.find_by_name("portable").unwrap();
+        assert!(portable.mode.is_nomad());
+        assert_eq!(portable.mode.as_str(), "nomade");
+        assert_eq!(
+            decoded.find_by_name("poste").unwrap().mode.as_str(),
+            "service"
+        );
+    }
+
+    #[test]
+    fn a_v2_registry_reads_as_service() {
+        let bytes = single_entry_bytes(2, None);
+        let decoded = Registry::decode(&bytes).unwrap();
+        let poste = decoded.find_by_name("poste").unwrap();
+        assert_eq!(poste.mode, ProfileMode::Service);
+        assert_eq!(poste.security_digest, [1u8; 32]);
+        assert_eq!(poste.generation.0, 4);
+        // The next write upgrades the layout.
+        assert_eq!(decoded.encode().unwrap()[0], 3);
+    }
+
+    #[test]
+    fn a_service_entry_digest_is_the_manifest_digest() {
+        let manifest_digest = [9u8; 32];
+        assert_eq!(
+            entry_digest(manifest_digest, &ProfileMode::Service),
+            manifest_digest,
+            "every existing registry digest must stay stable"
+        );
+    }
+
+    #[test]
+    fn a_nomad_entry_digest_binds_the_mode_and_its_salt() {
+        let manifest_digest = [9u8; 32];
+        let first = entry_digest(
+            manifest_digest,
+            &ProfileMode::Nomad {
+                kdf: 2,
+                salt: [1u8; SALT_LEN],
+            },
+        );
+        let second = entry_digest(
+            manifest_digest,
+            &ProfileMode::Nomad {
+                kdf: 2,
+                salt: [2u8; SALT_LEN],
+            },
+        );
+        assert_ne!(first, manifest_digest);
+        assert_ne!(first, second, "a new salt is a new security state");
+    }
+
+    #[test]
+    fn a_v1_registry_is_still_refused() {
+        let bytes = single_entry_bytes(1, None);
+        assert!(matches!(
+            Registry::decode(&bytes),
+            Err(VaultError::UnsupportedManifest(1))
+        ));
+    }
+
+    #[test]
+    fn a_burned_kdf_is_refused_and_named() {
+        let bytes = single_entry_bytes(3, Some(&[1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+        assert!(matches!(
+            Registry::decode(&bytes),
+            Err(VaultError::Container(aether_vault::VaultError::BurnedKdf(
+                1
+            )))
+        ));
+    }
+
+    #[test]
+    fn an_unknown_kdf_is_refused() {
+        let bytes = single_entry_bytes(3, Some(&[1, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+        assert!(matches!(
+            Registry::decode(&bytes),
+            Err(VaultError::Container(
+                aether_vault::VaultError::UnsupportedKdf(9)
+            ))
+        ));
+    }
+
+    #[test]
+    fn an_unknown_mode_byte_is_refused() {
+        let bytes = single_entry_bytes(3, Some(&[7]));
+        assert!(matches!(
+            Registry::decode(&bytes),
+            Err(VaultError::ManifestEncoding(_))
+        ));
     }
 
     #[test]

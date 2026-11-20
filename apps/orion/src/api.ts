@@ -263,6 +263,20 @@ export const discardStagedPsk = () => invoke<void>('discard_staged_psk')
 
 export const saveProfile = (draft: ProfileDraft) =>
   invoke<ClientConfig>('save_profile', { draft })
+/**
+ * Moves a `service` profile to `nomade`. The engine opens the platform's
+ * protected dialog for the new passphrase: the screen sends the name alone.
+ * Rejects with `Saisie annulée.` when the dialog is closed.
+ */
+export const makeNomad = (name: string) => invoke<ClientConfig>('make_nomad', { name })
+/**
+ * Sets a new passphrase on a `nomade` profile, unlocking it first if needed.
+ * The passphrase is typed in the engine's dialog, never in this window.
+ */
+export const changePassphrase = (name: string) =>
+  invoke<ClientConfig>('change_passphrase', { name })
+/** Moves an unlocked `nomade` profile back to `service`. */
+export const makeService = (name: string) => invoke<ClientConfig>('make_service', { name })
 export const deleteProfile = (name: string) =>
   invoke<ClientConfig>('delete_profile', { name })
 export const selectProfile = (name: string) =>

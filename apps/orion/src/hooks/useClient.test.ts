@@ -20,6 +20,9 @@ const api = vi.hoisted(() => ({
   onProfilePath: vi.fn(),
   saveProfile: vi.fn(),
   selectProfile: vi.fn(),
+  makeNomad: vi.fn(),
+  changePassphrase: vi.fn(),
+  makeService: vi.fn(),
 }))
 
 vi.mock('../api', () => api)
@@ -30,6 +33,7 @@ const portable: ClientProfile = {
   name: 'portable',
   endpoint: '203.0.113.10:51820',
   peer_public_key: 'gateway-public',
+  mode: 'service',
   profile_type: 'classic',
   public_key: 'client-public',
   has_private_key: true,
@@ -44,7 +48,7 @@ const portable: ClientProfile = {
   key_negotiation: null,
 }
 
-const config: ClientConfig = { profiles: [portable], selected: 'portable' }
+const config: ClientConfig = { profiles: [portable], selected: 'portable', locked: [] }
 const imported = (overrides: Partial<ImportOutcome> = {}): ImportOutcome => ({
   profile: { ...portable, name: 'imported' },
   identity_sealed: false,
@@ -194,10 +198,52 @@ describe('useClient', () => {
     await waitFor(() => expect(result.current.selectedProfile?.name).toBe('portable'))
 
     const other: ClientProfile = { ...portable, name: 'bureau' }
-    api.getConfig.mockResolvedValue({ profiles: [portable, other], selected: 'bureau' })
+    api.getConfig.mockResolvedValue({ profiles: [portable, other], selected: 'bureau', locked: [] })
     act(() => configChanged())
 
     await waitFor(() => expect(result.current.selectedProfile?.name).toBe('bureau'))
+  })
+
+  // A lock turns the nomad profiles back to locked, and the engine says so
+  // with an event: the window must read the configuration again.
+  it('rereads the configuration when the engine reports a config change', async () => {
+    const { result } = renderHook(() => useClient())
+    await waitFor(() => expect(result.current.selectedProfile?.name).toBe('portable'))
+
+    const lockedCoffre = { name: 'coffre', client_public_key: 'c', peer_public_key: 'g' }
+    api.getConfig.mockResolvedValue({ profiles: [], selected: 'coffre', locked: [lockedCoffre] })
+    act(() => emit({ type: 'config_changed' }))
+
+    await waitFor(() => expect(result.current.config.locked).toHaveLength(1))
+    expect(result.current.config.profiles).toHaveLength(0)
+  })
+
+  // The engine opens a locked profile inside a connect and answers with
+  // nothing: the list must be read back, or it keeps showing the row locked.
+  it('rereads the configuration after a connect', async () => {
+    const { result } = renderHook(() => useClient())
+    await waitFor(() => expect(result.current.selectedProfile?.name).toBe('portable'))
+    const lockedCoffre = { name: 'coffre', client_public_key: 'c', peer_public_key: 'g' }
+    api.getConfig.mockResolvedValue({ profiles: [portable], selected: 'portable', locked: [lockedCoffre] })
+    api.connect.mockResolvedValueOnce(undefined)
+
+    await act(async () => {
+      await result.current.connect('coffre')
+    })
+
+    await waitFor(() => expect(result.current.config.locked).toHaveLength(1))
+  })
+
+  // A locked selected profile is not among the profiles: the header must name
+  // it, not fall back to the first profile and connect another tunnel.
+  it('keeps a locked selected profile as the connect target', async () => {
+    const lockedCoffre = { name: 'coffre', client_public_key: 'c', peer_public_key: 'g' }
+    api.getConfig.mockResolvedValue({ profiles: [portable], selected: 'coffre', locked: [lockedCoffre] })
+    const { result } = renderHook(() => useClient())
+
+    await waitFor(() => expect(result.current.selectedLocked?.name).toBe('coffre'))
+    expect(result.current.selectedProfile).toBeNull()
+    expect(result.current.selectedName).toBe('coffre')
   })
 
   it('reports every associated-profile import outcome', async () => {
@@ -221,12 +267,12 @@ describe('useClient', () => {
   })
 
   it('updates configuration through successful actions', async () => {
-    const saved = { profiles: [{ ...portable, name: 'saved' }], selected: 'saved' }
+    const saved = { profiles: [{ ...portable, name: 'saved' }], selected: 'saved', locked: [] }
     api.connect.mockResolvedValue(undefined)
     api.disconnect.mockResolvedValue(undefined)
     api.importProfile.mockResolvedValue(imported())
     api.saveProfile.mockResolvedValue(saved)
-    api.deleteProfile.mockResolvedValue({ profiles: [], selected: null })
+    api.deleteProfile.mockResolvedValue({ profiles: [], selected: null, locked: [] })
     api.selectProfile.mockResolvedValue(config)
     const { result } = renderHook(() => useClient())
     await waitFor(() => expect(result.current.selectedProfile?.name).toBe('portable'))
@@ -277,5 +323,53 @@ describe('useClient', () => {
 
     act(() => result.current.clearError())
     expect(result.current.error).toBeNull()
+  })
+
+  /// The dialog the user closed is an answer, not a failure: nothing is shown
+  /// as an error and the configuration is left as it was.
+  it('reports a cancelled passphrase dialog as neutral, and a refusal as an error', async () => {
+    api.getConfig.mockResolvedValue(config)
+    const { result } = renderHook(() => useClient())
+    await waitFor(() => expect(result.current.selectedProfile?.name).toBe('portable'))
+
+    api.makeNomad.mockRejectedValueOnce('Saisie annulée.')
+    let outcome: string | undefined
+    await act(async () => {
+      outcome = await result.current.makeNomad('portable')
+    })
+    expect(outcome).toBe('cancelled')
+    expect(result.current.error).toBeNull()
+
+    api.changePassphrase.mockRejectedValueOnce('profil « portable » introuvable')
+    await act(async () => {
+      await expect(result.current.changePassphrase('portable')).rejects.toBe(
+        'profil « portable » introuvable',
+      )
+    })
+    expect(result.current.error).toBe('profil « portable » introuvable')
+  })
+
+  /// Closing the unlock dialog from «Se connecter» is a choice, not a refusal:
+  /// it resolves as cancelled and leaves the global error line empty. The
+  /// header connect and the locked-row connect both reach this path.
+  it('reports a closed unlock dialog on connect as cancelled, not as an error', async () => {
+    api.getConfig.mockResolvedValue(config)
+    const { result } = renderHook(() => useClient())
+    await waitFor(() => expect(result.current.selectedProfile?.name).toBe('portable'))
+
+    api.connect.mockRejectedValueOnce('Saisie annulée.')
+    let outcome: string | undefined
+    await act(async () => {
+      outcome = await result.current.connect('coffre')
+    })
+    expect(outcome).toBe('cancelled')
+    expect(result.current.error).toBeNull()
+
+    api.connect.mockRejectedValueOnce('profil « coffre » introuvable')
+    await act(async () => {
+      outcome = await result.current.connect('coffre')
+    })
+    expect(outcome).toBe('done')
+    expect(result.current.error).toBe('profil « coffre » introuvable')
   })
 })

@@ -6,6 +6,7 @@ import type {
   ClientConfig,
   ClientProfile,
   LogLine,
+  PassphraseGesture,
   ProfileDraft,
   PskKind,
   TelemetrySample,
@@ -13,11 +14,13 @@ import type {
 } from '../types'
 
 const MAX_LOGS = 80
+/** The engine's answer when the user closes the passphrase dialog. */
+const PASSPHRASE_CANCELLED = 'Saisie annulée.'
 /** Throughput curve window. At one sample per second, ~1 minute. */
 const MAX_SAMPLES = 60
 
 export function useClient() {
-  const [config, setConfig] = useState<ClientConfig>({ profiles: [], selected: null })
+  const [config, setConfig] = useState<ClientConfig>({ profiles: [], selected: null, locked: [] })
   const [state, setState] = useState<TunnelState>('down')
   const [backend, setBackend] = useState<string>('')
   const [adapterUp, setAdapterUp] = useState(false)
@@ -126,6 +129,12 @@ export function useClient() {
           setError(ev.message)
           pushLog('error', ev.message)
           break
+        case 'config_changed':
+          // The engine moved the profiles on its own: a lock turned the
+          // nomad ones back to locked. Without this reread the window would
+          // keep showing them open, with their endpoint.
+          api.getConfig().then(setConfig).catch(() => {})
+          break
       }
     })
     const unlistenProfilePath = api.onProfilePath(() => {
@@ -147,7 +156,14 @@ export function useClient() {
     }
   }, [consumeProfilePath, pushLog])
 
-  const connect = useCallback(async (name?: string) => {
+  /**
+   * Connects, and says whether the user stopped the unlock dialog.
+   *
+   * Resolves `cancelled` when the engine answers `Saisie annulée.`: a choice,
+   * shown as a neutral notice by the caller and never on the error line. Any
+   * other refusal lands on the error line and resolves `done`.
+   */
+  const connect = useCallback(async (name?: string): Promise<PassphraseGesture> => {
     setError(null)
     // New session, new negotiation: we start over from "unknown". Resetting
     // it here rather than on the `connecting` transition is deliberate — a
@@ -159,8 +175,16 @@ export function useClient() {
     setCapture(null)
     try {
       await api.connect(name)
+      return 'done'
     } catch (e) {
+      if (String(e) === PASSPHRASE_CANCELLED) return 'cancelled'
       setError(String(e))
+      return 'done'
+    } finally {
+      // A connect may have opened a locked profile, and the engine answers it
+      // with nothing: the list would keep showing the row as locked. Read
+      // back whatever the outcome, since a refusal can also leave it moved.
+      api.getConfig().then(setConfig).catch(() => {})
     }
   }, [])
 
@@ -240,6 +264,40 @@ export function useClient() {
     }
   }, [])
 
+  /**
+   * Runs a passphrase gesture and applies the configuration it returns.
+   *
+   * A closed dialog resolves as `cancelled`, not as an error: the user chose to
+   * stop, and the configuration is left as it was.
+   */
+  const passphraseGesture = useCallback(
+    async (run: () => Promise<ClientConfig>): Promise<PassphraseGesture> => {
+      setError(null)
+      try {
+        setConfig(await run())
+        return 'done'
+      } catch (cause) {
+        if (String(cause) === PASSPHRASE_CANCELLED) return 'cancelled'
+        setError(String(cause))
+        throw cause
+      }
+    },
+    [],
+  )
+
+  const makeNomad = useCallback(
+    (name: string) => passphraseGesture(() => api.makeNomad(name)),
+    [passphraseGesture],
+  )
+  const changePassphrase = useCallback(
+    (name: string) => passphraseGesture(() => api.changePassphrase(name)),
+    [passphraseGesture],
+  )
+  const makeService = useCallback(
+    (name: string) => passphraseGesture(() => api.makeService(name)),
+    [passphraseGesture],
+  )
+
   const select = useCallback(async (name: string) => {
     try {
       setError(null)
@@ -252,8 +310,14 @@ export function useClient() {
 
   const clearPathImportedProfile = useCallback(() => setPathImportedProfile(null), [])
 
+  // A selected profile that is locked is not in `profiles`: falling back to
+  // the first profile would aim the header, and its connect button, at a
+  // different tunnel. The locked one is named instead.
+  const selectedLocked = config.locked.find((p) => p.name === config.selected) ?? null
   const selectedProfile =
-    config.profiles.find((p) => p.name === config.selected) ?? config.profiles[0] ?? null
+    config.profiles.find((p) => p.name === config.selected) ??
+    (selectedLocked ? null : (config.profiles[0] ?? null))
+  const selectedName = selectedProfile?.name ?? selectedLocked?.name
 
   return {
     config,
@@ -269,6 +333,8 @@ export function useClient() {
     capture,
     error,
     selectedProfile,
+    selectedLocked,
+    selectedName,
     pathImportedProfile,
     connect,
     disconnect,
@@ -278,6 +344,9 @@ export function useClient() {
     saveProfile,
     removeProfile,
     select,
+    makeNomad,
+    changePassphrase,
+    makeService,
     clearPathImportedProfile,
     clearError: () => setError(null),
   }

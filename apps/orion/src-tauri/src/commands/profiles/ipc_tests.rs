@@ -20,6 +20,7 @@ fn profile_draft() -> ProfileDraft {
         use_staged_key: true,
         clear_preshared_key: false,
         use_staged_psk: true,
+        nomad: false,
     }
 }
 
@@ -257,6 +258,7 @@ async fn saving_with_staged_secrets_refreshes_the_tray_after_the_engine_returns_
                         profiles: vec![],
                         selected: Some("gateway".into()),
                         vault_error: None,
+                        locked: Vec::new(),
                     }))
                 })
                 .await;
@@ -318,6 +320,8 @@ fn posture(protected: bool, waived: bool) -> EngineReply {
         volume_protected: protected,
         unencrypted_volume_waived: waived,
         memory_locked: true,
+        lock_watch_active: false,
+        nomad_available: false,
         memory: "pages verrouillées".into(),
         dumps_excluded: true,
         dumps: "exclus".into(),

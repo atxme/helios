@@ -122,6 +122,7 @@ mod lifecycle {
             Arc::new(DryRunBackend::default()),
             None,
             "0.0.0-test",
+            Arc::new(orion_core::vault::UnavailablePassphraseSource),
         )
         .expect("service opens on scratch paths")
     }

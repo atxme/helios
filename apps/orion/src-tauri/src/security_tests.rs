@@ -100,6 +100,7 @@ fn no_secret_is_ever_serialised_towards_the_interface() {
     let config = orion_core::ClientConfig {
         profiles: vec![profile],
         selected: Some("poste".into()),
+        locked: Vec::new(),
     };
     let json = serde_json::to_string(&ConfigView::from(&config)).expect("serialise");
 

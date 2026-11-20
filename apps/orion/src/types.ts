@@ -283,8 +283,44 @@ export interface About {
 // to leave the machine — plus a boolean saying whether each secret is present.
 export type ProfileKind = 'classic' | 'helios_key_negotiation'
 
+/**
+ * Where a profile is sealed — mirror of the engine's `ProfileView.mode`.
+ *
+ * `nomade` is opened by a passphrase typed in the platform's protected dialog,
+ * and it locks again when the session locks, the machine sleeps, the tunnel
+ * drops or the engine exits (ADR-006).
+ */
+export type ProfileMode = 'service' | 'nomade'
+
+/**
+ * A `nomade` profile still sealed in this session — mirror of
+ * `LockedProfileView`.
+ *
+ * Only what the list shows. A locked profile has no endpoint or settings the
+ * screen may display until its passphrase opens it.
+ */
+export interface LockedProfileView {
+  name: string
+  client_public_key: string
+  peer_public_key: string
+}
+
+/**
+ * How a passphrase gesture ended, when it did not fail.
+ *
+ * `cancelled` is the user closing the native dialog: a neutral outcome, not an
+ * error, and nothing in the configuration changed.
+ */
+export type PassphraseGesture = 'done' | 'cancelled'
+
 export interface ClientProfile {
   name: string
+  /**
+   * Where the profile is sealed: `service`, or `nomade` under a passphrase.
+   *
+   * Resolved by the engine from its registry, never from the stored shape.
+   */
+  mode: ProfileMode
   /**
    * Which of the two profile shapes this is (spec §19).
    *
@@ -355,6 +391,8 @@ export interface ClientProfile {
 export interface ClientConfig {
   profiles: ClientProfile[]
   selected: string | null
+  /** `nomade` profiles sealed in this session, which cannot be used until opened. */
+  locked: LockedProfileView[]
   /**
    * Why the vault could not be opened at start-up, when it could not. An empty
    * list says nothing about its cause: after a failed migration, this is the
@@ -393,6 +431,11 @@ export interface ProfileDraft {
    * only says "keep it". Without it, a save leaves the stored key untouched.
    */
   useStagedKey?: boolean
+  /**
+   * Seals a **new** profile under a passphrase. Read only when the name is new:
+   * on an existing profile the switch is its own gesture.
+   */
+  nomad?: boolean
   /** Drop the stored static PSK. */
   clearPresharedKey?: boolean
   /**
@@ -478,6 +521,7 @@ export type ClientEvent =
   | { type: 'log'; level: string; message: string }
   | { type: 'telemetry'; iface: string; rx_bps: number; tx_bps: number; rx_pps: number; tx_pps: number }
   | { type: 'error'; message: string }
+  | { type: 'config_changed' }
 
 export interface LogLine {
   level: string
@@ -559,6 +603,16 @@ export interface VaultPosture {
   /** Volume-encryption posture of the disk holding the profiles. */
   volume: string
   volumeProtected: boolean
+  /**
+   * The engine receives the session and power notifications that lock a
+   * `nomade` profile again. Without them no such profile can be opened.
+   */
+  lockWatchActive: boolean
+  /**
+   * The passphrase of a `nomade` profile is typed in the platform's protected
+   * dialog. Decided by the engine, never by the configuration.
+   */
+  nomadAvailable: boolean
   /** `danger_allow_unencrypted_volume` est posé : un refus devenu un choix. */
   unencryptedVolumeWaived: boolean
   /** Secret pages held out of swap and of the hibernation file. */

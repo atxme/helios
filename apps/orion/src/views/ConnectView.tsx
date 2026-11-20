@@ -14,7 +14,13 @@ import {
   ShieldQuestion,
   TerminalSquare,
 } from 'lucide-react'
-import type { ClientProfile, PskKind, TelemetrySample, TunnelState } from '../types'
+import type {
+  ClientProfile,
+  LockedProfileView,
+  PskKind,
+  TelemetrySample,
+  TunnelState,
+} from '../types'
 import {
   elapsed,
   formatBps,
@@ -43,6 +49,11 @@ const AMBER = '#A16207'
 interface Props {
   state: TunnelState
   profile: ClientProfile | null
+  /**
+   * The selected profile when it is a locked `nomade` one. It has no endpoint
+   * to show, and connecting it makes the engine open the passphrase dialog.
+   */
+  lockedProfile?: LockedProfileView | null
   upSince: number | null
   telemetry: TelemetrySample | null
   history: TelemetrySample[]
@@ -83,6 +94,7 @@ const PROTECTION_SKIN: Record<ProtectionTone, { border: string; fill: string; te
 export function ConnectView({
   state,
   profile,
+  lockedProfile = null,
   upSince,
   telemetry,
   history,
@@ -108,7 +120,9 @@ export function ConnectView({
   const protection = protectionMeta(profile, psk, state)
   // `has_private_key` rather than the key itself: the screen needs to know a
   // key exists, and never needed to hold one (ADR-006 §5).
-  const ready = Boolean(profile?.endpoint && profile.has_private_key && profile.peer_public_key)
+  const ready =
+    Boolean(profile?.endpoint && profile.has_private_key && profile.peer_public_key) ||
+    (profile === null && lockedProfile !== null)
   const PostureIcon = POSTURE_ICON[posture.posture]
   // Only "blocked" deserves a sentence: it's the one counter-intuitive case,
   // where the machine reaches nothing at all and the reason is an adapter the
@@ -139,7 +153,12 @@ export function ConnectView({
             color="text.secondary"
             sx={{ mt: 0.6, fontFamily: 'monospace', fontSize: 12, overflowWrap: 'anywhere' }}
           >
-            {profile?.endpoint || (profile ? 'endpoint non défini' : 'aucun profil sélectionné')}
+            {profile?.endpoint ||
+              (profile
+                ? 'endpoint non défini'
+                : lockedProfile
+                  ? `${lockedProfile.name} · Nomade · verrouillé`
+                  : 'aucun profil sélectionné')}
           </Typography>
           {/* The virtual address earns its place next to the endpoint only
               while the tunnel carries it: announcing an address the machine

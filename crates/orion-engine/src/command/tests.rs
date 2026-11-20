@@ -29,7 +29,7 @@ const SECRET: &str = "SECRET-QUI-NE-DOIT-PAS-FUIR";
 /// `import_profile_path` is absent on purpose: the UI reads the file it is
 /// given and sends the engine only its text (F11 ruling), so no command of
 /// the engine names a path.
-const ENGINE_COMMANDS: [&str; 38] = [
+const ENGINE_COMMANDS: [&str; 41] = [
     "get_state",
     "backend_kind",
     "adapter_is_up",
@@ -50,6 +50,9 @@ const ENGINE_COMMANDS: [&str; 38] = [
     "discard_staged_psk",
     "ssh_command",
     "save_profile",
+    "make_nomad",
+    "change_passphrase",
+    "make_service",
     "delete_profile",
     "select_profile",
     "validate_profile",
@@ -212,6 +215,15 @@ fn every_command() -> Vec<EngineCommand> {
         EngineCommand::DiscardStagedPsk,
         EngineCommand::SshCommand { name: None },
         EngineCommand::SaveProfile { draft: draft() },
+        EngineCommand::MakeNomad {
+            name: "poste".into(),
+        },
+        EngineCommand::ChangePassphrase {
+            name: "poste".into(),
+        },
+        EngineCommand::MakeService {
+            name: "poste".into(),
+        },
         EngineCommand::DeleteProfile {
             name: "poste".into(),
         },
@@ -288,6 +300,9 @@ fn label(command: &EngineCommand) -> &'static str {
         EngineCommand::DiscardStagedPsk => "discard_staged_psk",
         EngineCommand::SshCommand { .. } => "ssh_command",
         EngineCommand::SaveProfile { .. } => "save_profile",
+        EngineCommand::MakeNomad { .. } => "make_nomad",
+        EngineCommand::ChangePassphrase { .. } => "change_passphrase",
+        EngineCommand::MakeService { .. } => "make_service",
         EngineCommand::DeleteProfile { .. } => "delete_profile",
         EngineCommand::SelectProfile { .. } => "select_profile",
         EngineCommand::ValidateProfile { .. } => "validate_profile",
@@ -397,6 +412,7 @@ fn every_reply() -> Vec<EngineReply> {
     let config = ClientConfig {
         profiles: vec![secret_profile()],
         selected: Some("poste".into()),
+        locked: Vec::new(),
     };
     let imported = ImportOutcome {
         profile: ProfileView::from(&secret_profile()),
@@ -459,6 +475,8 @@ fn every_reply() -> Vec<EngineReply> {
             dumps: "excluded".to_string(),
             rotation_required: Vec::new(),
             legacy_present: false,
+            lock_watch_active: false,
+            nomad_available: false,
         }),
         EngineReply::PublicKey("cHVibGlj".into()),
         EngineReply::SshCommand("ssh operateur@poste".into()),
@@ -548,6 +566,7 @@ fn every_reply_serializes_without_secret_material() {
     let config = serde_json::to_string(&EngineReply::Config(ConfigView::from(&ClientConfig {
         profiles: vec![secret_profile()],
         selected: None,
+        locked: Vec::new(),
     })))
     .expect("a reply serialises");
     assert!(config.contains("\"has_private_key\":true"));

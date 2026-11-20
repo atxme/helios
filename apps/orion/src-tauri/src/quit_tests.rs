@@ -44,6 +44,7 @@ fn engine_on(scratch: &Scratch) -> Arc<EngineService> {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory")
 }

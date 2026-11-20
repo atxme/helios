@@ -77,6 +77,11 @@ pub struct ProfileView {
     pub heliosd_url: Option<String>,
     pub ssh_target: Option<String>,
     pub key_negotiation: Option<orion_core::KeyNegotiationSettings>,
+    /// Where the profile is sealed: `"service"` or `"nomade"`.
+    ///
+    /// Only the engine knows it, from the registry: [`ProfileView::from`] says
+    /// `"service"`, and the engine corrects it for a `nomade` profile.
+    pub mode: String,
     /// Which of the two shapes of spec §19 this profile is.
     ///
     /// Resolved, never `null`: a profile sealed before the discriminant
@@ -112,6 +117,7 @@ impl From<&ClientProfile> for ProfileView {
             heliosd_url: profile.heliosd_url.clone(),
             ssh_target: profile.ssh_target.clone(),
             key_negotiation: profile.key_negotiation.clone(),
+            mode: "service".to_string(),
             profile_type: profile.kind().as_str().to_string(),
             public_key: profile.public_key(),
             has_private_key: !profile.private_key.is_empty(),
@@ -121,11 +127,36 @@ impl From<&ClientProfile> for ProfileView {
     }
 }
 
+/// A `nomade` profile still sealed in this session.
+///
+/// Only what the list needs to show it: the public keys are the ones the
+/// operator knows, and nothing here says what mode it is, since a locked
+/// profile is by definition a `nomade` one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LockedProfileView {
+    pub name: String,
+    pub client_public_key: String,
+    pub peer_public_key: String,
+}
+
+impl From<&orion_core::LockedProfile> for LockedProfileView {
+    fn from(locked: &orion_core::LockedProfile) -> Self {
+        Self {
+            name: locked.name.clone(),
+            client_public_key: locked.client_public_key.clone(),
+            peer_public_key: locked.gateway_public_key.clone(),
+        }
+    }
+}
+
 /// The configuration as the interface sees it: profiles, redacted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigView {
     pub profiles: Vec<ProfileView>,
     pub selected: Option<String>,
+    /// `nomade` profiles that are sealed in this session, and cannot be used
+    /// until their passphrase opens them.
+    pub locked: Vec<LockedProfileView>,
     /// Why the vault could not be opened at start-up, when it could not.
     ///
     /// An empty list says nothing about its cause: after a failed migration,
@@ -138,6 +169,7 @@ impl From<&ClientConfig> for ConfigView {
         Self {
             profiles: config.profiles.iter().map(ProfileView::from).collect(),
             selected: config.selected.clone(),
+            locked: config.locked.iter().map(LockedProfileView::from).collect(),
             vault_error: None,
         }
     }

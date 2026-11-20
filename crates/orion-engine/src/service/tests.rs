@@ -50,6 +50,7 @@ fn open_builds_the_service_on_the_given_paths() {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory");
 
@@ -67,6 +68,7 @@ fn open_keeps_running_on_a_vault_it_cannot_read() {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("an unreadable vault does not stop the service");
 
@@ -92,6 +94,7 @@ async fn a_failed_relocation_is_visible_in_the_first_view() {
         None,
         "0.0.0-test",
         Some(failure.clone()),
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("a failed migration does not stop the service");
     let (client, _events) = crate::client::in_process(service)
@@ -115,6 +118,7 @@ async fn the_engine_answers_get_state_through_the_client() {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory");
     let (client, _events) = crate::client::in_process(service)
@@ -137,6 +141,7 @@ async fn a_certificate_action_on_an_unknown_profile_is_refused_and_recorded() {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory");
     let (client, _events) = crate::client::in_process(service)
@@ -176,6 +181,7 @@ async fn client_on(scratch: &Scratch) -> crate::client::EngineClient {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory");
     let (client, _events) = crate::client::in_process(service)
@@ -224,6 +230,7 @@ async fn renewing_every_profile_without_a_helios_profile_is_refused() {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory");
     let (client, _events) = crate::client::in_process(service)
@@ -250,6 +257,7 @@ async fn an_unreadable_recovery_id_is_refused() {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory");
     let (client, _events) = crate::client::in_process(service)
@@ -275,6 +283,7 @@ async fn the_overview_of_an_empty_configuration_is_empty() {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory");
     let (client, _events) = crate::client::in_process(service)
@@ -295,6 +304,7 @@ async fn last_certificate_error_of_an_unknown_profile_is_none() {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory");
     let (client, _events) = crate::client::in_process(service)
@@ -320,6 +330,7 @@ async fn a_malformed_invitation_is_refused() {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory");
     let (client, _events) = crate::client::in_process(service)
@@ -348,6 +359,7 @@ async fn a_malformed_request_id_is_refused() {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory");
     let (client, _events) = crate::client::in_process(service)
@@ -439,6 +451,7 @@ async fn pending_enrollments_answer_through_the_client() {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory");
     let (client, _events) = crate::client::in_process(service)
@@ -469,6 +482,7 @@ async fn pending_enrollments_are_read_from_the_given_identities() {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on the given paths");
     let (client, _events) = crate::client::in_process(service)
@@ -488,6 +502,7 @@ async fn about_reports_the_injected_log_path() {
         Arc::new(DryRunBackend::default()),
         Some(log.clone()),
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory");
     let (client, _events) = crate::client::in_process(service)
@@ -535,6 +550,7 @@ async fn teardown_is_idempotent_on_a_disconnected_engine() {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory");
 
@@ -563,6 +579,7 @@ fn service_with_selected_profile(scratch: &Scratch) -> Arc<EngineService> {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory");
     {
@@ -736,6 +753,7 @@ async fn an_imported_profile_keeps_its_key_in_the_engine() {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory");
     let (client, _events) = crate::client::in_process(Arc::clone(&service))
@@ -853,6 +871,7 @@ async fn a_generated_key_stays_in_the_engine() {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory");
     let (client, _events) = crate::client::in_process(Arc::clone(&service))
@@ -892,6 +911,7 @@ async fn an_adopted_key_answers_with_its_public_half() {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory");
     let (client, _events) = crate::client::in_process(Arc::clone(&service))
@@ -924,6 +944,7 @@ async fn an_adopted_psk_is_never_answered() {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory");
     let (client, _events) = crate::client::in_process(Arc::clone(&service))
@@ -1087,6 +1108,7 @@ async fn invalid_staged_secrets_are_not_echoed_or_retained() {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service opens on a fresh directory");
     let (client, _events) = crate::client::in_process(Arc::clone(&service))
@@ -1124,6 +1146,7 @@ async fn explicit_unencrypted_volume_consent_is_persisted_and_idempotent() {
             Arc::new(DryRunBackend::default()),
             None,
             "0.0.0-test",
+            Arc::new(orion_core::vault::UnavailablePassphraseSource),
         )
         .expect("the service opens on a fresh directory");
         let (client, _events) = crate::client::in_process(Arc::clone(&service))
@@ -1155,6 +1178,7 @@ async fn explicit_unencrypted_volume_consent_is_persisted_and_idempotent() {
         Arc::new(DryRunBackend::default()),
         None,
         "0.0.0-test",
+        Arc::new(orion_core::vault::UnavailablePassphraseSource),
     )
     .expect("the service reopens the same scratch paths");
     assert!(

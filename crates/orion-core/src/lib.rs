@@ -56,7 +56,7 @@ pub use certificate_actions::{CertificateAction, CertificateActionBlock, Certifi
 pub use certificate_inventory::{CertificateFacts, CertificateInventory, CertificatePhase};
 pub use config::{
     verify_pinned_gateway_certificate, ClientConfig, ClientProfile, KeyNegotiationSettings,
-    ProfileKind, TrustMaterial, DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS,
+    LockedProfile, ProfileKind, TrustMaterial, DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS,
 };
 pub use events::{CaptureCheck, ClientEvent, PskKind};
 pub use identity_store::{

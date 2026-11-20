@@ -85,6 +85,7 @@ fn config_with(profile: Option<ClientProfile>) -> Arc<Mutex<ClientConfig>> {
     Arc::new(Mutex::new(ClientConfig {
         profiles: profile.into_iter().collect(),
         selected: None,
+        locked: Vec::new(),
     }))
 }
 
@@ -330,8 +331,14 @@ mod start_connection {
         let mut backend = DryRunBackend::default();
         backend.negotiate_delay = std::time::Duration::from_millis(1);
         let backend = Arc::new(backend);
-        let service = EngineService::open(paths_under(scratch.path()), backend, None, "0.0.0-test")
-            .expect("service opens");
+        let service = EngineService::open(
+            paths_under(scratch.path()),
+            backend,
+            None,
+            "0.0.0-test",
+            Arc::new(orion_core::vault::UnavailablePassphraseSource),
+        )
+        .expect("service opens");
         {
             let mut config = service.config.lock().await;
             config.profiles = vec![classic_profile("selected"), classic_profile("target")];
@@ -366,8 +373,14 @@ mod start_connection {
         let scratch = Scratch::new("profile-not-found");
         let backend = Arc::new(DryRunBackend::default());
         let backend_observed = Arc::clone(&backend);
-        let service = EngineService::open(paths_under(scratch.path()), backend, None, "0.0.0-test")
-            .expect("service opens");
+        let service = EngineService::open(
+            paths_under(scratch.path()),
+            backend,
+            None,
+            "0.0.0-test",
+            Arc::new(orion_core::vault::UnavailablePassphraseSource),
+        )
+        .expect("service opens");
         let (events, _receiver) = EventQueue::new();
 
         assert_eq!(
@@ -410,6 +423,7 @@ mod start_connection {
             backend_for_service,
             None,
             "0.0.0-test",
+            Arc::new(orion_core::vault::UnavailablePassphraseSource),
         )
         .expect("service opens");
         {
@@ -493,6 +507,7 @@ mod start_connection {
             backend_for_service,
             None,
             "0.0.0-test",
+            Arc::new(orion_core::vault::UnavailablePassphraseSource),
         )
         .expect("service opens");
         {

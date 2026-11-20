@@ -140,6 +140,12 @@ pub struct ProfileDraft {
     /// returns it (ADR-006 §5), exactly as for [`Self::use_staged_key`].
     #[serde(default, rename = "useStagedPsk")]
     pub use_staged_psk: bool,
+    /// Seals a **new** profile under a passphrase (`nomade`).
+    ///
+    /// Read only when the name is new: on an existing profile the switch is its
+    /// own gesture ([`EngineCommand::MakeNomad`]), so the flag is ignored.
+    #[serde(default)]
+    pub nomad: bool,
 }
 
 /// Commands the UI may send. Each variant is one entry of the partition's
@@ -184,6 +190,18 @@ pub enum EngineCommand {
     },
     SaveProfile {
         draft: ProfileDraft,
+    },
+    /// Moves a `service` profile to `nomade`, under a passphrase the source asks for.
+    MakeNomad {
+        name: String,
+    },
+    /// Sets a new passphrase on a `nomade` profile, unlocking it first if needed.
+    ChangePassphrase {
+        name: String,
+    },
+    /// Moves an unlocked `nomade` profile back to `service`.
+    MakeService {
+        name: String,
     },
     DeleteProfile {
         name: String,
@@ -248,7 +266,12 @@ pub enum EngineCommand {
 ///
 /// No variant carries a secret: the views hold public keys and redacted
 /// profiles only, and [`SecretInput`] has no path back out.
+///
+/// The size spread is allowed on purpose: a reply is built once per call and
+/// moved once into its frame, so boxing the larger views would touch every
+/// call site for no gain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "reply", content = "value", rename_all = "snake_case")]
 pub enum EngineReply {
     Unit,

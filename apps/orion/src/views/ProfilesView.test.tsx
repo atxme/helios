@@ -56,6 +56,7 @@ const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => {
     heliosd_url: 'http://100.64.0.1:8080',
     ssh_target: null,
     key_negotiation: null,
+    mode: 'service',
     ...overrides,
   }
 }
@@ -99,6 +100,10 @@ function callbacks() {
     onSave: vi.fn().mockResolvedValue(undefined),
     onDelete: vi.fn().mockResolvedValue(undefined),
     onSelect: vi.fn().mockResolvedValue(undefined),
+    onMakeNomad: vi.fn().mockResolvedValue('done'),
+    onChangePassphrase: vi.fn().mockResolvedValue('done'),
+    onMakeService: vi.fn().mockResolvedValue('done'),
+    onConnect: vi.fn().mockResolvedValue(undefined),
   }
 }
 
@@ -128,6 +133,8 @@ beforeEach(() => {
     dumps: '',
     rotationRequired: [],
     legacyPresent: false,
+    lockWatchActive: true,
+    nomadAvailable: true,
   })
   api.allowUnencryptedVolume.mockResolvedValue(undefined)
   documents.readProfileDocument.mockResolvedValue('{"format":"orion-profile"}')
@@ -141,7 +148,7 @@ describe('ProfilesView interactions', () => {
       "La migration du coffre a échoué : l'ancien coffre est conservé. Cause : dossier neuf non écrivable"
     render(
       <ProfilesView
-        config={{ profiles: [], selected: null, vault_error: failure }}
+        config={{ profiles: [], selected: null, vault_error: failure, locked: [] }}
         pathImport={null}
         {...callbacks()}
       />,
@@ -153,7 +160,7 @@ describe('ProfilesView interactions', () => {
   it('shows no vault message when the vault opened', async () => {
     render(
       <ProfilesView
-        config={{ profiles: [profile()], selected: 'portable', vault_error: null }}
+        config={{ profiles: [profile()], selected: 'portable', vault_error: null, locked: [] }}
         pathImport={null}
         {...callbacks()}
       />,
@@ -171,7 +178,7 @@ describe('ProfilesView interactions', () => {
     const handlers = callbacks()
     render(
       <ProfilesView
-        config={{ profiles: [profile({ has_static_psk: true })], selected: 'portable' }}
+        config={{ profiles: [profile({ has_static_psk: true })], selected: 'portable', locked: [] }}
         pathImport={null}
         {...handlers}
       />,
@@ -254,7 +261,7 @@ describe('ProfilesView interactions', () => {
     const handlers = callbacks()
     render(
       <ProfilesView
-        config={{ profiles: [profile({ has_static_psk: true })], selected: 'portable' }}
+        config={{ profiles: [profile({ has_static_psk: true })], selected: 'portable', locked: [] }}
         pathImport={null}
         {...handlers}
       />,
@@ -304,7 +311,7 @@ describe('ProfilesView interactions', () => {
     const handlers = callbacks()
     render(
       <ProfilesView
-        config={{ profiles: [profile({ has_static_psk: true })], selected: 'portable' }}
+        config={{ profiles: [profile({ has_static_psk: true })], selected: 'portable', locked: [] }}
         pathImport={null}
         {...handlers}
       />,
@@ -342,7 +349,7 @@ describe('ProfilesView interactions', () => {
     const handlers = callbacks()
     render(
       <ProfilesView
-        config={{ profiles: [profile()], selected: 'portable' }}
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
         pathImport={null}
         {...handlers}
       />,
@@ -398,6 +405,7 @@ describe('ProfilesView interactions', () => {
             }),
           ],
           selected: 'portable',
+          locked: [],
         }}
         pathImport={null}
         {...handlers}
@@ -430,6 +438,7 @@ describe('ProfilesView interactions', () => {
         config={{
           profiles: [
             profile({
+              mode: 'service',
               profile_type: 'helios_key_negotiation',
               key_negotiation: {
                 mode: 'ml_kem',
@@ -443,6 +452,7 @@ describe('ProfilesView interactions', () => {
             }),
           ],
           selected: 'portable',
+          locked: [],
         }}
         pathImport={null}
         {...handlers}
@@ -467,7 +477,7 @@ describe('ProfilesView interactions', () => {
     const handlers = callbacks()
     render(
       <ProfilesView
-        config={{ profiles: [profile()], selected: 'portable' }}
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
         pathImport={null}
         {...handlers}
       />,
@@ -499,6 +509,7 @@ describe('ProfilesView interactions', () => {
             }),
           ],
           selected: 'portable',
+          locked: [],
         }}
         pathImport={null}
         {...handlers}
@@ -532,7 +543,7 @@ describe('ProfilesView interactions', () => {
     const handlers = callbacks()
     render(
       <ProfilesView
-        config={{ profiles: [profile()], selected: 'portable' }}
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
         pathImport={null}
         {...handlers}
       />,
@@ -554,7 +565,7 @@ describe('ProfilesView interactions', () => {
     const backup = profile({ name: 'backup', endpoint: 'backup.example:51820' })
     render(
       <ProfilesView
-        config={{ profiles: [profile(), backup], selected: 'portable' }}
+        config={{ profiles: [profile(), backup], selected: 'portable', locked: [] }}
         pathImport={null}
         {...handlers}
       />,
@@ -591,6 +602,7 @@ describe('ProfilesView interactions', () => {
         config={{
           profiles: [profile(), profile({ name: 'backup', endpoint: 'backup.example:51820' })],
           selected: 'portable',
+          locked: [],
         }}
         pathImport={null}
         {...handlers}
@@ -621,7 +633,7 @@ describe('ProfilesView interactions', () => {
     })
     render(
       <ProfilesView
-        config={{ profiles: [profile()], selected: 'portable' }}
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
         pathImport={null}
         {...handlers}
       />,
@@ -650,7 +662,7 @@ describe('ProfilesView interactions', () => {
     handlers.onImport.mockResolvedValueOnce(outcome())
     const { container } = render(
       <ProfilesView
-        config={{ profiles: [profile()], selected: 'portable' }}
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
         pathImport={null}
         {...handlers}
       />,
@@ -682,7 +694,7 @@ describe('ProfilesView interactions', () => {
     const handlers = callbacks()
     const { container, rerender } = render(
       <ProfilesView
-        config={{ profiles: [profile()], selected: 'portable' }}
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
         pathImport={null}
         importRequest={0}
         {...handlers}
@@ -697,7 +709,7 @@ describe('ProfilesView interactions', () => {
     for (const request of [1, 2]) {
       rerender(
         <ProfilesView
-          config={{ profiles: [profile()], selected: 'portable' }}
+          config={{ profiles: [profile()], selected: 'portable', locked: [] }}
           pathImport={null}
           importRequest={request}
           {...handlers}
@@ -708,7 +720,7 @@ describe('ProfilesView interactions', () => {
   })
 
   it('allows import without BitLocker only after stating the incomplete protection', async () => {
-    api.vaultPosture.mockResolvedValueOnce({
+    api.vaultPosture.mockResolvedValue({
       hardwareBacked: true,
       softwareKeystore: false,
       volume: 'Volume non chiffré.',
@@ -724,7 +736,7 @@ describe('ProfilesView interactions', () => {
     const handlers = callbacks()
     const { container } = render(
       <ProfilesView
-        config={{ profiles: [profile()], selected: 'portable' }}
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
         pathImport={null}
         {...handlers}
       />,
@@ -750,7 +762,7 @@ describe('ProfilesView interactions', () => {
   })
 
   it('retries the pending save as soon as the bare-volume choice is persisted', async () => {
-    api.vaultPosture.mockResolvedValueOnce({
+    api.vaultPosture.mockResolvedValue({
       hardwareBacked: true,
       softwareKeystore: false,
       volume: 'Volume non chiffré.',
@@ -766,7 +778,7 @@ describe('ProfilesView interactions', () => {
     const handlers = callbacks()
     render(
       <ProfilesView
-        config={{ profiles: [profile()], selected: 'portable' }}
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
         pathImport={null}
         {...handlers}
       />,
@@ -797,7 +809,7 @@ describe('ProfilesView interactions', () => {
     const handlers = callbacks()
     render(
       <ProfilesView
-        config={{ profiles: [profile()], selected: 'portable' }}
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
         pathImport={null}
         {...handlers}
       />,
@@ -865,6 +877,7 @@ describe('ProfilesView interactions', () => {
         config={{
           profiles: [profile({ address_v6: 'fd3c:91a2:7e04::2/128' })],
           selected: 'portable',
+          locked: [],
         }}
         pathImport={null}
         {...handlers}
@@ -907,7 +920,7 @@ describe('ProfilesView interactions', () => {
     const handlers = callbacks()
     render(
       <ProfilesView
-        config={{ profiles: [profile()], selected: 'portable' }}
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
         pathImport={null}
         {...handlers}
       />,
@@ -935,6 +948,7 @@ describe('ProfilesView interactions', () => {
         config={{
           profiles: [profile({ allowed_ips: '10.9.0.0/16, 192.168.1.0/24' })],
           selected: 'portable',
+          locked: [],
         }}
         pathImport={null}
         {...handlers}
@@ -967,6 +981,7 @@ describe('ProfilesView interactions', () => {
         config={{
           profiles: [profile({ allowed_ips: '0.0.0.0/0', ipv6_uncaptured_full_tunnel: true })],
           selected: 'portable',
+          locked: [],
         }}
         pathImport={null}
         {...handlers}
@@ -1008,7 +1023,7 @@ describe('ProfilesView interactions', () => {
     const handlers = callbacks()
     render(
       <ProfilesView
-        config={{ profiles: [profile()], selected: 'portable' }}
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
         pathImport={null}
         {...handlers}
       />,
@@ -1032,7 +1047,7 @@ describe('ProfilesView interactions', () => {
     const handlers = callbacks()
     render(
       <ProfilesView
-        config={{ profiles: [profile()], selected: 'portable' }}
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
         pathImport={null}
         {...handlers}
       />,
@@ -1124,6 +1139,7 @@ describe('ProfilesView interactions', () => {
             }),
           ],
           selected: 'atelier',
+          locked: [],
         }}
         pathImport={null}
         {...handlers}
@@ -1150,7 +1166,7 @@ describe('ProfilesView interactions', () => {
     const associated = profile({ name: 'portable', has_private_key: false })
     render(
       <ProfilesView
-        config={{ profiles: [profile()], selected: 'portable' }}
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
         pathImport={associated}
         {...handlers}
       />,
@@ -1158,5 +1174,357 @@ describe('ProfilesView interactions', () => {
 
     await waitFor(() => expect(handlers.onPathImportHandled).toHaveBeenCalledOnce())
     expect(screen.getByText(/remplacera le profil existant/)).toBeTruthy()
+  })
+})
+
+/** The sentences of the nomad profile, as the brief states them. */
+const NOMAD_WARNING =
+  "Le profil nomade protège un portable volé éteint : sans la passphrase, le tunnel ne monte pas. Il ne protège pas d'un logiciel malveillant ni d'un enregistreur de frappe présent à la saisie. Passphrase oubliée : supprimez le profil et faites-le ré-enrôler."
+const NOMAD_SERVICE_WARNING =
+  "Les copies de ce profil faites avant ce changement (sauvegardes, profil itinérant) s'ouvrent encore sans passphrase sur ce poste."
+const NOMAD_UNAVAILABLE =
+  'Le profil nomade exige la boîte de saisie protégée de Windows.'
+const locked = {
+  name: 'coffre',
+  client_public_key: 'client-coffre',
+  peer_public_key: 'gateway-coffre',
+}
+
+describe('ProfilesView nomad profile', () => {
+  it('badges the mode of the stored profile', () => {
+    render(
+      <ProfilesView
+        config={{
+          profiles: [profile(), profile({ name: 'voyage', mode: 'nomade' })],
+          selected: 'portable',
+          locked: [],
+        }}
+        pathImport={null}
+        {...callbacks()}
+      />,
+    )
+    expect(screen.getByText('Service')).toBeTruthy()
+    expect(screen.queryByText('Nomade')).toBeNull()
+  })
+
+  it('shows a nomad profile as Nomade and offers its two gestures only', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{
+          profiles: [profile({ name: 'voyage', mode: 'nomade' })],
+          selected: 'voyage',
+          locked: [],
+        }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    expect(screen.getByText('Nomade')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Passer en nomade' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Changer la passphrase' }))
+    await waitFor(() => expect(handlers.onChangePassphrase).toHaveBeenCalledOnce())
+    expect(handlers.onChangePassphrase).toHaveBeenCalledWith('voyage')
+    fireEvent.click(screen.getByRole('button', { name: 'Repasser en service' }))
+    await waitFor(() => expect(handlers.onMakeService).toHaveBeenCalledOnce())
+    expect(handlers.onMakeService).toHaveBeenCalledWith('voyage')
+  })
+
+  it('lists a locked profile with no endpoint and four gestures', () => {
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', locked: [locked] }}
+        pathImport={null}
+        {...callbacks()}
+      />,
+    )
+    expect(screen.getByText('Nomade · verrouillé')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'coffre' }))
+
+    for (const label of [
+      'Se connecter',
+      'Changer la passphrase',
+      'Repasser en service',
+      'Supprimer',
+    ]) {
+      expect(screen.getByRole('button', { name: label })).toBeTruthy()
+    }
+    expect(screen.queryByLabelText('Endpoint')).toBeNull()
+    expect(screen.queryByLabelText('Nom')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Passer en nomade' })).toBeNull()
+  })
+
+  it('sends only the profile name from each locked gesture', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', locked: [locked] }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'coffre' }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Se connecter' }))
+    await waitFor(() => expect(handlers.onConnect).toHaveBeenCalledOnce())
+    expect(handlers.onConnect).toHaveBeenCalledWith('coffre')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Changer la passphrase' }))
+    await waitFor(() => expect(handlers.onChangePassphrase).toHaveBeenCalledOnce())
+    expect(handlers.onChangePassphrase).toHaveBeenCalledWith('coffre')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Repasser en service' }))
+    await waitFor(() => expect(handlers.onMakeService).toHaveBeenCalledOnce())
+    expect(handlers.onMakeService).toHaveBeenCalledWith('coffre')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Supprimer' }))
+    const dialog = screen.getByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Supprimer' }))
+    await waitFor(() => expect(handlers.onDelete).toHaveBeenCalledOnce())
+    expect(handlers.onDelete).toHaveBeenCalledWith('coffre')
+  })
+
+  /// A configuration read again after a gesture still lists the profile as
+  /// locked: the screen must keep showing its gestures, not fall back to the
+  /// editor of the selected profile.
+  it('keeps the locked profile open when the configuration is read again', () => {
+    const handlers = callbacks()
+    const { rerender } = render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', locked: [locked] }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'coffre' }))
+    rerender(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', locked: [{ ...locked }] }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    expect(screen.getByRole('button', { name: 'Se connecter' })).toBeTruthy()
+    expect(screen.queryByLabelText('Endpoint')).toBeNull()
+  })
+
+  /// A gesture that opened the locked row removes it from the locked list. The
+  /// trash icon of the editor that takes its place must name the editor's own
+  /// profile, never the row that has just left.
+  it('aims the delete dialog at the editor profile after a locked row was opened', async () => {
+    const handlers = callbacks()
+    const { rerender } = render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', locked: [locked] }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'coffre' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Repasser en service' }))
+    await waitFor(() => expect(handlers.onMakeService).toHaveBeenCalledWith('coffre'))
+    rerender(
+      <ProfilesView
+        config={{
+          profiles: [profile(), profile({ name: 'coffre', mode: 'service' })],
+          selected: 'portable',
+          locked: [],
+        }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Supprimer le profil portable' }))
+    const dialog = screen.getByRole('dialog', { name: 'Supprimer « portable » ?' })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Supprimer' }))
+    await waitFor(() => expect(handlers.onDelete).toHaveBeenCalledOnce())
+    expect(handlers.onDelete).toHaveBeenCalledWith('portable')
+  })
+
+  /// The locked-row connect goes through the same unlock dialog: a closed
+  /// dialog is a neutral notice on the profile screen, never an error.
+  it('shows a closed unlock dialog from the locked row as a neutral notice', async () => {
+    const handlers = callbacks()
+    handlers.onConnect.mockResolvedValue('cancelled')
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', locked: [locked] }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'coffre' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Se connecter' }))
+    await waitFor(() => expect(screen.getByText('Saisie annulée.')).toBeTruthy())
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('passes a stored service profile to nomad with its name alone', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.vaultPosture).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: 'Passer en nomade' }))
+    await waitFor(() => expect(handlers.onMakeNomad).toHaveBeenCalledOnce())
+    expect(handlers.onMakeNomad).toHaveBeenCalledWith('portable')
+  })
+
+  it('will not switch a profile that has unsaved edits', async () => {
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
+        pathImport={null}
+        {...callbacks()}
+      />,
+    )
+    fireEvent.change(screen.getByLabelText('Endpoint'), { target: { value: 'vpn.example:51820' } })
+    expect(
+      (screen.getByRole('button', { name: 'Passer en nomade' }) as HTMLButtonElement).disabled,
+    ).toBe(true)
+  })
+
+  it('asks for the mode of a new profile and sends it on save', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Nouveau' }))
+    const mode = screen.getByRole('group', { name: 'Mode' })
+    fireEvent.click(within(mode).getByRole('button', { name: 'Nomade' }))
+    fireEvent.change(screen.getByLabelText('Nom'), { target: { value: 'voyage' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+    expect(handlers.onSave.mock.calls[0][0].nomad).toBe(true)
+  })
+
+  it('sends a new service profile without the nomad flag', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Nouveau' }))
+    fireEvent.change(screen.getByLabelText('Nom'), { target: { value: 'bureau' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+    expect(handlers.onSave.mock.calls[0][0].nomad).toBe(false)
+  })
+
+  it('shows no mode choice when editing an existing profile', () => {
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
+        pathImport={null}
+        {...callbacks()}
+      />,
+    )
+    expect(screen.queryByRole('group', { name: 'Mode' })).toBeNull()
+  })
+
+  it('warns about nomad when chosen for a new profile, and about copies when switching', () => {
+    const { unmount } = render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
+        pathImport={null}
+        {...callbacks()}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Nouveau' }))
+    fireEvent.click(within(screen.getByRole('group', { name: 'Mode' })).getByRole('button', { name: 'Nomade' }))
+    expect(screen.getByText(NOMAD_WARNING)).toBeTruthy()
+    expect(screen.queryByText(NOMAD_SERVICE_WARNING)).toBeNull()
+    unmount()
+
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
+        pathImport={null}
+        {...callbacks()}
+      />,
+    )
+    expect(screen.getByText(NOMAD_WARNING)).toBeTruthy()
+    expect(screen.getByText(NOMAD_SERVICE_WARNING)).toBeTruthy()
+  })
+
+  it('disables nomad when the platform dialog is unavailable', async () => {
+    api.vaultPosture.mockResolvedValue({
+      ...(await api.vaultPosture()),
+      nomadAvailable: false,
+    })
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
+        pathImport={null}
+        {...callbacks()}
+      />,
+    )
+    await waitFor(() => expect(screen.getByText(NOMAD_UNAVAILABLE)).toBeTruthy())
+    expect(
+      (screen.getByRole('button', { name: 'Passer en nomade' }) as HTMLButtonElement).disabled,
+    ).toBe(true)
+  })
+
+  it('disables the nomad choice of a new profile when the dialog is unavailable', async () => {
+    api.vaultPosture.mockResolvedValue({
+      ...(await api.vaultPosture()),
+      nomadAvailable: false,
+    })
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
+        pathImport={null}
+        {...callbacks()}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Nouveau' }))
+    await waitFor(() => expect(screen.getByText(NOMAD_UNAVAILABLE)).toBeTruthy())
+    const mode = screen.getByRole('group', { name: 'Mode' })
+    expect((within(mode).getByRole('button', { name: 'Nomade' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+  })
+
+  it('states a cancelled passphrase dialog as a neutral notice, not an error', async () => {
+    const handlers = callbacks()
+    handlers.onMakeNomad.mockResolvedValue('cancelled')
+    render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', locked: [] }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Passer en nomade' }))
+    await waitFor(() => expect(screen.getByText('Saisie annulée.')).toBeTruthy())
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('renders no password input in any nomad view', async () => {
+    const { container, unmount } = render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', locked: [locked] }}
+        pathImport={null}
+        {...callbacks()}
+      />,
+    )
+    expect(container.querySelector('input[type="password"]')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'coffre' }))
+    expect(container.querySelector('input[type="password"]')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Nouveau' }))
+    expect(container.querySelector('input[type="password"]')).toBeNull()
+    unmount()
   })
 })

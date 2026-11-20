@@ -286,6 +286,17 @@ describe('App interactions', () => {
     expect(mocks.beginOperatorCeremony).not.toHaveBeenCalled()
   })
 
+  /// The header connect and the locked-row connect share the unlock dialog: a
+  /// closed dialog is stated as a neutral notice, not as the error line.
+  it('shows a closed unlock dialog from the header connect as a neutral notice', async () => {
+    mocks.useClient.mockReturnValue(client({ connect: vi.fn().mockResolvedValue('cancelled') }))
+    render(<App />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'test-connect' }))
+    await waitFor(() => expect(screen.getByText('Saisie annulée.')).toBeTruthy())
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
   it('opens and closes posture details and delegates error dismissal', () => {
     const clearError = vi.fn()
     mocks.useClient.mockReturnValue(client({ error: 'backend unavailable', clearError }))

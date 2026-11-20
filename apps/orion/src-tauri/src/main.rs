@@ -207,7 +207,10 @@ fn ensure_frontend_dev_server() -> anyhow::Result<Option<FrontendDevServer>> {
 fn emit_sink(app: AppHandle) -> EventSink {
     let tunnel = operator::TunnelWatch::default();
     Arc::new(move |ev: ClientEvent| {
-        if matches!(ev, ClientEvent::StateChanged { .. }) {
+        if matches!(
+            ev,
+            ClientEvent::StateChanged { .. } | ClientEvent::ConfigChanged
+        ) {
             tray::refresh(&app);
         }
         if tunnel.entered_up_by(&ev) {
@@ -650,7 +653,7 @@ fn main() {
                 tracing::error!(%error, "emplacements d'Orion introuvables — Orion refuse de démarrer");
                 std::process::exit(1)
             });
-        EngineService::open(paths, backend, log_path, env!("CARGO_PKG_VERSION")).unwrap_or_else(
+        EngineService::open(paths, backend, log_path, env!("CARGO_PKG_VERSION"), Arc::new(orion_core::vault::UnavailablePassphraseSource)).unwrap_or_else(
             |error| {
                 tracing::error!(%error, "moteur d'Orion impossible à construire — Orion refuse de démarrer");
                 std::process::exit(1)
@@ -756,6 +759,9 @@ fn main() {
             open_ssh_terminal,
             delete_profile,
             select_profile,
+            make_nomad,
+            change_passphrase,
+            make_service,
             connect,
             disconnect,
             renew_psk,

@@ -177,6 +177,11 @@ export default function App() {
    * screen watches the value, not its truth.
    */
   const [importRequest, setImportRequest] = useState(0)
+  /**
+   * What the last header connect was told, when it was not a failure: the user
+   * closed the unlock dialog. Shown beside the error line, never on it.
+   */
+  const [connectNotice, setConnectNotice] = useState<string | null>(null)
   useEffect(() => {
     if (!postureAnchor) return
     let cancelled = false
@@ -316,6 +321,15 @@ export default function App() {
         >
           {c.error}
         </Alert>
+      ) : connectNotice ? (
+        <Alert
+          severity="info"
+          variant="outlined"
+          role="status"
+          sx={{ borderRadius: 0, border: 0, borderBottom: 1, borderColor: 'divider', py: 0.25 }}
+        >
+          {connectNotice}
+        </Alert>
       ) : (
         <Box />
       )}
@@ -432,15 +446,20 @@ export default function App() {
               <ConnectView
                 state={c.state}
                 profile={c.selectedProfile}
+                lockedProfile={c.selectedLocked}
                 upSince={c.upSince}
                 telemetry={c.telemetry}
                 history={c.history}
                 adapterUp={c.adapterUp}
                 psk={c.psk}
                 renewing={c.renewing}
-                onConnect={() => c.connect(c.selectedProfile?.name)}
+                onConnect={async () => {
+                  setConnectNotice(null)
+                  const outcome = await c.connect(c.selectedName)
+                  setConnectNotice(outcome === 'cancelled' ? 'Saisie annulée.' : null)
+                }}
                 onDisconnect={c.disconnect}
-                onOpenSsh={() => c.openSshTerminal(c.selectedProfile?.name)}
+                onOpenSsh={() => c.openSshTerminal(c.selectedName)}
                 onRenewKey={c.renewPsk}
               />
             </Box>
@@ -457,6 +476,10 @@ export default function App() {
                 onSave={c.saveProfile}
                 onDelete={c.removeProfile}
                 onSelect={c.select}
+                onMakeNomad={c.makeNomad}
+                onChangePassphrase={c.changePassphrase}
+                onMakeService={c.makeService}
+                onConnect={c.connect}
               />
             </Box>
           )}

@@ -72,36 +72,42 @@ pub struct TrayModel {
     pub state: TunnelState,
     /// Profile names, in the order the vault holds them.
     pub profiles: Vec<String>,
+    /// `nomade` profiles sealed in this session: listed, marked as locked, and
+    /// connectable like the others. The engine opens the passphrase box.
+    pub locked: Vec<String>,
     /// The profile a connection would apply to — the selected one, or the
     /// first if nothing is selected, which is the fallback the connection
     /// view already applies.
     pub active: Option<String>,
 }
 
+/// What the engine says of its profiles, for the menu: the usable names, the
+/// locked names, and the selected one.
+pub type TrayConfig = (Vec<String>, Vec<String>, Option<String>);
+
 /// The menu's model from what the engine answered.
 ///
 /// `state` is `None` when the answer could not be read, and `config` is `None`
 /// when the profile list could not be had. Either way the menu shows a failed
 /// tunnel with nothing to offer: it never claims to be connected on a guess.
-/// Otherwise the active profile is the selected one, or the first, which is
-/// the fallback a connection applies.
-pub fn model_from_engine(
-    state: Option<TunnelState>,
-    config: Option<(Vec<String>, Option<String>)>,
-) -> TrayModel {
-    let (Some(state), Some((profiles, selected))) = (state, config) else {
+/// Otherwise the active profile is the selected one, usable or locked, or the
+/// first usable one, which is the fallback a connection applies.
+pub fn model_from_engine(state: Option<TunnelState>, config: Option<TrayConfig>) -> TrayModel {
+    let (Some(state), Some((profiles, locked, selected))) = (state, config) else {
         return TrayModel {
             state: TunnelState::Failed,
             profiles: Vec::new(),
+            locked: Vec::new(),
             active: None,
         };
     };
     let active = selected
-        .filter(|name| profiles.iter().any(|profile| profile == name))
+        .filter(|name| profiles.contains(name) || locked.contains(name))
         .or_else(|| profiles.first().cloned());
     TrayModel {
         state,
         profiles,
+        locked,
         active,
     }
 }
@@ -297,6 +303,10 @@ mod windows {
                     .iter()
                     .map(|profile| profile.name.clone())
                     .collect::<Vec<String>>(),
+                view.locked
+                    .iter()
+                    .map(|profile| profile.name.clone())
+                    .collect::<Vec<String>>(),
                 view.selected,
             )),
             Ok(_) => None,
@@ -337,14 +347,23 @@ mod windows {
             }
         };
 
+        // The locked profiles follow the others, marked as such: the click is
+        // the same `Connect`, and the engine opens the passphrase box.
         let profiles: Vec<CheckMenuItem<tauri::Wry>> = model
             .profiles
             .iter()
-            .map(|name| {
+            .map(|name| (name, name.clone()))
+            .chain(
+                model
+                    .locked
+                    .iter()
+                    .map(|name| (name, format!("{name} (verrouillé)"))),
+            )
+            .map(|(name, label)| {
                 CheckMenuItem::with_id(
                     app,
                     profile_menu_id(name),
-                    name,
+                    label,
                     true,
                     model.is_engaged(name),
                     None::<&str>,
@@ -492,13 +511,18 @@ mod tests {
         TrayModel {
             state,
             profiles: profiles.iter().map(|name| name.to_string()).collect(),
+            locked: Vec::new(),
             active: active.map(|name| name.to_string()),
         }
     }
 
     #[test]
     fn an_engine_that_cannot_answer_shows_a_failed_tunnel_with_nothing_to_offer() {
-        let names = Some((vec!["bureau".to_string()], Some("bureau".to_string())));
+        let names = Some((
+            vec!["bureau".to_string()],
+            Vec::new(),
+            Some("bureau".to_string()),
+        ));
 
         let unreadable_state = model_from_engine(None, names.clone());
         assert_eq!(unreadable_state.state, TunnelState::Failed);
@@ -516,6 +540,7 @@ mod tests {
         let names = |selected: Option<&str>| {
             Some((
                 vec!["alpha".to_string(), "bravo".to_string()],
+                Vec::new(),
                 selected.map(str::to_string),
             ))
         };
@@ -526,8 +551,32 @@ mod tests {
         let unknown = model_from_engine(Some(TunnelState::Down), names(Some("absent")));
         assert_eq!(unknown.active.as_deref(), Some("alpha"));
 
-        let nothing = model_from_engine(Some(TunnelState::Down), Some((Vec::new(), None)));
+        let nothing = model_from_engine(
+            Some(TunnelState::Down),
+            Some((Vec::new(), Vec::new(), None)),
+        );
         assert_eq!(nothing.active, None);
+    }
+
+    /// A locked nomad profile is not among the usable ones, yet it stays listed
+    /// and selectable: the menu connects it, and the engine asks the passphrase.
+    #[test]
+    fn a_locked_profile_is_listed_and_can_be_the_active_one() {
+        let config = |selected: Option<&str>| {
+            Some((
+                vec!["alpha".to_string()],
+                vec!["coffre".to_string()],
+                selected.map(str::to_string),
+            ))
+        };
+
+        let model = model_from_engine(Some(TunnelState::Down), config(Some("coffre")));
+        assert_eq!(model.locked, vec!["coffre".to_string()]);
+        assert_eq!(model.active.as_deref(), Some("coffre"));
+
+        let other = model_from_engine(Some(TunnelState::Down), config(Some("alpha")));
+        assert_eq!(other.active.as_deref(), Some("alpha"));
+        assert_eq!(other.locked, vec!["coffre".to_string()]);
     }
 
     #[test]

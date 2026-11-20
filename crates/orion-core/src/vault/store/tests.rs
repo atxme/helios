@@ -607,6 +607,7 @@ fn a_legacy_file_is_migrated_and_removed() {
     let legacy = ClientConfig {
         profiles: vec![profile("poste")],
         selected: Some("poste".into()),
+        locked: Vec::new(),
     };
     let secret = legacy.profiles[0].private_key.duplicate();
     std::fs::write(
@@ -634,6 +635,7 @@ fn a_migrated_profile_stays_blocked_until_its_key_is_rotated() {
     let legacy = ClientConfig {
         profiles: vec![original.duplicate()],
         selected: None,
+        locked: Vec::new(),
     };
     std::fs::write(
         dir.join(LEGACY_FILE),
@@ -672,6 +674,7 @@ fn migrating_twice_is_harmless() {
     let legacy = ClientConfig {
         profiles: vec![profile("poste")],
         selected: None,
+        locked: Vec::new(),
     };
     std::fs::write(
         dir.join(LEGACY_FILE),
@@ -737,4 +740,763 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     found
+}
+
+const PASSPHRASE: &str = "cheval agrafe batterie correcte orion";
+
+/// Sets the lock watch on, as the engine does once its notifications run.
+fn watched(store: ProfileStore) -> ProfileStore {
+    store.set_lock_watch(true);
+    store
+}
+
+fn id_of(store: &ProfileStore, name: &str) -> ProfileId {
+    let root = store.root().unwrap();
+    store
+        .load_registry(&root)
+        .unwrap()
+        .find_by_name(name)
+        .unwrap()
+        .id
+}
+
+/// The passphrase the switch tests move a profile on to.
+const NEW_PASSPHRASE: &str = "pommier glacé soleil rouge nuage vingt";
+
+/// The `kdf` byte of a sealed container: `aether_vault`'s `HKDF_SHA256`, the
+/// identifier of a `nomade` manifest. A service manifest carries `RAW` (0).
+const HKDF_KDF_ID: u8 = 3;
+const RAW_KDF_ID: u8 = 0;
+
+/// Creates a `nomade` profile through the gesture, then forgets its key, so
+/// that the test starts from a locked profile.
+fn enrol(store: &ProfileStore, name: &str) -> ClientProfile {
+    let profile = profile(name);
+    // The gesture needs the lock watch; the caller's setting is restored.
+    let watch = store.lock_watch_active();
+    store.set_lock_watch(true);
+    store
+        .save_new_nomad_profile(&profile, PASSPHRASE)
+        .expect("enrol nomad");
+    store.set_lock_watch(watch);
+    store.forget_unlocked();
+    profile
+}
+
+/// A store on an existing directory, as a fresh process would open it.
+fn reopen(dir: &std::path::Path) -> ProfileStore {
+    ProfileStore::new(dir.to_path_buf(), Box::new(FixedRoot([4u8; KEY_LEN])))
+}
+
+/// Every file under `dir` with its bytes: a byte-identical comparison of the store.
+fn snapshot(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut files: Vec<_> = walk(dir)
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+fn generation_of(store: &ProfileStore, name: &str) -> u64 {
+    let root = store.root().unwrap();
+    store
+        .load_registry(&root)
+        .unwrap()
+        .find_by_name(name)
+        .unwrap()
+        .generation
+        .0
+}
+
+fn salt_of(store: &ProfileStore, name: &str) -> [u8; crate::vault::nomad::SALT_LEN] {
+    match store.mode_of(name).unwrap().unwrap() {
+        ProfileMode::Nomad { salt, .. } => salt,
+        ProfileMode::Service => panic!("{name} is a service profile"),
+    }
+}
+
+#[test]
+fn load_keeps_a_nomad_profile_locked() {
+    let (dir, store) = store("nomad-locked");
+    store.save_profile(&profile("poste")).unwrap();
+    let portable = enrol(&store, "portable");
+    let manifest = store.manifest_path(id_of(&store, "portable"));
+
+    // Garbage in place of the sealed manifest: a load that opened it would fail.
+    std::fs::write(&manifest, b"never opened by load").unwrap();
+    let loaded = store
+        .load()
+        .expect("a locked profile does not need its manifest");
+
+    assert_eq!(loaded.profiles.len(), 1);
+    assert_eq!(loaded.profiles[0].name, "poste");
+    assert!(loaded.find("portable").is_none());
+    assert_eq!(loaded.locked.len(), 1);
+    assert_eq!(loaded.locked[0].name, "portable");
+    assert_eq!(
+        loaded.locked[0].gateway_public_key,
+        portable.peer_public_key
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn unlock_opens_it_and_load_then_returns_it() {
+    let (dir, store) = store("nomad-unlock");
+    let store = watched(store);
+    let original = enrol(&store, "portable");
+
+    store.unlock("portable", PASSPHRASE).unwrap();
+    assert!(store.is_unlocked("portable"));
+
+    let loaded = store.load().unwrap();
+    assert!(loaded.locked.is_empty());
+    let portable = loaded.find("portable").expect("unlocked profile loaded");
+    assert_eq!(portable.private_key, original.private_key);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_wrong_passphrase_is_refused_and_leaves_it_locked() {
+    let (dir, store) = store("nomad-wrong");
+    let store = watched(store);
+    enrol(&store, "portable");
+
+    let error = store
+        .unlock("portable", "une autre passphrase assez longue")
+        .unwrap_err();
+    assert!(matches!(error, VaultError::WrongPassphrase), "got {error}");
+    assert!(!store.is_unlocked("portable"));
+    assert_eq!(store.load().unwrap().locked.len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn unlock_is_refused_without_the_lock_watch() {
+    let (dir, store) = store("nomad-no-watch");
+    enrol(&store, "portable");
+
+    let error = store.unlock("portable", PASSPHRASE).unwrap_err();
+    assert!(
+        matches!(error, VaultError::LockWatchUnavailable),
+        "got {error}"
+    );
+    assert!(!store.is_unlocked("portable"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_lock_during_unlock_discards_the_key() {
+    let (dir, mut store) = store("nomad-race");
+    store.set_lock_watch(true);
+    enrol(&store, "portable");
+    store.between_derivation_and_store = Some(Box::new(|store: &ProfileStore| {
+        store.forget_unlocked();
+    }));
+
+    let error = store.unlock("portable", PASSPHRASE).unwrap_err();
+    assert!(
+        matches!(&error, VaultError::ProfileLocked(name) if name == "portable"),
+        "got {error}"
+    );
+    assert!(!store.is_unlocked("portable"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn forget_unlocked_locks_every_nomad_profile_again() {
+    let (dir, store) = store("nomad-forget");
+    let store = watched(store);
+    enrol(&store, "portable");
+    enrol(&store, "bureau");
+    store.unlock("portable", PASSPHRASE).unwrap();
+    store.unlock("bureau", PASSPHRASE).unwrap();
+    assert!(store.load().unwrap().locked.is_empty());
+
+    store.forget_unlocked();
+
+    assert!(!store.is_unlocked("portable"));
+    assert!(!store.is_unlocked("bureau"));
+    let loaded = store.load().unwrap();
+    assert!(loaded.profiles.is_empty());
+    assert_eq!(loaded.locked.len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_locked_nomad_profile_is_never_written() {
+    let (dir, store) = store("nomad-no-write");
+    let original = enrol(&store, "portable");
+    let manifest = store.manifest_path(id_of(&store, "portable"));
+    let before = std::fs::read(&manifest).unwrap();
+
+    let mut edited = original.duplicate();
+    edited.endpoint = "198.51.100.7:51820".into();
+    let error = store.save_profile(&edited).unwrap_err();
+
+    assert!(
+        matches!(&error, VaultError::ProfileLocked(name) if name == "portable"),
+        "got {error}"
+    );
+    assert_eq!(std::fs::read(&manifest).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn saving_an_unlocked_nomad_profile_keeps_it_nomad() {
+    let (dir, store) = store("nomad-save-held");
+    let store = watched(store);
+    let original = enrol(&store, "portable");
+    store.unlock("portable", PASSPHRASE).unwrap();
+
+    let mut edited = original.duplicate();
+    edited.endpoint = "198.51.100.7:51820".into();
+    store.save_profile(&edited).unwrap();
+
+    assert!(store
+        .mode_of("portable")
+        .unwrap()
+        .is_some_and(|mode| mode.is_nomad()));
+    let root = store.root().unwrap();
+    assert_eq!(
+        store
+            .load_registry(&root)
+            .unwrap()
+            .find_by_name("portable")
+            .unwrap()
+            .generation
+            .0,
+        1,
+        "an ordinary edit is not a security event, whatever the mode"
+    );
+    store.forget_unlocked();
+    let loaded = store.load().unwrap();
+    assert_eq!(
+        loaded.locked.len(),
+        1,
+        "the edit must not have sealed it as service"
+    );
+    assert!(loaded.profiles.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn saving_over_a_locked_nomad_name_is_refused() {
+    let (dir, store) = store("nomad-name");
+    enrol(&store, "portable");
+
+    let error = store.save_profile(&profile("portable")).unwrap_err();
+    assert!(
+        matches!(&error, VaultError::ProfileLocked(name) if name == "portable"),
+        "got {error}"
+    );
+    assert_eq!(
+        store.mode_of("portable").unwrap().map(|m| m.is_nomad()),
+        Some(true)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn select_and_remove_need_no_passphrase() {
+    let (dir, store) = store("nomad-select-remove");
+    store.save_profile(&profile("poste")).unwrap();
+    enrol(&store, "portable");
+
+    store.select("portable").unwrap();
+    assert_eq!(store.load().unwrap().selected.as_deref(), Some("portable"));
+
+    store.remove_profile("portable").unwrap();
+    let loaded = store.load().unwrap();
+    assert!(loaded.locked.is_empty());
+    assert_eq!(loaded.profiles.len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn trailing_spaces_and_nfd_open_the_profile() {
+    let (dir, store) = store("nomad-normalise");
+    let store = watched(store);
+    let profile = profile("portable");
+    store
+        .save_new_nomad_profile(&profile, "rivière calme montagne bleue vingt")
+        .unwrap();
+    store.forget_unlocked();
+
+    store
+        .unlock("portable", "  rivie\u{0300}re calme montagne bleue vingt  ")
+        .expect("the same passphrase, typed differently, opens it");
+    assert!(store.is_unlocked("portable"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_next_manifest_above_the_registry_is_deleted() {
+    let (dir, store) = store("next-above");
+    store.save_profile(&profile("poste")).unwrap();
+    let id = id_of(&store, "poste");
+    let current = store.manifest_path(id);
+    let current_bytes = std::fs::read(&current).unwrap();
+    let next = store.next_manifest_path(id, SecurityGeneration(2));
+    std::fs::write(&next, b"a half-written step, never opened").unwrap();
+
+    let loaded = store.load().expect("the stray file is removed, not opened");
+
+    assert_eq!(loaded.profiles.len(), 1);
+    assert!(!next.exists(), "a step above the registry is a leftover");
+    assert_eq!(std::fs::read(&current).unwrap(), current_bytes);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_next_manifest_at_the_registry_generation_is_promoted() {
+    let (dir, store) = store("next-promoted");
+    store.save_profile(&profile("poste")).unwrap();
+    let id = id_of(&store, "poste");
+    let current = store.manifest_path(id);
+    let bytes = std::fs::read(&current).unwrap();
+    let next = store.next_manifest_path(id, SecurityGeneration(1));
+    std::fs::rename(&current, &next).unwrap();
+
+    let loaded = store.load().unwrap();
+
+    assert_eq!(loaded.profiles.len(), 1, "the promoted manifest opens");
+    assert!(!next.exists());
+    assert_eq!(std::fs::read(&current).unwrap(), bytes);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_migration_cannot_seal_over_a_nomad_profile() {
+    let (dir, store) = store("nomad-migration");
+    let portable = enrol(&store, "portable");
+    let manifest = store.manifest_path(id_of(&store, "portable"));
+    let before = std::fs::read(&manifest).unwrap();
+    let legacy = ClientConfig {
+        profiles: vec![portable.duplicate()],
+        selected: None,
+        locked: Vec::new(),
+    };
+    std::fs::write(
+        dir.join(LEGACY_FILE),
+        legacy.encode_legacy_fixture().unwrap(),
+    )
+    .unwrap();
+
+    let error = store.migrate_legacy().unwrap_err();
+
+    assert!(
+        matches!(&error, VaultError::ProfileLocked(name) if name == "portable"),
+        "got {error}"
+    );
+    assert_eq!(std::fs::read(&manifest).unwrap(), before);
+    assert!(store.legacy_present(), "the legacy file is kept on refusal");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn service_to_nomad_then_load_is_locked_after_forget() {
+    let (dir, store) = store("switch-to-nomad");
+    let store = watched(store);
+    let original = profile("poste");
+    store.save_profile(&original).unwrap();
+    let id = id_of(&store, "poste");
+
+    store.make_nomad("poste", NEW_PASSPHRASE).unwrap();
+    assert!(store.is_unlocked("poste"), "the switch leaves its key held");
+    store.forget_unlocked();
+
+    let loaded = store.load().unwrap();
+    assert!(loaded.profiles.is_empty());
+    assert_eq!(loaded.locked.len(), 1);
+    assert_eq!(loaded.locked[0].name, "poste");
+    let blob = std::fs::read(store.manifest_path(id)).unwrap();
+    assert_eq!(
+        blob[5], HKDF_KDF_ID,
+        "the old service path holds a nomad blob"
+    );
+
+    store.unlock("poste", NEW_PASSPHRASE).unwrap();
+    let loaded = store.load().unwrap();
+    assert_eq!(
+        loaded.find("poste").unwrap().private_key,
+        original.private_key
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn changing_the_passphrase_refuses_the_old_one() {
+    let (dir, store) = store("switch-change");
+    let store = watched(store);
+    enrol(&store, "portable");
+    let salt_before = salt_of(&store, "portable");
+
+    store.unlock("portable", PASSPHRASE).unwrap();
+    store.make_nomad("portable", NEW_PASSPHRASE).unwrap();
+    store.forget_unlocked();
+
+    assert_ne!(salt_of(&store, "portable"), salt_before, "a new salt");
+    let error = store.unlock("portable", PASSPHRASE).unwrap_err();
+    assert!(matches!(error, VaultError::WrongPassphrase), "got {error}");
+    store.unlock("portable", NEW_PASSPHRASE).unwrap();
+    assert!(store.is_unlocked("portable"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn back_to_service_opens_without_passphrase() {
+    let (dir, store) = store("switch-to-service");
+    let store = watched(store);
+    let original = enrol(&store, "portable");
+    store.unlock("portable", PASSPHRASE).unwrap();
+
+    store.make_service("portable").unwrap();
+
+    assert!(!store.is_unlocked("portable"), "the key is forgotten");
+    assert!(store
+        .mode_of("portable")
+        .unwrap()
+        .is_some_and(|mode| !mode.is_nomad()));
+    // A fresh process, with no passphrase anywhere, opens it.
+    let loaded = reopen(&dir).load().unwrap();
+    assert!(loaded.locked.is_empty());
+    assert_eq!(
+        loaded.find("portable").unwrap().private_key,
+        original.private_key
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn each_switch_raises_the_generation() {
+    let (dir, store) = store("switch-generation");
+    store.set_lock_watch(true);
+    store.save_profile(&profile("poste")).unwrap();
+    assert_eq!(generation_of(&store, "poste"), 1);
+
+    store.make_nomad("poste", NEW_PASSPHRASE).unwrap();
+    assert_eq!(generation_of(&store, "poste"), 2);
+
+    store.make_nomad("poste", PASSPHRASE).unwrap();
+    assert_eq!(
+        generation_of(&store, "poste"),
+        3,
+        "a passphrase change counts"
+    );
+
+    store.make_service("poste").unwrap();
+    assert_eq!(generation_of(&store, "poste"), 4);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_locked_nomad_profile_cannot_switch_and_nothing_changes() {
+    let (dir, store) = store("switch-locked");
+    let store = watched(store);
+    enrol(&store, "portable");
+    let before = snapshot(&dir);
+
+    let error = store.make_service("portable").unwrap_err();
+    assert!(
+        matches!(&error, VaultError::ProfileLocked(name) if name == "portable"),
+        "got {error}"
+    );
+    let error = store.make_nomad("portable", NEW_PASSPHRASE).unwrap_err();
+    assert!(
+        matches!(&error, VaultError::ProfileLocked(name) if name == "portable"),
+        "got {error}"
+    );
+    assert_eq!(snapshot(&dir), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_weak_new_passphrase_is_refused_and_nothing_changes() {
+    use crate::vault::passphrase::PassphraseError;
+
+    let (dir, store) = store("switch-weak");
+    store.set_lock_watch(true);
+    store.save_profile(&profile("poste")).unwrap();
+    let before = snapshot(&dir);
+
+    let error = store.make_nomad("poste", "motdepasse").unwrap_err();
+    assert!(
+        matches!(
+            error,
+            VaultError::NewPassphraseRefused(PassphraseError::TooCommon)
+        ),
+        "got {error}"
+    );
+    assert_eq!(snapshot(&dir), before, "a refused switch writes nothing");
+
+    let error = store
+        .save_new_nomad_profile(&profile("portable"), "motdepasse")
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            VaultError::NewPassphraseRefused(PassphraseError::TooCommon)
+        ),
+        "got {error}"
+    );
+    assert_eq!(snapshot(&dir), before, "a refused enrolment writes nothing");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_new_nomad_profile_never_touches_disk_as_service() {
+    let (dir, store) = store("switch-new-nomad");
+    store.set_lock_watch(true);
+    store
+        .save_new_nomad_profile(&profile("portable"), PASSPHRASE)
+        .unwrap();
+    let id = id_of(&store, "portable");
+    let blob = std::fs::read(store.manifest_path(id)).unwrap();
+
+    assert_eq!(blob[5], HKDF_KDF_ID);
+    assert_ne!(blob[5], RAW_KDF_ID);
+    let root = store.root().unwrap();
+    let entry = store
+        .load_registry(&root)
+        .unwrap()
+        .find(id)
+        .unwrap()
+        .clone();
+    assert!(
+        open_manifest(
+            &root,
+            id,
+            &entry.client_public_key,
+            &entry.gateway_public_key,
+            &blob,
+            ManifestKey::Service,
+        )
+        .is_err(),
+        "the installation root alone must not open it"
+    );
+    assert!(store.is_unlocked("portable"), "the key stays held");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_new_passphrase_for_an_existing_name_is_refused_with_the_switch_named() {
+    let (dir, store) = store("switch-exists");
+    store.set_lock_watch(true);
+    store.save_profile(&profile("poste")).unwrap();
+    let before = snapshot(&dir);
+
+    let error = store
+        .save_new_nomad_profile(&profile("poste"), PASSPHRASE)
+        .unwrap_err();
+    assert!(
+        matches!(&error, VaultError::ProfileExists(name) if name == "poste"),
+        "got {error}"
+    );
+    assert_eq!(snapshot(&dir), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_crash_after_each_write_leaves_an_openable_profile() {
+    for (index, stop) in [
+        SwitchStep::Staged,
+        SwitchStep::Registered,
+        SwitchStep::Renamed,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (dir, mut store) = store(&format!("switch-crash-{index}"));
+        store.set_lock_watch(true);
+        store.save_profile(&profile("poste")).unwrap();
+        let id = id_of(&store, "poste");
+        store.stop_switch_after = Some(stop);
+
+        let error = store.make_nomad("poste", NEW_PASSPHRASE).unwrap_err();
+        assert!(matches!(error, VaultError::Io { .. }), "got {error}");
+
+        // A fresh process settles the interrupted step, then opens the profile.
+        let reopened = watched(reopen(&dir));
+        let loaded = reopened.load().unwrap();
+        assert!(
+            !reopened
+                .next_manifest_path(id, SecurityGeneration(2))
+                .exists(),
+            "{stop:?}: the step is settled by the load"
+        );
+        match stop {
+            SwitchStep::Staged => {
+                assert_eq!(loaded.profiles.len(), 1, "{stop:?}: still service");
+                assert!(loaded.locked.is_empty());
+            }
+            SwitchStep::Registered | SwitchStep::Renamed => {
+                assert!(loaded.profiles.is_empty(), "{stop:?}: now nomade");
+                assert_eq!(loaded.locked.len(), 1);
+                reopened.unlock("poste", NEW_PASSPHRASE).unwrap();
+                assert_eq!(reopened.load().unwrap().profiles.len(), 1);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn a_tightened_policy_still_opens_an_existing_profile() {
+    let (dir, store) = store("switch-tightened");
+    let store = watched(store);
+    // `accept` now refuses this passphrase; the profile predates the rule.
+    let weak = "motdepasse";
+    let salt = crate::vault::nomad::new_salt().unwrap();
+    let key = PassphraseKey::derive(weak, &salt).unwrap();
+    let epoch = store.lock_epoch.load(std::sync::atomic::Ordering::Acquire);
+    store
+        .create_nomad(&profile("portable"), salt, key, epoch)
+        .unwrap();
+    store.forget_unlocked();
+
+    store.unlock("portable", weak).unwrap();
+    assert!(store.is_unlocked("portable"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_lock_during_a_new_nomad_enrolment_leaves_it_locked() {
+    let (dir, mut store) = store("enrol-lock-race");
+    store.set_lock_watch(true);
+    store.between_derivation_and_store = Some(Box::new(|store: &ProfileStore| {
+        store.forget_unlocked();
+    }));
+
+    store
+        .save_new_nomad_profile(&profile("portable"), PASSPHRASE)
+        .expect("the profile is written even when a lock lands");
+    assert!(!store.is_unlocked("portable"), "the lock wins");
+    assert_eq!(
+        store.mode_of("portable").unwrap().map(|m| m.is_nomad()),
+        Some(true)
+    );
+    let loaded = store.load().unwrap();
+    assert_eq!(loaded.locked.len(), 1);
+    assert!(loaded.profiles.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_lock_during_a_switch_leaves_the_profile_locked() {
+    let (dir, mut store) = store("switch-lock-race");
+    store.set_lock_watch(true);
+    store.save_profile(&profile("poste")).unwrap();
+    // The switch holds the unlocked map for its whole run, so a real lock
+    // waits for it. This hook only bumps the epoch, as a lock that already
+    // happened would have, and the switch must not keep the key.
+    store.between_derivation_and_store = Some(Box::new(|store: &ProfileStore| {
+        store
+            .lock_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }));
+
+    store
+        .make_nomad("poste", NEW_PASSPHRASE)
+        .expect("the switch is written even when a lock lands");
+    assert!(!store.is_unlocked("poste"), "the lock wins");
+    let loaded = store.load().unwrap();
+    assert_eq!(loaded.locked.len(), 1);
+    assert!(loaded.profiles.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_new_nomad_profile_without_the_lock_watch_is_refused_and_nothing_changes() {
+    let (dir, store) = store("enrol-no-watch");
+    store.save_profile(&profile("poste")).unwrap();
+    let before = snapshot(&dir);
+
+    let error = store
+        .save_new_nomad_profile(&profile("portable"), PASSPHRASE)
+        .unwrap_err();
+    assert!(
+        matches!(error, VaultError::LockWatchUnavailable),
+        "got {error}"
+    );
+    assert!(!store.is_unlocked("portable"));
+    assert_eq!(snapshot(&dir), before, "refused before any write");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_switch_without_the_lock_watch_is_refused_and_nothing_changes() {
+    let (dir, store) = store("switch-no-watch");
+    store.save_profile(&profile("poste")).unwrap();
+    let before = snapshot(&dir);
+
+    let error = store.make_nomad("poste", NEW_PASSPHRASE).unwrap_err();
+    assert!(
+        matches!(error, VaultError::LockWatchUnavailable),
+        "got {error}"
+    );
+    assert!(!store.is_unlocked("poste"));
+    assert_eq!(snapshot(&dir), before, "refused before any write");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A selection that runs while a switch is under way must not be lost, nor
+/// must it put the switched profile back to its old mode. The hook runs inside
+/// the switch, after the registry was read; the selection starts there on its
+/// own thread. Unserialised, it wrote its registry copy at once and the
+/// switch then overwrote it from an older one.
+#[test]
+fn a_selection_during_a_switch_waits_and_loses_nothing() {
+    let (dir, mut store) = store("switch-select-race");
+    store.set_lock_watch(true);
+    store.save_profile(&profile("poste")).unwrap();
+    store.save_profile(&profile("autre")).unwrap();
+    store.select("poste").unwrap();
+
+    let slot: Arc<Mutex<Option<std::sync::Weak<ProfileStore>>>> = Arc::new(Mutex::new(None));
+    let selector: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+    let (hook_slot, hook_selector) = (Arc::clone(&slot), Arc::clone(&selector));
+    store.between_derivation_and_store = Some(Box::new(move |_store: &ProfileStore| {
+        let shared = hook_slot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .expect("the store is alive");
+        *hook_selector.lock().unwrap() = Some(std::thread::spawn(move || {
+            shared.select("autre").expect("the selection is written");
+        }));
+        // Long enough for an unserialised selection to finish first.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }));
+    let store = Arc::new(store);
+    *slot.lock().unwrap() = Some(Arc::downgrade(&store));
+
+    store
+        .make_nomad("poste", NEW_PASSPHRASE)
+        .expect("the switch is written");
+    selector
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the selection started")
+        .join()
+        .unwrap();
+
+    let root = store.root().unwrap();
+    let registry = store.load_registry(&root).unwrap();
+    let poste = registry.find_by_name("poste").unwrap();
+    assert!(poste.mode.is_nomad(), "the switch is not undone");
+    assert_eq!(
+        registry.selected,
+        Some(registry.find_by_name("autre").unwrap().id),
+        "the selection is not lost"
+    );
+    store.forget_unlocked();
+    assert_eq!(store.load().expect("the vault still loads").locked.len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
 }
