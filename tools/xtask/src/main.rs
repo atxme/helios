@@ -214,19 +214,12 @@ fn orion_msi(unsigned: bool, with_nsis: bool, skip_npm_ci: bool) -> Result<()> {
 
     // Signing is required unless explicitly waived, and the waiver is loud:
     // the signing script itself announces every unsigned artifact.
+    let signing_certificate_set = std::env::var("ORION_SIGNING_CERT_SHA1").is_ok();
+    let timestamp_url_set = std::env::var("ORION_TIMESTAMP_URL").is_ok();
+    validate_orion_signing(unsigned, signing_certificate_set, timestamp_url_set)?;
     if unsigned {
         println!("==> UNSIGNED build: this installer must not be distributed");
         std::env::set_var("ORION_UNSIGNED_FOR_OFFLINE_SIGNING", "1");
-    } else {
-        for variable in ["ORION_SIGNING_CERT_SHA1", "ORION_TIMESTAMP_URL"] {
-            if std::env::var(variable).is_err() {
-                bail!(
-                    "{variable} is required to sign the installer. Set the Authenticode \
-                     thumbprint and an RFC 3161 timestamp server, or pass --unsigned to \
-                     produce a test installer that must not be distributed."
-                );
-            }
-        }
     }
 
     println!("==> WireGuardNT dependencies");
@@ -267,6 +260,29 @@ fn orion_msi(unsigned: bool, with_nsis: bool, skip_npm_ci: bool) -> Result<()> {
     )?;
 
     report_installers(&root.join("target").join("release").join("bundle"))
+}
+
+fn validate_orion_signing(
+    unsigned: bool,
+    certificate_set: bool,
+    timestamp_set: bool,
+) -> Result<()> {
+    if unsigned {
+        return Ok(());
+    }
+    for (variable, is_set) in [
+        ("ORION_SIGNING_CERT_SHA1", certificate_set),
+        ("ORION_TIMESTAMP_URL", timestamp_set),
+    ] {
+        if !is_set {
+            bail!(
+                "{variable} is required to sign the installer. Set the Authenticode \
+                 thumbprint and an RFC 3161 timestamp server, or pass --unsigned to \
+                 produce a test installer that must not be distributed."
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Lists what was produced, with a fingerprint for each artifact.
@@ -335,8 +351,7 @@ fn bundle(target: Option<String>, skip_frontend: bool, output: Option<PathBuf>) 
         ],
     )?;
 
-    let name = format!("helios-{version}-{target}");
-    let staging = output.unwrap_or_else(|| root.join("target").join("bundle").join(&name));
+    let staging = bundle_staging_dir(&root, &version, &target, output);
     if staging.exists() {
         std::fs::remove_dir_all(&staging)
             .with_context(|| format!("cleaning {}", staging.display()))?;
@@ -400,24 +415,37 @@ fn build_gateway(root: &Path, target: &str, skip_frontend: bool) -> Result<PathB
     }
 
     println!("==> heliosd ({GATEWAY_FEATURES})");
-    run(
-        root,
-        "cargo",
-        &[
-            "build",
-            "--release",
-            "--target",
-            target,
-            "-p",
-            "heliosd",
-            "--features",
-            GATEWAY_FEATURES,
-        ],
-    )?;
+    run(root, "cargo", &gateway_build_args(target))?;
     Ok(cargo_target_dir(root)
         .join(target)
         .join("release")
         .join("heliosd"))
+}
+
+fn bundle_staging_dir(
+    root: &Path,
+    version: &str,
+    target: &str,
+    output: Option<PathBuf>,
+) -> PathBuf {
+    output.unwrap_or_else(|| {
+        root.join("target")
+            .join("bundle")
+            .join(format!("helios-{version}-{target}"))
+    })
+}
+
+fn gateway_build_args(target: &str) -> [&str; 8] {
+    [
+        "build",
+        "--release",
+        "--target",
+        target,
+        "-p",
+        "heliosd",
+        "--features",
+        GATEWAY_FEATURES,
+    ]
 }
 
 fn publisher_keyring() -> Result<PathBuf> {
@@ -725,6 +753,138 @@ mod tests {
             cargo_target_dir_from(root, Some("build/out".into())),
             Path::new("/work/helios/build/out")
         );
+    }
+
+    #[test]
+    fn gateway_build_plan_uses_release_target_and_production_features() {
+        assert_eq!(
+            gateway_build_args("x86_64-unknown-linux-gnu"),
+            [
+                "build",
+                "--release",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "-p",
+                "heliosd",
+                "--features",
+                "netlink,wireguard,tpm,embed-ui",
+            ]
+        );
+    }
+
+    #[test]
+    fn bundle_staging_plan_uses_versioned_default_or_explicit_output() {
+        let root = Path::new("/work/helios");
+        assert_eq!(
+            bundle_staging_dir(root, "1.2.3", "x86_64-unknown-linux-gnu", None),
+            Path::new("/work/helios/target/bundle/helios-1.2.3-x86_64-unknown-linux-gnu")
+        );
+
+        let output = PathBuf::from("/tmp/release-candidate");
+        assert_eq!(
+            bundle_staging_dir(
+                root,
+                "1.2.3",
+                "x86_64-unknown-linux-gnu",
+                Some(output.clone())
+            ),
+            output
+        );
+    }
+
+    #[test]
+    fn unsigned_msi_preflight_does_not_require_signing_configuration() {
+        validate_orion_signing(true, false, false)
+            .expect("explicit unsigned installer skips Authenticode requirements");
+    }
+
+    #[test]
+    fn signed_msi_preflight_requires_the_authenticode_certificate() {
+        let error = validate_orion_signing(false, false, true)
+            .expect_err("signed installer requires certificate thumbprint");
+        assert!(format!("{error:#}").contains("ORION_SIGNING_CERT_SHA1 is required"));
+    }
+
+    #[test]
+    fn signed_msi_preflight_requires_the_timestamp_url() {
+        let error = validate_orion_signing(false, true, false)
+            .expect_err("signed installer requires an RFC 3161 timestamp URL");
+        assert!(format!("{error:#}").contains("ORION_TIMESTAMP_URL is required"));
+    }
+
+    #[test]
+    fn signed_msi_preflight_accepts_both_signing_requirements() {
+        validate_orion_signing(false, true, true)
+            .expect("certificate and timestamp URL allow a signed installer build");
+    }
+
+    #[test]
+    fn cli_app_dispatch_preserves_target_and_frontend_flag() {
+        let cli = Cli::try_parse_from([
+            "xtask",
+            "app",
+            "--target",
+            "aarch64-linux",
+            "--skip-frontend",
+        ])
+        .expect("valid app command");
+        assert!(matches!(
+            cli.command,
+            Cmd::App {
+                target: Some(target),
+                skip_frontend: true
+            } if target == "aarch64-linux"
+        ));
+    }
+
+    #[test]
+    fn cli_bundle_dispatch_preserves_explicit_output_path() {
+        let cli = Cli::try_parse_from([
+            "xtask",
+            "bundle",
+            "--target",
+            "x86_64-linux",
+            "--output",
+            "/tmp/staging",
+        ])
+        .expect("valid bundle command");
+        assert!(matches!(
+            cli.command,
+            Cmd::Bundle {
+                target: Some(target),
+                skip_frontend: false,
+                output: Some(output),
+            } if target == "x86_64-linux" && output == Path::new("/tmp/staging")
+        ));
+    }
+
+    #[test]
+    fn cli_orion_msi_dispatch_preserves_unsigned_nsis_and_dependency_flags() {
+        let cli = Cli::try_parse_from([
+            "xtask",
+            "orion-msi",
+            "--unsigned",
+            "--with-nsis",
+            "--skip-npm-ci",
+        ])
+        .expect("valid Orion MSI command");
+        assert!(matches!(
+            cli.command,
+            Cmd::OrionMsi {
+                unsigned: true,
+                with_nsis: true,
+                skip_npm_ci: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn cli_pack_dispatch_requires_an_input_directory() {
+        let error = match Cli::try_parse_from(["xtask", "pack"]) {
+            Ok(_) => panic!("pack should reject a missing bundle directory"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("--dir"));
     }
 
     /// A bundle's name contains the version, hence dots: substituting the
