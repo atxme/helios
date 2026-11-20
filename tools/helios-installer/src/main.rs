@@ -330,6 +330,17 @@ mod tests {
             Some("1.2.0"),
             true
         ));
+        assert!(!readiness_matches("version=1.2.0\n", Some("1.2.0"), true));
+        assert!(!readiness_matches(
+            "version=1.2.0\nmode_reel=true-extra\n",
+            Some("1.2.0"),
+            true
+        ));
+        assert!(!readiness_matches(
+            "version=1.2.0 \nmode_reel=true\n",
+            Some("1.2.0"),
+            true
+        ));
         assert!(readiness_matches(
             "version=1.2.0\nmode_reel=true\nfirewall_enforced=false\n",
             Some("1.2.0"),
@@ -368,6 +379,9 @@ mod tests {
             "release"
         ])
         .is_err());
+        assert!(Cli::try_parse_from(["helios-installer", "bootstrap", "--archive"]).is_err());
+        assert!(Cli::try_parse_from(["helios-installer", "bootstrap", "--unknown"]).is_err());
+        assert!(Cli::try_parse_from(["helios-installer", "unknown-command"]).is_err());
         assert!(bootstrap(None, None)
             .unwrap_err()
             .to_string()
