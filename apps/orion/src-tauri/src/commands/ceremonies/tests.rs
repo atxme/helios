@@ -292,6 +292,74 @@ async fn engine_replies(
     (client, engine)
 }
 
+async fn loopback_gateway(
+    request_count: usize,
+    answer: bool,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("ephemeral loopback listener");
+    let address = format!(
+        "http://{}",
+        listener.local_addr().expect("listener address")
+    );
+    let server = tokio::spawn(async move {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        for _ in 0..request_count {
+            let (mut stream, _) = listener.accept().await.expect("loopback request");
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).await.expect("request headers");
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+            }
+            if !answer {
+                continue;
+            }
+            let request_line = String::from_utf8_lossy(&request);
+            let path = request_line
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .expect("HTTP request path");
+            let body = match path {
+                "/api/certificates/operator/pending" => r#"{"operations":[]}"#,
+                "/api/certificates/operator/status" => {
+                    r#"{"ca_epoch":4,"ca_fingerprint":"ca-pq","ca_tls_epoch":2,"revoked_peers":[]}"#
+                }
+                "/api/certificates" => {
+                    r#"{"now_unix":123,"ca_fingerprint":"ca-pq","ca_epoch":4,"ca_tls_epoch":2,"peers":[{"name":"laptop","wg_public_key":"workstation-key","not_before":1,"not_after":999,"revoked":false,"pending":{}}]}"#
+                }
+                "/api/network" => {
+                    r#"{"wg_public_key":"gateway-key","wg_address":"10.0.0.1","peers":[{"name":"laptop","public_key":"workstation-key","address":"10.0.0.2"}]}"#
+                }
+                other => panic!("unexpected read-only gateway path: {other}"),
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("gateway response");
+        }
+        })
+        .await
+        .expect("gateway requests complete within the test deadline");
+    });
+    (address, server)
+}
+
 fn selected_profile() -> ConfigView {
     let mut primary = profile("primary", Some(" http://127.0.0.1:1 "));
     primary.peer_public_key = " gateway-key ".into();
@@ -380,6 +448,85 @@ async fn rotations_preserve_an_invalid_vault_location_as_a_separate_error() {
     assert!(overview.vault.is_none());
     assert_eq!(overview.vault_error, Some("emplacement"));
     engine.await.expect("scripted engine");
+
+    let domain = astra_operator::operations::fixtures::domain();
+    let unreadable = domain.path.with_file_name("unreadable.vault");
+    std::fs::write(&unreadable, b"not a vault").expect("invalid vault fixture");
+    let (client, engine) = engine_replies([(Query::State, Err("engine unavailable".into()))]).await;
+    let overview = rotations_overview(&client, Ok(unreadable.clone()))
+        .await
+        .expect("partial overview");
+
+    assert!(!overview.tunnel);
+    assert!(overview.vault.is_none());
+    assert_eq!(overview.vault_error, Some("illisible"));
+    std::fs::remove_file(unreadable).expect("remove invalid vault fixture");
+    engine.await.expect("scripted engine");
+}
+
+#[tokio::test]
+async fn rotations_keep_the_selected_loopback_gateway_but_refuse_unreachable_reads() {
+    use orion_core::operator_rotations::Reach;
+
+    let mut fixture = selected_profile();
+    let (gateway, server) = loopback_gateway(4, false).await;
+    fixture.profiles[1].heliosd_url = Some(gateway);
+    let domain = astra_operator::operations::fixtures::domain();
+    let (client, engine) = engine_replies([
+        (Query::State, Ok(EngineReply::State("up".into()))),
+        (Query::Config, Ok(EngineReply::Config(fixture))),
+    ])
+    .await;
+
+    let overview = rotations_overview(&client, Ok(domain.path.clone()))
+        .await
+        .expect("partial overview");
+
+    assert!(overview.tunnel);
+    assert!(matches!(overview.pending, Reach::Unreachable));
+    assert!(matches!(overview.authority, Reach::Unreachable));
+    assert!(matches!(overview.domain, Reach::Unreachable));
+    assert!(matches!(overview.workstations, Reach::Unreachable));
+    assert!(overview.vault_error.is_none());
+    assert!(overview.vault.is_some());
+    assert_eq!(domain.touches(), 0);
+    server.await.expect("loopback server");
+    engine.await.expect("scripted engine");
+}
+
+#[tokio::test]
+async fn rotations_show_valid_loopback_reads_without_opening_vault_keys() {
+    use orion_core::operator_rotations::Reach;
+
+    let mut fixture = selected_profile();
+    let (gateway, server) = loopback_gateway(4, true).await;
+    fixture.profiles[1].heliosd_url = Some(gateway);
+    let domain = astra_operator::operations::fixtures::domain();
+    let vault_bytes = std::fs::read(&domain.path).expect("fixture vault");
+    let (client, engine) = engine_replies([
+        (Query::State, Ok(EngineReply::State("up".into()))),
+        (Query::Config, Ok(EngineReply::Config(fixture))),
+    ])
+    .await;
+
+    let overview = rotations_overview(&client, Ok(domain.path.clone()))
+        .await
+        .expect("overview from read-only responses");
+
+    assert!(overview.tunnel);
+    assert!(matches!(overview.pending, Reach::Ok(ref pending) if pending.is_empty()));
+    assert!(matches!(overview.authority, Reach::Ok(ref status) if status.ca_epoch == 4));
+    assert!(matches!(overview.domain, Reach::Ok(ref view) if view.ca_epoch == 4));
+    assert!(matches!(overview.workstations, Reach::Ok(ref peers)
+        if peers.len() == 1 && peers[0].name == "laptop" && peers[0].not_after == 999));
+    assert!(overview.vault.is_some());
+    assert_eq!(domain.touches(), 0);
+    assert_eq!(
+        std::fs::read(&domain.path).expect("unchanged fixture vault"),
+        vault_bytes
+    );
+    server.await.expect("loopback server");
+    engine.await.expect("scripted engine");
 }
 
 #[tokio::test]
@@ -403,6 +550,66 @@ async fn peers_without_a_tunnel_show_neither_gateway_data_nor_a_workstation_key(
     assert!(overview.local_pending.is_none());
     assert!(overview.own_key.is_none());
     assert!(overview.now_unix.is_none());
+    engine.await.expect("scripted engine");
+}
+
+#[tokio::test]
+async fn peers_keep_the_connected_profile_key_when_its_loopback_gateway_refuses_reads() {
+    use orion_core::operator_rotations::Reach;
+
+    let mut fixture = selected_profile();
+    let (gateway, server) = loopback_gateway(4, false).await;
+    fixture.profiles[1].heliosd_url = Some(gateway);
+    let (client, engine) = engine_replies([
+        (Query::State, Ok(EngineReply::State("up".into()))),
+        (Query::Config, Ok(EngineReply::Config(fixture.clone()))),
+    ])
+    .await;
+
+    let overview = peers_overview(&client, &fixture, Err("invalid path".into()))
+        .await
+        .expect("partial overview");
+
+    assert!(matches!(overview.certificates, Reach::Unreachable));
+    assert!(matches!(overview.admitted, Reach::Unreachable));
+    assert!(matches!(overview.astra_revoked, Reach::Unreachable));
+    assert!(matches!(overview.pending_revocations, Reach::Unreachable));
+    assert_eq!(overview.own_key.as_deref(), Some("workstation-key"));
+    assert!(overview.now_unix.is_none());
+    assert!(overview.local_pending.is_none());
+    server.await.expect("loopback server");
+    engine.await.expect("scripted engine");
+}
+
+#[tokio::test]
+async fn peers_show_valid_loopback_reads_and_only_public_peer_data() {
+    use orion_core::operator_rotations::Reach;
+
+    let mut fixture = selected_profile();
+    let (gateway, server) = loopback_gateway(4, true).await;
+    fixture.profiles[1].heliosd_url = Some(gateway);
+    let (client, engine) = engine_replies([
+        (Query::State, Ok(EngineReply::State("up".into()))),
+        (Query::Config, Ok(EngineReply::Config(fixture.clone()))),
+    ])
+    .await;
+
+    let overview = peers_overview(&client, &fixture, Err("invalid path".into()))
+        .await
+        .expect("overview from read-only responses");
+
+    assert!(
+        matches!(overview.certificates, Reach::Ok(ref peers) if peers.len() == 1 && peers[0].name == "laptop")
+    );
+    assert!(
+        matches!(overview.admitted, Reach::Ok(ref peers) if peers.len() == 1 && peers[0].name == "laptop")
+    );
+    assert!(matches!(overview.astra_revoked, Reach::Ok(ref keys) if keys.is_empty()));
+    assert!(matches!(overview.pending_revocations, Reach::Ok(ref keys) if keys.is_empty()));
+    assert_eq!(overview.own_key.as_deref(), Some("workstation-key"));
+    assert_eq!(overview.now_unix, Some(123));
+    assert!(overview.local_pending.is_none());
+    server.await.expect("loopback server");
     engine.await.expect("scripted engine");
 }
 
