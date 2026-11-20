@@ -12,7 +12,11 @@ pub(crate) async fn connect(
     name: Option<String>,
 ) -> Result<(), String> {
     allow_engine_foreground(&state);
-    match state.client.call(EngineCommand::Connect { name }).await? {
+    connect_from(&state.client, name).await
+}
+
+async fn connect_from(client: &EngineClient, name: Option<String>) -> Result<(), String> {
+    match client.call(EngineCommand::Connect { name }).await? {
         EngineReply::Unit => Ok(()),
         _ => Err(unexpected_engine_reply()),
     }
@@ -30,8 +34,20 @@ pub(crate) async fn connect(
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) async fn select_and_connect(app: &AppHandle, name: &str) -> Result<(), String> {
     let state = app.state::<AppState>();
-    match state
-        .client
+    select_and_connect_from(&state.client, name, || {
+        // The window may be open behind the menu and must observe the selection.
+        let _ = app.emit("helios://config-changed", ());
+        allow_engine_foreground(&state);
+    })
+    .await
+}
+
+async fn select_and_connect_from(
+    client: &EngineClient,
+    name: &str,
+    on_selected: impl FnOnce(),
+) -> Result<(), String> {
+    match client
         .call(EngineCommand::SelectProfile {
             name: name.to_string(),
         })
@@ -40,20 +56,8 @@ pub(crate) async fn select_and_connect(app: &AppHandle, name: &str) -> Result<()
         EngineReply::Config(_) => {}
         _ => return Err(unexpected_engine_reply()),
     }
-    // The window may be open behind the menu: it reads its profile list from
-    // Rust, and nothing else would tell it the selection just moved.
-    let _ = app.emit("helios://config-changed", ());
-    allow_engine_foreground(&state);
-    match state
-        .client
-        .call(EngineCommand::Connect {
-            name: Some(name.to_string()),
-        })
-        .await?
-    {
-        EngineReply::Unit => Ok(()),
-        _ => Err(unexpected_engine_reply()),
-    }
+    on_selected();
+    connect_from(client, Some(name.to_string())).await
 }
 
 #[tauri::command]
@@ -67,7 +71,11 @@ pub(crate) async fn disconnect(app: AppHandle) -> Result<(), String> {
 /// its outcome on the event stream, like the scheduled one.
 #[tauri::command]
 pub(crate) async fn renew_psk(state: State<'_, AppState>) -> Result<(), String> {
-    match state.client.call(EngineCommand::RenewPsk).await? {
+    renew_psk_from(&state.client).await
+}
+
+async fn renew_psk_from(client: &EngineClient) -> Result<(), String> {
+    match client.call(EngineCommand::RenewPsk).await? {
         EngineReply::Unit => Ok(()),
         _ => Err(unexpected_engine_reply()),
     }
@@ -78,8 +86,15 @@ pub(crate) async fn renew_psk(state: State<'_, AppState>) -> Result<(), String> 
 /// can leave a tunnel behind that the others think is gone.
 pub(crate) async fn stop_connection(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    match state.client.call(EngineCommand::Disconnect).await? {
+    disconnect_from(&state.client).await
+}
+
+async fn disconnect_from(client: &EngineClient) -> Result<(), String> {
+    match client.call(EngineCommand::Disconnect).await? {
         EngineReply::Unit => Ok(()),
         _ => Err(unexpected_engine_reply()),
     }
 }
+
+#[cfg(test)]
+mod tests;
