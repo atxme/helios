@@ -1750,9 +1750,10 @@ celles de Windows ; leurs légendes sont distinctes d'un geste à l'autre. Un pr
     à définir avant la campagne. Attendu : le déverrouillage est refusé (ADR-006 §5), et la
     posture le dit.
 156. **[cible] Échec de déconnexion pendant un verrouillage.** Lorsque la déconnexion échoue
-    au moment d'un verrouillage, l'échec est écrit dans le journal du moteur (niveau
-    `warn`), et n'apparaît **pas** dans la fenêtre d'Orion. Attendu : la ligne est dans le
-    journal du moteur ; la fenêtre ne l'affiche pas, c'est la limite connue d'ADR-006.
+    au moment d'un verrouillage, l'échec arrive dans la fenêtre d'Orion comme tout événement
+    du moteur (état « Échec », ligne d'erreur), et dans le journal du moteur. Attendu :
+    la fenêtre affiche l'échec ; la liste des profils montre le profil « Nomade ·
+    verrouillé » sans qu'aucune action soit nécessaire.
 157. **[cible] Passphrase absente des commandes et de la mémoire JavaScript.** Dans une build
     de test, ouvrir les outils de développement de la WebView pendant chacun des gestes, et
     observer les commandes Tauri et les charges JSON. Attendu : aucune passphrase, ni clé qui

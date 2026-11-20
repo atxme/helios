@@ -87,16 +87,36 @@ impl EngineService {
         name: &str,
         purpose: PromptPurpose,
     ) -> Result<(), String> {
-        let nomad = matches!(
-            self.store.mode_of(name).map_err(store_message)?,
-            Some(ProfileMode::Nomad { .. })
-        );
-        if !nomad || self.store.is_unlocked(name) {
+        if !self.is_nomad(name)? || self.store.is_unlocked(name) {
             return Ok(());
         }
         // Read before the dialog: a lock that lands while it is open must win,
         // and the store only sees locks that land during its own derivation.
         let generation = self.generation();
+        self.check_passphrase(name, purpose, generation).await?;
+        self.reload_config().await
+    }
+
+    /// Whether `name` is sealed as a `nomade` profile. An unknown name is not.
+    fn is_nomad(&self, name: &str) -> Result<bool, String> {
+        Ok(matches!(
+            self.store.mode_of(name).map_err(store_message)?,
+            Some(ProfileMode::Nomad { .. })
+        ))
+    }
+
+    /// Asks the passphrase with `purpose` and opens the profile with it.
+    ///
+    /// The store derives the key and opens the manifest whether or not the
+    /// profile is already unlocked, so a wrong passphrase is refused either
+    /// way. A lock that landed since `generation` was read wins over the
+    /// outcome, and the profile stays locked.
+    async fn check_passphrase(
+        &self,
+        name: &str,
+        purpose: PromptPurpose,
+        generation: u64,
+    ) -> Result<(), String> {
         let passphrase = self.ask_passphrase(name, purpose).await?;
         let store = Arc::clone(&self.store);
         let profile = name.to_string();
@@ -109,7 +129,7 @@ impl EngineService {
         if !self.store.is_unlocked(name) {
             return Err(VaultError::ProfileLocked(name.to_string()).to_string());
         }
-        self.reload_config().await
+        Ok(())
     }
 
     /// Reads the configuration from the vault again, after a change to what
@@ -155,25 +175,46 @@ impl EngineService {
         Ok(self.config_view_now().await)
     }
 
-    /// Sets a new passphrase on a `nomade` profile. A locked one is opened
-    /// first, with its current passphrase.
+    /// Sets a new passphrase on a `nomade` profile.
+    ///
+    /// The current passphrase is always asked and checked first, the profile
+    /// being unlocked or not (spec §5.7): an open session is no proof of it.
+    /// A `service` profile is refused: sealing one is « Passer en nomade ».
     pub async fn change_passphrase(&self, name: String) -> Result<ConfigView, String> {
         self.require_known(&name)?;
-        self.unlock_if_nomad(&name, PromptPurpose::Current).await?;
-        let passphrase = self.new_passphrase(&name).await?;
-        self.in_store(move |store| store.make_nomad(&name, passphrase.as_str()))
+        if !self.is_nomad(&name)? {
+            return Err(format!("le profil « {name} » n'est pas un profil nomade"));
+        }
+        let generation = self.generation();
+        self.check_passphrase(&name, PromptPurpose::Current, generation)
             .await?;
+        let passphrase = self.new_passphrase(&name).await?;
+        let target = name.clone();
+        let sealed = self
+            .in_store(move |store| store.make_nomad(&target, passphrase.as_str()))
+            .await;
+        self.settle_gesture(&name, generation, sealed).await?;
         self.reload_config().await?;
         Ok(self.config_view_now().await)
     }
 
-    /// Takes an unlocked `nomade` profile back to `service`. A locked one is
-    /// opened first, with its current passphrase.
+    /// Takes a `nomade` profile back to `service`.
+    ///
+    /// The current passphrase is always asked and checked first, the profile
+    /// being unlocked or not (spec §5.7). A profile that is already `service`
+    /// is left as it is, and asks nothing: there is no passphrase to strip.
     pub async fn make_service(&self, name: String) -> Result<ConfigView, String> {
         self.require_known(&name)?;
-        self.unlock_if_nomad(&name, PromptPurpose::Current).await?;
-        self.in_store(move |store| store.make_service(&name))
-            .await?;
+        let generation = self.generation();
+        if self.is_nomad(&name)? {
+            self.check_passphrase(&name, PromptPurpose::Current, generation)
+                .await?;
+        }
+        let target = name.clone();
+        let sealed = self
+            .in_store(move |store| store.make_service(&target))
+            .await;
+        self.settle_gesture(&name, generation, sealed).await?;
         self.reload_config().await?;
         Ok(self.config_view_now().await)
     }

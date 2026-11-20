@@ -36,6 +36,11 @@ pub trait Engine: Send + Sync + 'static {
         events: &EventQueue,
     ) -> Result<EngineReply, String>;
 
+    /// The UI authenticated: `events` is the queue of its session. Anything the
+    /// engine raises on its own, outside a command, is pushed there. The
+    /// default ignores it.
+    fn session_opened(&self, _events: &EventQueue) {}
+
     /// Disconnects, releases the negotiated PSK, takes the adapter down. Idempotent.
     async fn teardown(&self);
 }
@@ -102,6 +107,7 @@ where
 
     let (frames_tx, mut frames) = mpsc::channel(INCOMING_FRAMES);
     let (queue, mut events) = EventQueue::new();
+    engine.session_opened(&queue);
     let reading = tokio::spawn(read_requests(reader, frames_tx));
 
     let outcome = run(

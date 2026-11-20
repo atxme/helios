@@ -207,7 +207,10 @@ fn ensure_frontend_dev_server() -> anyhow::Result<Option<FrontendDevServer>> {
 fn emit_sink(app: AppHandle) -> EventSink {
     let tunnel = operator::TunnelWatch::default();
     Arc::new(move |ev: ClientEvent| {
-        if matches!(ev, ClientEvent::StateChanged { .. }) {
+        if matches!(
+            ev,
+            ClientEvent::StateChanged { .. } | ClientEvent::ConfigChanged
+        ) {
             tray::refresh(&app);
         }
         if tunnel.entered_up_by(&ev) {

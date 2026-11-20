@@ -784,9 +784,11 @@ remplace pas.
   natives, `AllowSetForegroundWindow`) n'a **jamais été compilé localement** : il
   n'est validé que par la CI Windows puis sur cible. Tout ce qui le touche est
   **à éprouver sur cible** (recette : [MANUAL-TESTING](../testing/MANUAL-TESTING.md), « O. F6 »).
-  Un échec de déconnexion pendant un verrouillage est écrit dans le journal du
-  moteur, mais n'est pas encore affiché dans la fenêtre d'Orion : l'utilisateur ne
-  le voit pas sans consulter ce journal.
+  Ce qu'un verrouillage produit (le tunnel qui tombe, y compris un échec de
+  déconnexion, et les profils qui redeviennent verrouillés) part sur le flux
+  d'événements de la session de l'IHM, comme tout autre événement. Seul un
+  verrouillage qui tombe alors qu'aucune IHM n'est attachée (arrêt du moteur)
+  n'est écrit que dans le journal du moteur.
 * **Orion Linux reste sans stockage protégé.** Câbler Secret Service
   (`libsecret`) relève d'un lot distinct ; le refus explicite actuel reste le bon
   comportement en attendant. macOS est hors périmètre : Orion ne le cible pas.

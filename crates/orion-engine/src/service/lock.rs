@@ -7,8 +7,9 @@
 use std::sync::atomic::Ordering;
 
 use orion_core::{
+    backend::EventSink,
     vault::{registry::ProfileMode, VaultError},
-    ClientConfig,
+    ClientConfig, ClientEvent,
 };
 
 use super::EngineService;
@@ -32,15 +33,31 @@ impl EngineService {
     /// comes down before the keys are forgotten. Last, the configuration is
     /// read again: forgetting the keys leaves the profiles in memory, and a
     /// profile the engine still holds is one it could connect without asking.
-    pub async fn on_lock_event(&self, event: LockEvent, events: &EventQueue) {
+    ///
+    /// What the lock raises goes to the queue of the UI session when one is
+    /// attached, so the window learns the tunnel is down and the profiles are
+    /// locked. `fallback` takes it only when no session is attached.
+    pub async fn on_lock_event(&self, event: LockEvent, fallback: &EventQueue) {
         self.lock_generation.fetch_add(1, Ordering::AcqRel);
+        let events = self.session_queue().unwrap_or_else(|| fallback.clone());
         if self.mounted_profile_is_nomad().await {
             // A failed disconnection is already on the event stream: the
             // controller reports it there. The keys are forgotten either way.
             let _ = self.stop_connection(events.sink()).await;
         }
         self.drop_unlocked_keys().await;
+        // After the reload: a window that reads the configuration on this
+        // event gets the profiles locked.
+        (events.sink())(ClientEvent::ConfigChanged);
         tracing::info!(event = ?event, "nomad profiles locked");
+    }
+
+    /// The queue of the UI session being served, if any.
+    fn session_queue(&self) -> Option<EventQueue> {
+        self.session_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Forgets every unlocked key, and reads the configuration again.
@@ -106,9 +123,35 @@ impl EngineService {
         let Some(name) = self.controller.mounted_profile().await else {
             return false;
         };
+        self.may_be_nomad(&name)
+    }
+
+    /// Whether `name` must be treated as a `nomade` profile: it is one, or its
+    /// mode cannot be read. Stricter on a doubt, as the lock is.
+    pub(super) fn may_be_nomad(&self, name: &str) -> bool {
         !matches!(
-            self.store.mode_of(&name),
+            self.store.mode_of(name),
             Ok(Some(ProfileMode::Service)) | Ok(None)
         )
+    }
+
+    /// Takes the tunnel down again when a lock landed since `generation` and the
+    /// tunnel just mounted belongs to a `nomade` profile.
+    ///
+    /// `on_lock_event` moves the generation before it reads the mounted
+    /// profile, and the controller sets it synchronously inside `connect`: so
+    /// either the lock saw the mount and took it down, or this sees the move.
+    /// The refusal is the one a gesture gives.
+    pub(super) async fn settle_mount(
+        &self,
+        name: &str,
+        generation: u64,
+        sink: EventSink,
+    ) -> Result<(), String> {
+        if !self.lock_landed_since(generation) || !self.may_be_nomad(name) {
+            return Ok(());
+        }
+        let _ = self.stop_connection(sink).await;
+        Err(self.refuse_locked(name).await)
     }
 }

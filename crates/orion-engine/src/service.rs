@@ -145,6 +145,14 @@ pub struct EngineService {
     /// while one landed compares the value it read before the dialog with the
     /// one it reads after, and refuses to keep the key when they differ.
     lock_generation: AtomicU64,
+    /// The event queue of the UI session being served, when there is one. A
+    /// lock event raises its consequences there: they reach the window the
+    /// same way every other event does.
+    session_events: StdMutex<Option<EventQueue>>,
+    /// Test seam: runs just before the controller mounts a tunnel, to stage a
+    /// lock that lands between the unlock and the mount.
+    #[cfg(test)]
+    before_mount: StdMutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl EngineService {
@@ -352,6 +360,9 @@ impl EngineService {
             app_version,
             passphrases,
             lock_generation: AtomicU64::new(0),
+            session_events: StdMutex::new(None),
+            #[cfg(test)]
+            before_mount: StdMutex::new(None),
         })
     }
 
@@ -727,7 +738,18 @@ impl Engine for EngineService {
 
     /// Disconnects and stops what the connection started. The event side is
     /// discarded: the UI that would have listened has gone. Idempotent.
+    fn session_opened(&self, events: &EventQueue) {
+        *self
+            .session_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(events.clone());
+    }
+
     async fn teardown(&self) {
+        self.session_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         let discard: EventSink = Arc::new(|_| {});
         if let Err(error) = self.stop_connection(discard).await {
             tracing::warn!(%error, "déconnexion à la fermeture du moteur");

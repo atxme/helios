@@ -635,6 +635,115 @@ async fn each_event_closes_a_nomad_tunnel_and_locks() {
     }
 }
 
+/// Collects what the session pushes until the profiles are reported moved.
+async fn events_until_config_changed(
+    events: &mut tokio::sync::mpsc::Receiver<ClientEvent>,
+) -> Vec<ClientEvent> {
+    let mut seen = Vec::new();
+    let reached = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(event) = events.recv().await {
+            let done = matches!(event, ClientEvent::ConfigChanged);
+            seen.push(event);
+            if done {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        reached.is_ok(),
+        "no config change reached the window: {seen:?}"
+    );
+    seen
+}
+
+#[tokio::test]
+async fn a_lock_reaches_the_window_through_the_session() {
+    let scratch = Scratch::new("lock-reaches-window");
+    seed_nomad(scratch.path(), "poste");
+    let source = Scripted::new(vec![Answer::Give(PASSPHRASE)], false);
+    let service = service_on(scratch.path(), source);
+    let (client, mut session) = client_of(Arc::clone(&service)).await;
+    client
+        .call(EngineCommand::Connect { name: None })
+        .await
+        .expect("the tunnel starts");
+    states_until_up(&mut session).await;
+
+    // The fallback is a queue nobody reads: only a session queue can deliver.
+    let (fallback, _unread) = EventQueue::new();
+    service
+        .on_lock_event(LockEvent::SessionLock, &fallback)
+        .await;
+
+    let seen = events_until_config_changed(&mut session).await;
+    assert!(
+        seen.iter().any(|event| matches!(
+            event,
+            ClientEvent::StateChanged {
+                state: TunnelState::Down
+            }
+        )),
+        "the window is told the tunnel is down: {seen:?}"
+    );
+    let json = serde_json::to_string(&seen).expect("events serialise");
+    assert!(
+        !json.contains(PASSPHRASE),
+        "no secret travels with the event"
+    );
+}
+
+#[tokio::test]
+async fn a_lock_without_a_session_falls_back_to_the_given_queue() {
+    let scratch = Scratch::new("lock-fallback");
+    seed_nomad(scratch.path(), "poste");
+    let service = service_on(scratch.path(), Scripted::new(Vec::new(), false));
+
+    let (fallback, mut raised) = EventQueue::new();
+    service
+        .on_lock_event(LockEvent::SessionLock, &fallback)
+        .await;
+
+    assert!(matches!(
+        raised.recv().await,
+        Some(ClientEvent::ConfigChanged)
+    ));
+}
+
+#[tokio::test]
+async fn a_locked_profile_can_be_selected_and_then_connected() {
+    let scratch = Scratch::new("select-locked");
+    store_at(scratch.path())
+        .save_profile(&profile("bureau"))
+        .expect("a service profile is saved");
+    seed_nomad(scratch.path(), "poste");
+    let source = Scripted::new(vec![Answer::Give(PASSPHRASE)], false);
+    let service = service_on(scratch.path(), Arc::clone(&source));
+    let (client, mut session) = client_of(Arc::clone(&service)).await;
+
+    let view = config_of(
+        client
+            .call(EngineCommand::SelectProfile {
+                name: "poste".into(),
+            })
+            .await,
+    );
+    assert_eq!(view.selected.as_deref(), Some("poste"));
+    assert!(view.locked.iter().any(|locked| locked.name == "poste"));
+
+    // The connection without a name follows the selection, and opens it.
+    client
+        .call(EngineCommand::Connect { name: None })
+        .await
+        .expect("the locked profile connects");
+    states_until_up(&mut session).await;
+    assert_eq!(source.purposes(), vec![PromptPurpose::Unlock]);
+    assert_eq!(
+        service.controller.mounted_profile().await.as_deref(),
+        Some("poste")
+    );
+}
+
 #[tokio::test]
 async fn a_service_tunnel_survives_a_lock() {
     let scratch = Scratch::new("lock-service");
@@ -790,4 +899,212 @@ async fn a_lock_during_save_new_nomad_leaves_the_profile_locked() {
         store_at(scratch.path()).mode_of("poste"),
         Ok(Some(ProfileMode::Nomad { .. }))
     ));
+}
+
+// # Final review fixes
+
+/// A lock that lands after the unlock and before the controller mounts the
+/// tunnel finds nothing mounted to take down. The mount must still not stand.
+#[tokio::test]
+async fn a_lock_between_the_unlock_and_the_mount_leaves_no_tunnel() {
+    let scratch = Scratch::new("lock-before-mount");
+    seed_nomad(scratch.path(), "poste");
+    let source = Scripted::new(vec![Answer::Give(PASSPHRASE)], false);
+    let service = service_on(scratch.path(), source);
+    let weak = Arc::downgrade(&service);
+    *service.before_mount.lock().expect("hook slot") = Some(Box::new(move || {
+        // What `on_lock_event` does first: the generation moves, and the keys
+        // are forgotten. Nothing is mounted yet, so it has no tunnel to drop.
+        let service = weak.upgrade().expect("the service is alive");
+        service.lock_generation.fetch_add(1, AtomicOrdering::AcqRel);
+        service.store.forget_unlocked();
+    }));
+    let (client, _session) = client_of(Arc::clone(&service)).await;
+
+    let reply = client.call(EngineCommand::Connect { name: None }).await;
+
+    assert_refused(
+        reply,
+        &VaultError::ProfileLocked("poste".into()).to_string(),
+    );
+    assert_eq!(service.controller.state(), TunnelState::Down);
+    assert!(service.controller.mounted_profile().await.is_none());
+    assert!(!service.store.is_unlocked("poste"));
+    assert_locked_and_unusable(&service, "poste").await;
+}
+
+/// The same lock does not touch a `service` tunnel.
+#[tokio::test]
+async fn a_lock_before_the_mount_spares_a_service_profile() {
+    let scratch = Scratch::new("lock-before-mount-service");
+    store_at(scratch.path())
+        .save_profile(&profile("bureau"))
+        .expect("a service profile is saved");
+    let service = service_on(scratch.path(), Scripted::new(Vec::new(), false));
+    let weak = Arc::downgrade(&service);
+    *service.before_mount.lock().expect("hook slot") = Some(Box::new(move || {
+        let service = weak.upgrade().expect("the service is alive");
+        service.lock_generation.fetch_add(1, AtomicOrdering::AcqRel);
+    }));
+    let (client, mut session) = client_of(Arc::clone(&service)).await;
+
+    client
+        .call(EngineCommand::Connect { name: None })
+        .await
+        .expect("a service tunnel is not locked");
+    states_until_up(&mut session).await;
+}
+
+/// The profile is unlocked in this session: the gestures still ask, and check.
+fn unlocked_service(scratch: &Scratch, source: Arc<Scripted>) -> Arc<EngineService> {
+    seed_nomad(scratch.path(), "poste");
+    let service = service_on(scratch.path(), source);
+    service
+        .store
+        .unlock("poste", PASSPHRASE)
+        .expect("the profile opens");
+    assert!(service.store.is_unlocked("poste"));
+    service
+}
+
+#[tokio::test]
+async fn change_passphrase_asks_current_even_when_the_profile_is_unlocked() {
+    let scratch = Scratch::new("change-unlocked");
+    let source = Scripted::new(
+        vec![
+            Answer::Give(PASSPHRASE),
+            Answer::Give(NEW_PASSPHRASE),
+            Answer::Give(NEW_PASSPHRASE),
+        ],
+        false,
+    );
+    let service = unlocked_service(&scratch, Arc::clone(&source));
+    let (client, _events) = client_of(Arc::clone(&service)).await;
+
+    config_of(
+        client
+            .call(EngineCommand::ChangePassphrase {
+                name: "poste".into(),
+            })
+            .await,
+    );
+
+    assert_eq!(
+        source.purposes(),
+        vec![
+            PromptPurpose::Current,
+            PromptPurpose::New,
+            PromptPurpose::Confirm
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_wrong_current_passphrase_stops_change_passphrase_on_an_unlocked_profile() {
+    let scratch = Scratch::new("change-wrong");
+    let source = Scripted::new(vec![Answer::Give(NEW_PASSPHRASE)], false);
+    let service = unlocked_service(&scratch, Arc::clone(&source));
+    let (client, _events) = client_of(Arc::clone(&service)).await;
+
+    let reply = client
+        .call(EngineCommand::ChangePassphrase {
+            name: "poste".into(),
+        })
+        .await;
+
+    assert_refused(reply, &VaultError::WrongPassphrase.to_string());
+    // Only the check was asked: no new passphrase, and the old one still opens.
+    assert_eq!(source.purposes(), vec![PromptPurpose::Current]);
+    store_at(scratch.path())
+        .unlock("poste", PASSPHRASE)
+        .expect("the passphrase did not change");
+}
+
+#[tokio::test]
+async fn make_service_asks_current_even_when_the_profile_is_unlocked() {
+    let scratch = Scratch::new("service-unlocked");
+    let source = Scripted::new(vec![Answer::Give(PASSPHRASE)], false);
+    let service = unlocked_service(&scratch, Arc::clone(&source));
+    let (client, _events) = client_of(Arc::clone(&service)).await;
+
+    let view = config_of(
+        client
+            .call(EngineCommand::MakeService {
+                name: "poste".into(),
+            })
+            .await,
+    );
+
+    assert_eq!(mode_in(&view, "poste"), "service");
+    assert_eq!(source.purposes(), vec![PromptPurpose::Current]);
+}
+
+#[tokio::test]
+async fn a_wrong_current_passphrase_keeps_an_unlocked_profile_nomad() {
+    let scratch = Scratch::new("service-wrong");
+    let source = Scripted::new(vec![Answer::Give(NEW_PASSPHRASE)], false);
+    let service = unlocked_service(&scratch, Arc::clone(&source));
+    let (client, _events) = client_of(Arc::clone(&service)).await;
+
+    let reply = client
+        .call(EngineCommand::MakeService {
+            name: "poste".into(),
+        })
+        .await;
+
+    assert_refused(reply, &VaultError::WrongPassphrase.to_string());
+    assert!(matches!(
+        store_at(scratch.path()).mode_of("poste"),
+        Ok(Some(ProfileMode::Nomad { .. }))
+    ));
+}
+
+/// « Changer la passphrase » on a `service` profile would seal it as nomad
+/// without the guard of « Passer en nomade »: the engine refuses it.
+#[tokio::test]
+async fn change_passphrase_refuses_a_service_profile() {
+    let scratch = Scratch::new("change-service");
+    store_at(scratch.path())
+        .save_profile(&profile("bureau"))
+        .expect("a service profile is saved");
+    let source = Scripted::new(
+        vec![Answer::Give(PASSPHRASE), Answer::Give(PASSPHRASE)],
+        false,
+    );
+    let service = service_on(scratch.path(), Arc::clone(&source));
+    let (client, _events) = client_of(Arc::clone(&service)).await;
+
+    let reply = client
+        .call(EngineCommand::ChangePassphrase {
+            name: "bureau".into(),
+        })
+        .await;
+
+    assert_refused(reply, "le profil « bureau » n'est pas un profil nomade");
+    assert!(source.purposes().is_empty(), "nothing is asked");
+    assert!(matches!(
+        store_at(scratch.path()).mode_of("bureau"),
+        Ok(Some(ProfileMode::Service))
+    ));
+}
+
+#[tokio::test]
+async fn a_lock_during_change_passphrase_leaves_the_profile_locked() {
+    let scratch = Scratch::new("lock-change");
+    seed_nomad(scratch.path(), "poste");
+    let (service, _source) = locking_service(scratch.path());
+    let (client, _session) = client_of(Arc::clone(&service)).await;
+
+    let reply = client
+        .call(EngineCommand::ChangePassphrase {
+            name: "poste".into(),
+        })
+        .await;
+
+    assert_refused(
+        reply,
+        &VaultError::ProfileLocked("poste".into()).to_string(),
+    );
+    assert!(!service.store.is_unlocked("poste"));
+    assert_locked_and_unusable(&service, "poste").await;
 }

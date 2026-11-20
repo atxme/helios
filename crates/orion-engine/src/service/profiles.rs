@@ -635,14 +635,16 @@ impl EngineService {
         Ok(self.config_view(&cfg))
     }
 
-    /// Selects a profile that is in the configuration.
+    /// Selects a profile that is in the configuration, usable or locked.
     ///
     /// The tray's connect gesture selects through this command too, and it needs
     /// the unknown name refused here: the store would otherwise accept a name it
     /// does not hold and the connection would fail later without naming it.
     pub async fn select_profile(&self, name: String) -> Result<ConfigView, String> {
         let mut cfg = self.config.lock().await;
-        if cfg.find(&name).is_none() {
+        // A locked nomad profile is selectable: the registry holds the choice,
+        // and the connection that follows is the one that opens it.
+        if cfg.find(&name).is_none() && !cfg.locked.iter().any(|locked| locked.name == name) {
             return Err(format!("profil « {name} » introuvable"));
         }
         self.store.select(&name).map_err(|e| e.to_string())?;

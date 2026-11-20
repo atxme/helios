@@ -350,8 +350,10 @@ fn add_dll_directory(directory: &Path) -> Result<(), String> {
 
 /// Locks the nomad profiles for each lock event the watch reports, in order.
 ///
-/// No UI session is attached to the watch, so what a lock pushes has nowhere
-/// to go: it is logged, rather than dropped without a trace.
+/// What a lock pushes goes to the UI session's own event queue, which the
+/// engine finds by itself. The queue made here is only the fallback for a lock
+/// that lands while no UI is attached: what it takes is logged, rather than
+/// dropped without a trace.
 #[cfg(windows)]
 async fn relay_lock_events(
     engine: Arc<EngineService>,
