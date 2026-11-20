@@ -1856,6 +1856,27 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn plan_lock_is_exclusive_and_released_and_journal_is_private() {
+        const CHILD: &str = "HELIOS_TEST_PLAN_LOCK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // A parallel test's fork can briefly keep the flock's file
+            // description alive after drop, until that child execs.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "firmware::tests::plan_lock_is_exclusive_and_released_and_journal_is_private",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .expect("run the lock test in an isolated process");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed;"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         use std::os::unix::fs::PermissionsExt;
         let (_dir, path, _plan, _gateway) = transaction(false);
         let lock = PlanLock::acquire(&path).unwrap();
