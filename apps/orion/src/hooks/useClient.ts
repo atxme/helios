@@ -129,6 +129,12 @@ export function useClient() {
           setError(ev.message)
           pushLog('error', ev.message)
           break
+        case 'config_changed':
+          // The engine moved the profiles on its own: a lock turned the
+          // nomad ones back to locked. Without this reread the window would
+          // keep showing them open, with their endpoint.
+          api.getConfig().then(setConfig).catch(() => {})
+          break
       }
     })
     const unlistenProfilePath = api.onProfilePath(() => {
@@ -174,6 +180,11 @@ export function useClient() {
       if (String(e) === PASSPHRASE_CANCELLED) return 'cancelled'
       setError(String(e))
       return 'done'
+    } finally {
+      // A connect may have opened a locked profile, and the engine answers it
+      // with nothing: the list would keep showing the row as locked. Read
+      // back whatever the outcome, since a refusal can also leave it moved.
+      api.getConfig().then(setConfig).catch(() => {})
     }
   }, [])
 
@@ -299,8 +310,14 @@ export function useClient() {
 
   const clearPathImportedProfile = useCallback(() => setPathImportedProfile(null), [])
 
+  // A selected profile that is locked is not in `profiles`: falling back to
+  // the first profile would aim the header, and its connect button, at a
+  // different tunnel. The locked one is named instead.
+  const selectedLocked = config.locked.find((p) => p.name === config.selected) ?? null
   const selectedProfile =
-    config.profiles.find((p) => p.name === config.selected) ?? config.profiles[0] ?? null
+    config.profiles.find((p) => p.name === config.selected) ??
+    (selectedLocked ? null : (config.profiles[0] ?? null))
+  const selectedName = selectedProfile?.name ?? selectedLocked?.name
 
   return {
     config,
@@ -316,6 +333,8 @@ export function useClient() {
     capture,
     error,
     selectedProfile,
+    selectedLocked,
+    selectedName,
     pathImportedProfile,
     connect,
     disconnect,

@@ -521,6 +521,7 @@ export type ClientEvent =
   | { type: 'log'; level: string; message: string }
   | { type: 'telemetry'; iface: string; rx_bps: number; tx_bps: number; rx_pps: number; tx_pps: number }
   | { type: 'error'; message: string }
+  | { type: 'config_changed' }
 
 export interface LogLine {
   level: string

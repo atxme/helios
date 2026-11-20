@@ -866,14 +866,31 @@ export function ProfilesView({
     }
   }
 
-  /** The profile the delete dialog is about: the locked one picked, else the draft. */
-  const deleteTarget = lockedFocus ?? draft.name
+  // The locked profile picked in the list, while the configuration still says
+  // it is locked. Once it is not, the editor takes the place back.
+  const lockedView =
+    lockedFocus === null ? undefined : config.locked.find((locked) => locked.name === lockedFocus)
+
+  /**
+   * The profile the delete dialog is about: the locked one the editor shows,
+   * else the draft. Derived from what the editor shows, not from the focus: a
+   * focus left behind by a gesture that unlocked its row would aim the
+   * deletion at a profile the screen no longer displays.
+   */
+  const deleteTarget = lockedView?.name ?? draft.name
+
+  // The focus follows the configuration: a row that left the locked list (a
+  // gesture opened it) takes its focus with it, so a later pick cannot find a
+  // stale name.
+  useEffect(() => {
+    if (lockedFocus !== null && lockedView === undefined) setLockedFocus(null)
+  }, [lockedFocus, lockedView])
 
   const remove = async () => {
     try {
       await onDelete(deleteTarget)
       setDeleteOpen(false)
-      if (lockedFocus === null) setDirty(false)
+      if (lockedView === undefined) setDirty(false)
       setLockedFocus(null)
     } catch {
       // The global error explains the failure and the dialog stays open.
@@ -1000,10 +1017,6 @@ export function ProfilesView({
   // Known false only: while the posture is being read, the choice stays
   // available and the engine refuses it if it must.
   const nomadBlocked = posture?.nomadAvailable === false
-  // The locked profile picked in the list, while the configuration still says
-  // it is locked. Once it is not, the editor takes the place back.
-  const lockedView =
-    lockedFocus === null ? undefined : config.locked.find((locked) => locked.name === lockedFocus)
   const storedKind = config.profiles.find((profile) => profile.name === draft.name)?.profile_type
   const draftKind: ClientProfile['profile_type'] = draft.key_negotiation
     ? 'helios_key_negotiation'

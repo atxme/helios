@@ -446,6 +446,7 @@ export default function App() {
               <ConnectView
                 state={c.state}
                 profile={c.selectedProfile}
+                lockedProfile={c.selectedLocked}
                 upSince={c.upSince}
                 telemetry={c.telemetry}
                 history={c.history}
@@ -454,11 +455,11 @@ export default function App() {
                 renewing={c.renewing}
                 onConnect={async () => {
                   setConnectNotice(null)
-                  const outcome = await c.connect(c.selectedProfile?.name)
+                  const outcome = await c.connect(c.selectedName)
                   setConnectNotice(outcome === 'cancelled' ? 'Saisie annulée.' : null)
                 }}
                 onDisconnect={c.disconnect}
-                onOpenSsh={() => c.openSshTerminal(c.selectedProfile?.name)}
+                onOpenSsh={() => c.openSshTerminal(c.selectedName)}
                 onRenewKey={c.renewPsk}
               />
             </Box>

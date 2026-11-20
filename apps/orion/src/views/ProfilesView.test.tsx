@@ -1308,6 +1308,40 @@ describe('ProfilesView nomad profile', () => {
     expect(screen.queryByLabelText('Endpoint')).toBeNull()
   })
 
+  /// A gesture that opened the locked row removes it from the locked list. The
+  /// trash icon of the editor that takes its place must name the editor's own
+  /// profile, never the row that has just left.
+  it('aims the delete dialog at the editor profile after a locked row was opened', async () => {
+    const handlers = callbacks()
+    const { rerender } = render(
+      <ProfilesView
+        config={{ profiles: [profile()], selected: 'portable', locked: [locked] }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'coffre' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Repasser en service' }))
+    await waitFor(() => expect(handlers.onMakeService).toHaveBeenCalledWith('coffre'))
+    rerender(
+      <ProfilesView
+        config={{
+          profiles: [profile(), profile({ name: 'coffre', mode: 'service' })],
+          selected: 'portable',
+          locked: [],
+        }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Supprimer le profil portable' }))
+    const dialog = screen.getByRole('dialog', { name: 'Supprimer « portable » ?' })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Supprimer' }))
+    await waitFor(() => expect(handlers.onDelete).toHaveBeenCalledOnce())
+    expect(handlers.onDelete).toHaveBeenCalledWith('portable')
+  })
+
   /// The locked-row connect goes through the same unlock dialog: a closed
   /// dialog is a neutral notice on the profile screen, never an error.
   it('shows a closed unlock dialog from the locked row as a neutral notice', async () => {
