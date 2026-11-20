@@ -330,12 +330,10 @@ pub(crate) async fn make_nomad(
     name: String,
 ) -> Result<ConfigView, String> {
     allow_engine_foreground(&state);
-    let view = match state.client.call(EngineCommand::MakeNomad { name }).await? {
-        EngineReply::Config(value) => value,
-        _ => return Err(unexpected_engine_reply()),
-    };
-    tray::refresh(&app);
-    Ok(view)
+    change_nomad_profile(&state.client, EngineCommand::MakeNomad { name }, || {
+        tray::refresh(&app)
+    })
+    .await
 }
 
 /// Sets a new passphrase on a `nomade` profile, unlocking it first if needed.
@@ -348,16 +346,12 @@ pub(crate) async fn change_passphrase(
     name: String,
 ) -> Result<ConfigView, String> {
     allow_engine_foreground(&state);
-    let view = match state
-        .client
-        .call(EngineCommand::ChangePassphrase { name })
-        .await?
-    {
-        EngineReply::Config(value) => value,
-        _ => return Err(unexpected_engine_reply()),
-    };
-    tray::refresh(&app);
-    Ok(view)
+    change_nomad_profile(
+        &state.client,
+        EngineCommand::ChangePassphrase { name },
+        || tray::refresh(&app),
+    )
+    .await
 }
 
 /// Moves a `nomade` profile back to `service`, unlocking it first if needed.
@@ -371,15 +365,19 @@ pub(crate) async fn make_service(
     name: String,
 ) -> Result<ConfigView, String> {
     allow_engine_foreground(&state);
-    let view = match state
-        .client
-        .call(EngineCommand::MakeService { name })
-        .await?
-    {
-        EngineReply::Config(value) => value,
-        _ => return Err(unexpected_engine_reply()),
-    };
-    tray::refresh(&app);
+    change_nomad_profile(&state.client, EngineCommand::MakeService { name }, || {
+        tray::refresh(&app)
+    })
+    .await
+}
+
+async fn change_nomad_profile(
+    client: &EngineClient,
+    command: EngineCommand,
+    refresh_tray: impl FnOnce(),
+) -> Result<ConfigView, String> {
+    let view = profile_config(client, command).await?;
+    refresh_tray();
     Ok(view)
 }
 

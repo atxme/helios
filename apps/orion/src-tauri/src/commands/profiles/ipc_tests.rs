@@ -307,6 +307,104 @@ async fn profile_change_refused_by_the_engine_leaves_the_tray_untouched() {
     }
 }
 
+fn config_reply() -> EngineReply {
+    EngineReply::Config(ConfigView {
+        profiles: vec![],
+        selected: Some("gateway".into()),
+        vault_error: None,
+        locked: Vec::new(),
+    })
+}
+
+fn assert_nomad_command(command: EngineCommand, expected: &str) {
+    let actual = match command {
+        EngineCommand::MakeNomad { name } => ("make_nomad", name),
+        EngineCommand::ChangePassphrase { name } => ("change_passphrase", name),
+        EngineCommand::MakeService { name } => ("make_service", name),
+        _ => panic!("expected a nomad profile gesture"),
+    };
+    assert_eq!(actual, (expected, "gateway".into()));
+}
+
+#[tokio::test]
+async fn nomad_profile_gestures_forward_names_and_refresh_after_success() {
+    for (command, expected) in [
+        (
+            EngineCommand::MakeNomad {
+                name: "gateway".into(),
+            },
+            "make_nomad",
+        ),
+        (
+            EngineCommand::ChangePassphrase {
+                name: "gateway".into(),
+            },
+            "change_passphrase",
+        ),
+        (
+            EngineCommand::MakeService {
+                name: "gateway".into(),
+            },
+            "make_service",
+        ),
+    ] {
+        let (client, mut engine) = scripted_engine().await;
+        let refreshed = Cell::new(false);
+        let (result, ()) = tokio::join!(
+            change_nomad_profile(&client, command, || refreshed.set(true)),
+            async move {
+                engine
+                    .reply(|command| {
+                        assert_nomad_command(command, expected);
+                        Ok(config_reply())
+                    })
+                    .await;
+            }
+        );
+
+        assert_eq!(
+            result.expect("configuration view").selected.as_deref(),
+            Some("gateway")
+        );
+        assert!(refreshed.get());
+    }
+}
+
+#[tokio::test]
+async fn refused_or_mismatched_nomad_gesture_does_not_refresh_tray() {
+    for reply in [
+        Ok::<_, String>(EngineReply::Unit),
+        Err("passphrase dialog cancelled".into()),
+    ] {
+        let expected = match &reply {
+            Ok(_) => unexpected_engine_reply(),
+            Err(error) => error.clone(),
+        };
+        let (client, mut engine) = scripted_engine().await;
+        let refreshed = Cell::new(false);
+        let (result, ()) = tokio::join!(
+            change_nomad_profile(
+                &client,
+                EngineCommand::MakeService {
+                    name: "gateway".into()
+                },
+                || refreshed.set(true),
+            ),
+            async move {
+                engine
+                    .reply(|command| {
+                        assert_nomad_command(command, "make_service");
+                        reply
+                    })
+                    .await;
+            }
+        );
+
+        assert_eq!(result.err().as_deref(), Some(expected.as_str()));
+        assert!(!refreshed.get());
+    }
+}
+
 fn posture(protected: bool, waived: bool) -> EngineReply {
     EngineReply::VaultPosture(VaultPosture {
         hardware_backed: true,
