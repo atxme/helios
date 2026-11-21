@@ -28,7 +28,7 @@ use axum::{
 use futures_util::{stream, StreamExt as _};
 use serde::Deserialize;
 
-use aether::speedtest::Pacer;
+use aether::speedtest::{Pacer, TcpReceiveMeter};
 
 use crate::{auth, AppState};
 
@@ -67,6 +67,7 @@ fn serve_raw_blocking(
         .map_err(|error| anyhow::anyhow!("binding raw speedtest UDP on {bind}: {error}"))?;
     tcp.set_nonblocking(true)?;
     udp.set_read_timeout(Some(UDP_READ_TIMEOUT))?;
+    enlarge_udp_receive_buffer(&udp);
     tracing::info!("raw speedtest TCP/UDP listening on {bind}");
 
     let tcp_state = state.clone();
@@ -138,7 +139,8 @@ fn handle_tcp_session(mut stream: TcpStream) -> anyhow::Result<()> {
         "speedtest TCP start does not match its hello"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(u64::from(duration));
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(u64::from(duration));
     match mode {
         aether::speedtest::SPEEDTEST_MODE_DOWNLOAD => {
             let buffer = raw_buffer();
@@ -150,11 +152,15 @@ fn handle_tcp_session(mut stream: TcpStream) -> anyhow::Result<()> {
             stream.shutdown(Shutdown::Write)?;
         }
         aether::speedtest::SPEEDTEST_MODE_UPLOAD => {
+            // The client counts nothing itself: what it handed to its socket
+            // includes its send buffer. This end is where the bytes arrive,
+            // so this end reports them.
+            let mut meter = TcpReceiveMeter::new(started, duration);
             let mut buffer = vec![0u8; aether::speedtest::SPEEDTEST_TCP_BUFFER_BYTES];
             loop {
                 match stream.read(&mut buffer) {
                     Ok(0) => break,
-                    Ok(_) => {}
+                    Ok(read) => meter.record(read, Instant::now()),
                     Err(error)
                         if matches!(
                             error.kind(),
@@ -166,10 +172,38 @@ fn handle_tcp_session(mut stream: TcpStream) -> anyhow::Result<()> {
                     Err(error) => return Err(error.into()),
                 }
             }
+            let mut summary = [0u8; aether::speedtest::TCP_SUMMARY_BYTES];
+            summary[..aether::speedtest::TCP_CONTROL_BYTES].copy_from_slice(&tcp_control(
+                aether::speedtest::TCP_KIND_SUMMARY,
+                mode,
+                duration,
+                session,
+            ));
+            summary[aether::speedtest::TCP_CONTROL_BYTES..]
+                .copy_from_slice(&meter.finish().encode());
+            stream.write_all(&summary)?;
         }
         _ => unreachable!("validate_mode checked the TCP mode"),
     }
     Ok(())
+}
+
+/// Asks for [`aether::speedtest::SPEEDTEST_UDP_RECV_BUFFER_BYTES`] on a
+/// measurement socket.
+///
+/// Not a startup condition: the service still measures with the default
+/// buffer, only with a higher risk of reporting its own overflow as loss. So a
+/// refusal is logged, with what the socket actually holds, and not raised.
+fn enlarge_udp_receive_buffer(socket: &UdpSocket) {
+    let socket = socket2::SockRef::from(socket);
+    if let Err(error) =
+        socket.set_recv_buffer_size(aether::speedtest::SPEEDTEST_UDP_RECV_BUFFER_BYTES)
+    {
+        tracing::warn!(%error, "raw speedtest UDP: receive buffer left at its default size");
+    }
+    if let Ok(granted) = socket.recv_buffer_size() {
+        tracing::debug!(granted, "raw speedtest UDP receive buffer");
+    }
 }
 
 fn run_udp_server(

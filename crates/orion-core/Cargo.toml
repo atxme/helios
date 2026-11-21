@@ -29,6 +29,10 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+# Tampon de réception des sockets UDP du speedtest (`SO_RCVBUF`), que `std`
+# ne permet pas de poser. Déjà dans l'arbre via aether-key-negotiation, quinn
+# et tokio : aucun coût supplémentaire de chaîne d'approvisionnement.
+socket2 = "0.6"
 directories = "6"
 base64.workspace = true
 aws-lc-rs.workspace = true

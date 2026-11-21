@@ -27,6 +27,10 @@ tokio = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+# Tampon de réception des sockets UDP du speedtest (`SO_RCVBUF`), que `std`
+# ne permet pas de poser. Déjà dans l'arbre via aether-key-negotiation, quinn
+# et tokio : aucun coût supplémentaire de chaîne d'approvisionnement.
+socket2 = "0.6"
 anyhow.workspace = true
 async-trait = { workspace = true }
 futures-util.workspace = true

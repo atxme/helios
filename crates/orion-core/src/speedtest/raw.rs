@@ -285,11 +285,11 @@ fn measure_raw_tcp(
             thread::sleep(Duration::from_millis(250));
         }
     });
-    let mut bytes = 0u64;
+    let mut streams = Vec::with_capacity(aether::speedtest::SPEEDTEST_TCP_STREAMS);
     let mut first_error = None;
     for worker in workers {
         match worker.join() {
-            Ok(Ok(value)) => bytes = bytes.saturating_add(value),
+            Ok(Ok(counters)) => streams.push(counters),
             Ok(Err(error)) if first_error.is_none() => first_error = Some(error),
             Ok(Err(_)) => {}
             Err(_) if first_error.is_none() => first_error = Some("flux TCP interrompu".into()),
@@ -301,25 +301,56 @@ fn measure_raw_tcp(
     if let Some(error) = first_error {
         return Err(SpeedTestError::Transport(error));
     }
-    let elapsed = monitor_started.elapsed();
+    let bytes = streams
+        .iter()
+        .fold(0u64, |sum, stream| sum.saturating_add(stream.total_bytes));
     if bytes == 0 {
         return Err(SpeedTestError::BadResponse("aucun octet TCP mesuré".into()));
     }
+    // Counted where the bytes arrived, warm-up set aside, each stream over
+    // its own window: the figure `iperf3 -P 4 -O 2` prints on its receiver
+    // line.
+    let mbps = aether::speedtest::tcp_rate_mbps(&streams).ok_or_else(|| {
+        SpeedTestError::BadResponse("aucun octet TCP reçu après la mise en régime".into())
+    })?;
     emit_progress(
         progress,
         phase,
         1.0,
-        rate_mbps(bytes, elapsed),
+        mbps,
         bytes,
         global_started,
         phase_message(phase),
     );
     Ok(RawMeasurement {
-        mbps: rate_mbps(bytes, elapsed),
+        mbps,
         bytes,
         loss_pct: None,
         jitter_ms: None,
     })
+}
+
+/// One TCP leg, without the latency probe or the progress a run carries.
+#[cfg(test)]
+pub(super) fn measure_raw_tcp_for_test(
+    target: SocketAddr,
+    mode: u8,
+    duration_secs: u16,
+) -> Result<RawMeasurement, SpeedTestError> {
+    let phase = if mode == aether::speedtest::SPEEDTEST_MODE_UPLOAD {
+        SpeedTestPhase::TcpUpload
+    } else {
+        SpeedTestPhase::TcpDownload
+    };
+    let progress: SpeedTestProgressSink = Arc::new(|_| {});
+    measure_raw_tcp(
+        target,
+        mode,
+        duration_secs,
+        phase,
+        &progress,
+        Instant::now(),
+    )
 }
 
 fn raw_tcp_stream(
@@ -328,7 +359,7 @@ fn raw_tcp_stream(
     duration_secs: u16,
     barrier: Arc<Barrier>,
     counter: Arc<AtomicU64>,
-) -> Result<u64, String> {
+) -> Result<aether::speedtest::TcpReceiveCounters, String> {
     let session = next_session();
     // Every worker reaches the barrier, even when its connection or control
     // handshake fails. Otherwise the parent and the other streams could wait
@@ -381,6 +412,7 @@ fn raw_tcp_stream(
     })();
     barrier.wait();
     let mut stream = prepared?;
+    let started = Instant::now();
     stream
         .write_all(&tcp_control(
             aether::speedtest::TCP_KIND_GO,
@@ -389,15 +421,15 @@ fn raw_tcp_stream(
             session,
         ))
         .map_err(|error| error.to_string())?;
-    let mut bytes = 0u64;
     match mode {
         aether::speedtest::SPEEDTEST_MODE_DOWNLOAD => {
+            let mut meter = aether::speedtest::TcpReceiveMeter::new(started, duration_secs);
             let mut buffer = vec![0u8; aether::speedtest::SPEEDTEST_TCP_BUFFER_BYTES];
             loop {
                 match stream.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(read) => {
-                        bytes = bytes.saturating_add(read as u64);
+                        meter.record(read, Instant::now());
                         counter.fetch_add(read as u64, Ordering::Relaxed);
                     }
                     Err(error)
@@ -411,25 +443,68 @@ fn raw_tcp_stream(
                     Err(error) => return Err(error.to_string()),
                 }
             }
+            Ok(meter.finish())
         }
         aether::speedtest::SPEEDTEST_MODE_UPLOAD => {
             let buffer = raw_buffer();
-            let deadline = Instant::now() + Duration::from_secs(u64::from(duration_secs));
+            let deadline = started + Duration::from_secs(u64::from(duration_secs));
             while Instant::now() < deadline {
                 let written = stream.write(&buffer).map_err(|error| error.to_string())?;
                 if written == 0 {
                     break;
                 }
-                bytes = bytes.saturating_add(written as u64);
+                // Live progress only: these bytes were handed to the socket,
+                // not delivered. The result comes from the gateway's summary.
                 counter.fetch_add(written as u64, Ordering::Relaxed);
             }
             stream
                 .shutdown(Shutdown::Write)
                 .map_err(|error| error.to_string())?;
+            read_upload_summary(&mut stream, mode, duration_secs, session)
         }
-        _ => return Err("direction TCP invalide".into()),
+        _ => Err("direction TCP invalide".into()),
     }
-    Ok(bytes)
+}
+
+/// What the gateway received on an upload stream.
+///
+/// The gateway sends it once it has read the end of the stream, so waiting
+/// for it also waits for the send buffer to drain: the leg ends when the last
+/// byte arrived, not when it was queued.
+fn read_upload_summary(
+    stream: &mut TcpStream,
+    mode: u8,
+    duration_secs: u16,
+    session: u64,
+) -> Result<aether::speedtest::TcpReceiveCounters, String> {
+    let mut summary = [0u8; aether::speedtest::TCP_SUMMARY_BYTES];
+    stream.read_exact(&mut summary).map_err(|error| {
+        // The stream was served, so the port is ours: a close here is a
+        // gateway that did not count, not a foreign listener.
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            "la passerelle a fermé le flux sans rendre son décompte de réception".to_string()
+        } else {
+            foreign_or_transport(error)
+        }
+    })?;
+    let (control, counters) = summary.split_at(aether::speedtest::TCP_CONTROL_BYTES);
+    let control: &[u8; aether::speedtest::TCP_CONTROL_BYTES] =
+        control.try_into().map_err(|_| "résumé TCP tronqué")?;
+    let header = parse_tcp_control(control).map_err(|error| error.to_string())?;
+    if header
+        != (
+            aether::speedtest::TCP_KIND_SUMMARY,
+            mode,
+            duration_secs,
+            session,
+        )
+    {
+        return Err("résumé TCP de la passerelle invalide".into());
+    }
+    let counters: &[u8; aether::speedtest::TCP_COUNTERS_BYTES] =
+        counters.try_into().map_err(|_| "résumé TCP tronqué")?;
+    aether::speedtest::TcpReceiveCounters::decode(counters)
+        .ok_or_else(|| "compteurs TCP de la passerelle incohérents".into())
 }
 
 pub(super) fn emit_progress(

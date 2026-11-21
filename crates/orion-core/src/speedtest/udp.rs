@@ -24,6 +24,7 @@ pub(super) fn measure_raw_udp(
     socket
         .set_read_timeout(Some(Duration::from_millis(100)))
         .map_err(raw_transport)?;
+    enlarge_receive_buffer(&socket);
     let session = next_session();
     let hello = udp_frame(
         aether::speedtest::UDP_KIND_HELLO,
@@ -101,6 +102,21 @@ pub(super) fn measure_raw_udp(
             started,
         ),
         _ => Err(SpeedTestError::BadResponse("direction UDP invalide".into())),
+    }
+}
+
+/// Asks for [`aether::speedtest::SPEEDTEST_UDP_RECV_BUFFER_BYTES`].
+///
+/// A download leg arrives in the gateway pacer's bursts, and Windows gives a
+/// UDP socket a receive buffer that a single burst can overflow — loss the
+/// leg would then report as the path's. A refusal does not stop the leg,
+/// which still measures with the default buffer; it is logged.
+fn enlarge_receive_buffer(socket: &UdpSocket) {
+    let socket = socket2::SockRef::from(socket);
+    if let Err(error) =
+        socket.set_recv_buffer_size(aether::speedtest::SPEEDTEST_UDP_RECV_BUFFER_BYTES)
+    {
+        tracing::warn!(%error, "speedtest UDP : tampon de réception laissé à sa taille par défaut");
     }
 }
 

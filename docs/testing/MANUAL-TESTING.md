@@ -2190,7 +2190,11 @@ iperf3 -c 100.64.1.2 -p 5202
 
 Comparer au speedtest d'Orion, qui mesure la même chose par un autre chemin :
 
-* **débit TCP proche** des deux côtés — le speedtest est juste ;
+* **débit TCP proche** des deux côtés — le speedtest est juste. Comparer à
+  `iperf3 -c <VIP> -p 5202 -P 4 -O 2` (et `-R` pour le descendant), ligne
+  `receiver` : comme elle, le speedtest compte les octets **reçus** (en
+  montant, c'est la gateway qui les rend à Orion) sur quatre flux, et laisse
+  hors du calcul la mise en régime de TCP, au plus 2 s par jambe ;
 * **perte UDP proche de zéro** sous `iperf3 -u -b <débit TCP>` — c'est la même
   question que pose la jambe de qualité, cadencée à 85 % du débit TCP ;
 * un `iperf3 -u -b 0` renvoie une perte énorme, et c'est **normal** : sans

@@ -34,6 +34,17 @@ fn tcp_upload_accepts_a_matching_start_and_the_entire_stream() {
         .unwrap();
     client.write_all(b"test payload").unwrap();
     client.shutdown(Shutdown::Write).unwrap();
+    // The receiver reports what arrived: the client counts nothing itself.
+    let mut summary = [0; TCP_SUMMARY_BYTES];
+    client.read_exact(&mut summary).expect("upload summary");
+    let control: [u8; TCP_CONTROL_BYTES] = summary[..TCP_CONTROL_BYTES].try_into().unwrap();
+    assert_eq!(
+        parse_tcp_control(&control).expect("valid summary"),
+        (TCP_KIND_SUMMARY, SPEEDTEST_MODE_UPLOAD, 1, 42)
+    );
+    let counters: [u8; TCP_COUNTERS_BYTES] = summary[TCP_CONTROL_BYTES..].try_into().unwrap();
+    let counters = TcpReceiveCounters::decode(&counters).expect("coherent counters");
+    assert_eq!(counters.total_bytes, b"test payload".len() as u64);
     server
         .join()
         .expect("server thread")
