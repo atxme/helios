@@ -55,11 +55,28 @@ const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => {
     persistent_keepalive: 25,
     heliosd_url: 'http://100.64.0.1:8080',
     ssh_target: null,
+    dns: null,
     key_negotiation: null,
     mode: 'service',
     ...overrides,
   }
 }
+
+/** A Helios profile: the negotiation block is what makes it one. */
+const heliosProfile = (overrides: Partial<ClientProfile> = {}): ClientProfile =>
+  profile({
+    profile_type: 'helios_key_negotiation',
+    key_negotiation: {
+      mode: 'ml_kem',
+      minimum_mode: 'static_psk',
+      endpoint: '203.0.113.10:51821',
+      server_name: '203.0.113.10',
+      gateway_ca_der: 'ca',
+      gateway_pq_certificate: 'pq',
+      identity: 'orion-portable',
+    },
+    ...overrides,
+  })
 
 /**
  * What the shell reports for a profile whose identity is not on this machine.
@@ -1037,6 +1054,164 @@ describe('ProfilesView interactions', () => {
       target: { value: '0.0.0.0/0' },
     })
     expect(screen.getByText(/IPv6 sort en clair/)).toBeTruthy()
+  })
+
+  /**
+   * The resolver list of a classic profile: an optional field, empty for none.
+   * What is typed is sent as typed; an empty field sends no list at all.
+   */
+  it('sends the classic profile resolvers as typed, and none once emptied', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{
+          profiles: [profile({ dns: ['86.54.11.100'] })],
+          selected: 'portable',
+          locked: [],
+        }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+    // A classic profile has no gateway to ask: no choice, only the field.
+    expect(screen.queryByRole('button', { name: 'Proposé par la passerelle' })).toBeNull()
+    const field = () => screen.getByRole('textbox', { name: 'DNS' }) as HTMLInputElement
+    expect(field().value).toBe('86.54.11.100')
+
+    fireEvent.change(field(), { target: { value: '86.54.11.100, 86.54.11.200' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+    expect(handlers.onSave.mock.calls[0][0].dns).toEqual(['86.54.11.100', '86.54.11.200'])
+  })
+
+  it('sends no resolver list for an emptied classic field', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{
+          profiles: [profile({ dns: ['86.54.11.100'] })],
+          selected: 'portable',
+          locked: [],
+        }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'DNS' }), { target: { value: '' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+    expect(handlers.onSave.mock.calls[0][0].dns).toBeNull()
+  })
+
+  /**
+   * A Helios profile asks the gateway by default. «Personnalisé» opens the
+   * field, and what is typed is what the save carries.
+   */
+  it('writes the custom resolvers of a Helios profile', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{ profiles: [heliosProfile()], selected: 'portable', locked: [] }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+    // «Personnalisé» also names a split-tunnel segment: the DNS choice is
+    // read within its own group.
+    const dnsChoice = within(screen.getByRole('group', { name: 'DNS' }))
+    const pressed = (name: string) =>
+      dnsChoice.getByRole('button', { name }).getAttribute('aria-pressed')
+
+    expect(pressed('Proposé par la passerelle')).toBe('true')
+    expect(screen.queryByRole('textbox', { name: 'DNS' })).toBeNull()
+
+    fireEvent.click(dnsChoice.getByRole('button', { name: 'Personnalisé' }))
+    expect(pressed('Personnalisé')).toBe('true')
+    fireEvent.change(screen.getByRole('textbox', { name: 'DNS' }), {
+      target: { value: '86.54.11.100' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+    expect(handlers.onSave.mock.calls[0][0].dns).toEqual(['86.54.11.100'])
+  })
+
+  /** Going back to the gateway sends `null`, whatever list was stored before. */
+  it('sends null when a Helios profile goes back to the gateway', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{
+          profiles: [heliosProfile({ dns: ['86.54.11.100', '86.54.11.200'] })],
+          selected: 'portable',
+          locked: [],
+        }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+    const dnsChoice = within(screen.getByRole('group', { name: 'DNS' }))
+    expect(
+      dnsChoice.getByRole('button', { name: 'Personnalisé' }).getAttribute('aria-pressed'),
+    ).toBe('true')
+    expect((screen.getByRole('textbox', { name: 'DNS' }) as HTMLInputElement).value).toBe(
+      '86.54.11.100, 86.54.11.200',
+    )
+
+    fireEvent.click(dnsChoice.getByRole('button', { name: 'Proposé par la passerelle' }))
+    expect(screen.queryByRole('textbox', { name: 'DNS' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+    expect(handlers.onSave.mock.calls[0][0].dns).toBeNull()
+  })
+
+  /** A private, repeated or fourth resolver is refused on the field, and cannot be saved. */
+  it('refuses a private, repeated or excess resolver before saving', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{ profiles: [heliosProfile()], selected: 'portable', locked: [] }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+    fireEvent.click(
+      within(screen.getByRole('group', { name: 'DNS' })).getByRole('button', {
+        name: 'Personnalisé',
+      }),
+    )
+    const save = () => screen.getByRole('button', { name: 'Enregistrer' }) as HTMLButtonElement
+    const type = (value: string) =>
+      fireEvent.change(screen.getByRole('textbox', { name: 'DNS' }), { target: { value } })
+
+    // Empty while custom: a list is required, the gateway is not implied.
+    expect(screen.getByText('Saisir une à trois adresses IPv4 publiques')).toBeTruthy()
+    expect(save().disabled).toBe(true)
+
+    type('192.168.1.1')
+    expect(screen.getByText('Adresse IPv4 publique attendue : 192.168.1.1')).toBeTruthy()
+    expect(save().disabled).toBe(true)
+
+    type('86.54.11.100, 86.54.11.100')
+    expect(screen.getByText('Adresse en double : 86.54.11.100')).toBeTruthy()
+    expect(save().disabled).toBe(true)
+
+    type('86.54.11.100, 86.54.11.200, 1.1.1.1, 9.9.9.9')
+    expect(screen.getByText('3 adresses au plus')).toBeTruthy()
+    expect(save().disabled).toBe(true)
+
+    type('86.54.11.100, 86.54.11.200')
+    expect(screen.queryByText(/Adresse IPv4 publique attendue/)).toBeNull()
+    expect(save().disabled).toBe(false)
   })
 
   /**

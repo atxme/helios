@@ -5,7 +5,14 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 
 import App from '../App'
-import type { CaptureCheck, ClientProfile, LogLine, TunnelState, VaultPosture } from '../types'
+import type {
+  CaptureCheck,
+  ClientProfile,
+  DnsState,
+  LogLine,
+  TunnelState,
+  VaultPosture,
+} from '../types'
 import { ConnectView } from '../views/ConnectView'
 import { ProfilesView } from '../views/ProfilesView'
 import { CopyButton } from './CopyButton'
@@ -31,14 +38,18 @@ const profile = (overrides: Partial<ClientProfile> = {}): ClientProfile => ({
   persistent_keepalive: 25,
   heliosd_url: 'http://100.64.0.1:8080',
   ssh_target: null,
+  dns: null,
   key_negotiation: null,
   ...overrides,
 })
+
+const noDns: DnsState = { check: null, proposalUnread: false }
 
 function postureHtml(
   selected: ClientProfile,
   vault: VaultPosture | null,
   capture: CaptureCheck | null = null,
+  dns: DnsState = noDns,
 ): string {
   const anchor = document.createElement('button')
   document.body.append(anchor)
@@ -51,6 +62,7 @@ function postureHtml(
       profile={selected}
       psk="ml_kem"
       capture={capture}
+      dns={dns}
       vault={vault}
     />,
   )
@@ -291,6 +303,70 @@ describe('Orion presentational branches', () => {
     expect(alone).toContain('fd3c:91a2:7e04::2/128 non posée par le pilote')
     expect(alone).not.toContain('non appliqué')
     expect(alone).toContain('0.0.0.0/0, ::/0')
+  })
+
+  /// The «dns» row states what the adapter did with its resolvers, and only
+  /// a failure is amber: a resolver left on the system is a choice, not a leak.
+  it('states the resolvers the tunnel applied, and where they came from', () => {
+    const gateway = postureHtml(profile(), null, null, {
+      check: { status: 'applied', servers: ['86.54.11.100', '86.54.11.200'], origin: 'gateway' },
+      proposalUnread: false,
+    })
+    expect(gateway).toContain('86.54.11.100, 86.54.11.200 — passerelle')
+    expect(gateway).not.toContain('rgb(161, 98, 7)')
+
+    const origins = [
+      ['default', 'DNS4EU par défaut'],
+      ['custom', 'personnalisé'],
+      ['profile', 'profil'],
+    ] as const
+    for (const [origin, label] of origins) {
+      const html = postureHtml(profile(), null, null, {
+        check: { status: 'applied', servers: ['86.54.11.100'], origin },
+        proposalUnread: false,
+      })
+      expect(html).toContain(`86.54.11.100 — ${label}`)
+    }
+  })
+
+  it('names why the system resolvers stay in place, without amber', () => {
+    const cases = [
+      ['not_full_tunnel', 'DNS local : le profil ne capture pas tout le trafic'],
+      ['gateway_declines', 'DNS local : la passerelle ne propose pas de DNS par le tunnel'],
+      ['no_resolver', "DNS local : le profil n'en déclare pas"],
+    ] as const
+    for (const [reason, label] of cases) {
+      const html = postureHtml(profile(), null, null, {
+        check: { status: 'left', reason },
+        proposalUnread: false,
+      })
+      expect(html).toContain(label)
+      expect(html).not.toContain('rgb(161, 98, 7)')
+    }
+  })
+
+  it('states a refused resolver change in amber, with the driver answer', () => {
+    const failed = postureHtml(profile(), null, null, {
+      check: { status: 'failed', reason: 'résolveurs DNS non appliqués : pilote refusé' },
+      proposalUnread: false,
+    })
+    expect(failed).toContain(
+      'DNS non appliqué : les requêtes sortent hors du tunnel — ' +
+        'résolveurs DNS non appliqués : pilote refusé',
+    )
+    expect(failed).toContain('rgb(161, 98, 7)')
+  })
+
+  /// An unread proposal leaves the verdict on screen and says so beside it.
+  it('keeps the applied resolvers and notes an unread gateway proposal', () => {
+    const unread = postureHtml(profile(), null, null, {
+      check: { status: 'applied', servers: ['86.54.11.100', '86.54.11.200'], origin: 'default' },
+      proposalUnread: true,
+    })
+    expect(unread).toContain(
+      '86.54.11.100, 86.54.11.200 — DNS4EU par défaut (proposition de la passerelle non lue)',
+    )
+    expect(unread).not.toContain('rgb(161, 98, 7)')
   })
 
   it('does not present an unverified capture as a healthy one', () => {

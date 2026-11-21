@@ -5,6 +5,7 @@ import type {
   CaptureCheck,
   ClientConfig,
   ClientProfile,
+  DnsState,
   LogLine,
   PassphraseGesture,
   ProfileDraft,
@@ -36,6 +37,9 @@ export function useClient() {
   // What the mounted adapter was read back to capture. `null` = no verdict:
   // nothing mounted, or a backend that cannot read it back.
   const [capture, setCapture] = useState<CaptureCheck | null>(null)
+  // The resolvers the adapter applied, and whether the gateway's proposal was
+  // left unread. Both are per connection, like the capture.
+  const [dns, setDns] = useState<DnsState>({ check: null, proposalUnread: false })
   const [error, setError] = useState<string | null>(null)
   const [pathImportedProfile, setPathImportedProfile] = useState<ClientProfile | null>(null)
   const upSinceRef = useRef<number | null>(null)
@@ -104,7 +108,10 @@ export function useClient() {
             // Unlike the PSK, the capture outlives `failed`: the adapter stays
             // mounted on failure with the routes it had (ADR-001 §3 bis), so a
             // missing `::/0` is still missing. Only unmounting ends it.
-            if (ev.state === 'down') setCapture(null)
+            if (ev.state === 'down') {
+              setCapture(null)
+              setDns({ check: null, proposalUnread: false })
+            }
           }
           break
         case 'protection':
@@ -112,6 +119,16 @@ export function useClient() {
           break
         case 'capture':
           setCapture(ev.capture)
+          break
+        case 'dns':
+          // An unread proposal is not a verdict: the default it leaves in
+          // place is what the last verdict already described. Keep that
+          // verdict and only note the gap beside it.
+          if (ev.dns.status === 'proposal_unread') {
+            setDns((prev) => ({ ...prev, proposalUnread: true }))
+          } else {
+            setDns((prev) => ({ check: ev.dns, proposalUnread: prev.proposalUnread }))
+          }
           break
         case 'renewal':
           setRenewing(ev.in_flight)
@@ -331,6 +348,7 @@ export function useClient() {
     psk,
     renewing,
     capture,
+    dns,
     error,
     selectedProfile,
     selectedLocked,

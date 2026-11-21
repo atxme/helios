@@ -303,6 +303,7 @@ export default function App() {
         profile={c.selectedProfile}
         psk={c.psk}
         capture={c.capture}
+        dns={c.dns}
         vault={vault}
       />
 

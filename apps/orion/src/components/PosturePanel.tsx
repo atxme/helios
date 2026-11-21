@@ -3,7 +3,16 @@ import Divider from '@mui/material/Divider'
 import Popover from '@mui/material/Popover'
 import Typography from '@mui/material/Typography'
 import { AlertTriangle } from 'lucide-react'
-import type { CaptureCheck, ClientProfile, PskKind, TunnelState, VaultPosture } from '../types'
+import type {
+  CaptureCheck,
+  ClientProfile,
+  DnsLeaveReason,
+  DnsOrigin,
+  DnsState,
+  PskKind,
+  TunnelState,
+  VaultPosture,
+} from '../types'
 import { modeMeta, postureMeta, protectionMeta, stateMeta } from './state'
 import { CopyButton } from './CopyButton'
 import { GUTTER } from '../theme'
@@ -44,6 +53,8 @@ interface Props {
    * profile's list without claiming anything about it.
    */
   capture: CaptureCheck | null
+  /** What the adapter did with its resolvers, from the core's `dns` event. */
+  dns: DnsState
   /**
    * What the vault can claim about itself. `null` while it is being read, or
    * when it could not be — in which case the rows simply do not appear.
@@ -63,12 +74,14 @@ export function PosturePanel({
   profile,
   psk,
   capture,
+  dns,
   vault,
 }: Props) {
   const posture = postureMeta(state, adapterUp)
   const protection = protectionMeta(profile, psk, state)
   const traffic = trafficFact(profile, capture)
   const address = addressFact(profile, capture)
+  const resolvers = dnsFact(dns)
   const negotiation = profile?.key_negotiation
 
   return (
@@ -121,6 +134,7 @@ export function PosturePanel({
         />
         {/* Amber only for what the machine reports: see `trafficFact`. */}
         <Row label="trafic via le tunnel" value={traffic.value} tone={traffic.tone} />
+        <Row label="dns" value={resolvers.value} tone={resolvers.tone} />
       </Box>
 
       {vault && (
@@ -236,6 +250,50 @@ function addressFact(
     }
   }
   return { value: listed, copy: listed, count: addresses.length }
+}
+
+const DNS_ORIGIN_LABEL: Record<DnsOrigin, string> = {
+  gateway: 'passerelle',
+  default: 'DNS4EU par défaut',
+  custom: 'personnalisé',
+  profile: 'profil',
+}
+
+const DNS_LEFT_LABEL: Record<DnsLeaveReason, string> = {
+  not_full_tunnel: 'DNS local : le profil ne capture pas tout le trafic',
+  gateway_declines: 'DNS local : la passerelle ne propose pas de DNS par le tunnel',
+  no_resolver: "DNS local : le profil n'en déclare pas",
+}
+
+/**
+ * The «dns» row: the resolvers the tunnel applied, or why it applied none.
+ *
+ * Amber only for `failed`, the one case where the traffic is about to leave
+ * the tunnel. A resolver left on the system is stated as it is, not as a
+ * fault. An unread gateway proposal keeps the verdict and says so beside it.
+ * No verdict yet is a dash: nothing has been applied and nothing is claimed.
+ */
+function dnsFact(dns: DnsState): { value: string; tone?: string } {
+  const { check, proposalUnread } = dns
+  if (check === null) return { value: '—' }
+  switch (check.status) {
+    case 'applied': {
+      const value = `${check.servers.join(', ')} — ${DNS_ORIGIN_LABEL[check.origin]}`
+      return {
+        value: proposalUnread ? `${value} (proposition de la passerelle non lue)` : value,
+      }
+    }
+    case 'left':
+      return { value: DNS_LEFT_LABEL[check.reason] }
+    case 'failed':
+      return {
+        value: `DNS non appliqué : les requêtes sortent hors du tunnel — ${check.reason}`,
+        tone: AMBER,
+      }
+    case 'proposal_unread':
+      // Never a verdict: the hook keeps it out of `check`.
+      return { value: '—' }
+  }
 }
 
 /** One fact: its instrument label and its value. */

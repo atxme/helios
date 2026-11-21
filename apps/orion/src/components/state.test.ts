@@ -27,6 +27,7 @@ const profile = (over: Partial<ClientProfile> = {}): ClientProfile => ({
   persistent_keepalive: 25,
   heliosd_url: null,
   ssh_target: null,
+  dns: null,
   key_negotiation: null,
   ...over,
 })
