@@ -270,8 +270,17 @@ fn measure_raw_tcp(
     let phase_finished = Arc::clone(&finished);
     let monitor_started = measurement_started;
     let monitor = thread::spawn(move || {
+        let leg = Duration::from_secs(u64::from(duration_secs));
         while !phase_finished.load(Ordering::Acquire) {
             let elapsed = monitor_started.elapsed();
+            // Past the leg, nothing more is sent: an upload is waiting for the
+            // gateway's count while its send buffers drain. A live rate kept
+            // dividing by a growing time would sink on screen for as long as
+            // the drain lasts, then jump to the result. The last live frame
+            // stands until the result frame replaces it.
+            if elapsed >= leg {
+                break;
+            }
             let bytes = phase_counter.load(Ordering::Relaxed);
             emit_progress(
                 &phase_progress,
@@ -337,12 +346,22 @@ pub(super) fn measure_raw_tcp_for_test(
     mode: u8,
     duration_secs: u16,
 ) -> Result<RawMeasurement, SpeedTestError> {
+    measure_raw_tcp_with_progress_for_test(target, mode, duration_secs, Arc::new(|_| {}))
+}
+
+/// As [`measure_raw_tcp_for_test`], with the leg's progress frames.
+#[cfg(test)]
+pub(super) fn measure_raw_tcp_with_progress_for_test(
+    target: SocketAddr,
+    mode: u8,
+    duration_secs: u16,
+    progress: SpeedTestProgressSink,
+) -> Result<RawMeasurement, SpeedTestError> {
     let phase = if mode == aether::speedtest::SPEEDTEST_MODE_UPLOAD {
         SpeedTestPhase::TcpUpload
     } else {
         SpeedTestPhase::TcpDownload
     };
-    let progress: SpeedTestProgressSink = Arc::new(|_| {});
     measure_raw_tcp(
         target,
         mode,
