@@ -96,6 +96,7 @@ const emptyInventory: CertificateInventory = {
 }
 
 const noIssues: ProfileIssues = {
+  dns: null,
   name: null,
   endpoint: null,
   private_key: null,
@@ -1170,6 +1171,39 @@ describe('ProfilesView interactions', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
     await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
     expect(handlers.onSave.mock.calls[0][0].dns).toBeNull()
+  })
+
+  /**
+   * A list the screen accepts can still be refused by the engine: the field
+   * carries that refusal, and the save stays blocked.
+   */
+  it('shows an engine refusal of the resolver list on the DNS field', async () => {
+    api.validateProfile.mockResolvedValue({
+      ...noIssues,
+      dns: 'résolveurs DNS du profil refusés : 86.54.11.100 est présent plusieurs fois',
+    })
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{ profiles: [heliosProfile()], selected: 'portable', locked: [] }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+    fireEvent.click(
+      within(screen.getByRole('group', { name: 'DNS' })).getByRole('button', {
+        name: 'Personnalisé',
+      }),
+    )
+    fireEvent.change(screen.getByRole('textbox', { name: 'DNS' }), {
+      target: { value: '86.54.11.100' },
+    })
+    const refusal = 'résolveurs DNS du profil refusés : 86.54.11.100 est présent plusieurs fois'
+    await waitFor(() => expect(screen.getByText(refusal)).toBeTruthy())
+    const save = screen.getByRole('button', { name: 'Enregistrer' }) as HTMLButtonElement
+    expect(save.disabled).toBe(true)
   })
 
   /** A private, repeated or fourth resolver is refused on the field, and cannot be saved. */

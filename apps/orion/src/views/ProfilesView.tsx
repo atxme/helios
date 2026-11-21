@@ -1113,10 +1113,15 @@ export function ProfilesView({
   // a classic profile has no gateway to ask, so its list is just the field.
   const heliosProfile = draftKind === 'helios_key_negotiation'
   const customDns = !heliosProfile || manualDns || draft.dns !== null
+  // The screen's own judgement first, it is immediate; the engine's refusal
+  // (`issues.dns`) only arrives once typing has settled, and covers the list
+  // as the core would store it.
   const dnsError = !customDns
     ? null
     : (clientDnsError(draft.dns) ??
-      (heliosProfile && draft.dns === null ? 'Saisir une à trois adresses IPv4 publiques' : null))
+      (heliosProfile && draft.dns === null ? 'Saisir une à trois adresses IPv4 publiques' : null) ??
+      issues.dns ??
+      null)
 
   const invalid = kindChanged || Object.values(issues).some(Boolean) || dnsError !== null
   // Read from the value, except when the user has asked to write it himself:

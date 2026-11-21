@@ -476,6 +476,11 @@ export interface ProfileIssues {
   heliosd_url: string | null
   ssh_target: string | null
   /**
+   * Fault of the resolver list, as the engine refuses it: an empty list, or a
+   * resolver that is not public, repeated, or a fourth one.
+   */
+  dns: string | null
+  /**
    * Fault of the key-negotiation block as a whole.
    *
    * One message rather than one per sub-field: what makes the block wrong is
