@@ -110,7 +110,7 @@ reste alors à faire à part.
 | F3 | **Fusionné dans `main` le 23 octobre 2026.** État terminal `revoked` porté par le même sérialiseur que le slot, génération incrémentée | v5 §11.1 | : | **Oui** |
 | F4 | **Fusionné dans `main` le 23 octobre 2026.** Retrait de la **valeur de négociation** `classic` de `ProtectionMode` (protocole v5 côté gateway) : migration de `network.toml` et de l'octet `mode_id = 0` du bloc de négociation dans le manifeste de coffre. **Ne touche pas au profil Orion `type = classic`**, le profil WireGuard générique sans négociation, que v5 §19 conserve comme chemin produit distinct (`ProfileKind::Classic`, octet de type `1`, import wg-quick) | v5 §19 | : | **Oui** |
 | F5 | Fichier de récupération WireGuard signé ML-DSA-65 + Ed25519 | ADR-002 lot 3 | D1 | **Oui**, après D1 |
-| F6 | Profil Orion **`nomade`** : relier `ProfileMode`, IKM `profile_root_key ‖ passphrase_key`, re-saisie après veille. **Livré sur la branche `feat/f6-profil-nomade`, pas encore fusionné dans `main`** ; validation Windows à faire (le code Windows n'a été compilé que par la CI ; recette : MANUAL-TESTING, « O. F6 ») | ADR-006 « Limites connues » | : | **Oui** |
+| F6 | Profil Orion **`nomade`** : relier `ProfileMode`, IKM `profile_root_key ‖ passphrase_key`, re-saisie après veille. **Fusionné dans `main` le 20 novembre 2026** ; validation Windows à faire (le code Windows n'a été compilé que par la CI ; recette : MANUAL-TESTING, « O. F6 ») | ADR-006 « Limites connues » | : | **Oui** |
 | F7 | DNS tunnelé côté Orion et gateway | ADR-006, `ruleset.rs` | D5 | **Oui**, après D5 |
 
 La veille confirme la direction retenue en F1 : Rosenpass alimente le même slot
@@ -123,7 +123,7 @@ une distribution automatique de PSK sans l'avoir livrée.
 
 | # | Fonctionnalité | Source | Dépend de | Faisable ici ? |
 | --- | --- | --- | --- | --- |
-| F8 | **Rate limiting** et **logging borné** : ajouter `limit` au patch vendored de `rustables`, comme déjà fait pour `fib`, `objref` et `exthdr` | FIREWALL-V2 « Audit de `rustables` » | : | **Oui** (code), validation noyau en V5 |
+| F8 | **Écarté le 21 novembre 2026.** Rate limiting et logging borné dans le pare-feu : aucune règle livrée n'emploie de limite (l'IR `RateLimit` existe, seul l'encodage Netlink manque), le port WireGuard ne répond à aucun paquet non authentifié et porte ses propres cookies, le seul log (`ct state invalid`, groupe NFLOG 7) n'a pas de lecteur livré, et le reste n'est joignable que par le tunnel. Seul cas à réexaminer si le besoin apparaît : le coût d'une poignée de main sur le port de négociation public (51821), à traiter côté QUIC plutôt que par une règle générale | FIREWALL-V2 « Audit de `rustables` » | : | Sans objet |
 | F9 | Pairs Meshnet IPv6 : couvrir un préfixe global du lien WAN | ETUDE-IPV6 T06 | V4 | Code : **oui** ; validation : **non** (cible) |
 | F10 | Forwarding IPv6 choisi explicitement (phase 4) | ETUDE-IPV6 | V4 | Code : **oui** ; validation : **non** (cible) |
 
@@ -180,7 +180,7 @@ et `--remap-path-prefix`.
 | # | Point | Source | Action | Faisable ici ? |
 | --- | --- | --- | --- | --- |
 | T1 | `glib 0.18.5` / `gtk 0.18.2` via Tauri `2.12.1` : RUSTSEC-2024-0429 et GTK3 non maintenu | security/SECURITY.md, `Cargo.lock` | **décidé le 2026-10-09 : pas de migration GTK4.** Orion reste sur Tauri. L'avis reste suivi comme transitif | Décision prise |
-| T2 | `rustables 0.8.8` vendored conservé ; montée vers `0.9` bloquée par la chaîne bindgen / syn | FIREWALL-V2, manifests amont | reproduire le blocage avec la résolution complète ; reprendre les patches `fib`, `objref`, `exthdr` et leurs tests ABI ; `limit` reste absent (F8) | **Oui** |
+| T2 | `rustables 0.8.8` vendored conservé ; montée vers `0.9` bloquée par la chaîne bindgen / syn | FIREWALL-V2, manifests amont | reproduire le blocage avec la résolution complète ; reprendre les patches `fib`, `objref`, `exthdr` et leurs tests ABI ; `limit` reste absent (F8 écarté) | **Oui** |
 | T3 | Absence de garantie de reseed avec entropie fraîche avant chaque clé privée ; le binding Rust n'expose pas cette garantie | `aether::random`, v5 §4.3, ROTATION-CERTIFICATS §2.3.2 | obtenir une API fournisseur garantissant le reseed ; ne pas porter d'état DRBG localement | Dépend d'un fournisseur |
 | T4 | Migration `SecretString` écrite pour `StoredChannel`, `ClientProfile`, `ProfileManifest` et `ClientIdentityBundle` | ADR-006 §5, `aether::secret::json`, `orion-core/src/{config,identity_store}.rs` | compiler et exécuter les tests et la régression ; **vérifier DPAPI sur Windows** ; ne clôturer qu'après validation | Compilation et tests : **oui** ; DPAPI : **non** (cible Windows) |
 | T5 | Réorganisation des crates — **découpages faits le 18 octobre 2026** : `orion-core` `backend/mod.rs`, `helios-api` `routes.rs` et `certificates.rs`, `main.rs` Tauri d'Orion, suivi WebSocket de `helios`. Restent : `impl RenewalSession`, qui demande un type `RenewalTransport` (réécriture, pas déplacement), le réalignement de `ruleset/tests/` (renommage de tests) et les renommages de fichiers (`key_nego`, `backend/` du pare-feu et de WireGuard) | CRATE-REORGANIZATION §13 | décision avant chacun des trois restes | Découpages : **oui** ; compilation Windows du `main.rs` Tauri : **non** (CI native) |
@@ -210,7 +210,7 @@ Faisable maintenant (sans matériel)
   outillage headless Orion · T2 · T4 compilation · T5 · T6 mesure
   D1, D5 à D8 arbitrages
   F14 Orion seul binaire client (enrôlement v5 d'abord), après F11
-  F6 nomade · F8 limit · F15 reproductible
+  F15 reproductible
 
 Faisable en code, validation sur cible à planifier
   F5 (après D1) · F7 (après D5) · F12 libsecret · F13 NSIS
