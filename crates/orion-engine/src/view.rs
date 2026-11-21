@@ -5,6 +5,7 @@
 //! here is a rename in the interface.
 
 use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 
 use orion_core::certificate_renewal::RenewalStep;
 use orion_core::{ClientConfig, ClientProfile};
@@ -76,6 +77,9 @@ pub struct ProfileView {
     pub persistent_keepalive: u16,
     pub heliosd_url: Option<String>,
     pub ssh_target: Option<String>,
+    /// Resolvers the tunnel sets. `null` = no choice written: a Helios profile
+    /// asks its gateway, a classic one declares none.
+    pub dns: Option<Vec<Ipv4Addr>>,
     pub key_negotiation: Option<orion_core::KeyNegotiationSettings>,
     /// Where the profile is sealed: `"service"` or `"nomade"`.
     ///
@@ -116,6 +120,7 @@ impl From<&ClientProfile> for ProfileView {
             persistent_keepalive: profile.persistent_keepalive,
             heliosd_url: profile.heliosd_url.clone(),
             ssh_target: profile.ssh_target.clone(),
+            dns: profile.dns.clone(),
             key_negotiation: profile.key_negotiation.clone(),
             mode: "service".to_string(),
             profile_type: profile.kind().as_str().to_string(),

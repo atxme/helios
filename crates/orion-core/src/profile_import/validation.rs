@@ -35,6 +35,9 @@ pub struct ProfileIssues {
     pub persistent_keepalive: Option<String>,
     pub heliosd_url: Option<String>,
     pub ssh_target: Option<String>,
+    /// Fault of the resolver list: an empty list, or one the engine refuses
+    /// (non-public, repeated, more than three). `None` when no list is set.
+    pub dns: Option<String>,
     /// Fault of the key-negotiation block as a whole.
     ///
     /// Deliberately a single message rather than one per sub-field: what
@@ -113,6 +116,20 @@ pub fn inspect_profile(profile: &ClientProfile) -> ProfileIssues {
             .heliosd_url
             .as_deref()
             .and_then(|value| when_filled(value, validate_heliosd_url)),
+        // An empty list is a value refused, not an empty field: "no choice"
+        // is `None`, and a list with nothing in it chooses nothing.
+        dns: profile.dns.as_deref().and_then(|servers| {
+            if servers.is_empty() {
+                Some(
+                    "la liste de DNS est vide : supprimer le choix pour garder ceux du système"
+                        .into(),
+                )
+            } else {
+                aether::client_dns::validate_resolvers(servers)
+                    .err()
+                    .map(|error| error.to_string())
+            }
+        }),
         // The block is only judged once the gateway key it is pinned to is
         // readable: without it, every certificate would look wrong while the
         // profile is merely incomplete.

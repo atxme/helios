@@ -82,6 +82,7 @@ pub fn merge_draft(
     profile.persistent_keepalive = draft.persistent_keepalive;
     profile.heliosd_url = draft.heliosd_url;
     profile.ssh_target = draft.ssh_target;
+    profile.dns = draft.dns;
     profile.key_negotiation = draft.key_negotiation;
     // An existing stable profile keeps its declared variant. Switching
     // between classic and Helios requires another profile identifier (spec
