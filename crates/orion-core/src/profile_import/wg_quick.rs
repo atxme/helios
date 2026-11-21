@@ -174,6 +174,8 @@ pub(super) fn parse_wg_quick(contents: &str, file_name: &str) -> Result<WgQuickI
         preshared_key: peer.get("presharedkey").map(|key| key.as_str().into()),
         address,
         address_v6,
+        // The `DNS =` line of a wg-quick file is not imported: the choice is made in Orion.
+        dns: None,
         allowed_ips: peer
             .get("allowedips")
             .cloned()

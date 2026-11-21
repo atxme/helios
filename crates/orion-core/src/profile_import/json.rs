@@ -166,6 +166,8 @@ impl From<JsonProfile> for ClientProfile {
             profile_type: profile.profile_type,
             address: profile.address,
             address_v6: profile.address_v6,
+            // The `.orion` document does not carry a DNS choice yet.
+            dns: None,
             allowed_ips: profile
                 .allowed_ips
                 .unwrap_or_else(|| DEFAULT_ALLOWED_IPS.to_string()),

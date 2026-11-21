@@ -14,6 +14,7 @@
 //! runtime profiles cannot be serialized through a read API or legacy writer.
 
 use std::fmt;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use aether::key_negotiation::ProtectionMode;
@@ -483,6 +484,16 @@ pub struct ClientProfile {
     /// (§2.6), so a tunnel without its IPv4 address is not a target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address_v6: Option<String>,
+    /// IPv4 resolvers the tunnel uses, replacing the system's, when the
+    /// profile captures all IPv4 (`TunnelCapture::Full` or `Ipv4Only`).
+    ///
+    /// `None` means the profile carries no DNS choice and the system's
+    /// resolvers stay in place, exactly as before the field existed; it is
+    /// never written when absent. `Some(vec![])` is refused by
+    /// [`Self::validate`]: a profile that proposes nothing is not a choice.
+    /// The list is checked by [`aether::client_dns::validate_resolvers`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<Vec<Ipv4Addr>>,
     /// Traffic routed into the tunnel. Defaults to [`DEFAULT_ALLOWED_IPS`].
     ///
     /// One or more CIDR prefixes, comma-separated — the `wg-quick` spelling of
@@ -574,6 +585,7 @@ impl fmt::Debug for ClientProfile {
             .field("preshared_key", &self.preshared_key.as_ref().map(|_| "***"))
             .field("address", &self.address)
             .field("address_v6", &self.address_v6)
+            .field("dns", &self.dns)
             .field("allowed_ips", &self.allowed_ips)
             .field("persistent_keepalive", &self.persistent_keepalive)
             .field("heliosd_url", &self.heliosd_url)
@@ -596,6 +608,7 @@ impl ClientProfile {
             preshared_key: self.preshared_key.as_ref().map(SecretString::duplicate),
             address: self.address.clone(),
             address_v6: self.address_v6.clone(),
+            dns: self.dns.clone(),
             allowed_ips: self.allowed_ips.clone(),
             persistent_keepalive: self.persistent_keepalive,
             heliosd_url: self.heliosd_url.clone(),
@@ -700,6 +713,16 @@ impl ClientProfile {
         }
         if self.peer_public_key.trim().is_empty() {
             anyhow::bail!("la clé publique de la gateway est requise");
+        }
+        if let Some(servers) = &self.dns {
+            if servers.is_empty() {
+                anyhow::bail!(
+                    "la liste de DNS du profil est vide : un profil qui ne propose aucun \
+                     résolveur n'est pas un choix, supprimer le champ pour garder ceux du système"
+                );
+            }
+            aether::client_dns::validate_resolvers(servers)
+                .map_err(|e| anyhow::anyhow!("résolveurs DNS du profil refusés : {e}"))?;
         }
         if let Some(settings) = &self.key_negotiation {
             // Only a **static** PSK contradicts a negotiating mode. The one
@@ -815,6 +838,7 @@ impl Default for ClientProfile {
             preshared_key: None,
             address: None,
             address_v6: None,
+            dns: None,
             allowed_ips: default_allowed_ips(),
             persistent_keepalive: DEFAULT_KEEPALIVE_SECS,
             heliosd_url: None,
