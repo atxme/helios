@@ -7,6 +7,15 @@ use super::fixtures::{CLIENT_PRIVATE, GATEWAY_PUBLIC};
 use crate::profile_import::{complete_profile_import, parse_profile_import};
 use crate::ClientConfig;
 
+/// The entries a DNS notice names as not applied. The notice also echoes the
+/// whole `DNS =` line, so assertions on it must look at this segment only.
+fn refused_entries(notice: &str) -> &str {
+    let (_, rest) = notice
+        .split_once("non appliqué(s) par Orion : ")
+        .expect("la formule d'avis DNS");
+    rest.split_once(" — ").expect("la suite de l'avis").0
+}
+
 /// `wg-quick` has no notion of invitation: a file without `PrivateKey`
 /// is an incomplete file, and saying so early avoids a tunnel that never
 /// mounts without explanation.
@@ -90,7 +99,7 @@ fn an_ordinary_wireguard_file_imports_and_reports_what_is_not_applied() {
         .iter()
         .any(|notice| notice.contains("Table = off")));
     // The DNS notice names the refused entry and the rule it broke.
-    assert!(imported.notices[0].contains("100.64.0.1"));
+    assert_eq!(refused_entries(&imported.notices[0]), "100.64.0.1");
     assert!(imported.notices[0].contains("seuls les résolveurs IPv4 publics"));
 }
 
@@ -129,8 +138,10 @@ fn a_dns_line_keeps_ipv4_and_names_the_rest() {
         .filter(|notice| notice.starts_with("DNS ="))
         .collect();
     assert_eq!(dns_notices.len(), 1, "notices: {:?}", imported.notices);
-    assert!(dns_notices[0].contains("2606:4700::1111"));
-    assert!(dns_notices[0].contains("corp.example"));
+    assert_eq!(
+        refused_entries(dns_notices[0]),
+        "2606:4700::1111, corp.example"
+    );
 }
 
 /// Without a public IPv4 resolver there is nothing to apply: the profile
@@ -144,7 +155,7 @@ fn a_dns_line_without_ipv4_stays_a_notice() {
     let imported = parse_profile_import(&contents, "dns.conf").expect("import");
     assert_eq!(imported.profile.dns, None);
     assert_eq!(imported.notices.len(), 1, "notices: {:?}", imported.notices);
-    assert!(imported.notices[0].contains("2606:4700::1111"));
+    assert_eq!(refused_entries(&imported.notices[0]), "2606:4700::1111");
 }
 
 /// Private and duplicate IPv4 entries, and a fourth resolver, are refused by
@@ -170,9 +181,8 @@ fn a_dns_line_applies_the_resolver_rules_entry_by_entry() {
         .iter()
         .find(|notice| notice.starts_with("DNS ="))
         .expect("un avis DNS");
-    for refused in ["10.0.0.1", "1.1.1.1", "4.4.4.4"] {
-        assert!(notice.contains(refused), "{refused} absent de : {notice}");
-    }
+    // The first 1.1.1.1 is kept; only its duplicate is named.
+    assert_eq!(refused_entries(notice), "10.0.0.1, 1.1.1.1, 4.4.4.4");
 }
 
 /// The one class where refusing is right: a command the configuration
