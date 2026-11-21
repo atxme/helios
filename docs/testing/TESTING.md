@@ -715,6 +715,14 @@ un verdict PASS ou FAIL par ligne :
   rien ne sort vers Internet ;
 - aucune clé privée dans le journal du démon.
 
+Avec `--throughput` (exige `iperf3`), le banc ouvre `iperf_port` et confronte
+le speedtest brut d'Orion (exemple `raw_speedtest` d'`orion-core`, outil de
+développement non livré) à `iperf3 -P 4 -O 2 -t 8`, ligne `receiver`, dans
+chaque sens : écart toléré de 15 %. Les deux comptent les octets reçus, mise
+en régime exclue ; au-delà, l'un des deux mesure autre chose. Sur veth, les
+deux sont limités par le CPU : ce débit dit si la **mesure** est juste, pas
+ce que porte un lien réel.
+
 Le pair est **déclaré dans `network.toml`**, pas admis par l'API : l'admission
 exige les certificats de négociation, dont la moitié gateway est scellée dans
 un TPM que le banc n'a pas. Le banc éprouve donc le plan de données, **pas**
