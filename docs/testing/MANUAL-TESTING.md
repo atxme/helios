@@ -1759,6 +1759,72 @@ celles de Windows ; leurs légendes sont distinctes d'un geste à l'autre. Un pr
     observer les commandes Tauri et les charges JSON. Attendu : aucune passphrase, ni clé qui
     en dérive, n'apparaît dans une commande, une charge ou une chaîne JavaScript.
 
+**P. F7 : DNS des postes**
+
+Le DNS d'un poste en tunnel complet passe par le tunnel (ADR-001, amendement « DNS
+des postes »). Le code Windows (`defguard_wireguard_rs` : règle NRPT `.` et DNS de
+l'adaptateur) n'a jamais été exécuté sur cible : cette recette est sa première
+exécution. Sous WSL, seuls les tests unitaires et le banc netns (côté passerelle)
+l'exercent ; rien de ceci n'a encore été observé sur cible.
+
+Prérequis : une passerelle dont `network.toml` laisse `client_dns` absent et
+`allow_client_internet = true`, et un poste Windows avec Orion compilé avec
+`--features wireguard`. Les adresses attendues sont celles de la passerelle :
+par défaut `86.54.11.100` et `86.54.11.200`.
+
+158. **[cible] DNS du défaut appliqué.** Profil `helios` en tunnel complet
+    (`0.0.0.0/0, ::/0`), connecté. Dans PowerShell (administrateur) :
+
+    ```powershell
+    Get-DnsClientNrptPolicy | Format-List Namespace, NameServers
+    Get-DnsClientServerAddress -InterfaceAlias orion0 -AddressFamily IPv4
+    ```
+
+    Attendu : une règle `Namespace : .` dont `NameServers` liste `86.54.11.100` et
+    `86.54.11.200`, et ces mêmes adresses sur l'adaptateur `orion0`. Le panneau de
+    posture affiche la ligne « DNS » avec ces serveurs. L'origine est « DNS4EU par
+    défaut » au montage, puis « passerelle » une fois la proposition lue (quelques
+    secondes après la connexion).
+159. **[cible] Résolution par le tunnel.** Même session :
+
+    ```powershell
+    Resolve-DnsName example.com
+    ```
+
+    Attendu : une réponse de type `A` (et `AAAA` si la zone en publie une). Aucune
+    erreur « DNS name does not exist » ni délai de plus de quelques secondes.
+160. **[cible] Aucun port 53 sur la carte physique.** Capturer sur la carte physique
+    (non `orion0`) pendant `Resolve-DnsName example.com` : Wireshark avec le filtre
+    d'affichage `udp.port == 53 || tcp.port == 53`, ou `pktmon` (vérifier la syntaxe
+    avec `pktmon --help` sur la version de Windows). Attendu : aucun paquet sur le
+    port 53 ; le trafic sortant vers la gateway est un flux WireGuard (UDP, port de
+    `wg_listen_port`).
+161. **[cible] Arrêt brutal d'Orion.** Tunnel monté, arrêter Orion sans passer par
+    « Quitter » :
+
+    ```powershell
+    Stop-Process -Name orion -Force
+    Get-DnsClientNrptPolicy | Format-List Namespace, NameServers
+    Resolve-DnsName example.com
+    ```
+
+    Le tunnel ne doit pas être resté monté (`Get-NetAdapter -Name orion0` ne
+    répond plus, ou son état est « Disabled » ; sinon l'arrêt ne prouve rien et
+    l'étape est à refaire). Attendu : la règle NRPT peut subsister, pointant vers
+    les résolveurs publics ; `Resolve-DnsName example.com` **répond quand même**.
+    Un poste qui ne résout plus rien après un crash d'Orion est un échec.
+162. **[cible] Profil « Helios seul » sans règle.** Profil Helios dont la capture
+    n'est pas `0.0.0.0/0` (par exemple `100.64.0.0/10` seul), connecté. Attendu :
+    `Get-DnsClientNrptPolicy` ne contient aucune règle `.` ; le panneau de posture
+    affiche « DNS local : le profil ne capture pas tout le trafic ». Un remplacement
+    « Personnalisé » saisi sur ce profil est signalé « non appliqué », pas appliqué.
+163. **[cible] La passerelle ne propose pas de DNS.** Sur la passerelle, mettre
+    `client_dns = []` dans `network.toml`, puis recharger sa configuration (chemin de
+    rechargement à chaud). Reconnecter le profil `helios` en tunnel complet.
+    Attendu : aucune règle `.` dans `Get-DnsClientNrptPolicy` ; le panneau de posture
+    affiche « DNS local : la passerelle ne propose pas de DNS par le tunnel ». La
+    résolution fonctionne par le DNS local. Remettre `client_dns` absent ensuite.
+
 ### Le chemin manuel
 
 Dans un autre terminal, générer deux identités de test :
@@ -1790,8 +1856,10 @@ PersistentKeepalive = 25
 Remplacer les valeurs entre chevrons par les clés générées. Vérifier que le
 profil importé est présenté comme un brouillon, puis l’enregistrer. Réimporter
 le même fichier doit avertir que l’enregistrement remplacera le profil
-existant. Un fichier contenant un second `[Peer]` ou `DNS = 100.64.0.1` doit
-être refusé explicitement et ne doit modifier aucun profil enregistré.
+existant. Un fichier contenant un second `[Peer]` doit être refusé explicitement
+et ne doit modifier aucun profil enregistré. Un `DNS = 100.64.0.1` (adresse CGNAT,
+non publique) n'est pas refusé : l'import avertit que cette adresse n'est pas
+appliquée, et le profil n'a pas de DNS.
 
 Le même fichier avec `AllowedIPs = 0.0.0.0/0` seul (l’ancien tunnel complet)
 doit s’importer tel quel : sous « Avancé », le choix « Personnalisé » est actif

@@ -131,9 +131,11 @@ pub struct FirewallPolicy {
     /// `wg_iface -> wan_iface` and masquerade, **only** in a state where
     /// traffic is allowed.
     ///
-    /// Closed by default. What this does not cover: DNS. The client keeps
-    /// its resolver, so its requests leave outside the tunnel — an Orion
-    /// profile does not yet know how to push a resolver.
+    /// Closed by default. DNS is not a separate rule: the gateway proposes a
+    /// resolver to peers (`/api/client/dns`), and their queries to it cross
+    /// this same forward and NAT. Orion applies that resolver only when the
+    /// profile captures all IPv4 traffic, and a failed application is shown,
+    /// not hidden (ADR-001, amendment « DNS des postes »).
     pub allow_client_internet: bool,
     /// WireGuard interface, source of client traffic to route.
     pub wg_iface: String,

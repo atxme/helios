@@ -569,7 +569,7 @@ physiques, jamais en `forward`.
 | Cohérence | deux résolutions indépendantes : négociation et WireGuard peuvent choisir deux familles différentes | même nom d'hôte, deux appels |
 | Repli | aucun : un AAAA injoignable fait échouer la négociation | — |
 | Happy Eyeballs | absent ; pertinent pour la négociation (QUIC, un aller-retour) et pour le choix de l'endpoint WG | RFC 8305 |
-| DNS du client | non tunnelisé, limite connue documentée | `helios-firewall/src/ruleset.rs` doc « DNS is not tunneled » |
+| DNS du client | non tunnelisé à la date de l'étude ; **levé par F7 (21 novembre 2026)** : résolveur proposé par la passerelle, appliqué par Orion | `helios-firewall/src/ruleset.rs` (doc « Client DNS ») |
 | DNS de la gateway | egress UDP/TCP 53 scopé WAN, déjà agnostique | `gateway_wan.rs::gateway_own_egress` |
 
 Recommandations : résoudre **une fois** le nom de l'endpoint, conserver la
@@ -674,7 +674,7 @@ scénarios 1, 3 à 8, 10, 14 et 16 ; 9, 12 et 15 restent à ajouter.
 | `ipv6.forwarding = 1` désactive l'autoconfiguration du WAN | latent | moyenne | avertissement + `accept_ra = 2` documenté (Helios ne modifie pas les sysctls) |
 | RA rogue reçu sur LAN ou tunnel | à créer | moyenne | RA acceptés sur WAN seulement |
 | Route IPv6 non contrôlée d'un autre VPN capturant le préfixe ULA | latent | faible | épinglage v6 dans `vip_routing` |
-| DNS leak IPv6 | inchangé (DNS non tunnelisé) | inchangé | limite connue ADR-004 lot 5 |
+| DNS leak IPv6 | inchangé pour un résolveur IPv6 du réseau local (F7 ne propose que des résolveurs IPv4) | inchangé | F7, ADR-001 amendement « DNS des postes » |
 | Deux familles choisies pour négociation et WG | latent | faible | une résolution, RFC 8305 |
 | MSS calculé avec en-têtes v4 | latent (clamp bloqué) | faible | T15 |
 | `rustables` peu maintenu, `fib` absent → pas d'anti-spoofing v6 hors tunnel | existant (v4 aussi) | moyenne | cryptokey routing sur `helios0` ; `fib` reste différé (`FIREWALL-V2.md`) |
