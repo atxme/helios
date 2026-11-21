@@ -19,12 +19,12 @@ use crate::events::ClientEvent;
 /// Polling period of the internal heliosd API.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// Max delay of a status request.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Keeps the terminal diagnostic useful when reqwest wraps the operating
 /// system error in several transport layers. The IHM receives only the short
 /// transition message below; this chain is for the operator at the terminal.
-fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut parts = vec![error.to_string()];
     let mut source = error.source();
     while let Some(cause) = source {

@@ -766,6 +766,19 @@ impl VpnController {
         self.start_renewal(trigger, user_sink).await;
     }
 
+    /// Hands the gateway's DNS proposal to the backend, which applies it when
+    /// the adapter is up (see [`VpnBackend::apply_gateway_dns`]).
+    pub async fn apply_gateway_dns(
+        &self,
+        profile: &ClientProfile,
+        proposal: ClientDnsProposal,
+        sink: &EventSink,
+    ) -> anyhow::Result<()> {
+        self.backend
+            .apply_gateway_dns(profile, proposal, sink)
+            .await
+    }
+
     /// Renews now, at the user's request (and for the V1 measurement).
     pub async fn renew_now(&self, user_sink: EventSink) -> anyhow::Result<()> {
         if self.state() != TunnelState::Up || self.installed.lock().await.is_none() {

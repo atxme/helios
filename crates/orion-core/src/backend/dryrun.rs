@@ -222,6 +222,11 @@ impl VpnBackend for DryRunBackend {
         proposal: ClientDnsProposal,
         sink: &EventSink,
     ) -> anyhow::Result<()> {
+        // A proposal that lands once the adapter is down is stale: the next
+        // `up` asks the gateway again.
+        if !self.adapter_up.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         *self
             .gateway_dns
             .lock()
@@ -291,7 +296,7 @@ impl VpnBackend for DryRunBackend {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
@@ -364,7 +369,7 @@ mod tests {
     /// client fixture: ML-KEM mode, and the PSK a committed negotiation leaves
     /// in place. Signing needs `certificate-signing`, as in `config`'s tests.
     #[cfg(feature = "certificate-signing")]
-    fn helios() -> ClientProfile {
+    pub(crate) fn helios() -> ClientProfile {
         use base64::engine::general_purpose::STANDARD;
         use base64::Engine as _;
 
@@ -480,6 +485,37 @@ mod tests {
                 origin: crate::dns::DnsOrigin::Default,
             })
         );
+    }
+
+    /// A proposal that arrives after the tunnel went down (a fetch that was
+    /// in flight when the task was aborted) must not be retained or applied.
+    #[cfg(feature = "certificate-signing")]
+    #[tokio::test]
+    async fn a_late_proposal_after_down_is_ignored() {
+        let backend = DryRunBackend {
+            negotiate_delay: Duration::ZERO,
+            ..DryRunBackend::default()
+        };
+        let (sink, log) = collector();
+        let helios = helios();
+        backend.up(&helios, &sink).await.unwrap();
+        backend.down(&sink).await.unwrap();
+        let decision_before = backend.last_dns_decision();
+        let events_before = dns_events(&log).len();
+
+        backend
+            .apply_gateway_dns(
+                &helios,
+                ClientDnsProposal {
+                    servers: vec!["1.0.0.1".parse().unwrap()],
+                },
+                &sink,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(backend.last_dns_decision(), decision_before);
+        assert_eq!(dns_events(&log).len(), events_before);
     }
 
     #[tokio::test]

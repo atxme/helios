@@ -967,6 +967,11 @@ impl VpnBackend for WireGuardBackend {
         proposal: ClientDnsProposal,
         sink: &EventSink,
     ) -> anyhow::Result<()> {
+        // A proposal that lands once the adapter is down is stale: the next
+        // `up` asks the gateway again.
+        if !self.adapter_up.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         *self.gateway_dns() = Some(proposal);
         let decision = decide(profile, self.gateway_dns().as_ref());
         let api = self.api()?;

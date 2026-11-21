@@ -5,13 +5,24 @@
 //! no backend re-derives the choice on its own.
 
 use std::net::Ipv4Addr;
+use std::time::Duration;
 
-use aether::client_dns::{ClientDnsProposal, DEFAULT_CLIENT_DNS};
+use aether::client_dns::{
+    validate_resolvers, ClientDnsProposal, CLIENT_DNS_PATH, DEFAULT_CLIENT_DNS,
+};
 use serde::{Deserialize, Serialize};
 
+use crate::backend::{EventSink, VpnController};
 use crate::config::{ClientProfile, ProfileKind};
-use crate::events::DnsCheck;
+use crate::events::{ClientEvent, DnsCheck};
 use crate::profile_import::{tunnel_capture, TunnelCapture};
+use crate::telemetry::{error_chain, REQUEST_TIMEOUT};
+
+/// Most attempts at reading the gateway's proposal while it is unreachable.
+pub const PROPOSAL_ATTEMPTS: u32 = 5;
+
+/// Pause between two attempts that found the gateway unreachable.
+pub const PROPOSAL_RETRY_DELAY: Duration = Duration::from_secs(3);
 
 /// Where the resolvers of an applied decision come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +141,108 @@ pub fn decide(profile: &ClientProfile, proposal: Option<&ClientDnsProposal>) -> 
             origin: DnsOrigin::Default,
         },
     }
+}
+
+/// Why the gateway's resolver proposal could not be used.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ProposalError {
+    /// The gateway answers, but has no route for the proposal: an older Helios.
+    #[error("la passerelle ne propose pas de DNS (version antérieure)")]
+    NotServed,
+    /// No usable answer this time: connection, timeout, or an HTTP error.
+    #[error("passerelle injoignable : {0}")]
+    Unreachable(String),
+    /// The gateway answered, but what it sent is not a valid proposal.
+    #[error("proposition DNS refusée : {0}")]
+    Invalid(String),
+}
+
+/// Reads the resolver proposal the gateway serves to this client, through the
+/// tunnel at `heliosd_url`.
+///
+/// A 404 means the gateway predates the proposal. A proposal whose resolvers
+/// are refused by [`validate_resolvers`] is an error, never corrected.
+pub async fn fetch_proposal(heliosd_url: &str) -> Result<ClientDnsProposal, ProposalError> {
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        // Same reasoning as the telemetry probe: this URL is inside the
+        // tunnel, and an inherited proxy cannot route it.
+        .no_proxy()
+        .build()
+        .map_err(|error| ProposalError::Unreachable(error_chain(&error)))?;
+    let url = format!("{}{CLIENT_DNS_PATH}", heliosd_url.trim_end_matches('/'));
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| ProposalError::Unreachable(error_chain(&error)))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(ProposalError::NotServed);
+    }
+    if !status.is_success() {
+        return Err(ProposalError::Unreachable(format!("réponse HTTP {status}")));
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| ProposalError::Unreachable(error_chain(&error)))?;
+    let proposal: ClientDnsProposal =
+        serde_json::from_slice(&body).map_err(|error| ProposalError::Invalid(error.to_string()))?;
+    validate_resolvers(&proposal.servers)
+        .map_err(|error| ProposalError::Invalid(error.to_string()))?;
+    Ok(proposal)
+}
+
+/// Reads the gateway's proposal once the tunnel is up, and hands it to the
+/// backend.
+///
+/// An unreachable gateway is asked again, up to [`PROPOSAL_ATTEMPTS`] times,
+/// `retry_delay` apart. A gateway without the route, or one whose proposal is
+/// refused, is not asked again. A failure is reported once, as
+/// [`DnsCheck::ProposalUnread`]; the resolvers mounted with the tunnel stay in
+/// place, and nothing else changes.
+pub async fn follow_gateway_proposal(
+    controller: &VpnController,
+    profile: &ClientProfile,
+    heliosd_url: &str,
+    retry_delay: Duration,
+    sink: &EventSink,
+) {
+    let mut last_detail = String::new();
+    for attempt in 1..=PROPOSAL_ATTEMPTS {
+        if attempt > 1 {
+            tokio::time::sleep(retry_delay).await;
+        }
+        match fetch_proposal(heliosd_url).await {
+            Ok(proposal) => {
+                if let Err(error) = controller.apply_gateway_dns(profile, proposal, sink).await {
+                    sink(ClientEvent::dns(DnsCheck::Failed {
+                        reason: format!("résolveurs DNS non appliqués : {error}"),
+                    }));
+                }
+                return;
+            }
+            Err(ProposalError::Unreachable(detail)) => {
+                tracing::debug!(
+                    target: "orion_core::dns",
+                    attempt,
+                    detail = %detail,
+                    "gateway DNS proposal not read yet"
+                );
+                last_detail = detail;
+            }
+            Err(error) => {
+                sink(ClientEvent::dns(DnsCheck::ProposalUnread {
+                    reason: error.to_string(),
+                }));
+                return;
+            }
+        }
+    }
+    sink(ClientEvent::dns(DnsCheck::ProposalUnread {
+        reason: format!("passerelle injoignable après {PROPOSAL_ATTEMPTS} essais : {last_detail}"),
+    }));
 }
 
 #[cfg(test)]
@@ -311,6 +424,208 @@ mod tests {
             DnsCheck::Left {
                 reason: DnsLeaveReason::NoResolver
             }
+        );
+    }
+
+    fn response(status: &str, body: &str) -> Option<String> {
+        Some(format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ))
+    }
+
+    /// Serves one request per entry, in order: a canned response, or `None`
+    /// to close the connection without answering.
+    async fn serve_each(responses: Vec<Option<String>>) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local listener");
+        let address = listener.local_addr().expect("local address");
+        tokio::spawn(async move {
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.expect("request");
+                let mut request = vec![0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                if let Some(response) = response {
+                    stream
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("response");
+                }
+            }
+        });
+        format!("http://{address}/")
+    }
+
+    #[tokio::test]
+    async fn fetch_reads_the_proposal() {
+        let url = serve_each(vec![response("200 OK", r#"{"servers":["1.0.0.1"]}"#)]).await;
+        assert_eq!(
+            fetch_proposal(&url).await,
+            Ok(ClientDnsProposal {
+                servers: vec![GATEWAY]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_maps_404_to_not_served() {
+        let url = serve_each(vec![response("404 Not Found", "")]).await;
+        assert_eq!(fetch_proposal(&url).await, Err(ProposalError::NotServed));
+    }
+
+    #[tokio::test]
+    async fn fetch_refuses_a_private_resolver() {
+        let url = serve_each(vec![response("200 OK", r#"{"servers":["10.0.0.1"]}"#)]).await;
+        assert!(
+            matches!(
+                fetch_proposal(&url).await,
+                Err(ProposalError::Invalid(detail)) if detail.contains("10.0.0.1")
+            ),
+            "a private resolver is refused, never corrected"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_reports_a_closed_port_as_unreachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("local listener");
+        let url = format!("http://{}/", listener.local_addr().expect("address"));
+        drop(listener);
+        assert!(matches!(
+            fetch_proposal(&url).await,
+            Err(ProposalError::Unreachable(_))
+        ));
+    }
+
+    #[cfg(feature = "certificate-signing")]
+    fn collector() -> (
+        EventSink,
+        std::sync::Arc<std::sync::Mutex<Vec<ClientEvent>>>,
+    ) {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = std::sync::Arc::clone(&log);
+        let sink: EventSink = std::sync::Arc::new(move |event| {
+            captured.lock().unwrap().push(event);
+        });
+        (sink, log)
+    }
+
+    #[cfg(feature = "certificate-signing")]
+    fn dns_checks(log: &std::sync::Arc<std::sync::Mutex<Vec<ClientEvent>>>) -> Vec<DnsCheck> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                ClientEvent::Dns { dns } => Some(dns.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A Helios tunnel mounted on the dry-run backend, with the mount's DNS
+    /// applied, and the controller that will receive the gateway's proposal.
+    #[cfg(feature = "certificate-signing")]
+    async fn mounted_helios() -> (
+        std::sync::Arc<crate::backend::dryrun::DryRunBackend>,
+        VpnController,
+        ClientProfile,
+        EventSink,
+        std::sync::Arc<std::sync::Mutex<Vec<ClientEvent>>>,
+    ) {
+        use crate::backend::{dryrun::DryRunBackend, VpnBackend as _};
+
+        let mut dryrun = DryRunBackend::default();
+        dryrun.negotiate_delay = Duration::ZERO;
+        let backend = std::sync::Arc::new(dryrun);
+        let controller = VpnController::new(backend.clone());
+        let (sink, log) = collector();
+        let profile = crate::backend::dryrun::tests::helios();
+        backend.up(&profile, &sink).await.expect("dry-run up");
+        (backend, controller, profile, sink, log)
+    }
+
+    #[cfg(feature = "certificate-signing")]
+    #[tokio::test]
+    async fn an_old_gateway_keeps_the_mount_dns() {
+        let url = serve_each(vec![response("404 Not Found", "")]).await;
+        let (backend, controller, profile, sink, log) = mounted_helios().await;
+
+        follow_gateway_proposal(&controller, &profile, &url, Duration::ZERO, &sink).await;
+
+        let checks = dns_checks(&log);
+        assert_eq!(
+            checks.len(),
+            2,
+            "the mount's decision, then one unread proposal: {checks:?}"
+        );
+        assert!(matches!(
+            checks.last(),
+            Some(DnsCheck::ProposalUnread { .. })
+        ));
+        assert_eq!(
+            backend.last_dns_decision(),
+            Some(DnsDecision::Apply {
+                servers: DEFAULT_CLIENT_DNS.to_vec(),
+                origin: DnsOrigin::Default,
+            }),
+            "the mount's resolvers stay in place"
+        );
+    }
+
+    #[cfg(feature = "certificate-signing")]
+    #[tokio::test]
+    async fn an_unreachable_gateway_is_asked_again_then_its_proposal_applies() {
+        let url = serve_each(vec![None, response("200 OK", r#"{"servers":["1.0.0.1"]}"#)]).await;
+        let (backend, controller, profile, sink, log) = mounted_helios().await;
+
+        follow_gateway_proposal(&controller, &profile, &url, Duration::ZERO, &sink).await;
+
+        assert_eq!(
+            backend.last_dns_decision(),
+            Some(DnsDecision::Apply {
+                servers: vec![GATEWAY],
+                origin: DnsOrigin::Gateway,
+            })
+        );
+        assert!(
+            !dns_checks(&log)
+                .iter()
+                .any(|check| matches!(check, DnsCheck::ProposalUnread { .. })),
+            "a proposal read on a retry is not a failure"
+        );
+    }
+
+    #[cfg(feature = "certificate-signing")]
+    #[tokio::test]
+    async fn an_unreachable_gateway_is_reported_once_after_every_attempt() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("local listener");
+        let url = format!("http://{}/", listener.local_addr().expect("address"));
+        drop(listener);
+        let (backend, controller, profile, sink, log) = mounted_helios().await;
+
+        follow_gateway_proposal(&controller, &profile, &url, Duration::ZERO, &sink).await;
+
+        let checks = dns_checks(&log);
+        let unread: Vec<&DnsCheck> = checks
+            .iter()
+            .filter(|check| matches!(check, DnsCheck::ProposalUnread { .. }))
+            .collect();
+        assert_eq!(unread.len(), 1, "{checks:?}");
+        assert!(
+            matches!(
+                unread[0],
+                DnsCheck::ProposalUnread { reason } if reason.contains("5 essais")
+            ),
+            "{checks:?}"
+        );
+        assert_eq!(
+            backend.last_dns_decision(),
+            Some(DnsDecision::Apply {
+                servers: DEFAULT_CLIENT_DNS.to_vec(),
+                origin: DnsOrigin::Default,
+            })
         );
     }
 }
