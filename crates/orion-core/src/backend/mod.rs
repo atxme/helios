@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use aether::client_dns::ClientDnsProposal;
 use aether::TunnelState;
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -83,6 +84,23 @@ pub trait VpnBackend: Send + Sync {
     /// [`VpnController`] from a single resolution; a backend refuses a name
     /// instead of resolving it a second time (`endpoint_resolution`).
     async fn up(&self, profile: &ClientProfile, sink: &EventSink) -> anyhow::Result<()>;
+
+    /// Applies the resolvers `proposal` names, as the tunnel's DNS, and keeps
+    /// the proposal: [`VpnBackend::up`] applies it again on every later
+    /// mount, until [`VpnBackend::down`] forgets it.
+    ///
+    /// The choice itself is made by [`crate::dns::decide`]. A driver refusing
+    /// the servers is reported as [`crate::events::DnsCheck::Failed`], not
+    /// returned: the adapter stays mounted either way. The default does
+    /// nothing, for a backend without a resolver to set.
+    async fn apply_gateway_dns(
+        &self,
+        _profile: &ClientProfile,
+        _proposal: ClientDnsProposal,
+        _sink: &EventSink,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Unmounts the adapter. **Called only on explicit disconnection.**
     async fn down(&self, sink: &EventSink) -> anyhow::Result<()>;

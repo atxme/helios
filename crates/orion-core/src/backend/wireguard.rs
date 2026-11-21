@@ -74,14 +74,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aether::client_dns::ClientDnsProposal;
 use aether::TunnelState;
 use async_trait::async_trait;
 use defguard_wireguard_rs::{
-    key::Key, net::IpAddrMask, peer::Peer, InterfaceConfiguration, WGApi, WireguardInterfaceApi,
+    dns::DnsConfig, key::Key, net::IpAddrMask, peer::Peer, InterfaceConfiguration, WGApi,
+    WireguardInterfaceApi,
 };
 
 use crate::config::ClientProfile;
-use crate::events::{CaptureCheck, ClientEvent};
+use crate::dns::{decide, DnsDecision};
+use crate::events::{CaptureCheck, ClientEvent, DnsCheck};
 
 use super::{EventSink, VpnBackend};
 
@@ -113,6 +116,8 @@ pub struct WireGuardBackend {
     adapter_up: AtomicBool,
     /// Peer's public key, to find its stats in `read_interface_data`.
     peer_key: Mutex<Option<Key>>,
+    /// The resolver proposal the gateway sent, until `down` forgets it.
+    gateway_dns: Mutex<Option<ClientDnsProposal>>,
 }
 
 impl WireGuardBackend {
@@ -129,6 +134,7 @@ impl WireGuardBackend {
             api: Mutex::new(api),
             adapter_up: AtomicBool::new(false),
             peer_key: Mutex::new(None),
+            gateway_dns: Mutex::new(None),
         })
     }
 
@@ -151,6 +157,13 @@ impl WireGuardBackend {
     /// Same reasoning for the peer key: an `Option<Key>`, nothing to corrupt.
     fn peer_key(&self) -> std::sync::MutexGuard<'_, Option<Key>> {
         self.peer_key
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Same reasoning for the retained proposal: an `Option`, nothing to corrupt.
+    fn gateway_dns(&self) -> std::sync::MutexGuard<'_, Option<ClientDnsProposal>> {
+        self.gateway_dns
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -658,6 +671,40 @@ fn assess_capture(
     CaptureCheck::Complete
 }
 
+/// Applies a DNS decision to the adapter and reports the verdict.
+///
+/// A refusal is an event, never an error: the adapter stays mounted whatever
+/// the resolvers do, and the user is told which ones were not set.
+fn apply_dns(api: &WgApiImpl, decision: &DnsDecision, sink: &EventSink) {
+    let servers: Vec<IpAddr> = match decision {
+        DnsDecision::Apply { servers, .. } => servers.iter().copied().map(IpAddr::V4).collect(),
+        DnsDecision::Leave { .. } => {
+            // On Linux, defguard 0.12.2 skips an empty list: the system
+            // resolvers stay in place, and the warning says so. On Windows the
+            // same empty configuration clears the NRPT rule and the adapter's DNS.
+            if cfg!(target_os = "linux") {
+                sink(ClientEvent::log(
+                    "warn",
+                    "DNS du tunnel non modifié : sous Linux, une liste vide n'est pas \
+                     appliquée, les résolveurs du système restent en place",
+                ));
+            }
+            Vec::new()
+        }
+    };
+    let config = match decision {
+        DnsDecision::Apply { .. } => DnsConfig::full_tunnel(&servers),
+        DnsDecision::Leave { .. } => DnsConfig::default(),
+    };
+    let check = match api.set_dns(&config) {
+        Ok(()) => decision.check(),
+        Err(e) => DnsCheck::Failed {
+            reason: format!("résolveurs DNS refusés par le pilote : {e}"),
+        },
+    };
+    sink(ClientEvent::dns(check));
+}
+
 /// What the user is told about a capture verdict.
 ///
 /// The verdict itself goes first, for the posture panel. A gap is then an
@@ -826,6 +873,8 @@ impl VpnBackend for WireGuardBackend {
             },
             &self.observe_capture(&api, &peer.public_key),
         );
+        let decision = decide(profile, self.gateway_dns().as_ref());
+        apply_dns(&api, &decision, sink);
         drop(api);
         for event in capture_events(&capture) {
             sink(event);
@@ -849,6 +898,7 @@ impl VpnBackend for WireGuardBackend {
         let result = api.remove_interface();
         self.adapter_up.store(false, Ordering::SeqCst);
         *self.peer_key() = None;
+        *self.gateway_dns() = None;
         drop(api);
 
         sink(ClientEvent::log(
@@ -908,6 +958,19 @@ impl VpnBackend for WireGuardBackend {
             "pair réinscrit — session WireGuard réinitialisée sur la nouvelle clé post-quantique"
                 .to_string(),
         ));
+        Ok(())
+    }
+
+    async fn apply_gateway_dns(
+        &self,
+        profile: &ClientProfile,
+        proposal: ClientDnsProposal,
+        sink: &EventSink,
+    ) -> anyhow::Result<()> {
+        *self.gateway_dns() = Some(proposal);
+        let decision = decide(profile, self.gateway_dns().as_ref());
+        let api = self.api()?;
+        apply_dns(&api, &decision, sink);
         Ok(())
     }
 

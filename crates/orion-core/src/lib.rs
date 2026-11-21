@@ -30,6 +30,7 @@ pub mod certificate_recovery;
 pub mod certificate_renewal;
 pub mod certificates;
 pub mod config;
+pub mod dns;
 pub mod endpoint_resolution;
 pub mod enrollment;
 pub mod enrollment_draft;
