@@ -2,7 +2,9 @@
 //! properties it does not apply.
 
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 
+use aether::client_dns::{validate_resolvers, CLIENT_DNS_MAX};
 use anyhow::{Context, Result};
 
 use crate::{ClientProfile, DEFAULT_ALLOWED_IPS, DEFAULT_KEEPALIVE_SECS};
@@ -23,7 +25,7 @@ pub(super) struct WgQuickImport {
 }
 
 /// wg-quick properties Orion reads and applies.
-const WG_APPLIED_INTERFACE: &[&str] = &["privatekey", "address"];
+const WG_APPLIED_INTERFACE: &[&str] = &["privatekey", "address", "dns"];
 const WG_APPLIED_PEER: &[&str] = &[
     "publickey",
     "presharedkey",
@@ -44,13 +46,6 @@ const WG_APPLIED_PEER: &[&str] = &[
 fn wg_unapplied_notice(field: &str, value: &str) -> Option<String> {
     let value = value.trim();
     Some(match field {
-        // Orion does not tunnel DNS at all — the same documented limit the
-        // gateway's ruleset carries. Naming it here is the only chance the
-        // user has to learn it before the queries leave in the clear.
-        "dns" => format!(
-            "DNS = {value} : Orion n'applique pas de serveur DNS et ne tunnelise pas les \
-             requêtes de résolution ; elles sortiront hors du tunnel."
-        ),
         "mtu" => format!(
             "MTU = {value} : Orion laisse l'adaptateur choisir son MTU. Un chemin qui exigeait \
              cette valeur peut fragmenter."
@@ -64,6 +59,40 @@ fn wg_unapplied_notice(field: &str, value: &str) -> Option<String> {
         "fwmark" => format!("FwMark = {value} : Orion ne marque pas ses paquets."),
         _ => return None,
     })
+}
+
+/// Reads the `DNS =` line of a wg-quick file into the profile's resolvers.
+///
+/// Each entry is tried in order against the rules the gateway's list obeys
+/// ([`validate_resolvers`]): an entry that keeps the list valid is kept, and
+/// every other one is named in a single notice. Nothing is corrected — a search
+/// domain or an IPv6 resolver is not a choice Orion may make for its author.
+fn import_dns_line(value: &str, notices: &mut Vec<String>) -> Option<Vec<Ipv4Addr>> {
+    let mut kept: Vec<Ipv4Addr> = Vec::new();
+    let mut refused: Vec<&str> = Vec::new();
+    for entry in value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let accepted = entry.parse::<Ipv4Addr>().ok().filter(|address| {
+            let mut trial = kept.clone();
+            trial.push(*address);
+            validate_resolvers(&trial).is_ok()
+        });
+        match accepted {
+            Some(address) => kept.push(address),
+            None => refused.push(entry),
+        }
+    }
+    if !refused.is_empty() {
+        notices.push(format!(
+            "DNS = {value} : non appliqué(s) par Orion : {} — seuls les résolveurs IPv4 publics \
+             ({CLIENT_DNS_MAX} au plus) le sont.",
+            refused.join(", ")
+        ));
+    }
+    (!kept.is_empty()).then_some(kept)
 }
 
 /// Properties Orion refuses, because they run something.
@@ -143,6 +172,11 @@ pub(super) fn parse_wg_quick(contents: &str, file_name: &str) -> Result<WgQuickI
         anyhow::bail!("section [Interface] absente du fichier WireGuard");
     }
     let mut notices = Vec::new();
+    // Read before the other interface properties: `dns` sorts first among the
+    // ones reported, so its notice keeps the sorted order.
+    let dns = interface
+        .get("dns")
+        .and_then(|value| import_dns_line(value, &mut notices));
     classify_wg_fields(
         &interface,
         WG_APPLIED_INTERFACE,
@@ -174,8 +208,7 @@ pub(super) fn parse_wg_quick(contents: &str, file_name: &str) -> Result<WgQuickI
         preshared_key: peer.get("presharedkey").map(|key| key.as_str().into()),
         address,
         address_v6,
-        // The `DNS =` line of a wg-quick file is not imported: the choice is made in Orion.
-        dns: None,
+        dns,
         allowed_ips: peer
             .get("allowedips")
             .cloned()
