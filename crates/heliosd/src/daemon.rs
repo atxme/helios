@@ -559,6 +559,34 @@ mod tests {
     }
 
     #[test]
+    fn real_service_bind_rejects_an_ipv6_tunnel_address() {
+        let network = NetworkConfig {
+            wg_private_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".into(),
+            wg_address: "fd00::1/64".into(),
+            ..NetworkConfig::default()
+        };
+
+        let error = service_binds(&network, false)
+            .expect_err("the control plane requires an IPv4 tunnel address");
+
+        assert!(format!("{error:#}").contains("API listen address"));
+    }
+
+    #[test]
+    fn real_service_bind_does_not_hide_a_malformed_tunnel_host_with_loopback() {
+        let network = NetworkConfig {
+            wg_private_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".into(),
+            wg_address: "gateway-vip/10".into(),
+            ..NetworkConfig::default()
+        };
+
+        let error = service_binds(&network, false)
+            .expect_err("a configured but malformed VIP must stop startup");
+
+        assert!(format!("{error:#}").contains("API listen address"));
+    }
+
+    #[test]
     fn real_service_binds_share_the_configured_ipv4_host_and_keep_distinct_ports() {
         let network = NetworkConfig {
             wg_private_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".into(),
@@ -637,6 +665,46 @@ mod tests {
 
         assert!(format!("{error:#}").contains("at least one attempt"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn api_retry_returns_immediately_when_the_first_bind_succeeds() {
+        let calls = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+
+        serve_api_with_retry(3, Duration::from_secs(10), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .await
+        .expect("the first successful bind completes startup");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tokio::time::Instant::now() - started, Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn api_retry_can_recover_on_the_final_allowed_attempt() {
+        let calls = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+
+        serve_api_with_retry(3, Duration::from_millis(200), || {
+            let attempt = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt < 2 {
+                    anyhow::bail!("address is not assigned yet");
+                }
+                Ok(())
+            }
+        })
+        .await
+        .expect("a successful final attempt must be accepted");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_millis(400)
+        );
     }
 
     #[tokio::test(start_paused = true)]
