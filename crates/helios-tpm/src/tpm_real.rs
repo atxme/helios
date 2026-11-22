@@ -322,8 +322,10 @@ impl TpmSealer for TpmDevice {
     /// Defines the counter if it is missing, then makes the first increment.
     ///
     /// Definition and first increment are two TPM commands, not one: a power
-    /// cut between them leaves the counter defined at 0. That state is not
-    /// accepted as a value, and the next `ensure` completes the increment.
+    /// cut between them leaves the counter defined but unwritten
+    /// (TPMA_NV_WRITTEN clear). `NV_Read` refuses such an index with
+    /// `TPM2_RC_NV_UNINITIALIZED`, so the written attribute, not the value, is
+    /// what decides whether the first increment is still owed.
     fn ensure_counter(&mut self) -> Result<()> {
         let index = self.counter_nv_index;
         let mut ctx = open_context(&self.device_path).map_err(counter_unavailable)?;
@@ -332,17 +334,18 @@ impl TpmSealer for TpmDevice {
                 Some(handle) => (handle, false),
                 None => (define_counter_index(&mut ctx, index)?, true),
             };
-            let advanced = if fresh {
-                increment_counter_index(&mut ctx, handle).map(|_| ())
+            let written = if fresh {
+                Ok(false)
             } else {
-                read_counter_value(&mut ctx, handle).and_then(|value| {
-                    if value == 0 {
-                        increment_counter_index(&mut ctx, handle).map(|_| ())
-                    } else {
-                        Ok(())
-                    }
-                })
+                counter_is_written(&mut ctx, handle)
             };
+            let advanced = written.and_then(|written| {
+                if written {
+                    Ok(())
+                } else {
+                    increment_counter_index(&mut ctx, handle).map(|_| ())
+                }
+            });
             close_nv_handle(&mut ctx, handle);
             advanced
         })();
@@ -478,6 +481,15 @@ fn read_counter_value(ctx: &mut Context, handle: NvIndexHandle) -> Result<u64> {
         .try_into()
         .map_err(|_| TpmError::Connection("NV counter is not 8 bytes".into()))?;
     Ok(u64::from_be_bytes(bytes))
+}
+
+/// Has the counter ever been incremented? Read from the public area, which
+/// the TPM answers even when the data area is uninitialized.
+fn counter_is_written(ctx: &mut Context, handle: NvIndexHandle) -> Result<bool> {
+    let (public, _name) = ctx
+        .execute_without_session(|ctx| ctx.nv_read_public(handle))
+        .map_err(|e| TpmError::Connection(format!("NV read public (counter): {e}")))?;
+    Ok(public.attributes().written())
 }
 
 /// Increments the counter, then returns its new value.

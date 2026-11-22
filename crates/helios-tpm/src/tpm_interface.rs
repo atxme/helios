@@ -74,19 +74,37 @@ pub(crate) struct DryRunTpm {
     counter_path: Option<String>,
 }
 
-/// The simulated anti-rollback counter. `None` means the index is not defined.
+/// The simulated anti-rollback counter.
+///
+/// `Unreadable` keeps a corrupt or unreadable counter file as a state rather
+/// than failing the whole TPM: `open_tpm` serves sealing and unsealing too,
+/// and those must keep working. The counter operations report the cause.
 #[cfg(any(not(feature = "tpm"), test))]
 #[derive(Clone, Default)]
-pub(crate) struct CounterState(std::sync::Arc<std::sync::Mutex<Option<u64>>>);
+pub(crate) struct CounterState(std::sync::Arc<std::sync::Mutex<CounterCell>>);
+
+#[cfg(any(not(feature = "tpm"), test))]
+#[derive(Clone, Default)]
+pub(crate) enum CounterCell {
+    /// The index is not defined (no counter file).
+    #[default]
+    Undefined,
+    Value(u64),
+    /// The counter file exists but cannot be used; the cause is kept.
+    Unreadable(String),
+}
 
 #[cfg(any(not(feature = "tpm"), test))]
 impl CounterState {
-    fn get(&self) -> Option<u64> {
-        *self.0.lock().expect("simulated counter state poisoned")
+    fn get(&self) -> CounterCell {
+        self.0
+            .lock()
+            .expect("simulated counter state poisoned")
+            .clone()
     }
 
-    fn set(&self, value: u64) {
-        *self.0.lock().expect("simulated counter state poisoned") = Some(value);
+    fn set(&self, cell: CounterCell) {
+        *self.0.lock().expect("simulated counter state poisoned") = cell;
     }
 }
 
@@ -122,8 +140,9 @@ impl DryRunTpm {
     /// The simulated counter is loaded from `cfg.simulated_counter_path`: a
     /// new instance is built on every `open_tpm`, so the counter must live on
     /// disk to stay monotonic. An absent file means the index is undefined; an
-    /// unreadable one refuses the counter rather than resetting it.
-    pub(crate) fn from_env(cfg: &crate::settings::TpmSettings) -> Result<Self> {
+    /// unreadable one is kept as such and refuses the counter operations, never
+    /// a reset to zero. Loading cannot fail: sealing must not depend on it.
+    pub(crate) fn from_env(cfg: &crate::settings::TpmSettings) -> Self {
         let pcr_digest = std::env::var("HELIOS_TPM_FAKE_PCR")
             .ok()
             .and_then(|s| hex::decode(s).ok())
@@ -139,30 +158,14 @@ impl DryRunTpm {
              Recompile with --features tpm on the target."
         );
         let counter = CounterState::default();
-        match std::fs::read_to_string(&cfg.simulated_counter_path) {
-            Ok(text) => {
-                let value = text.trim().parse::<u64>().map_err(|_| {
-                    crate::TpmError::CounterUnavailable(
-                        "simulated counter file is not a decimal u64".into(),
-                    )
-                })?;
-                counter.set(value);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(crate::TpmError::CounterUnavailable(format!(
-                    "simulated counter file {}: {error}",
-                    cfg.simulated_counter_path
-                )))
-            }
-        }
-        Ok(Self {
+        counter.set(load_simulated_counter(&cfg.simulated_counter_path));
+        Self {
             pcr_digest,
             window_digest,
             nv: NvState::default(),
             counter,
             counter_path: Some(cfg.simulated_counter_path.clone()),
-        })
+        }
     }
 
     /// Writes `value` to the counter file before it becomes visible in memory,
@@ -172,7 +175,7 @@ impl DryRunTpm {
             crate::blob_store::atomic_write(path, value.to_string().as_bytes())
                 .map_err(|error| crate::TpmError::CounterUnavailable(error.to_string()))?;
         }
-        self.counter.set(value);
+        self.counter.set(CounterCell::Value(value));
         Ok(())
     }
 
@@ -276,18 +279,21 @@ impl TpmSealer for DryRunTpm {
     }
 
     fn ensure_counter(&mut self) -> Result<()> {
-        // 0 is the value a freshly defined index holds: the first increment
-        // has not happened yet, so it must happen now.
-        if self.counter.get().unwrap_or(0) == 0 {
-            self.store_counter(1)?;
+        match self.counter.get() {
+            CounterCell::Undefined => self.store_counter(1),
+            CounterCell::Value(_) => Ok(()),
+            CounterCell::Unreadable(cause) => Err(crate::TpmError::CounterUnavailable(cause)),
         }
-        Ok(())
     }
 
     fn read_counter(&mut self) -> Result<u64> {
-        self.counter
-            .get()
-            .ok_or_else(|| crate::TpmError::CounterUnavailable("counter not defined".into()))
+        match self.counter.get() {
+            CounterCell::Value(value) => Ok(value),
+            CounterCell::Undefined => Err(crate::TpmError::CounterUnavailable(
+                "counter not defined".into(),
+            )),
+            CounterCell::Unreadable(cause) => Err(crate::TpmError::CounterUnavailable(cause)),
+        }
     }
 
     fn increment_counter(&mut self) -> Result<u64> {
@@ -300,6 +306,20 @@ impl TpmSealer for DryRunTpm {
     }
 }
 
+/// Loads the simulated counter file. Absent is `Undefined`; anything that is not
+/// a decimal u64 or cannot be read is `Unreadable`, never a reset.
+#[cfg(any(not(feature = "tpm"), test))]
+fn load_simulated_counter(path: &str) -> CounterCell {
+    match std::fs::read_to_string(path) {
+        Ok(text) => match text.trim().parse::<u64>() {
+            Ok(value) => CounterCell::Value(value),
+            Err(_) => CounterCell::Unreadable("simulated counter file is not a decimal u64".into()),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => CounterCell::Undefined,
+        Err(error) => CounterCell::Unreadable(format!("simulated counter file {path}: {error}")),
+    }
+}
+
 // ───────────────────────── Real backend (target, feature tpm) ─────────────────────────
 //
 // The real TPM2 implementation (hardened sealing/unsealing, encrypted
@@ -307,3 +327,45 @@ impl TpmSealer for DryRunTpm {
 // here so `boot_controller` keeps the `crate::tpm_interface::TpmDevice` path.
 #[cfg(feature = "tpm")]
 pub(crate) use crate::tpm_real::TpmDevice;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::TpmSettings;
+
+    /// A corrupt counter file refuses the counter operations, but sealing and
+    /// unsealing — served by the same `open_tpm` — keep working.
+    #[test]
+    fn a_corrupt_simulated_counter_refuses_the_counter_not_the_seal() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TpmSettings {
+            simulated_counter_path: dir.path().join("counter").to_string_lossy().into(),
+            ..TpmSettings::default()
+        };
+        std::fs::write(&cfg.simulated_counter_path, b"not a number").unwrap();
+        let mut tpm = DryRunTpm::from_env(&cfg);
+
+        let secret = SecretKey::generate().unwrap();
+        let blob = tpm.seal(&secret).unwrap();
+        let unsealed = tpm.unseal(&blob).unwrap();
+        assert_eq!(unsealed.as_bytes(), secret.as_bytes());
+
+        assert!(matches!(
+            tpm.read_counter(),
+            Err(crate::TpmError::CounterUnavailable(_))
+        ));
+        assert!(matches!(
+            tpm.increment_counter(),
+            Err(crate::TpmError::CounterUnavailable(_))
+        ));
+        assert!(matches!(
+            tpm.ensure_counter(),
+            Err(crate::TpmError::CounterUnavailable(_))
+        ));
+        assert_eq!(
+            std::fs::read(&cfg.simulated_counter_path).unwrap(),
+            b"not a number",
+            "an unreadable counter must never be overwritten"
+        );
+    }
+}

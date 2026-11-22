@@ -33,20 +33,44 @@ pub fn advance(cfg: &TpmSettings) -> Result<u64> {
 /// Consumes an artifact issued for counter value `artifact`: accepted only if
 /// it equals the TPM counter, which is then incremented and returned.
 ///
-/// Any failure to read or increment the counter is reported as
-/// [`TpmError::CounterUnavailable`]; a value that does not match is
-/// [`TpmError::CounterMismatch`]. The outcome is published either way.
+/// Callers must serialise consumption. The read and the increment are two TPM
+/// commands, so two concurrent consumptions of the same value could both pass
+/// the read. The verification path consumes at one point, under one lock.
+///
+/// A value that does not match is refused and publishes nothing: a replayed or
+/// forged artifact must not overwrite the public status. A failure to read or
+/// increment, or an increment that does not produce `artifact + 1`, is
+/// published and reported as [`TpmError::CounterUnavailable`].
 // Not called outside tests yet: the artifact verification path is its only caller.
 #[allow(dead_code)]
 pub(crate) fn consume<T: TpmSealer>(tpm: &mut T, cfg: &TpmSettings, artifact: u64) -> Result<u64> {
-    let outcome = (|| {
-        let current = tpm.read_counter()?;
-        if current != artifact {
-            return Err(TpmError::CounterMismatch { artifact, current });
-        }
-        tpm.increment_counter()
-    })();
-    publish_outcome(cfg, outcome)
+    let current = tpm
+        .read_counter()
+        .map_err(|error| publish_failure(cfg, error))?;
+    if current != artifact {
+        return Err(TpmError::CounterMismatch { artifact, current });
+    }
+    let next = tpm
+        .increment_counter()
+        .map_err(|error| publish_failure(cfg, error))?;
+    if artifact.checked_add(1) != Some(next) {
+        let error = TpmError::CounterUnavailable(format!(
+            "increment returned {next} for artifact {artifact}, expected {artifact} + 1"
+        ));
+        return Err(publish_failure(cfg, error));
+    }
+    publish_status(cfg, Ok(next));
+    Ok(next)
+}
+
+/// Publishes a read or increment failure as `CounterUnavailable` and returns it.
+fn publish_failure(cfg: &TpmSettings, error: TpmError) -> TpmError {
+    let error = match error {
+        unavailable @ TpmError::CounterUnavailable(_) => unavailable,
+        other => TpmError::CounterUnavailable(other.to_string()),
+    };
+    publish_status(cfg, Err(&error));
+    error
 }
 
 /// Writes the public status atomically. A failed write is logged, never
@@ -82,7 +106,52 @@ fn publish_outcome(cfg: &TpmSettings, outcome: Result<u64>) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tpm_interface::{CounterState, DryRunTpm};
+    use crate::tpm_interface::{CounterState, DryRunTpm, SealedBlob};
+    use crate::SecretKey;
+    use zeroize::Zeroizing;
+
+    /// A TPM whose increment advances the counter by two, to exercise the
+    /// `artifact + 1` check.
+    struct SkewedIncrement(DryRunTpm);
+
+    impl TpmSealer for SkewedIncrement {
+        fn current_pcr_digest(&mut self) -> Result<[u8; 32]> {
+            self.0.current_pcr_digest()
+        }
+        fn seal(&mut self, secret: &SecretKey) -> Result<SealedBlob> {
+            self.0.seal(secret)
+        }
+        fn unseal(&mut self, blob: &SealedBlob) -> Result<SecretKey> {
+            self.0.unseal(blob)
+        }
+        fn arm_update_window(&mut self, payload: &[u8]) -> Result<()> {
+            self.0.arm_update_window(payload)
+        }
+        fn unseal_update_window(&mut self) -> Result<Zeroizing<Vec<u8>>> {
+            self.0.unseal_update_window()
+        }
+        fn revoke_update_window(&mut self) -> Result<()> {
+            self.0.revoke_update_window()
+        }
+        fn update_window_armed(&mut self) -> Result<bool> {
+            self.0.update_window_armed()
+        }
+        fn ensure_counter(&mut self) -> Result<()> {
+            self.0.ensure_counter()
+        }
+        fn read_counter(&mut self) -> Result<u64> {
+            self.0.read_counter()
+        }
+        fn increment_counter(&mut self) -> Result<u64> {
+            self.0.increment_counter()?;
+            self.0.increment_counter()
+        }
+    }
+
+    /// The published status file, as written.
+    fn published(cfg: &TpmSettings) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(&cfg.counter_status_path).unwrap()).unwrap()
+    }
 
     /// The `(artifact, current)` pair of a refused consumption.
     fn mismatch_of(result: Result<u64>) -> (u64, u64) {
@@ -148,6 +217,85 @@ mod tests {
     }
 
     #[test]
+    fn a_successful_consumption_publishes_the_new_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg(dir.path());
+        let mut tpm = DryRunTpm::with_digest([1; 32]);
+        tpm.ensure_counter().unwrap();
+        let current = tpm.read_counter().unwrap();
+
+        consume(&mut tpm, &cfg, current).unwrap();
+
+        assert_eq!(
+            published(&cfg),
+            serde_json::json!({ "counter": current + 1 })
+        );
+    }
+
+    #[test]
+    fn a_refused_artifact_publishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg(dir.path());
+        let mut tpm = DryRunTpm::with_digest([1; 32]);
+        tpm.ensure_counter().unwrap();
+        let current = tpm.read_counter().unwrap();
+        consume(&mut tpm, &cfg, current).unwrap();
+        let before = std::fs::read(&cfg.counter_status_path).unwrap();
+
+        // A replay and a forged value, both refused.
+        assert_eq!(
+            mismatch_of(consume(&mut tpm, &cfg, current)),
+            (current, current + 1)
+        );
+        assert_eq!(
+            mismatch_of(consume(&mut tpm, &cfg, u64::MAX)),
+            (u64::MAX, current + 1)
+        );
+
+        assert_eq!(
+            std::fs::read(&cfg.counter_status_path).unwrap(),
+            before,
+            "a refused artifact must not overwrite the public status"
+        );
+    }
+
+    #[test]
+    fn a_read_failure_publishes_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg(dir.path());
+        // Never ensured: the counter is undefined.
+        let mut tpm = DryRunTpm::with_digest([1; 32]);
+
+        let error = consume(&mut tpm, &cfg, 1).unwrap_err();
+
+        assert!(matches!(error, TpmError::CounterUnavailable(_)));
+        assert_eq!(
+            published(&cfg),
+            serde_json::json!({
+                "counter": null,
+                "error": "TPM counter unavailable: counter not defined"
+            })
+        );
+    }
+
+    #[test]
+    fn an_increment_that_does_not_produce_artifact_plus_one_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg(dir.path());
+        let mut tpm = SkewedIncrement(DryRunTpm::with_digest([1; 32]));
+        tpm.ensure_counter().unwrap();
+        let current = tpm.read_counter().unwrap();
+
+        let error = consume(&mut tpm, &cfg, current).unwrap_err();
+
+        assert!(
+            matches!(error, TpmError::CounterUnavailable(_)),
+            "{error:?}"
+        );
+        assert!(published(&cfg)["error"].is_string());
+    }
+
+    #[test]
     fn a_consumed_value_cannot_be_consumed_again() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = cfg(dir.path());
@@ -170,11 +318,11 @@ mod tests {
     fn the_simulated_counter_survives_a_new_instance() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = cfg(dir.path());
-        let mut first = DryRunTpm::from_env(&cfg).unwrap();
+        let mut first = DryRunTpm::from_env(&cfg);
         first.ensure_counter().unwrap();
         let advanced = first.increment_counter().unwrap();
 
-        let mut second = DryRunTpm::from_env(&cfg).unwrap();
+        let mut second = DryRunTpm::from_env(&cfg);
 
         assert_eq!(second.read_counter().unwrap(), advanced);
     }

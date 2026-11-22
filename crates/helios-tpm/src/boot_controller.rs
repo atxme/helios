@@ -327,7 +327,7 @@ pub(crate) fn open_tpm(cfg: &TpmSettings) -> Result<impl TpmSealer> {
     }
     #[cfg(not(feature = "tpm"))]
     {
-        crate::tpm_interface::DryRunTpm::from_env(cfg)
+        Ok(crate::tpm_interface::DryRunTpm::from_env(cfg))
     }
 }
 
