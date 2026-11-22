@@ -1824,6 +1824,16 @@ par défaut `86.54.11.100` et `86.54.11.200`.
     Attendu : aucune règle `.` dans `Get-DnsClientNrptPolicy` ; le panneau de posture
     affiche « DNS local : la passerelle ne propose pas de DNS par le tunnel ». La
     résolution fonctionne par le DNS local. Remettre `client_dns` absent ensuite.
+164. **[cible] Endpoint en FQDN : retour seul après une coupure du tunnel.** Profil
+    `helios` dont l'endpoint WireGuard est un FQDN (et non une adresse), en tunnel
+    complet, connecté. Redémarrer `heliosd` sur la passerelle (ou mettre le poste
+    en veille plus de 300 s). Attendu : le tunnel revient seul, sans reconnexion
+    manuelle ; le journal d'Orion montre la renégociation. Si la résolution du nom
+    échoue pendant la coupure, le journal indique « dernières adresses connues
+    réutilisées ». Cette étape valide aussi l'hypothèse que la règle NRPT `.` ne
+    retombe pas sur le DNS de l'adaptateur : si la résolution du nom réussissait
+    par le DNS local pendant la coupure, aucun échec ne serait journalisé, et
+    l'hypothèse serait à réviser.
 
 ### Le chemin manuel
 

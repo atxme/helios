@@ -28,8 +28,10 @@
 //! tunnel endpoint chosen without a race (no negotiation) would otherwise be
 //! pinned to the dead family.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -97,24 +99,79 @@ pub fn rfc8305_order(resolved: impl IntoIterator<Item = SocketAddr>) -> Vec<Sock
     ordered
 }
 
+/// Last addresses that resolved for each gateway name, keyed by the endpoint
+/// exactly as the profile writes it. Process-wide, std only.
+type KnownAddresses = Mutex<HashMap<String, Vec<SocketAddr>>>;
+
+fn known_addresses() -> &'static KnownAddresses {
+    static KNOWN: OnceLock<KnownAddresses> = OnceLock::new();
+    KNOWN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Orders a lookup result, remembers it on success, and falls back to the
+/// remembered addresses when the lookup fails or answers nothing.
+///
+/// A host with no remembered entry keeps the error, unchanged.
+fn remember_or_recall(
+    known: &KnownAddresses,
+    endpoint: &str,
+    lookup: Result<Vec<SocketAddr>>,
+) -> Result<Vec<SocketAddr>> {
+    let ordered = lookup.and_then(|resolved| {
+        let ordered = rfc8305_order(resolved);
+        if ordered.is_empty() {
+            anyhow::bail!("{endpoint} resolved to no usable address");
+        }
+        Ok(ordered)
+    });
+    let mut known = known.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match ordered {
+        Ok(ordered) => {
+            known.insert(endpoint.to_string(), ordered.clone());
+            Ok(ordered)
+        }
+        Err(error) => match known.get(endpoint) {
+            Some(recalled) => {
+                tracing::warn!(
+                    endpoint,
+                    error = format!("{error:#}"),
+                    "résolution de {endpoint} impossible, dernières adresses connues réutilisées"
+                );
+                Ok(recalled.clone())
+            }
+            None => Err(error),
+        },
+    }
+}
+
 /// Resolves `endpoint` (`host:port`, `[v6]:port` or `v4:port`) once, into
 /// the [`rfc8305_order`] of its addresses.
 ///
 /// A literal address short-circuits the resolver: nothing is queried, and
 /// the result is that address alone. Never empty on success.
+///
+/// # Last known addresses
+///
+/// The NRPT `.` rule that F7 applies on Windows sends every name lookup into
+/// the tunnel. When the tunnel is the thing being repaired (a restart of
+/// `heliosd`, a sleep longer than the gateway's slot reclamation), the lookup
+/// of the gateway's own name cannot succeed. A name that resolved before is
+/// therefore answered from memory when the lookup fails. This is harmless:
+/// the negotiation authenticates the gateway, so a stale address cannot
+/// impersonate it. A literal endpoint is never remembered.
 pub async fn resolve_candidates(endpoint: &str) -> Result<Vec<SocketAddr>> {
-    let resolved: Vec<SocketAddr> = match endpoint.parse::<SocketAddr>() {
-        Ok(literal) => vec![literal],
-        Err(_) => tokio::net::lookup_host(endpoint)
-            .await
-            .with_context(|| format!("resolving {endpoint}"))?
-            .collect(),
-    };
-    let ordered = rfc8305_order(resolved);
-    if ordered.is_empty() {
-        anyhow::bail!("{endpoint} resolved to no usable address");
+    if let Ok(literal) = endpoint.parse::<SocketAddr>() {
+        let ordered = rfc8305_order([literal]);
+        if ordered.is_empty() {
+            anyhow::bail!("{endpoint} resolved to no usable address");
+        }
+        return Ok(ordered);
     }
-    Ok(ordered)
+    let lookup: Result<Vec<SocketAddr>> = tokio::net::lookup_host(endpoint)
+        .await
+        .with_context(|| format!("resolving {endpoint}"))
+        .map(|resolved| resolved.collect());
+    remember_or_recall(known_addresses(), endpoint, lookup)
 }
 
 /// A candidate that was started and did not win.
