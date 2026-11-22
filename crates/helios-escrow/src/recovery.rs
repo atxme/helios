@@ -69,6 +69,8 @@ pub enum RecoveryError {
     AuthorizationInvalid,
     #[error("the recovery authorization is for another gateway")]
     ForeignGateway,
+    #[error("the recovery authorization does not match the request that was prepared")]
+    RequestMismatch,
     #[error("the recovery frame is malformed")]
     FrameMalformed,
 }
@@ -110,9 +112,14 @@ pub fn prepare(
 
 /// Verifies the signed authorization against the escrow and returns the
 /// recovery frame, holding the WireGuard private key in a zeroizing buffer.
+///
+/// `request` is the payload [`prepare`] returned and the operator gave the
+/// publisher. Checks run in this order, and nothing is returned on refusal:
+/// signatures, then the escrow's gateway, then the request itself.
 pub fn assemble(
     escrow: &[u8],
     operator_private_key: &[u8],
+    request: &WireGuardRecoveryPayload,
     authorization: &SignedWireGuardRecovery,
 ) -> Result<Zeroizing<Vec<u8>>, RecoveryError> {
     let (wg_key, metadata) = open_checked(escrow, operator_private_key)?;
@@ -125,6 +132,9 @@ pub fn assemble(
     )?;
     if authorization.payload.gateway_public_key != metadata.gateway_public_key {
         return Err(RecoveryError::ForeignGateway);
+    }
+    if &authorization.payload != request {
+        return Err(RecoveryError::RequestMismatch);
     }
 
     encode_recovery_frame(authorization, &wg_key)
@@ -244,13 +254,22 @@ mod tests {
         counter: u64,
         gateway_public_key: [u8; 32],
     ) -> aether::sig::SignedWireGuardRecovery {
-        publisher()
-            .sign(WireGuardRecoveryPayload {
-                counter,
-                gateway_public_key,
-                expected_pcr_digest: None,
-            })
+        sign(WireGuardRecoveryPayload {
+            counter,
+            gateway_public_key,
+            expected_pcr_digest: None,
+        })
+    }
+
+    fn sign(payload: WireGuardRecoveryPayload) -> aether::sig::SignedWireGuardRecovery {
+        publisher().sign(payload).unwrap()
+    }
+
+    /// The request the operator prepares from the escrow, as the publisher sees it.
+    fn prepared(escrow: &[u8], operator_private: &[u8], counter: u64) -> WireGuardRecoveryPayload {
+        prepare(escrow, operator_private, Some(counter), None)
             .unwrap()
+            .payload
     }
 
     #[test]
@@ -328,8 +347,9 @@ mod tests {
         let wg = wg_private();
         let escrow = escrow_of(&wg, &operator_public, Some(5));
         let auth = authorization(6, wg_public(&wg));
+        let request = prepared(&escrow, operator_private.as_slice(), 6);
 
-        let frame = assemble(&escrow, operator_private.as_slice(), &auth).unwrap();
+        let frame = assemble(&escrow, operator_private.as_slice(), &request, &auth).unwrap();
         let (decoded, key) = decode_recovery_frame(&frame).unwrap();
         assert_eq!(decoded, auth);
         assert_eq!(key.as_slice(), &wg);
@@ -342,11 +362,45 @@ mod tests {
         let escrow = escrow_of(&wg, &operator_public, Some(5));
         let other_gateway = wg_public(&wg_private());
         let auth = authorization(6, other_gateway);
+        let request = prepared(&escrow, operator_private.as_slice(), 6);
 
         assert!(matches!(
-            assemble(&escrow, operator_private.as_slice(), &auth),
+            assemble(&escrow, operator_private.as_slice(), &request, &auth),
             Err(RecoveryError::ForeignGateway)
         ));
+    }
+
+    #[test]
+    fn assemble_refuses_an_authorization_for_another_counter() {
+        let (operator_private, operator_public) = generate_operator_keypair().unwrap();
+        let wg = wg_private();
+        let escrow = escrow_of(&wg, &operator_public, Some(5));
+        // Signed for N+1 = 7, while the operator prepared a request for 6.
+        let auth = authorization(7, wg_public(&wg));
+        let request = prepared(&escrow, operator_private.as_slice(), 6);
+
+        assert_eq!(
+            assemble(&escrow, operator_private.as_slice(), &request, &auth),
+            Err(RecoveryError::RequestMismatch)
+        );
+    }
+
+    #[test]
+    fn assemble_refuses_an_authorization_for_another_pcr_digest() {
+        let (operator_private, operator_public) = generate_operator_keypair().unwrap();
+        let wg = wg_private();
+        let escrow = escrow_of(&wg, &operator_public, Some(5));
+        let request = prepared(&escrow, operator_private.as_slice(), 6);
+        let auth = sign(WireGuardRecoveryPayload {
+            counter: 6,
+            gateway_public_key: wg_public(&wg),
+            expected_pcr_digest: Some([1u8; 32]),
+        });
+
+        assert_eq!(
+            assemble(&escrow, operator_private.as_slice(), &request, &auth),
+            Err(RecoveryError::RequestMismatch)
+        );
     }
 
     #[test]
@@ -357,9 +411,10 @@ mod tests {
         let mut auth = authorization(6, wg_public(&wg));
         auth.signatures
             .retain(|entry| entry.alg == aether::sig::AlgId::Ed25519.as_str());
+        let request = prepared(&escrow, operator_private.as_slice(), 6);
 
         assert!(matches!(
-            assemble(&escrow, operator_private.as_slice(), &auth),
+            assemble(&escrow, operator_private.as_slice(), &request, &auth),
             Err(RecoveryError::AuthorizationInvalid)
         ));
     }
@@ -370,7 +425,8 @@ mod tests {
         let wg = wg_private();
         let escrow = escrow_of(&wg, &operator_public, Some(5));
         let auth = authorization(6, wg_public(&wg));
-        let frame = assemble(&escrow, operator_private.as_slice(), &auth).unwrap();
+        let request = prepared(&escrow, operator_private.as_slice(), 6);
+        let frame = assemble(&escrow, operator_private.as_slice(), &request, &auth).unwrap();
 
         assert!(matches!(
             decode_recovery_frame(&frame[..frame.len() - 1]),
