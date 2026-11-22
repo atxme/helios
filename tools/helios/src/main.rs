@@ -325,15 +325,39 @@ enum EscrowCmd {
         #[arg(long)]
         output_dir: PathBuf,
     },
-    /// Opens an escrow and writes the recovery file.
-    Open {
+    /// Writes the request to sign to recover a gateway's WireGuard identity.
+    PrepareRecovery {
         /// Escrow retrieved from the gateway (`wg-key.escrow`).
         #[arg(long)]
         escrow: PathBuf,
         /// Operator's escrow private key.
         #[arg(long)]
         private_key: PathBuf,
-        /// Recovery file to produce.
+        /// Counter to sign. Defaults to the escrow's counter plus one.
+        #[arg(long)]
+        counter: Option<u64>,
+        /// Expected PCR digest, as 64 hex digits, to bind the recovery to.
+        #[arg(long, value_parser = escrow::parse_pcr_digest)]
+        expected_pcr_digest: Option<[u8; 32]>,
+        /// Request file to send to the publisher. Never overwritten.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Assembles the recovery frame from the publisher's authorization.
+    AssembleRecovery {
+        /// Escrow retrieved from the gateway (`wg-key.escrow`).
+        #[arg(long)]
+        escrow: PathBuf,
+        /// Operator's escrow private key.
+        #[arg(long)]
+        private_key: PathBuf,
+        /// Request file written by `prepare-recovery`.
+        #[arg(long)]
+        request: PathBuf,
+        /// Authorization signed by the publisher (`helios-publisher wg-recovery`).
+        #[arg(long)]
+        authorization: PathBuf,
+        /// Recovery frame to produce. Never overwritten; holds the key in clear.
         #[arg(long)]
         output: PathBuf,
     },
@@ -759,11 +783,28 @@ async fn execute_command(api: &transport::Api, command: Cmd) -> Result<()> {
         },
         Cmd::Escrow { command } => match command {
             EscrowCmd::Keygen { output_dir } => escrow::keygen(&output_dir),
-            EscrowCmd::Open {
+            EscrowCmd::PrepareRecovery {
                 escrow,
                 private_key,
+                counter,
+                expected_pcr_digest,
                 output,
-            } => escrow::open(&escrow, &private_key, &output),
+            } => escrow::prepare_recovery(
+                &escrow,
+                &private_key,
+                counter,
+                expected_pcr_digest,
+                &output,
+            ),
+            EscrowCmd::AssembleRecovery {
+                escrow,
+                private_key,
+                request,
+                authorization,
+                output,
+            } => {
+                escrow::assemble_recovery(&escrow, &private_key, &request, &authorization, &output)
+            }
         },
         Cmd::KeyNego { command } => key_nego::run(command).await,
         Cmd::AppUpdate {

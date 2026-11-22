@@ -47,4 +47,6 @@ shlex = "2.0.1"
 libc = "0.2"
 
 [dev-dependencies]
+# Signature de test avec les graines de développement (voir `escrow`).
+aether = { workspace = true, features = ["publisher-signing"] }
 tempfile = "3"

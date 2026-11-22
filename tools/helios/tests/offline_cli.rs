@@ -56,7 +56,7 @@ fn profile_check_reports_presence_of_the_private_key_without_printing_it() {
 }
 
 #[test]
-fn offline_escrow_commands_print_only_the_public_keys_and_leave_a_recovery_file() {
+fn offline_escrow_recovery_prints_no_private_key_and_refuses_to_overwrite() {
     let temp = tempfile::tempdir().unwrap();
     let keygen = helios(temp.path())
         .args(["escrow", "keygen", "--output-dir", "operator"])
@@ -75,7 +75,7 @@ fn offline_escrow_commands_print_only_the_public_keys_and_leave_a_recovery_file(
     let gateway = aether::wg::generate_keypair().unwrap();
     let public = STANDARD.decode(operator_public.trim()).unwrap();
     let metadata = helios_escrow::EscrowMetadata {
-        counter: Some(1),
+        counter: Some(5),
         gateway_public_key: STANDARD
             .decode(&gateway.public_key)
             .unwrap()
@@ -89,26 +89,81 @@ fn offline_escrow_commands_print_only_the_public_keys_and_leave_a_recovery_file(
     )
     .unwrap();
     fs::write(temp.path().join("wg.escrow"), blob).unwrap();
+
+    // The retired `escrow open` must no longer exist.
+    let retired = helios(temp.path())
+        .args(["escrow", "open", "--escrow", "wg.escrow"])
+        .output()
+        .unwrap();
+    assert!(!retired.status.success());
+
+    let prepare = helios(temp.path())
+        .args([
+            "escrow",
+            "prepare-recovery",
+            "--escrow",
+            "wg.escrow",
+            "--private-key",
+            "operator/escrow-private.key",
+            "--output",
+            "request.json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(successful_stdout(&prepare).trim(), gateway.public_key);
+    assert!(!String::from_utf8_lossy(&prepare.stderr).contains(gateway.private_key.expose()));
+    let request = fs::read_to_string(temp.path().join("request.json")).unwrap();
+    assert!(request.contains("\"counter\": 6"), "{request}");
+    assert!(!request.contains(gateway.private_key.expose()));
+
+    // The publisher signs the request with the development keys.
+    let payload: aether::sig::WireGuardRecoveryPayload = serde_json::from_str(&request).unwrap();
+    let authorization = aether::sig::PublisherSigner::from_seed_material(
+        1,
+        b"helios-sign-ed25519-dev-seed-001",
+        b"helios-sign-mldsa65-dev-seed-001",
+    )
+    .unwrap()
+    .sign(payload)
+    .unwrap();
+    fs::write(
+        temp.path().join("authorization.json"),
+        serde_json::to_vec(&authorization).unwrap(),
+    )
+    .unwrap();
+
     let args = [
         "escrow",
-        "open",
+        "assemble-recovery",
         "--escrow",
         "wg.escrow",
         "--private-key",
         "operator/escrow-private.key",
+        "--request",
+        "request.json",
+        "--authorization",
+        "authorization.json",
         "--output",
-        "recovery.key",
+        "wg-key.recovery",
     ];
-    let opened = helios(temp.path()).args(args).output().unwrap();
-    assert_eq!(successful_stdout(&opened).trim(), gateway.public_key);
-    assert!(!String::from_utf8_lossy(&opened.stderr).contains(gateway.private_key.expose()));
-    let recovered = fs::read_to_string(temp.path().join("recovery.key")).unwrap();
-    assert!(
-        recovered == gateway.private_key.expose(),
-        "the recovery key differs"
+    let assembled = helios(temp.path()).args(args).output().unwrap();
+    assert_eq!(successful_stdout(&assembled).trim(), gateway.public_key);
+    for stream in [&assembled.stdout, &assembled.stderr] {
+        assert!(!String::from_utf8_lossy(stream).contains(gateway.private_key.expose()));
+    }
+    let frame = fs::read(temp.path().join("wg-key.recovery")).unwrap();
+    let (decoded, key) = helios_escrow::recovery::decode_recovery_frame(&frame).unwrap();
+    assert_eq!(decoded, authorization);
+    assert_eq!(
+        key.as_slice(),
+        STANDARD.decode(gateway.private_key.expose()).unwrap()
     );
+
     let repeated = helios(temp.path()).args(args).output().unwrap();
     assert!(!repeated.status.success());
     assert!(repeated.stdout.is_empty());
-    assert!(fs::read_to_string(temp.path().join("recovery.key")).unwrap() == recovered);
+    assert_eq!(
+        fs::read(temp.path().join("wg-key.recovery")).unwrap(),
+        frame
+    );
 }
