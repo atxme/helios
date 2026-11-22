@@ -29,6 +29,7 @@
 //! protection, and persistence still require target trials — like the
 //! firewall's Netlink effects.
 
+pub mod anti_rollback;
 mod blob_store;
 mod boot_controller;
 #[cfg(test)]
@@ -112,6 +113,12 @@ pub enum TpmError {
 
     #[error("update-window state is uncertain and could not be safely cleaned up: {0}")]
     UpdateWindowCleanupFailed(String),
+
+    #[error("TPM counter unavailable: {0}")]
+    CounterUnavailable(String),
+
+    #[error("artifact counter {artifact} does not match the TPM counter {current}")]
+    CounterMismatch { artifact: u64, current: u64 },
 
     #[error(transparent)]
     Keystore(#[from] keystore::KeystoreError),

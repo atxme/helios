@@ -111,7 +111,7 @@ fn io_err(path: &str, e: std::io::Error) -> TpmError {
 
 /// Atomic write: temp file + rename, so a power cut never leaves a
 /// truncated blob/state (the next boot depends on it).
-fn atomic_write(path: &str, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(path: &str, bytes: &[u8]) -> Result<()> {
     let p = Path::new(path);
     if let Some(parent) = p.parent() {
         if !parent.as_os_str().is_empty() {

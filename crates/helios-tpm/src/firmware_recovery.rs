@@ -400,6 +400,15 @@ mod tests {
             }
             self.inner.revoke_update_window()
         }
+        fn ensure_counter(&mut self) -> Result<()> {
+            self.inner.ensure_counter()
+        }
+        fn read_counter(&mut self) -> Result<u64> {
+            self.inner.read_counter()
+        }
+        fn increment_counter(&mut self) -> Result<u64> {
+            self.inner.increment_counter()
+        }
     }
     #[test]
     fn recovery_preserves_both_vaults_without_reading_the_old_nv_policy() {

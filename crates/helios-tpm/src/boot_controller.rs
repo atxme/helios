@@ -327,8 +327,7 @@ pub(crate) fn open_tpm(cfg: &TpmSettings) -> Result<impl TpmSealer> {
     }
     #[cfg(not(feature = "tpm"))]
     {
-        let _ = cfg;
-        Ok(crate::tpm_interface::DryRunTpm::from_env())
+        crate::tpm_interface::DryRunTpm::from_env(cfg)
     }
 }
 
@@ -378,6 +377,9 @@ mod tests {
             update_window_marker_path: dir.join("update-window.marker").to_string_lossy().into(),
             update_window_nv_index: 0x0180_4845,
             update_window_seconds: 1800,
+            anti_rollback_nv_index: 0x0180_4847,
+            simulated_counter_path: dir.join("simulated-nv-counter").to_string_lossy().into(),
+            counter_status_path: dir.join("anti-rollback.json").to_string_lossy().into(),
         }
     }
 
@@ -512,6 +514,18 @@ mod tests {
         fn update_window_armed(&mut self) -> Result<bool> {
             self.0.update_window_armed()
         }
+
+        fn ensure_counter(&mut self) -> Result<()> {
+            self.0.ensure_counter()
+        }
+
+        fn read_counter(&mut self) -> Result<u64> {
+            self.0.read_counter()
+        }
+
+        fn increment_counter(&mut self) -> Result<u64> {
+            self.0.increment_counter()
+        }
     }
 
     struct FailingWindowReadTpm(DryRunTpm);
@@ -543,6 +557,18 @@ mod tests {
 
         fn update_window_armed(&mut self) -> Result<bool> {
             self.0.update_window_armed()
+        }
+
+        fn ensure_counter(&mut self) -> Result<()> {
+            self.0.ensure_counter()
+        }
+
+        fn read_counter(&mut self) -> Result<u64> {
+            self.0.read_counter()
+        }
+
+        fn increment_counter(&mut self) -> Result<u64> {
+            self.0.increment_counter()
         }
     }
 
@@ -582,6 +608,18 @@ mod tests {
 
         fn update_window_armed(&mut self) -> Result<bool> {
             self.inner.update_window_armed()
+        }
+
+        fn ensure_counter(&mut self) -> Result<()> {
+            self.inner.ensure_counter()
+        }
+
+        fn read_counter(&mut self) -> Result<u64> {
+            self.inner.read_counter()
+        }
+
+        fn increment_counter(&mut self) -> Result<u64> {
+            self.inner.increment_counter()
         }
     }
 

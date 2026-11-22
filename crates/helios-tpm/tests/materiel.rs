@@ -19,6 +19,10 @@
 //! gateway's window is never touched. The index survives the trial; remove it
 //! with `tpm2_nvundefine 0x01804846` if the machine is not disposable.
 //!
+//! The anti-rollback counter trial likewise defines a disposable counter,
+//! `0x01804848` (production: `0x01804847`), removable with
+//! `tpm2_nvundefine 0x01804848`.
+//!
 //! This is what distinguishes these trials from the RAUC cycle trials, which
 //! touched boot slots and could render the target unbootable.
 //!
@@ -82,6 +86,16 @@ fn settings(dir: &std::path::Path, allow_provisioning: bool) -> TpmSettings {
         // trial must never undefine the index a real gateway relies on.
         update_window_nv_index: 0x0180_4846,
         update_window_seconds: 300,
+        // The production counter index is reserved; the trial uses its own.
+        anti_rollback_nv_index: 0x0180_4847,
+        simulated_counter_path: dir
+            .join("simulated-nv-counter")
+            .to_string_lossy()
+            .into_owned(),
+        counter_status_path: dir
+            .join("anti-rollback.json")
+            .to_string_lossy()
+            .into_owned(),
     }
 }
 
@@ -307,4 +321,47 @@ fn an_update_window_is_armed_then_revoked_on_the_tpm() {
     BootController::cancel_update_window(&cfg).expect("removing restored marker");
 
     std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// The anti-rollback counter moves forward on the TPM and only there: each
+/// `advance` survives a new connection, and the value never goes back.
+///
+/// Uses the disposable index `0x01804848`, distinct from the production
+/// counter `0x01804847`. The index survives the trial; remove it with
+/// `tpm2_nvundefine 0x01804848` if the machine is not disposable.
+#[test]
+fn the_anti_rollback_counter_only_moves_forward_on_the_tpm() {
+    if !hardware_requested("anti-rollback NV counter") {
+        return;
+    }
+    let dir = disposable_dir("compteur-anti-rollback");
+    let cfg = TpmSettings {
+        anti_rollback_nv_index: 0x0180_4848,
+        ..settings(&dir, false)
+    };
+
+    let first =
+        helios_tpm::anti_rollback::advance(&cfg).expect("defining and advancing the counter");
+    assert_eq!(
+        helios_tpm::anti_rollback::current(&cfg).expect("reading the counter on a new connection"),
+        first,
+        "the counter must persist on the TPM across connections"
+    );
+
+    let second = helios_tpm::anti_rollback::advance(&cfg).expect("advancing the counter again");
+    assert_eq!(
+        second,
+        first + 1,
+        "each advance moves the counter by exactly one"
+    );
+    assert_eq!(
+        helios_tpm::anti_rollback::current(&cfg).expect("reading the counter after advance"),
+        second
+    );
+
+    let published: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&cfg.counter_status_path).expect("reading the published status"),
+    )
+    .expect("the status is JSON");
+    assert_eq!(published, serde_json::json!({ "counter": second }));
 }

@@ -40,6 +40,17 @@ pub(crate) trait TpmSealer {
     fn revoke_update_window(&mut self) -> Result<()>;
     /// Does the policy-protected NV slot contain a live Helios payload?
     fn update_window_armed(&mut self) -> Result<bool>;
+
+    // ── Anti-rollback counter (see `crate::anti_rollback`) ───────────────────
+
+    /// Defines the counter index if it is missing (counter type, owner
+    /// read/write, `no_da`), then makes the first increment. Idempotent: an
+    /// already-advanced counter does not move.
+    fn ensure_counter(&mut self) -> Result<()>;
+    /// Reads the current counter value.
+    fn read_counter(&mut self) -> Result<u64>;
+    /// Increments the counter and returns the new value.
+    fn increment_counter(&mut self) -> Result<u64>;
 }
 
 // ───────────────────────── Simulated backend (WSL2 / dev) ─────────────────────────
@@ -57,6 +68,26 @@ pub(crate) struct DryRunTpm {
     pcr_digest: [u8; 32],
     window_digest: [u8; 32],
     nv: NvState,
+    counter: CounterState,
+    /// Where the simulated counter survives between instances; `None` keeps it
+    /// in memory only (tests).
+    counter_path: Option<String>,
+}
+
+/// The simulated anti-rollback counter. `None` means the index is not defined.
+#[cfg(any(not(feature = "tpm"), test))]
+#[derive(Clone, Default)]
+pub(crate) struct CounterState(std::sync::Arc<std::sync::Mutex<Option<u64>>>);
+
+#[cfg(any(not(feature = "tpm"), test))]
+impl CounterState {
+    fn get(&self) -> Option<u64> {
+        *self.0.lock().expect("simulated counter state poisoned")
+    }
+
+    fn set(&self, value: u64) {
+        *self.0.lock().expect("simulated counter state poisoned") = Some(value);
+    }
 }
 
 /// The part of a simulated TPM that **survives a reboot**.
@@ -87,8 +118,12 @@ impl NvState {
 #[cfg(any(not(feature = "tpm"), test))]
 impl DryRunTpm {
     /// Builds from the environment: `HELIOS_TPM_FAKE_PCR` (32-byte hex) or zeros.
-    #[cfg(not(feature = "tpm"))]
-    pub(crate) fn from_env() -> Self {
+    ///
+    /// The simulated counter is loaded from `cfg.simulated_counter_path`: a
+    /// new instance is built on every `open_tpm`, so the counter must live on
+    /// disk to stay monotonic. An absent file means the index is undefined; an
+    /// unreadable one refuses the counter rather than resetting it.
+    pub(crate) fn from_env(cfg: &crate::settings::TpmSettings) -> Result<Self> {
         let pcr_digest = std::env::var("HELIOS_TPM_FAKE_PCR")
             .ok()
             .and_then(|s| hex::decode(s).ok())
@@ -103,11 +138,42 @@ impl DryRunTpm {
             "simulated TPM ('tpm' feature not compiled) — NO hardware guarantee. \
              Recompile with --features tpm on the target."
         );
-        Self {
+        let counter = CounterState::default();
+        match std::fs::read_to_string(&cfg.simulated_counter_path) {
+            Ok(text) => {
+                let value = text.trim().parse::<u64>().map_err(|_| {
+                    crate::TpmError::CounterUnavailable(
+                        "simulated counter file is not a decimal u64".into(),
+                    )
+                })?;
+                counter.set(value);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(crate::TpmError::CounterUnavailable(format!(
+                    "simulated counter file {}: {error}",
+                    cfg.simulated_counter_path
+                )))
+            }
+        }
+        Ok(Self {
             pcr_digest,
             window_digest,
             nv: NvState::default(),
+            counter,
+            counter_path: Some(cfg.simulated_counter_path.clone()),
+        })
+    }
+
+    /// Writes `value` to the counter file before it becomes visible in memory,
+    /// so a failed write leaves the previous value in force.
+    fn store_counter(&self, value: u64) -> Result<()> {
+        if let Some(path) = &self.counter_path {
+            crate::blob_store::atomic_write(path, value.to_string().as_bytes())
+                .map_err(|error| crate::TpmError::CounterUnavailable(error.to_string()))?;
         }
+        self.counter.set(value);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -116,6 +182,8 @@ impl DryRunTpm {
             pcr_digest,
             window_digest: [0u8; 32],
             nv: NvState::default(),
+            counter: CounterState::default(),
+            counter_path: None,
         }
     }
 
@@ -134,6 +202,14 @@ impl DryRunTpm {
     #[cfg(test)]
     pub(crate) fn sharing_nv(mut self, nv: &NvState) -> Self {
         self.nv = nv.clone();
+        self
+    }
+
+    /// Shares the anti-rollback counter with another instance, i.e. models the
+    /// same TPM across a reboot.
+    #[cfg(test)]
+    pub(crate) fn sharing_counter(mut self, counter: &CounterState) -> Self {
+        self.counter = counter.clone();
         self
     }
 }
@@ -197,6 +273,30 @@ impl TpmSealer for DryRunTpm {
         Ok(self.nv.get().is_some_and(|bytes| {
             bytes.len() >= 36 && crate::update_window::is_armed_prefix(&bytes[32..36])
         }))
+    }
+
+    fn ensure_counter(&mut self) -> Result<()> {
+        // 0 is the value a freshly defined index holds: the first increment
+        // has not happened yet, so it must happen now.
+        if self.counter.get().unwrap_or(0) == 0 {
+            self.store_counter(1)?;
+        }
+        Ok(())
+    }
+
+    fn read_counter(&mut self) -> Result<u64> {
+        self.counter
+            .get()
+            .ok_or_else(|| crate::TpmError::CounterUnavailable("counter not defined".into()))
+    }
+
+    fn increment_counter(&mut self) -> Result<u64> {
+        let next = self
+            .read_counter()?
+            .checked_add(1)
+            .ok_or_else(|| crate::TpmError::CounterUnavailable("counter overflow".into()))?;
+        self.store_counter(next)?;
+        Ok(next)
     }
 }
 

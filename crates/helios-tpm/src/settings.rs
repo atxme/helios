@@ -33,6 +33,14 @@ pub struct TpmSettings {
     pub update_window_nv_index: u32,
     /// How long an armed window stays valid, in seconds.
     pub update_window_seconds: u64,
+    /// NV counter index of the anti-rollback counter (owner range, `no_da`).
+    pub anti_rollback_nv_index: u32,
+    /// File standing in for the NV counter when no TPM is compiled in.
+    /// Only used by the simulated backend; a real TPM never reads it.
+    pub simulated_counter_path: String,
+    /// Public status of the anti-rollback counter: `{"counter": N}` or the
+    /// failure cause. Never secret.
+    pub counter_status_path: String,
 }
 
 impl Default for TpmSettings {
@@ -51,6 +59,9 @@ impl Default for TpmSettings {
             update_window_marker_path: "/var/lib/helios/update-window.marker".to_string(),
             update_window_nv_index: 0x0180_4845,
             update_window_seconds: 30 * 60,
+            anti_rollback_nv_index: 0x0180_4847,
+            simulated_counter_path: "/var/lib/helios/simulated-nv-counter".to_string(),
+            counter_status_path: "/var/lib/helios/anti-rollback.json".to_string(),
         }
     }
 }
@@ -75,6 +86,21 @@ mod tests {
         assert_eq!(
             settings.update_window_marker_path,
             "/var/lib/helios/update-window.marker"
+        );
+    }
+
+    #[test]
+    fn the_anti_rollback_counter_has_its_reserved_index_and_paths() {
+        let settings = TpmSettings::default();
+
+        assert_eq!(settings.anti_rollback_nv_index, 0x0180_4847);
+        assert_eq!(
+            settings.simulated_counter_path,
+            "/var/lib/helios/simulated-nv-counter"
+        );
+        assert_eq!(
+            settings.counter_status_path,
+            "/var/lib/helios/anti-rollback.json"
         );
     }
 

@@ -66,12 +66,16 @@ const BLOB_MAGIC: &[u8; 4] = b"HTPM";
 const BLOB_VERSION: u8 = 1;
 const BANK_SHA256: u8 = 1;
 
+/// Size of the anti-rollback counter's data area: a big-endian u64.
+const COUNTER_SIZE: u16 = 8;
+
 pub(crate) struct TpmDevice {
     device_path: String,
     bank: String,
     indices: Vec<u8>,
     window_indices: Vec<u8>,
     window_nv_index: u32,
+    counter_nv_index: u32,
 }
 
 impl TpmDevice {
@@ -107,6 +111,7 @@ impl TpmDevice {
             indices: cfg.pcr_selection.clone(),
             window_indices: cfg.update_window_pcr_selection.clone(),
             window_nv_index: cfg.update_window_nv_index,
+            counter_nv_index: cfg.anti_rollback_nv_index,
         })
     }
 }
@@ -311,6 +316,67 @@ impl TpmSealer for TpmDevice {
             .read_update_window_bytes(4)?
             .is_some_and(|prefix| is_armed_prefix(&prefix)))
     }
+
+    // ── Anti-rollback counter ────────────────────────────────────────────────
+
+    /// Defines the counter if it is missing, then makes the first increment.
+    ///
+    /// Definition and first increment are two TPM commands, not one: a power
+    /// cut between them leaves the counter defined at 0. That state is not
+    /// accepted as a value, and the next `ensure` completes the increment.
+    fn ensure_counter(&mut self) -> Result<()> {
+        let index = self.counter_nv_index;
+        let mut ctx = open_context(&self.device_path).map_err(counter_unavailable)?;
+        let outcome = (|| {
+            let (handle, fresh) = match open_nv_index(&mut ctx, index)? {
+                Some(handle) => (handle, false),
+                None => (define_counter_index(&mut ctx, index)?, true),
+            };
+            let advanced = if fresh {
+                increment_counter_index(&mut ctx, handle).map(|_| ())
+            } else {
+                read_counter_value(&mut ctx, handle).and_then(|value| {
+                    if value == 0 {
+                        increment_counter_index(&mut ctx, handle).map(|_| ())
+                    } else {
+                        Ok(())
+                    }
+                })
+            };
+            close_nv_handle(&mut ctx, handle);
+            advanced
+        })();
+        outcome.map_err(counter_unavailable)
+    }
+
+    fn read_counter(&mut self) -> Result<u64> {
+        self.with_counter(read_counter_value)
+    }
+
+    fn increment_counter(&mut self) -> Result<u64> {
+        self.with_counter(increment_counter_index)
+    }
+}
+
+impl TpmDevice {
+    /// Runs `operation` on the defined anti-rollback counter; the index handle
+    /// is closed on every path.
+    fn with_counter<T>(
+        &self,
+        operation: impl FnOnce(&mut Context, NvIndexHandle) -> Result<T>,
+    ) -> Result<T> {
+        let index = self.counter_nv_index;
+        let mut ctx = open_context(&self.device_path).map_err(counter_unavailable)?;
+        let outcome = (|| {
+            let handle = open_nv_index(&mut ctx, index)?.ok_or_else(|| {
+                TpmError::CounterUnavailable(format!("NV counter {index:#x} is not defined"))
+            })?;
+            let result = operation(&mut ctx, handle);
+            close_nv_handle(&mut ctx, handle);
+            result
+        })();
+        outcome.map_err(counter_unavailable)
+    }
 }
 
 impl TpmDevice {
@@ -368,6 +434,66 @@ impl TpmDevice {
 }
 
 // ─────────────────────────────── Helpers TPM2 ───────────────────────────────
+
+fn counter_unavailable(error: TpmError) -> TpmError {
+    match error {
+        unavailable @ TpmError::CounterUnavailable(_) => unavailable,
+        other => TpmError::CounterUnavailable(other.to_string()),
+    }
+}
+
+/// Defines the anti-rollback counter: owner read and write, `no_da`, and no
+/// authorization policy. Unlike the window index, an existing counter is never
+/// undefined: a counter that is recreated is a counter that goes backwards.
+fn define_counter_index(ctx: &mut Context, index: u32) -> Result<NvIndexHandle> {
+    let tpm_handle = NvIndexTpmHandle::new(index)
+        .map_err(|e| TpmError::Connection(format!("NV index {index:#x}: {e}")))?;
+    let attributes = NvIndexAttributesBuilder::new()
+        .with_owner_write(true)
+        .with_owner_read(true)
+        .with_nv_index_type(NvIndexType::Counter)
+        .with_no_da(true)
+        .build()
+        .map_err(|e| TpmError::Connection(format!("NV counter attributes: {e}")))?;
+    let public = NvPublicBuilder::new()
+        .with_nv_index(tpm_handle)
+        .with_index_name_algorithm(HashingAlgorithm::Sha256)
+        .with_index_attributes(attributes)
+        .with_index_auth_policy(empty_digest()?)
+        .with_data_area_size(usize::from(COUNTER_SIZE))
+        .build()
+        .map_err(|e| TpmError::Connection(format!("NV counter public: {e}")))?;
+
+    ctx.execute_with_nullauth_session(|ctx| ctx.nv_define_space(Provision::Owner, None, public))
+        .map_err(|e| TpmError::Connection(format!("NV counter define: {e}")))
+}
+
+/// Reads the counter's big-endian value through the owner authorization.
+fn read_counter_value(ctx: &mut Context, handle: NvIndexHandle) -> Result<u64> {
+    let data = ctx
+        .execute_with_nullauth_session(|ctx| ctx.nv_read(NvAuth::Owner, handle, COUNTER_SIZE, 0))
+        .map_err(|e| TpmError::Connection(format!("NV read (counter): {e}")))?;
+    let bytes: [u8; 8] = data
+        .value()
+        .try_into()
+        .map_err(|_| TpmError::Connection("NV counter is not 8 bytes".into()))?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+/// Increments the counter, then returns its new value.
+fn increment_counter_index(ctx: &mut Context, handle: NvIndexHandle) -> Result<u64> {
+    ctx.execute_with_nullauth_session(|ctx| ctx.nv_increment(NvAuth::Owner, handle))
+        .map_err(|e| TpmError::Connection(format!("NV increment (counter): {e}")))?;
+    read_counter_value(ctx, handle)
+}
+
+fn close_nv_handle(ctx: &mut Context, handle: NvIndexHandle) {
+    let mut object = ObjectHandle::from(handle);
+    log_cleanup_error(
+        "close anti-rollback counter index",
+        ctx.tr_close(&mut object),
+    );
+}
 
 fn open_context(device: &str) -> Result<Context> {
     let tcti_name = if device.contains(':') {
