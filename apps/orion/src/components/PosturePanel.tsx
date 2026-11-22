@@ -13,7 +13,13 @@ import type {
   TunnelState,
   VaultPosture,
 } from '../types'
-import { modeMeta, postureMeta, protectionMeta, stateMeta } from './state'
+import {
+  dnsLeavesFullTunnel,
+  modeMeta,
+  postureMeta,
+  protectionMeta,
+  stateMeta,
+} from './state'
 import { CopyButton } from './CopyButton'
 import { GUTTER } from '../theme'
 
@@ -77,7 +83,7 @@ export function PosturePanel({
   dns,
   vault,
 }: Props) {
-  const posture = postureMeta(state, adapterUp)
+  const posture = postureMeta(state, adapterUp, dnsLeavesFullTunnel(dns))
   const protection = protectionMeta(profile, psk, state)
   const traffic = trafficFact(profile, capture)
   const address = addressFact(profile, capture)
@@ -268,10 +274,11 @@ const DNS_LEFT_LABEL: Record<DnsLeaveReason, string> = {
 /**
  * The «dns» row: the resolvers the tunnel applied, or why it applied none.
  *
- * Amber only for `failed`, the one case where the traffic is about to leave
- * the tunnel. A resolver left on the system is stated as it is, not as a
- * fault. An unread gateway proposal keeps the verdict and says so beside it.
- * No verdict yet is a dash: nothing has been applied and nothing is claimed.
+ * Amber when the traffic leaves the tunnel although the profile is a full
+ * tunnel: `failed`, and `left` for `gateway_declines` or `no_resolver`
+ * (spec §5.6). `not_full_tunnel` stays neutral. An unread gateway proposal
+ * keeps the verdict and says so beside it. No verdict yet is a dash: nothing
+ * has been applied and nothing is claimed.
  */
 function dnsFact(dns: DnsState): { value: string; tone?: string } {
   const { check, proposalUnread } = dns
@@ -284,7 +291,10 @@ function dnsFact(dns: DnsState): { value: string; tone?: string } {
       }
     }
     case 'left':
-      return { value: DNS_LEFT_LABEL[check.reason] }
+      return {
+        value: DNS_LEFT_LABEL[check.reason],
+        tone: dnsLeavesFullTunnel(dns) ? AMBER : undefined,
+      }
     case 'failed':
       return {
         value: `DNS non appliqué : les requêtes sortent hors du tunnel — ${check.reason}`,

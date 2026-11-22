@@ -65,6 +65,15 @@ describe('Orion UI state', () => {
     }
   })
 
+  it('says in the headline that DNS leaves the tunnel, without changing the label', () => {
+    const plain = postureMeta('up', true)
+    const leaking = postureMeta('up', true, true)
+    expect(leaking.label).toBe('Protégé')
+    expect(leaking.color).toBe(plain.color)
+    expect(leaking.detail).toBe('Trafic routé par la gateway, DNS hors du tunnel.')
+    expect(plain.detail).toBe('Trafic routé par la gateway.')
+  })
+
   it('does not confuse a static PSK with a PQC PSK', () => {
     // The same WireGuard slot, two different facts: one never rotates.
     expect(protectionMeta(profile(), 'ml_kem', 'up').tone).toBe('pqc')

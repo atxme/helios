@@ -68,6 +68,8 @@ interface Props {
   renewing: boolean
   /** Renews the ML-KEM PSK through the tunnel. */
   onRenewKey: () => void
+  /** DNS queries leave a full tunnel: the headline says so. */
+  dnsLeavesTunnel?: boolean
 }
 
 const POSTURE_ICON = {
@@ -105,9 +107,10 @@ export function ConnectView({
   onDisconnect,
   onOpenSsh,
   onRenewKey,
+  dnsLeavesTunnel = false,
 }: Props) {
   const meta = stateMeta(state)
-  const posture = postureMeta(state, adapterUp)
+  const posture = postureMeta(state, adapterUp, dnsLeavesTunnel)
   const [now, setNow] = useState(Date.now())
 
   useEffect(() => {

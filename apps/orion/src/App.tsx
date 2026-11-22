@@ -20,7 +20,7 @@ import { AboutDialog } from './components/AboutDialog'
 import { EventLog } from './components/EventLog'
 import { OrionMark } from './components/OrionMark'
 import { PosturePanel } from './components/PosturePanel'
-import { postureMeta } from './components/state'
+import { dnsLeavesFullTunnel, postureMeta } from './components/state'
 import { GUTTER, PINE } from './theme'
 import { overlapReason } from './views/astra/rotationRows'
 
@@ -454,6 +454,7 @@ export default function App() {
                 adapterUp={c.adapterUp}
                 psk={c.psk}
                 renewing={c.renewing}
+                dnsLeavesTunnel={dnsLeavesFullTunnel(c.dns)}
                 onConnect={async () => {
                   setConnectNotice(null)
                   const outcome = await c.connect(c.selectedName)

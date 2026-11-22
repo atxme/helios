@@ -329,20 +329,29 @@ describe('Orion presentational branches', () => {
     }
   })
 
-  it('names why the system resolvers stay in place, without amber', () => {
-    const cases = [
-      ['not_full_tunnel', 'DNS local : le profil ne capture pas tout le trafic'],
+  it('names why the system resolvers stay in place, amber when the tunnel is full', () => {
+    // A full capture whose DNS queries leave the tunnel is amber: the posture
+    // must not read as protected while they do (spec §5.6).
+    const amber = [
       ['gateway_declines', 'DNS local : la passerelle ne propose pas de DNS par le tunnel'],
       ['no_resolver', "DNS local : le profil n'en déclare pas"],
     ] as const
-    for (const [reason, label] of cases) {
+    for (const [reason, label] of amber) {
       const html = postureHtml(profile(), null, null, {
         check: { status: 'left', reason },
         proposalUnread: false,
       })
       expect(html).toContain(label)
-      expect(html).not.toContain('rgb(161, 98, 7)')
+      expect(html).toContain('rgb(161, 98, 7)')
     }
+    // A profile that does not capture everything does not claim a full
+    // tunnel: its reason stays neutral.
+    const neutral = postureHtml(profile(), null, null, {
+      check: { status: 'left', reason: 'not_full_tunnel' },
+      proposalUnread: false,
+    })
+    expect(neutral).toContain('DNS local : le profil ne capture pas tout le trafic')
+    expect(neutral).not.toContain('rgb(161, 98, 7)')
   })
 
   it('states a refused resolver change in amber, with the driver answer', () => {
