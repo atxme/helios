@@ -104,9 +104,16 @@ Le poser dans `/var/lib/helios/wg-key.recovery` par l'accès hors bande, puis
 redémarrer : la gateway ne le lit que si son coffre est indéchiffrable, le
 rescelle et l'efface.
 
-La même cérémonie est disponible dans Orion, onglet *Astra › Rotations*, au-dessus
-du panneau des rotations : bloc « Récupérer l'identité de la gateway », qui
-fait les deux étapes par sélection de fichiers, sans tunnel.
+La même cérémonie est disponible dans Orion, sous Windows seulement, onglet
+*Astra › Rotations*, au-dessus du panneau des rotations : bloc « Récupérer
+l'identité de la gateway », sans tunnel. La clé de séquestre se choisit dans une
+boîte native de Windows et Orion la lit elle-même ; le fichier `wg-key.recovery`
+s'enregistre à l'emplacement choisi dans une boîte native, et Orion l'écrit lui-même.
+Ni la clé ni le fichier ne passent par l'interface : elle n'affiche que le nom du
+fichier écrit. Un refus est affiché par l'un des dix codes fermés :
+`escrow_unreadable`, `legacy_escrow`, `escrow_inconsistent`, `counter_unknown`,
+`authorization_invalid`, `foreign_gateway`, `request_mismatch`, `frame_malformed`,
+`request_malformed` ou `platform_unsupported` (hors Windows).
 
 ## 2 bis. Mettre à jour l'OS de la gateway
 

@@ -156,13 +156,15 @@ helios escrow prepare-recovery --escrow wg-key.escrow \
 ```
 
 La commande affiche la clé publique de l'identité et le compteur à signer, par
-défaut celui du séquestre plus un. Ce défaut ne vaut qu'après un billet dans le
-même démarrage ; sans billet (coffre perdu simplement), la valeur à passer avec
-`--counter` est le compteur courant `C`, lu dans `anti-rollback.json` ou avec
-`heliosd tpm counter-status`. Dans Orion, la même valeur va dans le champ
-facultatif « Valeur du compteur (lue sur la gateway) ». L'éditeur signe `wg-recovery-request.json`
-avec `helios-publisher wg-recovery`, puis l'opérateur assemble le fichier à
-déposer :
+défaut celui du séquestre plus un. Ce défaut vaut dès qu'un billet a été consommé
+depuis l'écriture du séquestre, y compris quand le billet et la récupération sont
+consommés à deux démarrages différents. Sans billet consommé depuis (coffre perdu
+simplement), le compteur à passer est le compteur courant `C`. Dans les deux cas,
+la valeur à préférer est celle lue sur la gateway (`heliosd tpm counter-status`
+ou `anti-rollback.json`), à passer avec `--counter` ; dans Orion, la même valeur va
+dans le champ facultatif « Valeur du compteur (lue sur la gateway) ». L'éditeur
+signe `wg-recovery-request.json` avec `helios-publisher wg-recovery`, puis
+l'opérateur assemble le fichier à déposer :
 
 ```sh
 helios escrow assemble-recovery --escrow wg-key.escrow \
@@ -176,7 +178,9 @@ Cette étape refuse une autorisation pour une autre gateway ou un autre compteur
 avant toute écriture. Le fichier `wg-key.recovery` porte la clé privée en clair :
 le déposer dans `/var/lib/helios/wg-key.recovery`, par l'accès hors bande, puis
 redémarrer. La gateway ne lit ce fichier que si son coffre est indéchiffrable ;
-elle le rescelle, puis l'efface.
+elle le rescelle, puis l'efface. Dans Orion (Windows seulement), la clé de
+séquestre se choisit dans une boîte native et le fichier s'enregistre par une
+boîte native : ni l'une ni l'autre ne passe par l'interface.
 
 Le séquestre peut être en retard sur le TPM : il ne porte que la valeur du
 dernier démarrage qui a ouvert le coffre. Avant de signer, vérifier la valeur sur
@@ -186,6 +190,33 @@ la gateway (`anti-rollback.json`) si elle est joignable.
 consommés au même démarrage, le billet vise `C` et la récupération `C+1`. Le
 billet est consommé d'abord (`C` → `C+1`), la récupération ensuite (`C+1` → `C+2`).
 L'éditeur signe donc le billet pour `C` et le fichier de récupération pour `C+1`.
+La même règle vaut quand les deux sont consommés à des démarrages différents : le
+compteur a avancé d'autant, et la valeur lue sur la gateway fait foi.
+
+## Passage au compteur NV
+
+Une gateway déployée avant F5 n'a pas encore de compteur NV, et son séquestre est
+au format HESC v1 : il ne porte ni compteur ni clé publique, aucune requête de
+récupération ne peut en être tirée. Le passage se fait ainsi.
+
+1. Installer le `heliosd` de F5 et le redémarrer **une fois, sur des PCR
+   inchangés**. Ce démarrage définit le compteur (`observe_counter` : définition
+   si absent, puis lecture, publiée dans `anti-rollback.json`). Le coffre
+   s'ouvrant normalement, il réécrit aussi `wg-key.escrow` au format HESC v2, avec
+   le compteur lu à cet instant. La déclaration `escrow_public_key` doit être en
+   place, sans quoi aucun séquestre n'est écrit.
+2. Vérifier `anti-rollback.json` : il doit porter `{"counter": N}`, sans `error`.
+   Récupérer ensuite le nouveau `wg-key.escrow` et le conserver hors de la gateway.
+
+Garde-fous :
+
+* ne jamais combiner ce premier démarrage de F5 avec une mise à jour qui déplace
+  les PCR (noyau, bootloader, firmware), sauf fenêtre de mise à jour armée
+  ([ADR-007](adr/ADR-007-FENETRE-DE-MISE-A-JOUR.md)). Sinon le coffre est perdu,
+  le séquestre est encore au format v1, et aucun outil ne peut récupérer la clé ;
+* si `anti-rollback.json` porte une `error`, ne jamais installer de mise à jour
+  qui déplace les PCR sans fenêtre armée ;
+* l'accès Tailscale n'est pas affecté pendant tout le passage.
 
 ## Firmware : préparation, installation et redémarrage
 

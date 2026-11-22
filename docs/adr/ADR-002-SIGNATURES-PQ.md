@@ -350,11 +350,14 @@ courants.
 
 ## Migration
 
-Rien n'est déployé : **rupture nette**, pas de période de tolérance. Les billets
-Ed25519 seuls (`helios-tpm-reseal-v1`) sont refusés. Le passage au compteur NV
-(lot compteur, 22 novembre 2026) suit la même règle : la signature `v2` n'est
-plus vérifiée, le billet est `v3`, sans période de double acceptation.
+Une gateway est déployée. La rupture reste **nette**, sans période de tolérance :
+les billets Ed25519 seuls (`helios-tpm-reseal-v1`) sont refusés. Le passage au
+compteur NV (lot compteur, 22 novembre 2026) suit la même règle : la signature
+`v2` n'est plus vérifiée, le billet est `v3`, sans période de double acceptation.
 Une période de double acceptation serait précisément une fenêtre de downgrade.
+Le passage de cette gateway suit « Passage au compteur NV » dans
+[MAINTENANCE.md](../MAINTENANCE.md) : le premier démarrage de F5, sur des PCR
+inchangés, définit le compteur et réécrit le séquestre.
 
 ## Ce que cela ne protège pas
 

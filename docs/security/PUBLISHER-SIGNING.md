@@ -87,13 +87,15 @@ WireGuard : la requête est publique. L'outil signe ce JSON tel quel, refuse tou
 champ inconnu et n'écrase jamais un fichier existant.
 
 Le `counter` signé doit être celui que la gateway attend au moment de la
-récupération. Si un billet de rescellement est consommé dans le même démarrage,
-la récupération vise la valeur suivante : billet pour `C`, récupération pour
-`C+1`. `prepare-recovery` propose `C+1` par défaut, d'après le séquestre ;
-l'opérateur vérifie la valeur sur la gateway (`heliosd tpm counter-status`) avant
-de signer. Sans billet dans le même démarrage (coffre perdu simplement), la
-valeur à passer avec `--counter` est le compteur courant `C`, et non `C+1` ; dans
-Orion, la même valeur va dans le champ facultatif « Valeur du compteur (lue sur la
+récupération. `prepare-recovery` propose, par défaut, le compteur du séquestre
+plus un : ce défaut vaut dès qu'un billet de rescellement a été consommé depuis
+l'écriture du séquestre, y compris quand le billet et la récupération sont
+consommés à deux démarrages différents. Dans ce cas, le billet vise `C` et la
+récupération `C+1`. Sans billet consommé depuis (coffre perdu simplement), la
+valeur à passer avec `--counter` est le compteur courant `C`, et non `C+1`. La
+valeur à préférer est toujours celle lue sur la gateway (`heliosd tpm
+counter-status` ou `anti-rollback.json`), à passer avec `--counter` ; dans Orion,
+la même valeur va dans le champ facultatif « Valeur du compteur (lue sur la
 gateway) ».
 
 Les deux signatures couvrent exactement :
