@@ -95,6 +95,7 @@ function client(overrides: Record<string, unknown> = {}) {
     adapterUp: false,
     selectedProfile: null,
     psk: null,
+    dns: { check: null, proposalUnread: false },
     backend: 'dry-run',
     pathImportedProfile: null,
     error: null,
