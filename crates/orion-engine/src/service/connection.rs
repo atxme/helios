@@ -209,12 +209,17 @@ impl EngineService {
                     }
                     TunnelState::Down | TunnelState::Failed => {
                         telemetry.stop();
-                        if let Some(task) = dns_task_slot
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take()
-                        {
-                            task.abort();
+                        // The adapter stays mounted on `Failed`, and a `Failed -> Up`
+                        // recovery reads the proposal retained by the DNS task: only
+                        // `Down` ends it.
+                        if matches!(state, TunnelState::Down) {
+                            if let Some(task) = dns_task_slot
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take()
+                            {
+                                task.abort();
+                            }
                         }
                         if let Some(task) = renewal_task
                             .lock()
@@ -301,14 +306,6 @@ impl EngineService {
     /// that differ by one step end up differing by more.
     pub async fn stop_connection(&self, sink: EventSink) -> Result<(), String> {
         self.telemetry.stop();
-        if let Some(task) = self
-            .gateway_dns_task
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            task.abort();
-        }
         // The inference stops before the state moves, not after: a poll that read
         // `Up` and lands once the tunnel is down would re-announce `Connecting`
         // behind the disconnection the user just asked for.
@@ -319,6 +316,16 @@ impl EngineService {
             .take();
         if let Some(poll) = poll {
             poll.abort();
+        }
+        // After the poll: a late `Up` from the poll would otherwise spawn a DNS
+        // task that nothing aborts.
+        if let Some(task) = self
+            .gateway_dns_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
         }
         self.controller
             .disconnect(sink)
