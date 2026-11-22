@@ -5,18 +5,20 @@
 # `helios-build:<12 premiers hex du SHA-256 de ce fichier>`.
 #
 # Monter de version : changer les ARG ci-dessous (DEBIAN_DIGEST, SNAPSHOT,
-# RUSTUP_INIT_SHA256, RUST_VERSION, NODE_VERSION, NODE_SHA256). Les versions
+# RUSTUP_VERSION, RUSTUP_INIT_SHA256, RUST_VERSION, NODE_VERSION, NODE_SHA256). Les versions
 # de Rust et de Node sont ensuite alignées dans le dépôt : `python3
 # scripts/toolchain_pins.py` dit ce qui reste à changer. Les paquets apt sont
 # figés par l'horodatage SNAPSHOT : les changer évolue avec lui.
 #
 # Valeurs courantes : DEBIAN_DIGEST = index multi-architectures de
 # debian:trixie-slim (`docker buildx imagetools inspect debian:trixie-slim`) ;
-# RUSTUP_INIT_SHA256 = static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init.sha256 ;
+# RUSTUP_INIT_SHA256 = static.rust-lang.org/rustup/archive/<RUSTUP_VERSION>/x86_64-unknown-linux-gnu/rustup-init.sha256
+# (version figée : le chemin dist/ sert le dernier rustup, qui casse le SHA-256 à chaque sortie) ;
 # NODE_SHA256 = nodejs.org/dist/v<NODE_VERSION>/SHASUMS256.txt, ligne linux-x64.tar.xz.
 
 ARG DEBIAN_DIGEST=a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 ARG SNAPSHOT=20261120T000000Z
+ARG RUSTUP_VERSION=1.29.3
 ARG RUSTUP_INIT_SHA256=b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55
 ARG RUST_VERSION=1.100.0
 ARG NODE_VERSION=26.13.1
@@ -25,6 +27,7 @@ ARG NODE_SHA256=5c063e46bab0fbc1c17cc445d7ff129cbdcd0471be6ed83b6ab864f8143bc864
 FROM debian:trixie-slim@sha256:${DEBIAN_DIGEST}
 
 ARG SNAPSHOT
+ARG RUSTUP_VERSION
 ARG RUSTUP_INIT_SHA256
 ARG RUST_VERSION
 ARG NODE_VERSION
@@ -70,7 +73,7 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources \
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo
 RUN curl --proto '=https' --tlsv1.2 -sSfL \
-      https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init \
+      https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init \
       -o /tmp/rustup-init \
  && echo "${RUSTUP_INIT_SHA256}  /tmp/rustup-init" | sha256sum -c - \
  && chmod +x /tmp/rustup-init \

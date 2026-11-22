@@ -28,6 +28,8 @@ const OUT_MOUNT: &str = "/helios/out";
 const KEYRING_MOUNT: &str = "/helios/keyring.json";
 const CARGO_HOME_MOUNT: &str = "/helios/cargo";
 const TARGET_MOUNT: &str = "/helios/target";
+/// Runs the command under the umask the outputs depend on (see [`run_args`]).
+const UMASK_WRAPPER: [&str; 4] = ["sh", "-c", "umask 022 && exec \"$@\"", "helios-build"];
 const RUSTFLAGS: &str =
     "--remap-path-prefix=/helios/src=/helios --remap-path-prefix=/helios/cargo=/cargo";
 
@@ -173,6 +175,9 @@ pub fn source_date_epoch(root: &Path) -> Result<u64> {
 }
 
 /// The `docker run` arguments of one build, ending with the command.
+///
+/// The command runs under `umask 022` set explicitly, so that the modes of
+/// the outputs do not depend on the Docker daemon's default.
 pub fn run_args(run: &ContainerRun) -> Result<Vec<OsString>> {
     let keyring = std::path::absolute(&run.keyring)
         .with_context(|| format!("resolving the keyring path {}", run.keyring.display()))?;
@@ -208,6 +213,7 @@ pub fn run_args(run: &ContainerRun) -> Result<Vec<OsString>> {
         option(&mut args, "-e", format!("CARGO_BUILD_JOBS={jobs}"));
     }
     args.push(run.image.clone().into());
+    args.extend(UMASK_WRAPPER.iter().map(OsString::from));
     args.extend(run.command.iter().map(OsString::from));
     Ok(args)
 }
@@ -504,9 +510,33 @@ mod tests {
         )));
         assert!(args.ends_with(&[
             "helios-build:0123456789ab".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            "umask 022 && exec \"$@\"".to_string(),
+            "helios-build".to_string(),
             "cargo".to_string(),
             "--version".to_string(),
         ]));
+    }
+
+    #[test]
+    fn run_args_run_the_command_under_umask_022() {
+        let scratch = Scratch::new("umask");
+        let keyring = scratch.path().join("keyring.json");
+        write(&keyring, "{}");
+        let args = strings(&run_args(&sample_run(keyring)).expect("run args"));
+
+        let image = args
+            .iter()
+            .position(|arg| arg == "helios-build:0123456789ab")
+            .expect("image argument");
+        assert_eq!(&args[image + 1], "sh");
+        assert_eq!(&args[image + 2], "-c");
+        let script = &args[image + 3];
+        assert!(script.starts_with("umask 022 &&"), "{script}");
+        assert!(script.ends_with("exec \"$@\""), "{script}");
+        assert_eq!(&args[image + 4], "helios-build");
+        assert_eq!(&args[image + 5..], ["cargo", "--version"]);
     }
 
     #[test]
