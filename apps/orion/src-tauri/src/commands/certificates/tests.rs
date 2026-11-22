@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(not(windows))]
+use crate::commands::test_support::command_app;
 use crate::commands::test_support::scripted_engine;
 use aether::certificates::approval::{
     AstraCredentialApprovalRequest, AstraCredentialBinding, CredentialRegistry, CredentialState,
@@ -48,6 +50,124 @@ fn blocked_action() -> CertificateActionState {
         message: Some(reason.message()),
         blocked_by: Some(reason),
     }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn state_backed_certificate_commands_forward_through_the_managed_engine_client() {
+    use tauri::Manager;
+
+    let (client, mut engine) = scripted_engine().await;
+    let app = command_app(client);
+    let state = app.state::<AppState>();
+    let expected_settings = settings();
+
+    let command_task = async {
+        let inventory = certificate_inventory(state.clone(), Some(expected_settings.clone())).await;
+        let overview = certificate_overview(state.clone()).await;
+        let actions = certificate_actions(state.clone(), Some(expected_settings.clone())).await;
+        let action =
+            run_certificate_action(state.clone(), PROFILE.into(), CertificateAction::RenewNow)
+                .await;
+        let recovery = resume_certificate_recovery(state.clone(), "operation-a".into()).await;
+        let manifest = certificate_approval_manifest(state.clone(), PROFILE.into()).await;
+        let error = last_certificate_error(state, PROFILE.into()).await;
+        (
+            inventory, overview, actions, action, recovery, manifest, error,
+        )
+    };
+    let engine_task = async {
+        engine
+            .reply(|command| {
+                assert!(matches!(
+                    command,
+                    EngineCommand::CertificateInventory {
+                        key_negotiation: Some(_)
+                    }
+                ));
+                Ok(EngineReply::CertificateInventory(inventory()))
+            })
+            .await;
+        engine
+            .reply(|command| {
+                assert!(matches!(command, EngineCommand::CertificateOverview));
+                Ok(EngineReply::CertificateOverview(Vec::new()))
+            })
+            .await;
+        engine
+            .reply(|command| {
+                assert!(matches!(
+                    command,
+                    EngineCommand::CertificateActions {
+                        key_negotiation: Some(_)
+                    }
+                ));
+                Ok(EngineReply::CertificateActions(vec![blocked_action()]))
+            })
+            .await;
+        engine.reply(|command| {
+            assert!(matches!(command, EngineCommand::RunCertificateAction { name, action: CertificateAction::RenewNow } if name == PROFILE));
+            Ok(EngineReply::ActionOutcome(ActionOutcome::of(
+                PROFILE,
+                RenewalProgress::Committed { generation: 12 },
+            )))
+        }).await;
+        engine.reply(|command| {
+            assert!(matches!(command, EngineCommand::ResumeCertificateRecovery { operation_id } if operation_id == "operation-a"));
+            Ok(EngineReply::ActionOutcome(ActionOutcome::of(
+                PROFILE,
+                RenewalProgress::Recovered {
+                    generation: 12,
+                    activation_at: NOW + 200,
+                },
+            )))
+        }).await;
+        engine.reply(|command| {
+            assert!(matches!(command, EngineCommand::CertificateApprovalManifest { name } if name == PROFILE));
+            Ok(EngineReply::ApprovalManifest(ApprovalManifest {
+                operation_id: "operation-a".into(),
+                client_wg_public_key: WireGuardKey::from_bytes([8; 32]).to_base64(),
+                active_generation: 11,
+                requested_generation: 12,
+                request_fingerprint: Fingerprint::of(b"rotation request").to_hex(),
+                expires_at: NOW + 150,
+                eligible_credentials: 1,
+            }))
+        }).await;
+        engine.reply(|command| {
+            assert!(matches!(command, EngineCommand::LastCertificateError { name } if name == PROFILE));
+            Ok(EngineReply::LastError(Some("request expired".into())))
+        }).await;
+    };
+
+    let (
+        (
+            inventory_result,
+            overview_result,
+            actions_result,
+            action_result,
+            recovery_result,
+            manifest_result,
+            error_result,
+        ),
+        (),
+    ) = tokio::join!(command_task, engine_task);
+    assert_eq!(inventory_result.unwrap(), inventory());
+    assert!(overview_result.unwrap().is_empty());
+    assert_eq!(actions_result.unwrap(), vec![blocked_action()]);
+    assert_eq!(
+        action_result.unwrap().progress.get(PROFILE),
+        Some(&RenewalProgress::Committed { generation: 12 })
+    );
+    assert_eq!(
+        recovery_result.unwrap().progress.get(PROFILE),
+        Some(&RenewalProgress::Recovered {
+            generation: 12,
+            activation_at: NOW + 200,
+        })
+    );
+    assert_eq!(manifest_result.unwrap().eligible_credentials, 1);
+    assert_eq!(error_result.unwrap().as_deref(), Some("request expired"));
 }
 
 #[tokio::test]
