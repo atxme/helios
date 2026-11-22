@@ -183,6 +183,17 @@ pub async fn fetch_proposal(heliosd_url: &str) -> Result<ClientDnsProposal, Prop
     if !status.is_success() {
         return Err(ProposalError::Unreachable(format!("réponse HTTP {status}")));
     }
+    // A gateway without the route can answer `200` with its web page. Only a
+    // JSON answer is a proposal: anything else is a gateway that predates it.
+    let is_json = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"));
+    if !is_json {
+        return Err(ProposalError::NotServed);
+    }
     let body = response
         .bytes()
         .await
@@ -233,16 +244,25 @@ pub async fn follow_gateway_proposal(
                 last_detail = detail;
             }
             Err(error) => {
-                sink(ClientEvent::dns(DnsCheck::ProposalUnread {
-                    reason: error.to_string(),
-                }));
+                report_unread(sink, error.to_string());
                 return;
             }
         }
     }
-    sink(ClientEvent::dns(DnsCheck::ProposalUnread {
-        reason: format!("passerelle injoignable après {PROPOSAL_ATTEMPTS} essais : {last_detail}"),
-    }));
+    report_unread(
+        sink,
+        format!("passerelle injoignable après {PROPOSAL_ATTEMPTS} essais : {last_detail}"),
+    );
+}
+
+/// The proposal was not read: the verdict is kept as a flag on screen, and
+/// the reason goes to the journal, which is the one place that says why.
+fn report_unread(sink: &EventSink, reason: String) {
+    sink(ClientEvent::log(
+        "warn",
+        format!("proposition DNS de la passerelle non lue : {reason}"),
+    ));
+    sink(ClientEvent::dns(DnsCheck::ProposalUnread { reason }));
 }
 
 #[cfg(test)]
@@ -427,9 +447,15 @@ mod tests {
         );
     }
 
+    /// What a gateway serves: JSON, as `axum::Json` does.
     fn response(status: &str, body: &str) -> Option<String> {
+        with_content_type(status, "application/json", body)
+    }
+
+    fn with_content_type(status: &str, content_type: &str, body: &str) -> Option<String> {
         Some(format!(
-            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
             body.len()
         ))
     }
@@ -473,6 +499,20 @@ mod tests {
     #[tokio::test]
     async fn fetch_maps_404_to_not_served() {
         let url = serve_each(vec![response("404 Not Found", "")]).await;
+        assert_eq!(fetch_proposal(&url).await, Err(ProposalError::NotServed));
+    }
+
+    /// An older gateway whose router falls back to its web page answers `200`
+    /// with HTML: that is a gateway without the route, not a refused proposal.
+    #[tokio::test]
+    async fn fetch_maps_an_html_page_to_not_served() {
+        let page = "<!doctype html><html><body>console</body></html>";
+        let url = serve_each(vec![with_content_type(
+            "200 OK",
+            "text/html; charset=utf-8",
+            page,
+        )])
+        .await;
         assert_eq!(fetch_proposal(&url).await, Err(ProposalError::NotServed));
     }
 
@@ -544,6 +584,32 @@ mod tests {
         let profile = crate::backend::dryrun::tests::helios();
         backend.up(&profile, &sink).await.expect("dry-run up");
         (backend, controller, profile, sink, log)
+    }
+
+    /// The journal says why the proposal was not read, not only the flag.
+    #[cfg(feature = "certificate-signing")]
+    #[tokio::test]
+    async fn a_proposal_given_up_is_explained_in_the_journal() {
+        let url = serve_each(vec![response("404 Not Found", "")]).await;
+        let (_backend, controller, profile, sink, log) = mounted_helios().await;
+
+        follow_gateway_proposal(&controller, &profile, &url, Duration::ZERO, &sink).await;
+
+        let warnings: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                ClientEvent::Log { level, message } if level == "warn" => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            warnings
+                .iter()
+                .any(|message| message.contains("la passerelle ne propose pas de DNS")),
+            "{warnings:?}"
+        );
     }
 
     #[cfg(feature = "certificate-signing")]
