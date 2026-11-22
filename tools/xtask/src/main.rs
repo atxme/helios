@@ -26,7 +26,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use xtask::orion_deps;
+use xtask::{archive, orion_deps};
 
 /// Features of the shipped gateway. A production bundle carries all of them:
 /// a `heliosd` without `netlink` or `wireguard` would refuse to start on a
@@ -341,6 +341,7 @@ fn bundle(target: Option<String>, skip_frontend: bool, output: Option<PathBuf>) 
         "cargo",
         &[
             "build",
+            "--locked",
             "--release",
             "--target",
             &target,
@@ -435,9 +436,10 @@ fn bundle_staging_dir(
     })
 }
 
-fn gateway_build_args(target: &str) -> [&str; 8] {
+fn gateway_build_args(target: &str) -> [&str; 9] {
     [
         "build",
+        "--locked",
         "--release",
         "--target",
         target,
@@ -495,11 +497,7 @@ fn pack(dir: &Path, output: Option<PathBuf>) -> Result<()> {
         .to_string_lossy()
         .to_string();
 
-    run(
-        &parent,
-        "tar",
-        &["-czf", &archive.to_string_lossy(), "--", &name],
-    )?;
+    archive::create(&parent, &name, &archive, archive::entry_mtime())?;
 
     let digest = helios_update::sha256_file(&archive)
         .map_err(|e| anyhow::anyhow!("archive fingerprint: {e}"))?;
@@ -761,6 +759,7 @@ mod tests {
             gateway_build_args("x86_64-unknown-linux-gnu"),
             [
                 "build",
+                "--locked",
                 "--release",
                 "--target",
                 "x86_64-unknown-linux-gnu",
@@ -1066,8 +1065,8 @@ mod tests {
 
         let error = pack(&root, Some(archive.clone())).expect_err("unwritable output destination");
         let message = format!("{error:#}");
-        assert!(message.contains("tar -czf"), "{message}");
-        assert!(message.contains("failed"), "{message}");
+        assert!(message.contains("tar failed"), "{message}");
+        assert!(message.contains("not written"), "{message}");
         assert!(!archive.exists());
         assert!(!archive_path(&root).expect("default archive path").exists());
     }
