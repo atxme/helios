@@ -121,7 +121,7 @@ fn export_with(
     // A missing marker excludes a legitimate live OS window. Revoke any
     // orphaned NV copy by Owner, without reading a PCR-bound old index.
     provisioning::disarm_window(tpm, store)?;
-    let encrypted_secret = helios_escrow::seal_to_operator(public, root.as_bytes())
+    let encrypted_secret = helios_escrow::seal_secret_to_operator(public, root.as_bytes())
         .map_err(|e| refused(e.to_string()))?;
     Ok(FirmwareBackup {
         request,
@@ -296,7 +296,9 @@ mod tests {
         )
         .unwrap();
         let recovered =
-            helios_escrow::open_as_operator(private.as_slice(), &backup.encrypted_secret).unwrap();
+            helios_escrow::open_as_operator(private.as_slice(), &backup.encrypted_secret)
+                .unwrap()
+                .plaintext;
         (dir, cfg, tpm, backup, recovered)
     }
     fn sign(request: FirmwareRecoveryPayload) -> SignedFirmwareRecovery {

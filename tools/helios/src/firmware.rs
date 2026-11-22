@@ -577,7 +577,7 @@ fn private_key(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
 }
 fn recover(backup: &FirmwareBackup, private_path: &Path) -> Result<Zeroizing<Vec<u8>>> {
     let key = private_key(private_path)?;
-    let recovered = helios_escrow::open_as_operator(&key, &backup.encrypted_secret)?;
+    let recovered = helios_escrow::open_as_operator(&key, &backup.encrypted_secret)?.plaintext;
     firmware_recovery::check_secret(&backup.request, &recovered)?;
     Ok(recovered)
 }
@@ -613,7 +613,7 @@ fn prepare<G: Gateway>(
             backup.request.device_id == device && backup.request.target_version == version,
             "gateway exported another firmware context"
         );
-        let recovered = helios_escrow::open_as_operator(&key, &backup.encrypted_secret)?;
+        let recovered = helios_escrow::open_as_operator(&key, &backup.encrypted_secret)?.plaintext;
         firmware_recovery::check_secret(&backup.request, &recovered)?;
         Some(backup)
     } else {

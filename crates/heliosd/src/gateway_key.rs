@@ -213,7 +213,29 @@ fn write_escrow(network: &NetworkConfig, private_key: &str) {
         }
     };
 
-    match helios_escrow::seal_to_operator(&pubkey, private_key.as_bytes()) {
+    // Minimal repair until the counter is wired in: the escrow records the
+    // gateway public key, derived here from the key it carries.
+    let gateway_public_key = match aether::wg::public_from_private(private_key)
+        .ok()
+        .and_then(|public| {
+            base64::engine::general_purpose::STANDARD
+                .decode(public)
+                .ok()
+        })
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+    {
+        Some(key) => key,
+        None => {
+            warn!("the WireGuard key cannot be derived — escrow not written");
+            return;
+        }
+    };
+    let metadata = helios_escrow::EscrowMetadata {
+        counter: None,
+        gateway_public_key,
+    };
+
+    match helios_escrow::seal_to_operator(&pubkey, private_key.as_bytes(), &metadata) {
         Ok(blob) => match write_atomic(&escrow_path(), &blob) {
             Ok(()) => info!(
                 path = %escrow_path(),
@@ -757,7 +779,7 @@ mod tests {
             );
             let opened = helios_escrow::open_as_operator(private_key.as_ref(), &blob)
                 .expect("the operator must be able to open it");
-            assert_eq!(opened.as_slice(), wg_private.as_bytes());
+            assert_eq!(opened.plaintext.as_slice(), wg_private.as_bytes());
         });
     }
 

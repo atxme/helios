@@ -1,4 +1,6 @@
-use helios_escrow::{generate_operator_keypair, open_as_operator, seal_to_operator};
+use helios_escrow::{
+    generate_operator_keypair, open_as_operator, seal_to_operator, EscrowMetadata,
+};
 
 use crate::{Context, SealedKeystore, SecretKey, DOMAIN_GATEWAY_WG_KEY};
 
@@ -19,7 +21,13 @@ fn full_recovery_after_a_pcr_change() {
 
     let secret_before = SecretKey::from_bytes([1u8; 32]);
     store.store(&secret_before, &ctx(), wg_key).unwrap();
-    let escrow_blob = seal_to_operator(&operator_public, wg_key).unwrap();
+    // The recovery core checks the recorded key; this test covers the
+    // TPM round trip and does not depend on the key's value.
+    let metadata = EscrowMetadata {
+        counter: None,
+        gateway_public_key: [7u8; 32],
+    };
+    let escrow_blob = seal_to_operator(&operator_public, wg_key, &metadata).unwrap();
     assert_eq!(
         store.load(&secret_before, &ctx()).unwrap().as_slice(),
         wg_key
@@ -31,7 +39,9 @@ fn full_recovery_after_a_pcr_change() {
         "the vault must be unreadable with the new secret"
     );
 
-    let recovered = open_as_operator(operator_private.as_slice(), &escrow_blob).unwrap();
+    let recovered = open_as_operator(operator_private.as_slice(), &escrow_blob)
+        .unwrap()
+        .plaintext;
     assert_eq!(recovered.as_slice(), wg_key, "identity recovered");
 
     store.store(&secret_after, &ctx(), &recovered).unwrap();

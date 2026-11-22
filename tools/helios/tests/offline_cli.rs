@@ -74,8 +74,20 @@ fn offline_escrow_commands_print_only_the_public_keys_and_leave_a_recovery_file(
 
     let gateway = aether::wg::generate_keypair().unwrap();
     let public = STANDARD.decode(operator_public.trim()).unwrap();
-    let blob =
-        helios_escrow::seal_to_operator(&public, gateway.private_key.expose().as_bytes()).unwrap();
+    let metadata = helios_escrow::EscrowMetadata {
+        counter: Some(1),
+        gateway_public_key: STANDARD
+            .decode(&gateway.public_key)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    };
+    let blob = helios_escrow::seal_to_operator(
+        &public,
+        gateway.private_key.expose().as_bytes(),
+        &metadata,
+    )
+    .unwrap();
     fs::write(temp.path().join("wg.escrow"), blob).unwrap();
     let args = [
         "escrow",

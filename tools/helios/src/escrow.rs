@@ -77,7 +77,8 @@ pub fn open(escrow_path: &Path, private_key_path: &Path, output: &Path) -> Resul
     }
 
     let recovered = helios_escrow::open_as_operator(&private_key, &blob)
-        .map_err(|e| anyhow::anyhow!("could not open escrow: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("could not open escrow: {e}"))?
+        .plaintext;
     let wg_private_key = std::str::from_utf8(recovered.as_slice())
         .context("escrow does not contain a base64 WireGuard key")?
         .trim()
@@ -160,7 +161,17 @@ mod tests {
         let directory = test_directory("open");
         std::fs::create_dir_all(&directory).unwrap();
         let (private, public) = helios_escrow::generate_operator_keypair().unwrap();
-        let blob = helios_escrow::seal_to_operator(&public, WG_PRIVATE_KEY.as_bytes()).unwrap();
+        let gateway_public_key: [u8; 32] = B64
+            .decode(aether::wg::public_from_private(WG_PRIVATE_KEY).unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let metadata = helios_escrow::EscrowMetadata {
+            counter: Some(1),
+            gateway_public_key,
+        };
+        let blob =
+            helios_escrow::seal_to_operator(&public, WG_PRIVATE_KEY.as_bytes(), &metadata).unwrap();
         let escrow_path = directory.join("wg-key.escrow");
         let private_path = directory.join(PRIVATE_FILE);
         let output = directory.join("recovery.key");
@@ -219,14 +230,18 @@ mod tests {
         let output = directory.join("output");
         std::fs::write(&private_path, B64.encode(private.as_slice())).unwrap();
 
-        let non_utf8 = helios_escrow::seal_to_operator(&public, &[0xff, 0xfe]).unwrap();
+        let metadata = helios_escrow::EscrowMetadata {
+            counter: Some(1),
+            gateway_public_key: [7u8; 32],
+        };
+        let non_utf8 = helios_escrow::seal_to_operator(&public, &[0xff, 0xfe], &metadata).unwrap();
         std::fs::write(&escrow_path, non_utf8).unwrap();
         assert!(open(&escrow_path, &private_path, &output)
             .unwrap_err()
             .to_string()
             .contains("base64 WireGuard key"));
 
-        let invalid = helios_escrow::seal_to_operator(&public, b"not-a-wg-key").unwrap();
+        let invalid = helios_escrow::seal_to_operator(&public, b"not-a-wg-key", &metadata).unwrap();
         std::fs::write(&escrow_path, invalid).unwrap();
         assert!(open(&escrow_path, &private_path, &output)
             .unwrap_err()
