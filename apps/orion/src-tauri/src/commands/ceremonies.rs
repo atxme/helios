@@ -272,9 +272,11 @@ pub(crate) async fn rename_operator_key(
     slot_id: String,
     label: String,
 ) -> Result<(), String> {
-    ensure_no_open_ceremony(&state).await?;
-    let vault_path = state.vault_location.path()?;
-    crate::operator::rename_key(&vault_path, &slot_id, &label)
+    let status = state.operator.status().await;
+    guarded_operator_write(status.as_ref(), || {
+        let vault_path = state.vault_location.path()?;
+        crate::operator::rename_key(&vault_path, &slot_id, &label)
+    })
 }
 
 /// Records values on the domain relay beside the vault. No key: the relay is
@@ -284,11 +286,13 @@ pub(crate) async fn write_domain_relay(
     state: State<'_, AppState>,
     update: astra_operator::vault_gestures::RelayUpdate,
 ) -> Result<(), String> {
-    ensure_no_open_ceremony(&state).await?;
-    let vault_path = state.vault_location.path()?;
-    astra_operator::vault_gestures::write_relay(&vault_path, &update)
-        .map(|_| ())
-        .map_err(|error| format!("{error:#}"))
+    let status = state.operator.status().await;
+    guarded_operator_write(status.as_ref(), || {
+        let vault_path = state.vault_location.path()?;
+        astra_operator::vault_gestures::write_relay(&vault_path, &update)
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+    })
 }
 
 /// Records the connected gateway on the relay, from the leaf it serves.
@@ -301,11 +305,18 @@ pub(crate) async fn write_domain_relay(
 /// a relay or document that already names another gateway.
 #[tauri::command]
 pub(crate) async fn adopt_connected_gateway(state: State<'_, AppState>) -> Result<(), String> {
-    use orion_core::gateway_admin as admin;
-
     ensure_no_open_ceremony(&state).await?;
     let vault_path = state.vault_location.path()?;
-    let (base, tunnel_peer_key, _) = connected_profile(&state.client).await?;
+    adopt_connected_gateway_from(&state.client, vault_path).await
+}
+
+async fn adopt_connected_gateway_from(
+    engine: &EngineClient,
+    vault_path: std::path::PathBuf,
+) -> Result<(), String> {
+    use orion_core::gateway_admin as admin;
+
+    let (base, tunnel_peer_key, _) = connected_profile(engine).await?;
     let client = admin::orion_client().map_err(|error| error.to_string())?;
     let material = admin::gateway_negotiation(&client, &base)
         .await
@@ -426,7 +437,12 @@ pub(crate) async fn operator_rotation_transition_file(
 pub(crate) async fn operator_overview(
     state: State<'_, AppState>,
 ) -> Result<astra_operator::overview::VaultOverview, String> {
-    let path = state.vault_location.path()?;
+    operator_overview_from(state.vault_location.path()?).await
+}
+
+async fn operator_overview_from(
+    path: std::path::PathBuf,
+) -> Result<astra_operator::overview::VaultOverview, String> {
     on_work_stack("orion-vault-overview", "la lecture du coffre", move || {
         astra_operator::overview::read(&path).map_err(|error| error.to_string())
     })
@@ -609,6 +625,14 @@ pub(crate) async fn operator_send_vault_copy(
     ensure_no_open_ceremony(&state).await?;
     let vault_path = state.vault_location.path_to_look_at()?;
     let target = connected_target(&state).await?;
+    send_vault_copy_to(vault_path, target, replace_newer).await
+}
+
+async fn send_vault_copy_to(
+    vault_path: std::path::PathBuf,
+    target: crate::operator::GatewayTarget,
+    replace_newer: bool,
+) -> Result<crate::operator::rotations::VaultCopyOutcome, String> {
     let handle = tokio::runtime::Handle::current();
     on_work_stack(
         "orion-vault-copy",
@@ -668,19 +692,25 @@ pub(crate) async fn operator_export_vault(
         let picked = receiver
             .await
             .map_err(|_| "la boîte d'export du coffre s'est arrêtée".to_string())??;
-        match picked {
-            Some(target) => {
-                crate::operator::rotations::export_vault(&vault_path, &target)?;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+        export_picked_vault(&vault_path, picked)
     }
     #[cfg(not(target_os = "windows"))]
     {
         let _ = (state, window);
         Err("l'export du coffre n'existe que sous Windows".to_string())
     }
+}
+
+#[cfg(any(windows, test))]
+fn export_picked_vault(
+    vault_path: &std::path::Path,
+    target: Option<std::path::PathBuf>,
+) -> Result<bool, String> {
+    let Some(target) = target else {
+        return Ok(false);
+    };
+    crate::operator::rotations::export_vault(vault_path, &target)?;
+    Ok(true)
 }
 
 /// Opens a campaign for the actions this screen runs outside a rotation ceremony:
@@ -720,9 +750,13 @@ pub(crate) async fn operator_open_campaign(
 /// The certificate chain's held step, a copy. Read under the lock, which is never held across
 /// a call.
 fn held_chain(state: &AppState) -> Option<aether::certificates::transport::OperatorOpened> {
-    state
-        .chain_opened
-        .lock()
+    held_chain_from(&state.chain_opened)
+}
+
+fn held_chain_from(
+    held: &StdMutex<Option<aether::certificates::transport::OperatorOpened>>,
+) -> Option<aether::certificates::transport::OperatorOpened> {
+    held.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
 }
@@ -975,6 +1009,15 @@ fn no_open_ceremony(
     }
 }
 
+/// Runs a key-less vault/relay write only after the ceremony's last published state permits it.
+fn guarded_operator_write<T>(
+    status: Option<&aether::certificates::operator_session::OperatorStatus>,
+    write: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    no_open_ceremony(status)?;
+    write()
+}
+
 const NOT_THE_TUNNEL_GATEWAY: &str = "la gateway qui répond n'est pas celle du profil connecté";
 
 /// Whether the leaf a gateway served names that gateway, and the gateway is
@@ -1125,3 +1168,31 @@ fn gateway_profile<'v>(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "ceremonies/adoption_tests.rs"]
+mod adoption_tests;
+
+#[cfg(test)]
+#[path = "ceremonies/export_tests.rs"]
+mod export_tests;
+
+#[cfg(test)]
+#[path = "ceremonies/guarded_write_tests.rs"]
+mod guarded_write_tests;
+
+#[cfg(test)]
+#[path = "ceremonies/chain_tests.rs"]
+mod chain_tests;
+
+#[cfg(test)]
+#[path = "ceremonies/vault_tests.rs"]
+mod vault_tests;
+
+#[cfg(all(test, not(windows)))]
+#[path = "ceremonies/gateway_command_tests.rs"]
+mod gateway_command_tests;
+
+#[cfg(all(test, not(windows)))]
+#[path = "ceremonies/operator_campaign_tests.rs"]
+mod operator_campaign_tests;

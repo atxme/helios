@@ -56,6 +56,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# Exercise command entry points without a native window.
+tauri = { version = "2", features = ["test"] }
 # Une clé simulée signe de vraies assertions, celles que la cérémonie vérifie.
 aws-lc-rs.workspace = true
 # Chercher les ouvertures, sous leurs encodages, dans ce que reçoit la fenêtre.
