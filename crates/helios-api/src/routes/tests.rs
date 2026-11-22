@@ -270,7 +270,7 @@ async fn trust_publishes_the_required_hybrid_and_never_a_full_key() {
     // removes ML-DSA from REQUIRED_ALGS, this test breaks.
     assert_eq!(response.required_algs, vec!["ed25519", "ml-dsa-65"]);
     assert!(!response.publisher_keys.is_empty());
-    assert_eq!(response.reseal_domain, "helios-tpm-reseal-v2");
+    assert_eq!(response.reseal_domain, "helios-tpm-reseal-v3");
 
     // A fingerprint truncated to 128 bits, not the key.
     let payload = serde_json::to_string(&response).unwrap();
