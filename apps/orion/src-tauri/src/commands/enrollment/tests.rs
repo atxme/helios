@@ -145,3 +145,88 @@ async fn enrollment_commands_propagate_engine_refusals_and_reject_mismatched_rep
         EngineReply::RequestFile(REQUEST.into())
     );
 }
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn enrollment_commands_keep_the_preview_and_pending_request_bound_to_the_engine() {
+    let (client, mut engine) = scripted_engine().await;
+    let app = crate::commands::test_support::command_app(client);
+    let request = pending(0xab, "workstation", 1_799_999_800);
+    let id = request.request_id.to_string();
+    tokio::join!(
+        async {
+            let preview = preview_enrollment_invitation(app.state(), INVITATION.into())
+                .await
+                .expect("invitation preview");
+            let started = begin_enrollment(
+                app.state(),
+                preview.invitation_token,
+                preview.ca_fingerprint,
+                PROFILE.into(),
+            )
+            .await
+            .expect("begin with the preview's fingerprint and token");
+            let listed = list_pending_enrollments(app.state())
+                .await
+                .expect("list the pending request");
+            assert_eq!(listed.as_slice(), std::slice::from_ref(&request));
+            let selected = listed[0].request_id.to_string();
+            assert_eq!(
+                export_pending_request(app.state(), selected.clone()).await,
+                Ok(started)
+            );
+            discard_pending_enrollment(app.state(), selected)
+                .await
+                .expect("discard the selected request");
+            assert!(list_pending_enrollments(app.state())
+                .await
+                .unwrap()
+                .is_empty());
+        },
+        async {
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::PreviewEnrollmentInvitation { contents } if contents == INVITATION));
+                    Ok(EngineReply::InvitationPreview(InvitationPreviewView {
+                        server_name: "vpn.example.net".into(),
+                        ca_fingerprint: FINGERPRINT.into(),
+                        expires_at_unix: 1_800_000_000,
+                        invitation_token: TOKEN.into(),
+                    }))
+                })
+                .await;
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::BeginEnrollment {
+                        invitation, confirmed_ca_fingerprint, requested_name,
+                    } if invitation == TOKEN && confirmed_ca_fingerprint == FINGERPRINT && requested_name == PROFILE));
+                    Ok(EngineReply::EnrollmentStarted(REQUEST.into()))
+                })
+                .await;
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::ListPendingEnrollments));
+                    Ok(EngineReply::PendingEnrollments(vec![request.clone()]))
+                })
+                .await;
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::ExportPendingRequest { request_id } if request_id == id));
+                    Ok(EngineReply::RequestFile(REQUEST.into()))
+                })
+                .await;
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::DiscardPendingEnrollment { request_id } if request_id == id));
+                    Ok(EngineReply::Unit)
+                })
+                .await;
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::ListPendingEnrollments));
+                    Ok(EngineReply::PendingEnrollments(Vec::new()))
+                })
+                .await;
+        },
+    );
+}

@@ -2769,3 +2769,76 @@ fn readmission_refuses_the_same_token_twice_before_signing_or_issuing() {
     assert!(artifacts.is_empty());
     assert!(domain.registry_is_empty());
 }
+
+#[test]
+fn campaign_and_recovery_require_an_operation_id_before_reading_a_vault() {
+    for (kind, message) in [
+        (
+            OperationKind::ApproveCampaign,
+            "l'opération que l'autorité a ouverte",
+        ),
+        (
+            OperationKind::RecoverIdentity,
+            "l'identifiant qu'Orion détient",
+        ),
+    ] {
+        let (presses, received) = std::sync::mpsc::channel::<Press>();
+        drop(presses);
+        let mut published = Vec::new();
+        let error = run(
+            Id16::new([1; 16]).unwrap(),
+            OperationLocator {
+                kind,
+                operation_id: None,
+            },
+            received,
+            &mut |status| published.push(status),
+            Path::new("unused-authority.vault"),
+        )
+        .expect_err("an operation ID is required");
+        assert!(error.contains(message), "{error}");
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].operation, kind);
+        assert!(published[0].manifest.is_none());
+        assert!(published[0].keys.is_empty());
+    }
+}
+
+#[test]
+fn campaign_and_recovery_without_a_vault_never_offer_a_key_step() {
+    let vault = std::env::temp_dir().join(format!(
+        "orion-operation-vault-{}-absent",
+        std::process::id()
+    ));
+    assert!(!vault.exists());
+    let operation_id = Id16::new([2; 16]).unwrap();
+    for kind in [
+        OperationKind::ApproveCampaign,
+        OperationKind::RecoverIdentity,
+    ] {
+        let (presses, received) = std::sync::mpsc::channel::<Press>();
+        drop(presses);
+        let mut published = Vec::new();
+        let result = run(
+            Id16::new([1; 16]).unwrap(),
+            OperationLocator {
+                kind,
+                operation_id: Some(operation_id),
+            },
+            received,
+            &mut |status| published.push(status),
+            &vault,
+        );
+        assert!(result.is_err());
+        let [initial, failure] = published.as_slice() else {
+            panic!("expected verification followed by a refusal: {published:?}");
+        };
+        assert_eq!(initial.gesture, GestureState::Verifying);
+        assert_eq!(failure.gesture, GestureState::Failed);
+        assert_eq!(failure.operation_id, Some(operation_id));
+        assert_eq!(failure.refusal, Some(Refusal::HandoffMismatch));
+        assert!(failure.manifest.is_none());
+        assert!(failure.keys.is_empty());
+        assert!(failure.allowed.is_empty());
+    }
+}

@@ -1806,6 +1806,85 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn invalid_gateway_identity_terms_do_not_open_a_ceremony() {
+        let operator = OperatorCeremony::default();
+        let renew = |prepare_days, overlap_days, validity_days| GatewayGesture::Renew {
+            rotate_tls: false,
+            key_recovery: false,
+            prepare_days,
+            overlap_days,
+            validity_days,
+            in_chain: false,
+        };
+        for gesture in [
+            renew(0, 7, 365),
+            renew(7, MAX_GATEWAY_TERM_DAYS + 1, 365),
+            renew(7, 7, 0),
+            GatewayGesture::Rollback {
+                hours: 0,
+                reason: "operator confirmed".into(),
+            },
+            GatewayGesture::Rollback {
+                hours: MAX_ROLLBACK_HOURS + 1,
+                reason: "operator confirmed".into(),
+            },
+            GatewayGesture::Rollback {
+                hours: 1,
+                reason: "  \t ".into(),
+            },
+            GatewayGesture::Rollback {
+                hours: 1,
+                reason: "é".repeat(MAX_ROLLBACK_REASON_CHARS + 1),
+            },
+        ] {
+            assert!(operator
+                .begin_gateway(
+                    gesture,
+                    None,
+                    PathBuf::from(location::VAULT_FILE_NAME),
+                    "workstation".into(),
+                    None,
+                )
+                .await
+                .is_err());
+            assert!(operator.observed().await.is_none());
+        }
+        assert!(renew(1, MAX_GATEWAY_TERM_DAYS, 1).validate().is_ok());
+        assert!(GatewayGesture::Rollback {
+            hours: MAX_ROLLBACK_HOURS,
+            reason: format!(" {} ", "é".repeat(MAX_ROLLBACK_REASON_CHARS)),
+        }
+        .validate()
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn gateway_identity_gesture_without_a_tunnel_reports_the_refusal_and_can_be_dismissed() {
+        let operator = OperatorCeremony::default();
+        let error = operator
+            .begin_gateway(
+                GatewayGesture::Abort,
+                None,
+                PathBuf::from(location::VAULT_FILE_NAME),
+                "workstation".into(),
+                None,
+            )
+            .await
+            .expect_err("the abort requires a connected gateway");
+        assert_eq!(error, ceremony::NO_TUNNEL);
+        let observed = operator
+            .observed()
+            .await
+            .expect("the refusal remains visible");
+        assert!(!observed.automatic);
+        assert_eq!(observed.status.operation, OperationKind::GatewayIdentity);
+        assert_eq!(observed.status.gesture, GestureState::Failed);
+        assert_eq!(observed.status.refusal, Some(Refusal::GatewayUnavailable));
+        assert!(operator.dismiss().await.unwrap());
+        assert!(operator.status().await.is_none());
+    }
+
     /// An artifact belongs to a session: without one there is nothing to hand.
     #[tokio::test]
     async fn artifacts_are_empty_without_a_session() {
