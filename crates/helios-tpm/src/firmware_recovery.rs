@@ -360,6 +360,30 @@ mod tests {
         ));
     }
     #[test]
+    fn an_undefined_counter_refuses_the_restore_and_replaces_nothing() {
+        let (_dir, cfg, old, backup, recovered) = setup();
+        let counter = old.counter_handle();
+        let auth = sign(backup.request);
+        let store = BlobStore::new(&cfg);
+        let blob_before = std::fs::read(&cfg.sealed_blob_path).unwrap();
+        // The restoring TPM has no counter defined, so its value cannot be read.
+        let mut new = DryRunTpm::with_digest([9; 32]).with_window_digest([8; 32]);
+
+        let error = restore_with(&mut new, &store, &auth, &recovered).unwrap_err();
+
+        assert!(
+            matches!(error, TpmError::CounterUnavailable(_)),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&cfg.sealed_blob_path).unwrap(),
+            blob_before,
+            "the sealed root is not replaced"
+        );
+        assert_eq!(counter_value(&counter), 1, "no counter value is spent");
+    }
+
+    #[test]
     fn unauthenticated_wrong_root_and_stale_requests_never_replace_the_blob() {
         let (_dir, cfg, old, backup, recovered) = setup();
         let counter = old.counter_handle();

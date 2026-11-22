@@ -1251,6 +1251,48 @@ mod tests {
         }
     }
 
+    /// A counter that cannot be read refuses the recovery before anything is
+    /// consumed: the file stays, and the corrupt counter file is not overwritten.
+    #[test]
+    #[cfg_attr(
+        feature = "tpm",
+        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
+    )]
+    fn an_unreadable_counter_refuses_a_recovery_and_overwrites_nothing() {
+        if run_isolated_identity_scenario(
+            "an_unreadable_counter_refuses_a_recovery_and_overwrites_nothing",
+        ) {
+            return;
+        }
+        let dir = identity_dir();
+        let tpm = tpm_in(&dir);
+        let (private_key, public_key, current) = lost_vault(&dir);
+        let counter_file = PathBuf::from(&tpm.simulated_counter_path);
+        std::fs::write(&counter_file, b"not a counter").expect("corrupt counter file");
+        let frame = frame_of(&signed_recovery(1, &public_key), &private_key);
+        let recovery = PathBuf::from(recovery_path());
+        std::fs::write(&recovery, &frame).expect("operator recovery file");
+
+        let resolved = resolve(
+            &NetworkConfig::default(),
+            &BootDecision::Unsealed(current),
+            &tpm,
+        );
+
+        assert_eq!(resolved.origin, KeyOrigin::Missing);
+        assert!(resolved.private_key.is_empty());
+        assert_eq!(
+            std::fs::read(&recovery).expect("file"),
+            frame,
+            "the file stays"
+        );
+        assert_eq!(
+            std::fs::read(&counter_file).expect("counter file"),
+            b"not a counter",
+            "the corrupt counter file is not overwritten"
+        );
+    }
+
     /// An authorization for another counter value is refused, and nothing moves.
     #[test]
     #[cfg_attr(

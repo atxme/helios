@@ -183,6 +183,33 @@ mod tests {
     }
 
     #[test]
+    fn an_undefined_counter_refuses_the_recovery_and_spends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg(dir.path());
+        let (private, public) = gateway_identity();
+        let authorization = sign(1, public, None);
+        // No counter defined: its value cannot be read, so the recovery is refused.
+        let undefined = CounterState::default();
+
+        let error = accept_with(
+            || Ok(tpm_with(&undefined, [1; 32])),
+            &cfg,
+            &authorization,
+            &private,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, TpmError::CounterUnavailable(_)),
+            "{error:?}"
+        );
+        assert!(
+            tpm_with(&undefined, [1; 32]).read_counter().is_err(),
+            "the counter is still undefined: nothing was defined or spent"
+        );
+    }
+
+    #[test]
     fn a_consumed_recovery_cannot_be_replayed() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = cfg(dir.path());
