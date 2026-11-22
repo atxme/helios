@@ -41,8 +41,12 @@
 use std::path::PathBuf;
 
 use aether::{NetworkConfig, SecretString};
-use helios_tpm::{BootDecision, KeystoreError, SealedKeystore, TpmError};
-use tracing::{info, warn};
+use helios_escrow::recovery::{decode_recovery_frame, MAX_RECOVERY_FRAME};
+use helios_tpm::{
+    anti_rollback, wg_recovery, BootDecision, KeystoreError, SealedKeystore, TpmError, TpmSettings,
+};
+use std::io::Read;
+use tracing::{error, info, warn};
 use zeroize::Zeroizing;
 
 /// Location of the vault containing the WireGuard private key.
@@ -89,8 +93,10 @@ const ESCROW_PATH: &str = "/var/lib/helios/wg-key.escrow";
 /// Recovery file, delivered by the operator with the OTA bundle — the same
 /// channel as the resealing ticket, hence **no SSH required**.
 ///
-/// Contains the WireGuard private key in base64. Consumed **only once**, and
-/// only if the vault is actually undecipherable; erased immediately after.
+/// A frame of `helios_escrow::recovery`: the publisher's authorization, then
+/// the WireGuard private key. Consumed **only once**, and only if the vault is
+/// actually undecipherable and the authorization is valid for the current
+/// anti-rollback counter; erased immediately after.
 const RECOVERY_PATH: &str = "/var/lib/helios/wg-key.recovery";
 
 /// Origin of the key actually in use — used to alert the operator.
@@ -190,7 +196,7 @@ fn verify_declared_context(declared: &[u8], private_key: &str) -> ContextVerdict
 /// No fatal error: a missing escrow does not prevent the gateway from
 /// working, it only removes a recovery option. It is reported loudly rather
 /// than failing at startup.
-fn write_escrow(network: &NetworkConfig, private_key: &str) {
+fn write_escrow(network: &NetworkConfig, private_key: &str, tpm: &TpmSettings) {
     use base64::Engine as _;
 
     let Some(pubkey_b64) = network.escrow_public_key.as_deref().map(str::trim) else {
@@ -213,8 +219,9 @@ fn write_escrow(network: &NetworkConfig, private_key: &str) {
         }
     };
 
-    // Minimal repair until the counter is wired in: the escrow records the
-    // gateway public key, derived here from the key it carries.
+    // The escrow records the public key the carried private key derives to,
+    // and the counter in force when it is written: the operator checks a
+    // recovery against both. Without a readable counter, the field is absent.
     let gateway_public_key = match aether::wg::public_from_private(private_key)
         .ok()
         .and_then(|public| {
@@ -231,7 +238,7 @@ fn write_escrow(network: &NetworkConfig, private_key: &str) {
         }
     };
     let metadata = helios_escrow::EscrowMetadata {
-        counter: None,
+        counter: anti_rollback::current(tpm).ok(),
         gateway_public_key,
     };
 
@@ -251,21 +258,41 @@ fn write_escrow(network: &NetworkConfig, private_key: &str) {
 ///
 /// Only called when the vault is undecipherable: outside of that case, a
 /// stray recovery file must never be able to replace the key in effect —
-/// that would be an identity substitution vector.
-fn try_recovery(secret: &helios_tpm::SecretKey) -> Option<SecretString> {
-    let path = PathBuf::from(recovery_path());
-    let key = read_recovery_key(&path)?;
+/// that would be an identity substitution vector. The file is accepted only
+/// with a publisher authorization for the current anti-rollback counter.
+fn try_recovery(secret: &helios_tpm::SecretKey, tpm: &TpmSettings) -> Option<SecretString> {
+    use base64::Engine as _;
 
-    // Reseals immediately under the new TPM secret.
-    let context = match identity_context(&key) {
-        Ok(context) => context,
+    let path = PathBuf::from(recovery_path());
+    let frame = read_recovery_frame(&path)?;
+    let (authorization, key) = match decode_recovery_frame(&frame) {
+        Ok(decoded) => decoded,
         Err(e) => {
-            warn!("recovered key unusable ({e}) — ignored, not consumed");
+            warn!("invalid recovery file ({e}) — ignored, not consumed");
             return None;
         }
     };
-    if let Err(e) = keystore().store(secret, &context, key.as_bytes()) {
-        warn!("could not reseal the recovered key: {e}");
+    // Every refusal happens before the counter is spent: the file stays.
+    if let Err(e) = wg_recovery::accept(tpm, &authorization, &key) {
+        warn!("recovery file refused ({e}) — left in place, the identity is not restored");
+        return None;
+    }
+
+    // The counter is spent from here on: whatever follows, this file cannot
+    // restore the identity again.
+    let text = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(key.as_slice()));
+    let resealed = identity_context(&text)
+        .map_err(|e| format!("building its context: {e}"))
+        .and_then(|context| {
+            keystore()
+                .store(secret, &context, text.as_bytes())
+                .map_err(|e| e.to_string())
+        });
+    if let Err(cause) = resealed {
+        error!(
+            "could not reseal the recovered key after its counter was spent ({cause}) — \
+             the recovery file is left in place and cannot be used again"
+        );
         return None;
     }
 
@@ -280,31 +307,43 @@ fn try_recovery(secret: &helios_tpm::SecretKey) -> Option<SecretString> {
     }
 
     warn!("WireGuard identity restored from escrow and resealed");
-    Some(SecretString::new(key.as_str()))
+    Some(SecretString::new(text.as_str()))
 }
 
-/// Reads and validates the operator-delivered recovery file without
-/// consuming it. Invalid or unreadable files remain available for correction.
-/// Both the original contents and the trimmed key are wiped on every path
-/// (ADR-006 §5).
-fn read_recovery_key(path: &std::path::Path) -> Option<Zeroizing<String>> {
+/// Reads the operator-delivered recovery frame without consuming it, at most
+/// one byte past `MAX_RECOVERY_FRAME`: a larger file then fails to decode.
+/// Absent, unreadable or oversized files are left untouched. The bytes are
+/// wiped on drop (ADR-006 §5).
+fn read_recovery_frame(path: &std::path::Path) -> Option<Zeroizing<Vec<u8>>> {
     if !path.exists() {
         return None;
     }
-
-    let raw = match std::fs::read_to_string(path).map(Zeroizing::new) {
-        Ok(contents) => contents,
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(error) => {
             warn!("unreadable recovery file: {error}");
             return None;
         }
     };
-    let key = Zeroizing::new(raw.trim().to_string());
-    if let Err(error) = validate_wg_key(&key) {
-        warn!("invalid recovery file ({error}) — ignored, not consumed");
+    let mut frame = Zeroizing::new(Vec::new());
+    let bound = MAX_RECOVERY_FRAME as u64 + 1;
+    if let Err(error) = file.take(bound).read_to_end(&mut frame) {
+        warn!("unreadable recovery file: {error}");
         return None;
     }
-    Some(key)
+    Some(frame)
+}
+
+/// Moves the anti-rollback counter after an identity rotation. A failure is
+/// logged and does not undo the rotation: the older authorizations then stay
+/// valid until the counter can be moved.
+fn advance_counter(tpm: &TpmSettings) {
+    if let Err(error) = anti_rollback::advance(tpm) {
+        warn!(
+            "anti-rollback counter could not be advanced after the rotation ({error}) — \
+             older recovery authorizations stay valid until it can be"
+        );
+    }
 }
 
 fn write_atomic(path: &str, bytes: &[u8]) -> std::io::Result<()> {
@@ -325,7 +364,7 @@ fn write_atomic(path: &str, bytes: &[u8]) -> std::io::Result<()> {
 ///    sealed immediately so the switch to protected mode is automatic;
 /// 3. nothing: the gateway starts fail-closed without bringing up an
 ///    interface.
-pub fn resolve(network: &NetworkConfig, boot: &BootDecision) -> ResolvedKey {
+pub fn resolve(network: &NetworkConfig, boot: &BootDecision, tpm: &TpmSettings) -> ResolvedKey {
     let store = keystore();
     let secret = boot.secret();
 
@@ -367,7 +406,7 @@ pub fn resolve(network: &NetworkConfig, boot: &BootDecision) -> ResolvedKey {
                         info!("WireGuard key loaded from the sealed TPM vault");
                         // Escrow follows the key: if the escrow configuration
                         // was just added, it is created on this very startup.
-                        write_escrow(network, &key);
+                        write_escrow(network, &key, tpm);
                         return ResolvedKey {
                             private_key: SecretString::new(key.as_str()),
                             origin: KeyOrigin::Sealed,
@@ -385,8 +424,8 @@ pub fn resolve(network: &NetworkConfig, boot: &BootDecision) -> ResolvedKey {
                          bootloader or firmware) and the TPM secret has been \
                          regenerated. Looking for a recovery file…"
                     );
-                    if let Some(key) = try_recovery(secret) {
-                        write_escrow(network, key.expose());
+                    if let Some(key) = try_recovery(secret, tpm) {
+                        write_escrow(network, key.expose(), tpm);
                         return ResolvedKey {
                             private_key: key,
                             origin: KeyOrigin::Recovered,
@@ -424,7 +463,7 @@ pub fn resolve(network: &NetworkConfig, boot: &BootDecision) -> ResolvedKey {
                     info!(
                         "key sealed into {KEYSTORE_PATH} — remove `wg_private_key` from network.toml"
                     );
-                    write_escrow(network, plain);
+                    write_escrow(network, plain, tpm);
                 }
                 Err(e) => warn!("automatic sealing failed: {e}"),
             }
@@ -458,6 +497,7 @@ pub fn initialize(
     network: &NetworkConfig,
     boot: &BootDecision,
     rotate: bool,
+    tpm: &TpmSettings,
 ) -> Result<String, String> {
     let store = keystore();
     reject_overwrite(store.exists(), rotate)?;
@@ -473,7 +513,10 @@ pub fn initialize(
     store
         .store(secret, &context, keypair.private_key.expose().as_bytes())
         .map_err(|e| format!("could not seal the identity: {e}"))?;
-    write_escrow(network, keypair.private_key.expose());
+    if rotate {
+        advance_counter(tpm);
+    }
+    write_escrow(network, keypair.private_key.expose(), tpm);
 
     if rotate {
         warn!(
@@ -514,6 +557,7 @@ pub fn update_sealed(
     network: &NetworkConfig,
     boot: &BootDecision,
     new_private_key: &str,
+    tpm: &TpmSettings,
 ) -> Result<(), String> {
     let key = new_private_key.trim();
     validate_wg_key(key)?;
@@ -552,9 +596,11 @@ pub fn update_sealed(
         .store(secret, &context, key.as_bytes())
         .map_err(|e| format!("could not seal the new key: {e}"))?;
 
+    advance_counter(tpm);
+
     // Escrow must follow the new key: otherwise a post-OTA recovery would
     // restore the old identity, which no client expects anymore.
-    write_escrow(network, key);
+    write_escrow(network, key, tpm);
 
     warn!(
         "WireGuard private key replaced and resealed — the gateway's identity has \
@@ -575,7 +621,12 @@ pub fn validate_wg_key(key: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aether::sig::{
+        PublisherSigner, ResealPayload, SignedWireGuardRecovery, WireGuardRecoveryPayload,
+    };
     use base64::Engine as _;
+    use helios_escrow::recovery::encode_recovery_frame;
+    use helios_tpm::{BootController, SecretKey};
 
     const VALID: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
@@ -754,6 +805,95 @@ mod tests {
         true
     }
 
+    const OTHER_ED_SEED: [u8; 32] = *b"helios-sign-ed25519-other-seed01";
+    const OTHER_ML_SEED: [u8; 32] = *b"helios-sign-mldsa65-other-seed01";
+    const DEV_ED_SEED: [u8; 32] = *b"helios-sign-ed25519-dev-seed-001";
+    const DEV_ML_SEED: [u8; 32] = *b"helios-sign-mldsa65-dev-seed-001";
+
+    /// The TPM of one identity directory. The counter and the simulated
+    /// secret live there, and a boot provisions its secret into it.
+    fn tpm_in(dir: &std::path::Path) -> TpmSettings {
+        let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        TpmSettings {
+            enabled: true,
+            allow_provisioning: true,
+            device: path("no-tpm-device"),
+            sealed_blob_path: path("tpm-sealed.key"),
+            ticket_path: path("reseal-ticket.json"),
+            update_window_marker_path: path("update-window.marker"),
+            simulated_counter_path: path("simulated-nv-counter"),
+            counter_status_path: path("anti-rollback.json"),
+            ..TpmSettings::default()
+        }
+    }
+
+    /// The directory the isolated scenario was given.
+    fn identity_dir() -> PathBuf {
+        PathBuf::from(std::env::var_os(IDENTITY_DIR_ENV).expect("isolated identity directory"))
+    }
+
+    /// The secret of a boot over `tpm`, as the boot flow provisions it. A boot
+    /// also defines the anti-rollback counter.
+    fn boot_secret(tpm: &TpmSettings) -> SecretKey {
+        BootController::unlock(tpm)
+            .expect("simulated TPM boot")
+            .secret()
+            .expect("a boot with a secret")
+            .clone()
+    }
+
+    /// The secret of a boot in its own directory: the one a vault is sealed
+    /// under before a PCR change.
+    fn secret_in(dir: &std::path::Path) -> SecretKey {
+        std::fs::create_dir_all(dir).expect("secret directory");
+        boot_secret(&tpm_in(dir))
+    }
+
+    fn raw_key(base64_key: &str) -> [u8; 32] {
+        <[u8; 32]>::try_from(
+            base64::engine::general_purpose::STANDARD
+                .decode(base64_key)
+                .expect("base64 key"),
+        )
+        .expect("32-byte key")
+    }
+
+    /// The publisher's authorization for `counter`, under the development keys
+    /// the compiled keyring accepts.
+    fn signed_recovery(counter: u64, public_key: &str) -> SignedWireGuardRecovery {
+        PublisherSigner::from_seed_material(1, &DEV_ED_SEED, &DEV_ML_SEED)
+            .expect("development signer")
+            .sign(WireGuardRecoveryPayload {
+                counter,
+                gateway_public_key: raw_key(public_key),
+                expected_pcr_digest: None,
+            })
+            .expect("signature")
+    }
+
+    /// The frame the operator deposits for `authorization`.
+    fn frame_of(authorization: &SignedWireGuardRecovery, private_key: &str) -> Vec<u8> {
+        encode_recovery_frame(authorization, &raw_key(private_key))
+            .expect("recovery frame")
+            .to_vec()
+    }
+
+    /// Seals `private_key` as the identity vault an earlier boot wrote.
+    fn seal_vault(secret: &SecretKey, private_key: &str) {
+        let context = identity_context(private_key).expect("context");
+        keystore()
+            .store(secret, &context, private_key.as_bytes())
+            .expect("vault sealed");
+    }
+
+    /// The state after a PCR change: the vault was sealed under a secret the
+    /// current boot does not have. Returns the key pair and the current secret.
+    fn lost_vault(dir: &std::path::Path) -> (String, String, SecretKey) {
+        let (private_key, public_key) = keypair();
+        seal_vault(&secret_in(&dir.join("previous")), &private_key);
+        (private_key, public_key, boot_secret(&tpm_in(dir)))
+    }
+
     /// The escrow is the only recovery channel after a PCR change, and the
     /// gateway itself must be unable to open it — that is the whole design.
     /// This exercises the real write path, then opens the result as the
@@ -769,7 +909,7 @@ mod tests {
         let (wg_private, _) = keypair();
 
         in_identity_dir("escrow-write", |dir| {
-            write_escrow(&network, &wg_private);
+            write_escrow(&network, &wg_private, &tpm_in(dir));
             let blob = std::fs::read(dir.join("wg-key.escrow")).expect("escrow written");
             assert!(
                 !blob
@@ -796,9 +936,9 @@ mod tests {
         let (second, _) = keypair();
 
         in_identity_dir("escrow-replace", |dir| {
-            write_escrow(&network, &first);
+            write_escrow(&network, &first, &tpm_in(dir));
             let before = std::fs::read(dir.join("wg-key.escrow")).expect("first escrow");
-            write_escrow(&network, &second);
+            write_escrow(&network, &second, &tpm_in(dir));
             let after = std::fs::read(dir.join("wg-key.escrow")).expect("second escrow");
             assert_ne!(before, after, "the escrow was not rewritten");
         });
@@ -809,13 +949,14 @@ mod tests {
     #[test]
     fn an_absent_escrow_key_is_reported_without_writing() {
         in_identity_dir("escrow-absent", |dir| {
-            write_escrow(&NetworkConfig::default(), VALID);
+            write_escrow(&NetworkConfig::default(), VALID, &tpm_in(dir));
             write_escrow(
                 &NetworkConfig {
                     escrow_public_key: Some("   ".into()),
                     ..NetworkConfig::default()
                 },
                 VALID,
+                &tpm_in(dir),
             );
             assert!(
                 !dir.join("wg-key.escrow").exists(),
@@ -835,6 +976,7 @@ mod tests {
                     ..NetworkConfig::default()
                 },
                 VALID,
+                &tpm_in(dir),
             );
             assert!(!dir.join("wg-key.escrow").exists());
             // A syntactically valid but wrong-sized key: base64 decodes, the
@@ -847,6 +989,7 @@ mod tests {
                     ..NetworkConfig::default()
                 },
                 VALID,
+                &tpm_in(dir),
             );
             assert!(!dir.join("wg-key.escrow").exists());
         });
@@ -857,7 +1000,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("missing-recovery");
 
-        assert!(read_recovery_key(&path).is_none());
+        assert!(read_recovery_frame(&path).is_none());
     }
 
     #[test]
@@ -866,32 +1009,21 @@ mod tests {
         let path = directory.path().join("recovery-directory");
         std::fs::create_dir(&path).expect("create directory at recovery path");
 
-        assert!(read_recovery_key(&path).is_none());
+        assert!(read_recovery_frame(&path).is_none());
         assert!(path.is_dir());
     }
 
     #[test]
-    fn invalid_recovery_key_is_left_in_place_for_operator_correction() {
+    fn a_recovery_frame_is_read_without_consuming_it() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("wg-key.recovery");
-        std::fs::write(&path, "not-a-wireguard-key\n").expect("write invalid recovery key");
+        let (private_key, public_key) = keypair();
+        let frame = frame_of(&signed_recovery(1, &public_key), &private_key);
+        std::fs::write(&path, &frame).expect("write recovery frame");
 
-        assert!(read_recovery_key(&path).is_none());
-        assert_eq!(
-            std::fs::read_to_string(path).expect("recovery file remains"),
-            "not-a-wireguard-key\n"
-        );
-    }
+        let read = read_recovery_frame(&path).expect("readable recovery frame");
 
-    #[test]
-    fn valid_recovery_key_is_trimmed_before_returning_to_the_seal_path() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("wg-key.recovery");
-        std::fs::write(&path, format!("  {VALID}\n")).expect("write recovery key");
-
-        let key = read_recovery_key(&path).expect("valid recovery key");
-
-        assert_eq!(key.as_str(), VALID);
+        assert_eq!(read.as_slice(), frame.as_slice());
         assert!(
             path.exists(),
             "reading alone must not consume the recovery file"
@@ -945,7 +1077,11 @@ mod tests {
         let path = PathBuf::from(keystore_path());
         std::fs::write(&path, b"vault marker").expect("existing sealed vault");
 
-        let resolved = resolve(&NetworkConfig::default(), &BootDecision::Disabled);
+        let resolved = resolve(
+            &NetworkConfig::default(),
+            &BootDecision::Disabled,
+            &TpmSettings::default(),
+        );
 
         assert_eq!(resolved.origin, KeyOrigin::Missing);
         assert!(resolved.private_key.is_empty());
@@ -966,13 +1102,222 @@ mod tests {
             ..NetworkConfig::default()
         };
 
-        let resolved = resolve(&network, &BootDecision::Disabled);
+        let resolved = resolve(&network, &BootDecision::Disabled, &TpmSettings::default());
 
         assert_eq!(resolved.origin, KeyOrigin::PlaintextConfig);
         assert_eq!(resolved.private_key.expose(), VALID);
         assert_eq!(std::fs::read(path).unwrap(), b"vault marker");
     }
 
+    /// A signed authorization for the current counter restores the identity:
+    /// the counter is spent, the key is resealed under the current secret, and
+    /// the file is erased.
+    #[test]
+    fn a_signed_recovery_for_the_current_counter_is_resealed_and_erased() {
+        if run_isolated_identity_scenario(
+            "a_signed_recovery_for_the_current_counter_is_resealed_and_erased",
+        ) {
+            return;
+        }
+        let dir = identity_dir();
+        let tpm = tpm_in(&dir);
+        let (private_key, public_key, current) = lost_vault(&dir);
+        let counter = anti_rollback::current(&tpm).expect("counter");
+        let recovery = PathBuf::from(recovery_path());
+        std::fs::write(
+            &recovery,
+            frame_of(&signed_recovery(counter, &public_key), &private_key),
+        )
+        .expect("operator recovery file");
+
+        let resolved = resolve(
+            &NetworkConfig::default(),
+            &BootDecision::Unsealed(current.clone()),
+            &tpm,
+        );
+
+        assert_eq!(resolved.origin, KeyOrigin::Recovered);
+        assert_eq!(resolved.private_key.expose(), private_key.as_str());
+        assert!(!recovery.exists(), "the recovery file must be erased");
+        assert_eq!(anti_rollback::current(&tpm).expect("counter"), counter + 1);
+        let again = resolve(
+            &NetworkConfig::default(),
+            &BootDecision::Unsealed(current),
+            &tpm,
+        );
+        assert_eq!(
+            again.origin,
+            KeyOrigin::Sealed,
+            "the vault opens under the current secret"
+        );
+    }
+
+    /// Only the publisher-signed, key-bound authorization is accepted. Each
+    /// refusal leaves the file in place and the counter where it was.
+    #[test]
+    fn an_unsigned_or_foreign_recovery_is_left_in_place() {
+        if run_isolated_identity_scenario("an_unsigned_or_foreign_recovery_is_left_in_place") {
+            return;
+        }
+        let dir = identity_dir();
+        let tpm = tpm_in(&dir);
+        let (private_key, public_key, current) = lost_vault(&dir);
+        let counter = anti_rollback::current(&tpm).expect("counter");
+        let (other_private_key, _) = keypair();
+        let unknown_signer = PublisherSigner::from_seed_material(9, &OTHER_ED_SEED, &OTHER_ML_SEED)
+            .expect("unknown signer")
+            .sign(WireGuardRecoveryPayload {
+                counter,
+                gateway_public_key: raw_key(&public_key),
+                expected_pcr_digest: None,
+            })
+            .expect("signature");
+        // A signature made for a reseal ticket, with the same keys and epoch,
+        // carried over to a recovery: the domain must differ.
+        let reseal = PublisherSigner::from_seed_material(1, &DEV_ED_SEED, &DEV_ML_SEED)
+            .expect("development signer")
+            .sign(ResealPayload {
+                counter,
+                sealed_blob_anchor: [0; 32],
+                expected_pcr_digest: None,
+            })
+            .expect("signature");
+        let cross_domain = SignedWireGuardRecovery {
+            payload: WireGuardRecoveryPayload {
+                counter,
+                gateway_public_key: raw_key(&public_key),
+                expected_pcr_digest: None,
+            },
+            key_epoch: reseal.key_epoch,
+            signatures: reseal.signatures,
+        };
+        let cases = [
+            (
+                "a key that does not derive the authorized public key",
+                frame_of(&signed_recovery(counter, &public_key), &other_private_key),
+            ),
+            (
+                "a signature by an unknown key",
+                frame_of(&unknown_signer, &private_key),
+            ),
+            (
+                "a signature made over another domain",
+                frame_of(&cross_domain, &private_key),
+            ),
+        ];
+        let recovery = PathBuf::from(recovery_path());
+
+        for (case, frame) in cases {
+            std::fs::write(&recovery, &frame).expect("operator recovery file");
+            let resolved = resolve(
+                &NetworkConfig::default(),
+                &BootDecision::Unsealed(current.clone()),
+                &tpm,
+            );
+            assert_eq!(resolved.origin, KeyOrigin::Missing, "{case}");
+            assert_eq!(
+                std::fs::read(&recovery).expect("file"),
+                frame,
+                "{case}: file kept"
+            );
+            assert_eq!(
+                anti_rollback::current(&tpm).expect("counter"),
+                counter,
+                "{case}: counter unchanged"
+            );
+        }
+    }
+
+    /// An authorization for another counter value is refused, and nothing moves.
+    #[test]
+    fn a_recovery_for_another_counter_is_refused() {
+        if run_isolated_identity_scenario("a_recovery_for_another_counter_is_refused") {
+            return;
+        }
+        let dir = identity_dir();
+        let tpm = tpm_in(&dir);
+        let (private_key, public_key, current) = lost_vault(&dir);
+        let counter = anti_rollback::current(&tpm).expect("counter");
+        let frame = frame_of(&signed_recovery(counter + 1, &public_key), &private_key);
+        let recovery = PathBuf::from(recovery_path());
+        std::fs::write(&recovery, &frame).expect("operator recovery file");
+
+        let resolved = resolve(
+            &NetworkConfig::default(),
+            &BootDecision::Unsealed(current),
+            &tpm,
+        );
+
+        assert_eq!(resolved.origin, KeyOrigin::Missing);
+        assert_eq!(std::fs::read(&recovery).expect("file"), frame);
+        assert_eq!(anti_rollback::current(&tpm).expect("counter"), counter);
+    }
+
+    /// Once spent, the same file cannot restore the identity again, even after
+    /// the vault is lost once more.
+    #[test]
+    fn a_consumed_recovery_cannot_be_replayed() {
+        if run_isolated_identity_scenario("a_consumed_recovery_cannot_be_replayed") {
+            return;
+        }
+        let dir = identity_dir();
+        let tpm = tpm_in(&dir);
+        let (private_key, public_key, current) = lost_vault(&dir);
+        let counter = anti_rollback::current(&tpm).expect("counter");
+        let frame = frame_of(&signed_recovery(counter, &public_key), &private_key);
+        let recovery = PathBuf::from(recovery_path());
+        std::fs::write(&recovery, &frame).expect("operator recovery file");
+        let first = resolve(
+            &NetworkConfig::default(),
+            &BootDecision::Unsealed(current.clone()),
+            &tpm,
+        );
+        assert_eq!(first.origin, KeyOrigin::Recovered);
+
+        seal_vault(&secret_in(&dir.join("previous")), &private_key);
+        std::fs::write(&recovery, &frame).expect("replayed recovery file");
+        let replay = resolve(
+            &NetworkConfig::default(),
+            &BootDecision::Unsealed(current),
+            &tpm,
+        );
+
+        assert_eq!(replay.origin, KeyOrigin::Missing);
+        assert_eq!(
+            std::fs::read(&recovery).expect("file"),
+            frame,
+            "replay kept"
+        );
+        assert_eq!(anti_rollback::current(&tpm).expect("counter"), counter + 1);
+    }
+
+    /// A frame that does not decode is ignored and left for correction.
+    #[test]
+    fn an_invalid_recovery_frame_is_left_in_place() {
+        if run_isolated_identity_scenario("an_invalid_recovery_frame_is_left_in_place") {
+            return;
+        }
+        let dir = identity_dir();
+        let tpm = tpm_in(&dir);
+        let (_, _, current) = lost_vault(&dir);
+        let recovery = PathBuf::from(recovery_path());
+        std::fs::write(&recovery, b"not a recovery frame").expect("invalid recovery file");
+
+        let resolved = resolve(
+            &NetworkConfig::default(),
+            &BootDecision::Unsealed(current),
+            &tpm,
+        );
+
+        assert_eq!(resolved.origin, KeyOrigin::Missing);
+        assert_eq!(
+            std::fs::read(&recovery).expect("file"),
+            b"not a recovery frame"
+        );
+    }
+
+    /// Without a locked vault the recovery file is never read: no consumption,
+    /// no counter movement.
     #[test]
     fn a_recovery_file_without_a_locked_vault_is_not_consumed_or_used() {
         if run_isolated_identity_scenario(
@@ -980,15 +1325,123 @@ mod tests {
         ) {
             return;
         }
-        let path = PathBuf::from(recovery_path());
-        let recovery = format!(" {VALID}\n");
-        std::fs::write(&path, recovery.as_bytes()).expect("operator recovery file");
+        let dir = identity_dir();
+        let tpm = tpm_in(&dir);
+        let _ = boot_secret(&tpm);
+        let counter = anti_rollback::current(&tpm).expect("counter");
+        let (private_key, public_key) = keypair();
+        let recovery = PathBuf::from(recovery_path());
+        let frame = frame_of(&signed_recovery(counter, &public_key), &private_key);
+        std::fs::write(&recovery, &frame).expect("operator recovery file");
 
-        let resolved = resolve(&NetworkConfig::default(), &BootDecision::Disabled);
+        let resolved = resolve(&NetworkConfig::default(), &BootDecision::Disabled, &tpm);
 
         assert_eq!(resolved.origin, KeyOrigin::Missing);
         assert!(resolved.private_key.is_empty());
-        assert_eq!(std::fs::read(path).unwrap(), recovery.as_bytes());
+        assert_eq!(std::fs::read(&recovery).expect("file"), frame);
+        assert_eq!(anti_rollback::current(&tpm).expect("counter"), counter);
+    }
+
+    /// Rotation spends a counter value, so an authorization issued before it
+    /// no longer validates.
+    #[test]
+    fn rotation_advances_the_counter_and_invalidates_an_older_authorization() {
+        if run_isolated_identity_scenario(
+            "rotation_advances_the_counter_and_invalidates_an_older_authorization",
+        ) {
+            return;
+        }
+        let dir = identity_dir();
+        let tpm = tpm_in(&dir);
+        let secret = boot_secret(&tpm);
+        let (private_key, public_key) = keypair();
+        seal_vault(&secret, &private_key);
+        let before = anti_rollback::current(&tpm).expect("counter");
+        let older = signed_recovery(before, &public_key);
+
+        initialize(
+            &NetworkConfig::default(),
+            &BootDecision::Unsealed(secret),
+            true,
+            &tpm,
+        )
+        .expect("rotation");
+
+        assert_eq!(anti_rollback::current(&tpm).expect("counter"), before + 1);
+        let error = wg_recovery::accept(&tpm, &older, &raw_key(&private_key))
+            .expect_err("the older authorization must be refused");
+        assert!(
+            matches!(error, TpmError::CounterMismatch { .. }),
+            "{error:?}"
+        );
+    }
+
+    /// A key update escrows the counter value it leaves in place, after the
+    /// rotation.
+    #[test]
+    fn an_update_escrows_the_counter_after_the_rotation() {
+        if run_isolated_identity_scenario("an_update_escrows_the_counter_after_the_rotation") {
+            return;
+        }
+        let dir = identity_dir();
+        let tpm = tpm_in(&dir);
+        let secret = boot_secret(&tpm);
+        let (operator_private_key, operator_public_key) =
+            helios_escrow::generate_operator_keypair().expect("operator keypair");
+        let network = NetworkConfig {
+            escrow_public_key: Some(
+                base64::engine::general_purpose::STANDARD.encode(operator_public_key),
+            ),
+            ..NetworkConfig::default()
+        };
+        let (private_key, public_key) = keypair();
+        let before = anti_rollback::current(&tpm).expect("counter");
+
+        update_sealed(
+            &network,
+            &BootDecision::Unsealed(secret),
+            &private_key,
+            &tpm,
+        )
+        .expect("update");
+
+        let blob = std::fs::read(dir.join("wg-key.escrow")).expect("escrow written");
+        let opened = helios_escrow::open_as_operator(operator_private_key.as_ref(), &blob)
+            .expect("the operator opens the escrow");
+        let metadata = opened.metadata.expect("HESC v2 metadata");
+        assert_eq!(metadata.counter, Some(before + 1));
+        assert_eq!(metadata.gateway_public_key, raw_key(&public_key));
+    }
+
+    /// The escrow records the counter and the public key of the identity it
+    /// carries, so the operator can check a recovery against them.
+    #[test]
+    fn the_escrow_carries_the_counter_and_the_public_key() {
+        let (operator_private_key, operator_public_key) =
+            helios_escrow::generate_operator_keypair().expect("operator keypair");
+        let network = NetworkConfig {
+            escrow_public_key: Some(
+                base64::engine::general_purpose::STANDARD.encode(operator_public_key),
+            ),
+            ..NetworkConfig::default()
+        };
+        let (private_key, public_key) = keypair();
+
+        in_identity_dir("escrow-counter", |dir| {
+            let tpm = tpm_in(dir);
+            let _ = boot_secret(&tpm);
+            let counter = anti_rollback::current(&tpm).expect("counter");
+
+            write_escrow(&network, &private_key, &tpm);
+
+            let blob = std::fs::read(dir.join("wg-key.escrow")).expect("escrow written");
+            let metadata = helios_escrow::open_as_operator(operator_private_key.as_ref(), &blob)
+                .expect("the operator opens the escrow")
+                .metadata
+                .expect("HESC v2 metadata");
+            assert_eq!(metadata.counter, Some(counter));
+            assert_eq!(metadata.gateway_public_key, raw_key(&public_key));
+        });
     }
 
     #[test]
@@ -1001,12 +1454,21 @@ mod tests {
         let path = PathBuf::from(keystore_path());
         std::fs::write(&path, b"existing sealed bytes").expect("existing vault");
 
-        let no_rotation = initialize(&NetworkConfig::default(), &BootDecision::Disabled, false)
-            .expect_err("initialize must require explicit rotation");
+        let no_rotation = initialize(
+            &NetworkConfig::default(),
+            &BootDecision::Disabled,
+            false,
+            &TpmSettings::default(),
+        )
+        .expect_err("initialize must require explicit rotation");
         assert!(no_rotation.contains("Use --rotate"), "{no_rotation}");
-        let unavailable_rotation =
-            initialize(&NetworkConfig::default(), &BootDecision::Disabled, true)
-                .expect_err("rotation still requires a TPM secret");
+        let unavailable_rotation = initialize(
+            &NetworkConfig::default(),
+            &BootDecision::Disabled,
+            true,
+            &TpmSettings::default(),
+        )
+        .expect_err("rotation still requires a TPM secret");
         assert!(
             unavailable_rotation.contains("no TPM secret"),
             "{unavailable_rotation}"
@@ -1027,7 +1489,7 @@ mod tests {
     #[test]
     fn total_absence_of_key_is_reported() {
         let network = NetworkConfig::default();
-        let resolved = resolve(&network, &BootDecision::Disabled);
+        let resolved = resolve(&network, &BootDecision::Disabled, &TpmSettings::default());
         assert_eq!(resolved.origin, KeyOrigin::Missing);
         assert!(resolved.private_key.is_empty());
     }
@@ -1040,7 +1502,7 @@ mod tests {
             wg_private_key: VALID.into(),
             ..NetworkConfig::default()
         };
-        let resolved = resolve(&network, &BootDecision::Disabled);
+        let resolved = resolve(&network, &BootDecision::Disabled, &TpmSettings::default());
         assert_eq!(resolved.origin, KeyOrigin::PlaintextConfig);
         assert_eq!(resolved.private_key.expose(), VALID);
     }
@@ -1048,15 +1510,26 @@ mod tests {
     /// Without a TPM secret, sealing is refused rather than silently failing.
     #[test]
     fn update_refused_without_tpm_secret() {
-        assert!(update_sealed(&NetworkConfig::default(), &BootDecision::Disabled, VALID).is_err());
+        assert!(update_sealed(
+            &NetworkConfig::default(),
+            &BootDecision::Disabled,
+            VALID,
+            &TpmSettings::default()
+        )
+        .is_err());
     }
 
     /// Without a TPM secret, no sealing is possible: refuse rather than
     /// create an identity that would end up in the clear somewhere.
     #[test]
     fn initialization_refused_without_tpm_secret() {
-        let error = initialize(&NetworkConfig::default(), &BootDecision::Disabled, false)
-            .expect_err("without a TPM secret, initialization must fail");
+        let error = initialize(
+            &NetworkConfig::default(),
+            &BootDecision::Disabled,
+            false,
+            &TpmSettings::default(),
+        )
+        .expect_err("without a TPM secret, initialization must fail");
         assert!(error.contains("provision-tpm"), "message: {error}");
     }
 
@@ -1074,7 +1547,8 @@ mod tests {
         assert!(update_sealed(
             &NetworkConfig::default(),
             &BootDecision::Disabled,
-            "not-a-key"
+            "not-a-key",
+            &TpmSettings::default(),
         )
         .is_err());
     }

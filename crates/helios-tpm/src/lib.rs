@@ -44,6 +44,7 @@ mod tpm_interface;
 #[cfg(feature = "tpm")]
 mod tpm_real;
 mod update_window;
+pub mod wg_recovery;
 
 pub use boot_controller::{BootController, BootDecision};
 pub use keystore::{
@@ -120,6 +121,9 @@ pub enum TpmError {
 
     #[error("artifact counter {artifact} does not match the TPM counter {current}")]
     CounterMismatch { artifact: u64, current: u64 },
+
+    #[error("WireGuard recovery refused: {0}")]
+    RecoveryRefused(String),
 
     #[error(transparent)]
     Keystore(#[from] keystore::KeystoreError),

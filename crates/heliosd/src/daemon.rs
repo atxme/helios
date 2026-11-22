@@ -188,7 +188,7 @@ pub(crate) async fn run(
     // enough to impersonate the gateway. The config now only carries a
     // possible legacy fallback.
     let mut network = network;
-    let resolved = gateway_key::resolve(&network, &boot);
+    let resolved = gateway_key::resolve(&network, &boot, &tpm);
     match resolved.origin {
         gateway_key::KeyOrigin::Sealed => {}
         gateway_key::KeyOrigin::Recovered => warn!(
@@ -483,6 +483,7 @@ pub(crate) async fn run(
         peer_runtime,
         ipv6,
         boot,
+        tpm,
         api_ready,
         wan_auto,
     )
