@@ -3862,7 +3862,7 @@ dependencies = [
 
 [[package]]
 name = "orion"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "aether",
  "aether-fido",
