@@ -2,8 +2,8 @@ use crate::settings::TpmSettings;
 use tracing::{error, info, warn};
 
 use crate::{
-    blob_store::BlobStore, provisioning, secret::SecretKey, tpm_interface::TpmSealer,
-    update_window::WindowMarker, Result, TpmError,
+    anti_rollback, blob_store::BlobStore, provisioning, secret::SecretKey,
+    tpm_interface::TpmSealer, update_window::WindowMarker, Result, TpmError,
 };
 
 /// Outcome of the boot-time unlock sequence.
@@ -113,7 +113,36 @@ impl BootController {
     fn unlock_inner(cfg: &TpmSettings) -> Result<BootDecision> {
         let mut tpm = open_tpm(cfg)?;
         let store = BlobStore::new(cfg);
-        Self::run_flow(cfg, &mut tpm, &store)
+        Self::unlock_with(cfg, &mut tpm, &store)
+    }
+
+    /// The unlock sequence over any TPM backend. The anti-rollback counter is
+    /// observed before the flow: its status is published, and a failure there
+    /// refuses the artifacts it gates but never stops the boot.
+    fn unlock_with<T: TpmSealer>(
+        cfg: &TpmSettings,
+        tpm: &mut T,
+        store: &BlobStore<'_>,
+    ) -> Result<BootDecision> {
+        if cfg.enabled {
+            Self::observe_counter(cfg, tpm);
+        }
+        Self::run_flow(cfg, tpm, store)
+    }
+
+    /// Defines the anti-rollback counter if it is missing, then publishes its
+    /// value or the cause of its failure.
+    fn observe_counter<T: TpmSealer>(cfg: &TpmSettings, tpm: &mut T) {
+        let outcome = tpm.ensure_counter().and_then(|()| tpm.read_counter());
+        match &outcome {
+            Ok(counter) => info!(counter = *counter, "anti-rollback counter read"),
+            Err(error) => warn!(
+                %error,
+                "anti-rollback counter unavailable — reseal tickets and firmware \
+                 restorations are refused, the boot continues"
+            ),
+        }
+        anti_rollback::publish_status(cfg, outcome.as_ref().copied());
     }
 
     /// Arms an update window carrying the secret of `decision` across one
@@ -336,7 +365,7 @@ mod tests {
     use aether::sig::{PublisherSigner, ResealPayload};
 
     use super::*;
-    use crate::tpm_interface::DryRunTpm;
+    use crate::{tpm_interface::DryRunTpm, update_window::anchor_of};
 
     const DEV_ED_SEED: [u8; 32] = *b"helios-sign-ed25519-dev-seed-001";
     const DEV_ML_SEED: [u8; 32] = *b"helios-sign-mldsa65-dev-seed-001";
@@ -358,7 +387,6 @@ mod tests {
             std::fs::read(&cfg.sealed_blob_path).unwrap(),
             b"opaque sealed identity"
         );
-        assert!(!std::path::Path::new(&cfg.state_path).exists());
     }
 
     /// Builds a TPM config pointing to a temporary directory.
@@ -372,7 +400,6 @@ mod tests {
             pcr_selection: vec![0, 4, 7],
             sealed_blob_path: dir.join("sealed.key").to_string_lossy().into(),
             ticket_path: dir.join("ticket.json").to_string_lossy().into(),
-            state_path: dir.join("state.json").to_string_lossy().into(),
             update_window_pcr_selection: vec![0, 7],
             update_window_marker_path: dir.join("update-window.marker").to_string_lossy().into(),
             update_window_nv_index: 0x0180_4845,
@@ -384,16 +411,34 @@ mod tests {
     }
 
     /// Writes a ticket signed by the development key to disk.
-    fn write_ticket(path: &std::path::Path, version: u64, expected_pcr_digest: Option<[u8; 32]>) {
+    fn write_ticket(
+        path: &std::path::Path,
+        counter: u64,
+        sealed_blob_anchor: [u8; 32],
+        expected_pcr_digest: Option<[u8; 32]>,
+    ) {
         let signer = PublisherSigner::from_seed_material(1, &DEV_ED_SEED, &DEV_ML_SEED).unwrap();
         let ticket = signer
             .sign(ResealPayload {
-                counter: version,
-                sealed_blob_anchor: [0; 32],
+                counter,
+                sealed_blob_anchor,
                 expected_pcr_digest,
             })
             .unwrap();
         std::fs::write(path, serde_json::to_vec_pretty(&ticket).unwrap()).unwrap();
+    }
+
+    /// The anchor a ticket must carry to be issued for the blob on disk now.
+    fn anchor_now(cfg: &TpmSettings) -> [u8; 32] {
+        anchor_of(&std::fs::read(&cfg.sealed_blob_path).unwrap())
+    }
+
+    /// The anti-rollback counter as the TPM currently holds it.
+    fn counter_now(nv: &crate::tpm_interface::NvState) -> u64 {
+        DryRunTpm::with_digest([0; 32])
+            .sharing_nv(nv)
+            .read_counter()
+            .unwrap()
     }
 
     #[test]
@@ -445,24 +490,281 @@ mod tests {
     }
 
     #[test]
-    fn ota_with_valid_ticket_reseals() {
+    fn ota_with_a_ticket_for_the_current_counter_reseals() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_cfg(dir.path(), true);
         let store = BlobStore::new(&cfg);
+        let nv = crate::tpm_interface::NvState::default();
 
-        let mut tpm = DryRunTpm::with_digest([1u8; 32]);
-        BootController::run_flow(&cfg, &mut tpm, &store).unwrap(); // provision, version 0
+        boot_with(&cfg, &store, &nv, [1u8; 32], [9u8; 32], 0).unwrap(); // provision
+        let current = counter_now(&nv);
 
-        // OTA: new PCRs + signed ticket version 1.
-        write_ticket(std::path::Path::new(&cfg.ticket_path), 1, None);
-        let mut tpm = DryRunTpm::with_digest([2u8; 32]);
-        let d = BootController::run_flow(&cfg, &mut tpm, &store).unwrap();
+        // OTA: new PCRs + a ticket for the counter value the TPM holds now.
+        write_ticket(
+            std::path::Path::new(&cfg.ticket_path),
+            current,
+            anchor_now(&cfg),
+            None,
+        );
+        let d = boot_with(&cfg, &store, &nv, [2u8; 32], [9u8; 32], 0).unwrap();
         assert!(matches!(d, BootDecision::Resealed(_)));
+        assert_eq!(
+            counter_now(&nv),
+            current + 1,
+            "the ticket must spend the counter"
+        );
+        assert!(!std::path::Path::new(&cfg.ticket_path).exists());
 
-        // Ticket consumed; next boot on the same new PCRs -> nominal unseal.
-        let mut tpm = DryRunTpm::with_digest([2u8; 32]);
-        let d2 = BootController::run_flow(&cfg, &mut tpm, &store).unwrap();
+        // Next boot on the same new PCRs -> nominal unseal.
+        let d2 = boot_with(&cfg, &store, &nv, [2u8; 32], [9u8; 32], 0).unwrap();
         assert!(matches!(d2, BootDecision::Unsealed(_)));
+    }
+
+    #[test]
+    fn a_ticket_for_another_counter_is_refused() {
+        for offset in [-1i64, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = test_cfg(dir.path(), true);
+            let store = BlobStore::new(&cfg);
+            let nv = crate::tpm_interface::NvState::default();
+            boot_with(&cfg, &store, &nv, [1u8; 32], [9u8; 32], 0).unwrap();
+            let current = counter_now(&nv);
+            let artifact = current.checked_add_signed(offset).unwrap();
+            write_ticket(
+                std::path::Path::new(&cfg.ticket_path),
+                artifact,
+                anchor_now(&cfg),
+                None,
+            );
+
+            assert!(
+                matches!(
+                    boot_with(&cfg, &store, &nv, [2u8; 32], [9u8; 32], 0),
+                    Err(TpmError::CounterMismatch { artifact: a, current: c })
+                        if a == artifact && c == current
+                ),
+                "offset {offset}"
+            );
+            assert_eq!(counter_now(&nv), current, "a refused ticket must not spend");
+            assert!(
+                std::path::Path::new(&cfg.ticket_path).exists(),
+                "a refused ticket stays in place"
+            );
+        }
+    }
+
+    #[test]
+    fn replayed_ticket_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path(), true);
+        let store = BlobStore::new(&cfg);
+        let nv = crate::tpm_interface::NvState::default();
+        boot_with(&cfg, &store, &nv, [1u8; 32], [9u8; 32], 0).unwrap();
+        let current = counter_now(&nv);
+
+        // First resealing consumes the counter value.
+        write_ticket(
+            std::path::Path::new(&cfg.ticket_path),
+            current,
+            anchor_now(&cfg),
+            None,
+        );
+        boot_with(&cfg, &store, &nv, [2u8; 32], [9u8; 32], 0).unwrap();
+
+        // Replay of the same ticket, against the blob it was issued for and
+        // on new PCRs, is refused by the counter alone.
+        write_ticket(
+            std::path::Path::new(&cfg.ticket_path),
+            current,
+            anchor_now(&cfg),
+            None,
+        );
+        assert!(matches!(
+            boot_with(&cfg, &store, &nv, [3u8; 32], [9u8; 32], 0),
+            Err(TpmError::CounterMismatch { artifact, current: spent })
+                if artifact == current && spent == current + 1
+        ));
+    }
+
+    #[test]
+    fn a_ticket_for_another_sealed_blob_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path(), true);
+        let store = BlobStore::new(&cfg);
+        let nv = crate::tpm_interface::NvState::default();
+        boot_with(&cfg, &store, &nv, [1u8; 32], [9u8; 32], 0).unwrap();
+        let current = counter_now(&nv);
+        write_ticket(
+            std::path::Path::new(&cfg.ticket_path),
+            current,
+            [0xAA; 32],
+            None,
+        );
+
+        assert!(matches!(
+            boot_with(&cfg, &store, &nv, [2u8; 32], [9u8; 32], 0),
+            Err(TpmError::TicketAnchorMismatch)
+        ));
+        assert_eq!(counter_now(&nv), current);
+    }
+
+    /// Every counter operation but the read fails, as on a TPM whose counter
+    /// index cannot be defined.
+    struct NoCounterTpm(DryRunTpm);
+
+    impl TpmSealer for NoCounterTpm {
+        fn current_pcr_digest(&mut self) -> Result<[u8; 32]> {
+            self.0.current_pcr_digest()
+        }
+
+        fn seal(&mut self, secret: &SecretKey) -> Result<crate::tpm_interface::SealedBlob> {
+            self.0.seal(secret)
+        }
+
+        fn unseal(&mut self, blob: &crate::tpm_interface::SealedBlob) -> Result<SecretKey> {
+            self.0.unseal(blob)
+        }
+
+        fn arm_update_window(&mut self, payload: &[u8]) -> Result<()> {
+            self.0.arm_update_window(payload)
+        }
+
+        fn unseal_update_window(&mut self) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+            self.0.unseal_update_window()
+        }
+
+        fn revoke_update_window(&mut self) -> Result<()> {
+            self.0.revoke_update_window()
+        }
+
+        fn update_window_armed(&mut self) -> Result<bool> {
+            self.0.update_window_armed()
+        }
+
+        fn ensure_counter(&mut self) -> Result<()> {
+            Err(TpmError::CounterUnavailable("injected".into()))
+        }
+
+        fn read_counter(&mut self) -> Result<u64> {
+            self.0.read_counter()
+        }
+
+        fn increment_counter(&mut self) -> Result<u64> {
+            self.0.increment_counter()
+        }
+    }
+
+    #[test]
+    fn a_counter_that_cannot_be_created_refuses_the_ticket_but_boot_continues_nominally() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path(), true);
+        let store = BlobStore::new(&cfg);
+        let nv = crate::tpm_interface::NvState::default();
+        // Provisioned without a counter: the index does not exist yet.
+        let mut provisioning = DryRunTpm::with_digest([1u8; 32]).sharing_nv(&nv);
+        BootController::run_flow(&cfg, &mut provisioning, &store).unwrap();
+
+        // Nominal boot: the counter failure is published, the boot is not.
+        let mut tpm = NoCounterTpm(DryRunTpm::with_digest([1u8; 32]).sharing_nv(&nv));
+        let decision = BootController::unlock_with(&cfg, &mut tpm, &store).unwrap();
+        assert!(matches!(decision, BootDecision::Unsealed(_)));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(&cfg.counter_status_path).unwrap()
+            )
+            .unwrap(),
+            serde_json::json!({ "counter": null, "error": "TPM counter unavailable: injected" })
+        );
+
+        // A changed PCR state with a valid ticket: refused, not a panic.
+        write_ticket(
+            std::path::Path::new(&cfg.ticket_path),
+            1,
+            anchor_now(&cfg),
+            None,
+        );
+        let mut tpm = NoCounterTpm(DryRunTpm::with_digest([2u8; 32]).sharing_nv(&nv));
+        assert!(matches!(
+            BootController::unlock_with(&cfg, &mut tpm, &store),
+            Err(TpmError::CounterUnavailable(_))
+        ));
+        assert!(std::path::Path::new(&cfg.ticket_path).exists());
+    }
+
+    /// Fails the seal that follows a consumption, as an interrupted reseal does.
+    struct FailingSealTpm(DryRunTpm);
+
+    impl TpmSealer for FailingSealTpm {
+        fn current_pcr_digest(&mut self) -> Result<[u8; 32]> {
+            self.0.current_pcr_digest()
+        }
+
+        fn seal(&mut self, _secret: &SecretKey) -> Result<crate::tpm_interface::SealedBlob> {
+            Err(TpmError::Connection("injected seal failure".into()))
+        }
+
+        fn unseal(&mut self, blob: &crate::tpm_interface::SealedBlob) -> Result<SecretKey> {
+            self.0.unseal(blob)
+        }
+
+        fn arm_update_window(&mut self, payload: &[u8]) -> Result<()> {
+            self.0.arm_update_window(payload)
+        }
+
+        fn unseal_update_window(&mut self) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+            self.0.unseal_update_window()
+        }
+
+        fn revoke_update_window(&mut self) -> Result<()> {
+            self.0.revoke_update_window()
+        }
+
+        fn update_window_armed(&mut self) -> Result<bool> {
+            self.0.update_window_armed()
+        }
+
+        fn ensure_counter(&mut self) -> Result<()> {
+            self.0.ensure_counter()
+        }
+
+        fn read_counter(&mut self) -> Result<u64> {
+            self.0.read_counter()
+        }
+
+        fn increment_counter(&mut self) -> Result<u64> {
+            self.0.increment_counter()
+        }
+    }
+
+    #[test]
+    fn the_counter_is_consumed_before_the_new_secret_is_sealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path(), true);
+        let store = BlobStore::new(&cfg);
+        let nv = crate::tpm_interface::NvState::default();
+        boot_with(&cfg, &store, &nv, [1u8; 32], [9u8; 32], 0).unwrap();
+        let current = counter_now(&nv);
+        write_ticket(
+            std::path::Path::new(&cfg.ticket_path),
+            current,
+            anchor_now(&cfg),
+            None,
+        );
+
+        // The reseal fails after the increment: the ticket is spent in the TPM.
+        let mut failing = FailingSealTpm(DryRunTpm::with_digest([2u8; 32]).sharing_nv(&nv));
+        assert!(matches!(
+            BootController::unlock_with(&cfg, &mut failing, &store),
+            Err(TpmError::Connection(message)) if message == "injected seal failure"
+        ));
+        assert_eq!(counter_now(&nv), current + 1);
+
+        // The ticket file survived the crash; replaying it is refused.
+        assert!(matches!(
+            boot_with(&cfg, &store, &nv, [3u8; 32], [9u8; 32], 0),
+            Err(TpmError::CounterMismatch { artifact, current: spent })
+                if artifact == current && spent == current + 1
+        ));
     }
 
     // ── Update window ────────────────────────────────────────────────────────
@@ -481,6 +783,7 @@ mod tests {
         let mut tpm = DryRunTpm::with_digest(boot)
             .with_window_digest(window)
             .sharing_nv(nv);
+        BootController::observe_counter(cfg, &mut tpm);
         BootController::run_flow_at(cfg, &mut tpm, store, now)
     }
 
@@ -715,7 +1018,12 @@ mod tests {
             .unwrap();
         // A ticket must not be consumed after the same-secret nominal blob has
         // already been committed.
-        write_ticket(std::path::Path::new(&cfg.ticket_path), 1, None);
+        write_ticket(
+            std::path::Path::new(&cfg.ticket_path),
+            1,
+            anchor_now(&cfg),
+            None,
+        );
 
         let mut failing = FailingRevokeTpm(
             DryRunTpm::with_digest([2u8; 32])
@@ -750,7 +1058,12 @@ mod tests {
             .sharing_nv(&nv);
         provisioning::arm_window(&mut arm_tpm, &store, provisioned.secret().unwrap(), 1_000)
             .unwrap();
-        write_ticket(std::path::Path::new(&cfg.ticket_path), 1, None);
+        write_ticket(
+            std::path::Path::new(&cfg.ticket_path),
+            1,
+            anchor_now(&cfg),
+            None,
+        );
 
         let mut failing = FailingWindowReadTpm(
             DryRunTpm::with_digest([2u8; 32])
@@ -789,7 +1102,12 @@ mod tests {
         provisioning::arm_window(&mut arm_tpm, &store, provisioned.secret().unwrap(), 1_000)
             .unwrap();
         std::fs::write(&cfg.update_window_marker_path, b"invalid marker").unwrap();
-        write_ticket(std::path::Path::new(&cfg.ticket_path), 1, None);
+        write_ticket(
+            std::path::Path::new(&cfg.ticket_path),
+            1,
+            anchor_now(&cfg),
+            None,
+        );
 
         let result = boot_with(&cfg, &store, &nv, [2u8; 32], [9u8; 32], 500).unwrap();
         assert!(matches!(result, BootDecision::Resealed(_)));
@@ -817,7 +1135,12 @@ mod tests {
         provisioning::arm_window(&mut arm_tpm, &store, provisioned.secret().unwrap(), 1_000)
             .unwrap();
         std::fs::write(&cfg.update_window_marker_path, b"invalid marker").unwrap();
-        write_ticket(std::path::Path::new(&cfg.ticket_path), 1, None);
+        write_ticket(
+            std::path::Path::new(&cfg.ticket_path),
+            1,
+            anchor_now(&cfg),
+            None,
+        );
 
         let mut failing = FailingRevokeTpm(
             DryRunTpm::with_digest([2u8; 32])
@@ -1095,28 +1418,5 @@ mod tests {
         assert!(!BootDecision::Provisioned(key()).preserved_vaults());
         assert!(!BootDecision::Disabled.preserved_vaults());
         assert!(!BootDecision::Bypassed.preserved_vaults());
-    }
-
-    #[test]
-    fn replayed_ticket_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = test_cfg(dir.path(), true);
-        let store = BlobStore::new(&cfg);
-
-        let mut tpm = DryRunTpm::with_digest([1u8; 32]);
-        BootController::run_flow(&cfg, &mut tpm, &store).unwrap();
-
-        // First resealing with ticket version 1 -> state version 1.
-        write_ticket(std::path::Path::new(&cfg.ticket_path), 1, None);
-        let mut tpm = DryRunTpm::with_digest([2u8; 32]);
-        BootController::run_flow(&cfg, &mut tpm, &store).unwrap();
-
-        // Replay of the same version-1 ticket on new PCRs -> anti-rollback.
-        write_ticket(std::path::Path::new(&cfg.ticket_path), 1, None);
-        let mut tpm = DryRunTpm::with_digest([3u8; 32]);
-        assert!(matches!(
-            BootController::run_flow(&cfg, &mut tpm, &store),
-            Err(TpmError::TicketRollback { .. })
-        ));
     }
 }

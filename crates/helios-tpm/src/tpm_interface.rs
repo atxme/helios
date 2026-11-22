@@ -110,22 +110,31 @@ impl CounterState {
 
 /// The part of a simulated TPM that **survives a reboot**.
 ///
-/// The NV index does not live on the configuration partition, so a test that
-/// models a reboot by building a fresh [`DryRunTpm`] must carry it across —
+/// The NV indices do not live on the configuration partition, so a test that
+/// models a reboot by building a fresh [`DryRunTpm`] must carry them across —
 /// otherwise revocation would look like it works while the property under
-/// test, "a spent window stays spent", is never exercised.
+/// test, "a spent window stays spent", is never exercised. The anti-rollback
+/// counter is one of those indices.
 #[cfg(any(not(feature = "tpm"), test))]
 #[derive(Clone, Default)]
-pub(crate) struct NvState(std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>);
+pub(crate) struct NvState {
+    window: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    /// Only tests share NV state between instances, so only tests carry this.
+    #[cfg(test)]
+    counter: CounterState,
+}
 
 #[cfg(any(not(feature = "tpm"), test))]
 impl NvState {
     fn get(&self) -> Option<Vec<u8>> {
-        self.0.lock().expect("simulated NV state poisoned").clone()
+        self.window
+            .lock()
+            .expect("simulated NV state poisoned")
+            .clone()
     }
 
     fn set(&self, value: Option<Vec<u8>>) {
-        let mut state = self.0.lock().expect("simulated NV state poisoned");
+        let mut state = self.window.lock().expect("simulated NV state poisoned");
         if let Some(previous) = state.as_mut() {
             zeroize::Zeroize::zeroize(previous);
         }
@@ -200,12 +209,20 @@ impl DryRunTpm {
         self
     }
 
-    /// Shares the non-volatile state with another instance, i.e. models the
-    /// same TPM across a reboot.
+    /// Shares the non-volatile state, counter included, with another
+    /// instance, i.e. models the same TPM across a reboot.
     #[cfg(test)]
     pub(crate) fn sharing_nv(mut self, nv: &NvState) -> Self {
+        self.counter = nv.counter.clone();
         self.nv = nv.clone();
         self
+    }
+
+    /// The anti-rollback counter of this instance, to share it with another
+    /// instance that models the same TPM.
+    #[cfg(test)]
+    pub(crate) fn counter_handle(&self) -> CounterState {
+        self.counter.clone()
     }
 
     /// Shares the anti-rollback counter with another instance, i.e. models the

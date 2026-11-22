@@ -6,7 +6,7 @@ use aether::sig::{
 
 use crate::{Result, TpmError};
 
-/// v2 ticket: hybrid Ed25519 + ML-DSA-65 envelope, no v1 compatibility.
+/// v3 ticket: hybrid Ed25519 + ML-DSA-65 envelope, no older compatibility.
 pub(crate) struct ResealTicket {
     envelope: SignedResealTicket,
 }
@@ -17,12 +17,15 @@ impl ResealTicket {
         Ok(Self { envelope })
     }
 
-    pub(crate) const fn version(&self) -> u64 {
+    /// The anti-rollback counter value this ticket was issued for. Spending it
+    /// is the caller's job: see `anti_rollback::consume`.
+    pub(crate) const fn counter(&self) -> u64 {
         self.envelope.payload.counter
     }
 
-    /// Verifies the hybrid AND, the signed epoch, anti-replay, then the optional PCR binding.
-    pub(crate) fn verify(&self, current_version: u64, current_pcr: &[u8; 32]) -> Result<()> {
+    /// Verifies the hybrid AND, the signed epoch, the sealed blob it was issued
+    /// for, then the optional PCR binding.
+    pub(crate) fn verify(&self, current_pcr: &[u8; 32], current_anchor: &[u8; 32]) -> Result<()> {
         if USING_DEVELOPMENT_PUBLISHER_KEYS {
             static WARN_ONCE: Once = Once::new();
             WARN_ONCE.call_once(|| {
@@ -32,25 +35,22 @@ impl ResealTicket {
                 );
             });
         }
-        self.verify_with_keyring(PUBLISHER_KEYS, current_version, current_pcr)
+        self.verify_with_keyring(PUBLISHER_KEYS, current_pcr, current_anchor)
     }
 
     fn verify_with_keyring(
         &self,
         keyring: &[PublisherPublicKeys],
-        current_version: u64,
         current_pcr: &[u8; 32],
+        current_anchor: &[u8; 32],
     ) -> Result<()> {
         self.envelope
             .verify(keyring)
             .map_err(|_| TpmError::TicketInvalidSignature)?;
 
         let payload = &self.envelope.payload;
-        if payload.counter <= current_version {
-            return Err(TpmError::TicketRollback {
-                ticket: payload.counter,
-                current: current_version,
-            });
+        if payload.sealed_blob_anchor != *current_anchor {
+            return Err(TpmError::TicketAnchorMismatch);
         }
         if let Some(expected) = payload.expected_pcr_digest {
             if expected != *current_pcr {
@@ -69,17 +69,19 @@ mod tests {
 
     const ED_SEED: [u8; 32] = *b"helios-sign-ed25519-test-seed001";
     const ML_SEED: [u8; 32] = *b"helios-sign-mldsa65-test-seed001";
+    const ANCHOR: [u8; 32] = [7; 32];
 
     fn sign_ticket(
-        version: u64,
+        counter: u64,
+        sealed_blob_anchor: [u8; 32],
         expected_pcr_digest: Option<[u8; 32]>,
     ) -> (ResealTicket, PublisherPublicKeys) {
         let signer = PublisherSigner::from_seed_material(7, &ED_SEED, &ML_SEED).unwrap();
         let public_keys = signer.public_keys();
         let envelope = signer
             .sign(ResealPayload {
-                counter: version,
-                sealed_blob_anchor: [0; 32],
+                counter,
+                sealed_blob_anchor,
                 expected_pcr_digest,
             })
             .unwrap();
@@ -88,58 +90,60 @@ mod tests {
 
     #[test]
     fn valid_hybrid_ticket_is_accepted() {
-        let (ticket, keys) = sign_ticket(1, None);
-        assert!(ticket.verify_with_keyring(&[keys], 0, &[0u8; 32]).is_ok());
+        let (ticket, keys) = sign_ticket(1, ANCHOR, None);
+        assert!(ticket
+            .verify_with_keyring(&[keys], &[0u8; 32], &ANCHOR)
+            .is_ok());
+        assert_eq!(ticket.counter(), 1);
     }
 
     #[test]
     fn invalid_ed25519_signature_is_rejected() {
-        let (mut ticket, keys) = sign_ticket(1, None);
+        let (mut ticket, keys) = sign_ticket(1, ANCHOR, None);
         ticket.envelope.signatures[0].sig.push('A');
         assert!(matches!(
-            ticket.verify_with_keyring(&[keys], 0, &[0u8; 32]),
+            ticket.verify_with_keyring(&[keys], &[0u8; 32], &ANCHOR),
             Err(TpmError::TicketInvalidSignature)
         ));
     }
 
     #[test]
     fn missing_ml_dsa_signature_is_rejected() {
-        let (mut ticket, keys) = sign_ticket(1, None);
+        let (mut ticket, keys) = sign_ticket(1, ANCHOR, None);
         ticket
             .envelope
             .signatures
             .retain(|signature| signature.alg != "ml-dsa-65");
         assert!(matches!(
-            ticket.verify_with_keyring(&[keys], 0, &[0u8; 32]),
+            ticket.verify_with_keyring(&[keys], &[0u8; 32], &ANCHOR),
             Err(TpmError::TicketInvalidSignature)
         ));
     }
 
     #[test]
-    fn rollback_is_rejected() {
-        let (ticket, keys) = sign_ticket(3, None);
+    fn a_ticket_for_another_sealed_blob_is_refused() {
+        let (ticket, keys) = sign_ticket(1, [8; 32], None);
         assert!(matches!(
-            ticket.verify_with_keyring(&[keys], 3, &[0u8; 32]),
-            Err(TpmError::TicketRollback {
-                ticket: 3,
-                current: 3
-            })
+            ticket.verify_with_keyring(&[keys], &[0u8; 32], &ANCHOR),
+            Err(TpmError::TicketAnchorMismatch)
         ));
     }
 
     #[test]
     fn optional_pcr_binding_and_mismatch_is_rejected() {
-        let (without_pcr, keys) = sign_ticket(1, None);
+        let (without_pcr, keys) = sign_ticket(1, ANCHOR, None);
         assert!(without_pcr
-            .verify_with_keyring(&[keys], 0, &[99u8; 32])
+            .verify_with_keyring(&[keys], &[99u8; 32], &ANCHOR)
             .is_ok());
 
-        let (with_pcr, keys) = sign_ticket(1, Some([1u8; 32]));
+        let (with_pcr, keys) = sign_ticket(1, ANCHOR, Some([1u8; 32]));
         assert!(matches!(
-            with_pcr.verify_with_keyring(&[keys], 0, &[2u8; 32]),
+            with_pcr.verify_with_keyring(&[keys], &[2u8; 32], &ANCHOR),
             Err(TpmError::TicketPcrMismatch)
         ));
-        assert!(with_pcr.verify_with_keyring(&[keys], 0, &[1u8; 32]).is_ok());
+        assert!(with_pcr
+            .verify_with_keyring(&[keys], &[1u8; 32], &ANCHOR)
+            .is_ok());
     }
 
     #[test]
@@ -152,27 +156,27 @@ mod tests {
     }
 
     #[test]
-    fn signature_is_verified_before_anti_rollback_and_pcr() {
-        let (mut ticket, keys) = sign_ticket(1, Some([1u8; 32]));
+    fn signature_is_verified_before_the_anchor_and_pcr() {
+        let (mut ticket, keys) = sign_ticket(1, ANCHOR, Some([1u8; 32]));
         ticket.envelope.signatures.clear();
 
-        // A forged envelope must not act as an oracle allowing the counter
+        // A forged envelope must not act as an oracle allowing the anchor
         // and PCR to be distinguished before publisher authentication.
         assert!(matches!(
-            ticket.verify_with_keyring(&[keys], 99, &[2u8; 32]),
+            ticket.verify_with_keyring(&[keys], &[2u8; 32], &[8; 32]),
             Err(TpmError::TicketInvalidSignature)
         ));
     }
 
     #[test]
     fn json_rejects_malformed_pcr_digest_and_unknown_fields() {
-        let malformed = br#"{"payload":{"version":1,"expected_pcr_digest":"abcd"},"key_epoch":1,"signatures":[]}"#;
+        let malformed = br#"{"payload":{"counter":1,"sealed_blob_anchor":"00","expected_pcr_digest":"abcd"},"key_epoch":1,"signatures":[]}"#;
         assert!(matches!(
             ResealTicket::from_json(malformed),
             Err(TpmError::Serde(_))
         ));
 
-        let unknown = br#"{"payload":{"version":1,"expected_pcr_digest":null,"bypass":true},"key_epoch":1,"signatures":[]}"#;
+        let unknown = br#"{"payload":{"counter":1,"sealed_blob_anchor":"0000000000000000000000000000000000000000000000000000000000000000","expected_pcr_digest":null,"bypass":true},"key_epoch":1,"signatures":[]}"#;
         assert!(matches!(
             ResealTicket::from_json(unknown),
             Err(TpmError::Serde(_))

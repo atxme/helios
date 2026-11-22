@@ -18,7 +18,6 @@ pub struct TpmSettings {
     pub pcr_selection: Vec<u8>,
     pub sealed_blob_path: String,
     pub ticket_path: String,
-    pub state_path: String,
     /// PCRs bound to the **update window** — a strict subset of
     /// [`Self::pcr_selection`], PCR 4 excluded.
     ///
@@ -54,7 +53,6 @@ impl Default for TpmSettings {
             pcr_selection: vec![0, 4, 7],
             sealed_blob_path: "/var/lib/helios/sealed.key".to_string(),
             ticket_path: "/var/lib/helios/reseal-ticket.json".to_string(),
-            state_path: "/var/lib/helios/tpm-state.json".to_string(),
             update_window_pcr_selection: vec![0, 7],
             update_window_marker_path: "/var/lib/helios/update-window.marker".to_string(),
             update_window_nv_index: 0x0180_4845,
@@ -82,7 +80,6 @@ mod tests {
         assert_eq!(settings.pcr_selection, [0, 4, 7]);
         assert_eq!(settings.sealed_blob_path, "/var/lib/helios/sealed.key");
         assert_eq!(settings.ticket_path, "/var/lib/helios/reseal-ticket.json");
-        assert_eq!(settings.state_path, "/var/lib/helios/tpm-state.json");
         assert_eq!(
             settings.update_window_marker_path,
             "/var/lib/helios/update-window.marker"

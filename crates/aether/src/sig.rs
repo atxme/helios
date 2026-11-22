@@ -296,6 +296,21 @@ impl ArtifactPayload for ResealPayload {
 
 pub type SignedResealTicket = SignedEnvelope<ResealPayload>;
 
+/// What a gateway hands to the publisher to obtain a [`ResealPayload`]: the
+/// anti-rollback counter it currently holds and the digest of the sealed blob
+/// the ticket must be issued for. Not signed, and not trusted: the publisher
+/// signs whatever ticket it chooses, and the gateway checks the result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResealRequest {
+    pub counter: u64,
+    #[serde(
+        serialize_with = "serialize_digest",
+        deserialize_with = "deserialize_digest"
+    )]
+    pub sealed_blob_anchor: [u8; 32],
+}
+
 /// Authorizes restoration of one existing TPM root after planned firmware
 /// maintenance. This domain never authorizes creation of a replacement root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

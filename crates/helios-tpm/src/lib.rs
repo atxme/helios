@@ -49,6 +49,7 @@ pub use boot_controller::{BootController, BootDecision};
 pub use keystore::{
     Context, KeystoreError, SealedKeystore, DOMAIN_GATEWAY_WG_KEY, DOMAIN_KEY_NEGOTIATION_IDENTITY,
 };
+pub use provisioning::prepare_reseal_request;
 pub use secret::SecretKey;
 pub use settings::TpmSettings;
 
@@ -90,8 +91,8 @@ pub enum TpmError {
     #[error("invalid reseal ticket signature")]
     TicketInvalidSignature,
 
-    #[error("reseal ticket rejected (anti-replay): version {ticket} <= current {current}")]
-    TicketRollback { ticket: u64, current: u64 },
+    #[error("reseal ticket issued for another sealed blob — refused")]
+    TicketAnchorMismatch,
 
     #[error("reseal ticket bound to a PCR state different from the current one")]
     TicketPcrMismatch,

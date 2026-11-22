@@ -41,8 +41,6 @@ pub fn advance(cfg: &TpmSettings) -> Result<u64> {
 /// forged artifact must not overwrite the public status. A failure to read or
 /// increment, or an increment that does not produce `artifact + 1`, is
 /// published and reported as [`TpmError::CounterUnavailable`].
-// Not called outside tests yet: the artifact verification path is its only caller.
-#[allow(dead_code)]
 pub(crate) fn consume<T: TpmSealer>(tpm: &mut T, cfg: &TpmSettings, artifact: u64) -> Result<u64> {
     let current = tpm
         .read_counter()

@@ -469,6 +469,12 @@ pub(crate) enum TpmCommand {
     /// touches the disk. Asking afterwards is asking too late: the kernel has
     /// already moved and the next reboot loses the vaults.
     UpdateReadiness,
+    /// Prints the reseal request to send to the publisher, as JSON: the
+    /// anti-rollback counter this gateway holds and the anchor of its sealed
+    /// blob. The publisher's ticket is valid only for these two values.
+    PrepareReseal,
+    /// Prints the anti-rollback counter, or the reason it cannot be read.
+    CounterStatus,
 }
 
 #[derive(Subcommand)]

@@ -80,7 +80,22 @@ pub(crate) fn tpm_command(command: TpmCommand) -> anyhow::Result<()> {
             Ok(())
         }
         TpmCommand::UpdateReadiness => update_readiness(&tpm),
+        TpmCommand::PrepareReseal => {
+            println!("{}", reseal_request_json(&tpm)?);
+            Ok(())
+        }
+        TpmCommand::CounterStatus => {
+            println!("{}", helios_tpm::anti_rollback::current(&tpm)?);
+            Ok(())
+        }
     }
+}
+
+/// The reseal request, as the publisher reads it. It carries no secret.
+fn reseal_request_json(tpm: &TpmSettings) -> anyhow::Result<String> {
+    let request =
+        helios_tpm::prepare_reseal_request(tpm).context("preparing the reseal request")?;
+    Ok(serde_json::to_string(&request)?)
 }
 
 fn read_firmware_input() -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
@@ -346,6 +361,32 @@ mod tests {
             .contains("refusing to overwrite"));
 
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn the_reseal_request_carries_the_counter_and_the_blob_anchor() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = |name: &str| directory.path().join(name).to_string_lossy().into_owned();
+        std::fs::write(path("simulated-nv-counter"), "4").unwrap();
+        std::fs::write(path("sealed.key"), b"opaque sealed blob").unwrap();
+        let tpm = TpmSettings {
+            sealed_blob_path: path("sealed.key"),
+            simulated_counter_path: path("simulated-nv-counter"),
+            counter_status_path: path("anti-rollback.json"),
+            ..TpmSettings::default()
+        };
+
+        let json = reseal_request_json(&tpm).unwrap();
+
+        let request: aether::sig::ResealRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(request.counter, 4);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["sealed_blob_anchor"]
+                .as_str()
+                .map(str::len),
+            Some(64),
+            "the anchor is published as 64 hex characters"
+        );
     }
 
     #[test]

@@ -77,7 +77,6 @@ fn settings(dir: &std::path::Path, allow_provisioning: bool) -> TpmSettings {
             .join("reseal-ticket.json")
             .to_string_lossy()
             .into_owned(),
-        state_path: dir.join("tpm-state.json").to_string_lossy().into_owned(),
         update_window_pcr_selection: vec![0, 7],
         update_window_marker_path: dir
             .join("update-window.marker")
