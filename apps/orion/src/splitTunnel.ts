@@ -254,6 +254,21 @@ export function presetPrefixes(
  * screen shows the core's error instead of this warning.
  */
 export function leavesIpv6Uncaptured(value: string): boolean {
+  const { ipv4, ipv6 } = zeroPrefixFamilies(value)
+  return ipv4 && !ipv6
+}
+
+/**
+ * Does the list capture all of IPv4? The core's `full` and `ipv4_only` both
+ * do, and both are what a custom resolver list needs to be applied where the
+ * traffic is routed. A split tunnel does not.
+ */
+export function capturesAllIpv4(value: string): boolean {
+  return zeroPrefixFamilies(value).ipv4
+}
+
+/** Which families a list captures whole: an entry with prefix length zero. */
+function zeroPrefixFamilies(value: string): { ipv4: boolean; ipv6: boolean } {
   let ipv4 = false
   let ipv6 = false
   for (const entry of splitPrefixes(value)) {
@@ -266,7 +281,7 @@ export function leavesIpv6Uncaptured(value: string): boolean {
     if (isIpv4(host)) ipv4 = true
     else if (isIpv6(host)) ipv6 = true
   }
-  return ipv4 && !ipv6
+  return { ipv4, ipv6 }
 }
 
 /**

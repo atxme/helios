@@ -1174,6 +1174,52 @@ describe('ProfilesView interactions', () => {
   })
 
   /**
+   * A custom resolver list on a profile that does not capture all IPv4 is
+   * never applied where the traffic is not routed: the field says so, and the
+   * save is not blocked by it.
+   */
+  it('notes a custom DNS that the split tunnel does not carry, without blocking the save', async () => {
+    const handlers = callbacks()
+    render(
+      <ProfilesView
+        config={{
+          profiles: [heliosProfile({ dns: ['86.54.11.100'], allowed_ips: '100.64.0.0/10' })],
+          selected: 'portable',
+          locked: [],
+        }}
+        pathImport={null}
+        {...handlers}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+    expect(screen.getByText('non appliqué : le profil ne capture pas tout le trafic')).toBeTruthy()
+    fireEvent.change(screen.getByRole('textbox', { name: 'DNS' }), {
+      target: { value: '86.54.11.100, 86.54.11.200' },
+    })
+    expect(screen.getByText('non appliqué : le profil ne capture pas tout le trafic')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Enregistrer' }))
+    await waitFor(() => expect(handlers.onSave).toHaveBeenCalledOnce())
+  })
+
+  it('notes no custom DNS on a full capture', async () => {
+    render(
+      <ProfilesView
+        config={{
+          profiles: [heliosProfile({ dns: ['86.54.11.100'], allowed_ips: '0.0.0.0/0, ::/0' })],
+          selected: 'portable',
+          locked: [],
+        }}
+        pathImport={null}
+        {...callbacks()}
+      />,
+    )
+    await waitFor(() => expect(api.validateProfile).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: 'Avancé' }))
+    expect(screen.queryByText(/non appliqué : le profil ne capture/)).toBeNull()
+  })
+
+  /**
    * A list the screen accepts can still be refused by the engine: the field
    * carries that refusal, and the save stays blocked.
    */

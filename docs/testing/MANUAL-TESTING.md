@@ -1817,7 +1817,9 @@ par défaut `86.54.11.100` et `86.54.11.200`.
     n'est pas `0.0.0.0/0` (par exemple `100.64.0.0/10` seul), connecté. Attendu :
     `Get-DnsClientNrptPolicy` ne contient aucune règle `.` ; le panneau de posture
     affiche « DNS local : le profil ne capture pas tout le trafic ». Un remplacement
-    « Personnalisé » saisi sur ce profil est signalé « non appliqué », pas appliqué.
+    « Personnalisé » saisi sur ce profil affiche, sous le champ DNS, la mention
+    « non appliqué : le profil ne capture pas tout le trafic » ; l'enregistrement
+    reste possible.
 163. **[cible] La passerelle ne propose pas de DNS.** Sur la passerelle, mettre
     `client_dns = []` dans `network.toml`, puis recharger sa configuration (chemin de
     rechargement à chaud). Reconnecter le profil `helios` en tunnel complet.

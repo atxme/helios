@@ -36,6 +36,7 @@ import { CopyButton } from '../components/CopyButton'
 import { EnrollmentPanel } from './EnrollmentPanel'
 import { modeAllowed, modeLevel, modeMeta, PROTECTION_MODES } from '../components/state'
 import {
+  capturesAllIpv4,
   leavesIpv6Uncaptured,
   matchPreset,
   presetPrefixes,
@@ -1924,6 +1925,13 @@ export function ProfilesView({
                     value={draft.dns?.join(', ') ?? ''}
                     onChange={(value) => set('dns', parseClientDns(value))}
                   />
+                )}
+                {/* Non-blocking: the list is saved as typed. A split tunnel
+                    does not carry these resolvers, so they are not applied. */}
+                {draft.dns !== null && !issues.allowed_ips && !capturesAllIpv4(draft.allowed_ips) && (
+                  <Typography color="text.disabled" sx={{ fontSize: 10.5, lineHeight: 1.5 }}>
+                    non appliqué : le profil ne capture pas tout le trafic
+                  </Typography>
                 )}
               </Box>
             </Box>
