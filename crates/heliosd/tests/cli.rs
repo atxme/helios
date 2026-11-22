@@ -403,3 +403,121 @@ fn astra_channel_init_refuses_incomplete_pairing_or_wildcard_binding() {
         assert!(!root.join("astra-channel.json").exists());
     }
 }
+
+#[cfg(target_os = "linux")]
+mod firmware_commands {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+
+    fn run(root: &Path, arguments: &[&str], input: &[u8]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_heliosd"));
+        let mut child = command
+            .args(arguments)
+            .env("HELIOS_NETWORK_CONFIG", root.join("network.toml"))
+            .env("HELIOS_TEST_SERVICE_LOG", root.join("systemctl.log"))
+            // Only the fixture's systemctl can be reached from this process.
+            .env("PATH", root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start heliosd with isolated tools");
+        if !input.is_empty() {
+            child.stdin.take().unwrap().write_all(input).unwrap();
+        }
+        child.wait_with_output().expect("read heliosd result")
+    }
+
+    fn assert_refusal(output: Output, message: &str) {
+        assert!(!output.status.success(), "command must refuse the request");
+        assert!(
+            output.stdout.is_empty(),
+            "refusal must not produce a result"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(message), "expected {message:?}: {stderr}");
+    }
+
+    fn fake_service_status(root: &Path, code: u8) {
+        let script = root.join("systemctl");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HELIOS_TEST_SERVICE_LOG\"\nexit {code}\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn assert_service_probe(root: &Path) {
+        assert_eq!(
+            fs::read_to_string(root.join("systemctl.log")).unwrap(),
+            "is-active\n--quiet\nheliosd.service\n"
+        );
+    }
+
+    #[test]
+    fn firmware_preflight_refuses_malformed_or_oversized_stdin() {
+        let directory = tempfile::tempdir().unwrap();
+        for input in [&b""[..], &b"{\"payload\":"[..]] {
+            assert_refusal(
+                run(directory.path(), &["tpm", "firmware-preflight"], input),
+                "invalid firmware authorization",
+            );
+        }
+        let input = vec![b' '; helios_tpm::firmware_recovery::MAX_RESTORE_FRAME + 1];
+        assert_refusal(
+            run(directory.path(), &["tpm", "firmware-preflight"], &input),
+            "firmware input exceeds 64 KiB",
+        );
+    }
+
+    #[test]
+    fn firmware_restore_requires_systemd_to_confirm_the_daemon_is_inactive() {
+        let directory = tempfile::tempdir().unwrap();
+        for status in [0, 1, 4] {
+            fake_service_status(directory.path(), status);
+            assert_refusal(
+                run(directory.path(), &["tpm", "restore-firmware"], b""),
+                "stop heliosd.service before restoring its TPM root",
+            );
+            assert_service_probe(directory.path());
+        }
+    }
+
+    #[test]
+    fn firmware_restore_refuses_a_truncated_frame_when_the_daemon_is_inactive() {
+        let directory = tempfile::tempdir().unwrap();
+        fake_service_status(directory.path(), 3);
+        assert_refusal(
+            run(directory.path(), &["tpm", "restore-firmware"], &[0; 3]),
+            "invalid recovery frame size",
+        );
+        assert_service_probe(directory.path());
+    }
+
+    #[test]
+    fn firmware_export_refuses_an_invalid_escrow_key_encoding() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_refusal(
+            run(
+                directory.path(),
+                &[
+                    "tpm",
+                    "export-firmware",
+                    "--operator-public-key",
+                    "!!!!",
+                    "--device",
+                    "5bc922b7bd1adb5b6f99592611404036bd9f42d0",
+                    "--target-version",
+                    "2026.11",
+                ],
+                b"",
+            ),
+            "Invalid symbol",
+        );
+    }
+}

@@ -331,6 +331,26 @@ mod tests {
     }
 
     #[test]
+    fn a_disabled_tpm_reports_readiness_without_arming_an_update_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("update-window.marker");
+        let settings = TpmSettings {
+            enabled: false,
+            sealed_blob_path: directory.path().join("sealed.key").display().to_string(),
+            update_window_marker_path: marker.display().to_string(),
+            ..TpmSettings::default()
+        };
+
+        update_readiness(&settings).expect("a disabled TPM has a defined readiness result");
+        let refusal = prepare_update(&settings, false).expect_err("arming requires unsealing");
+        assert!(refusal.to_string().contains("not a nominal unseal"));
+        assert!(
+            !marker.exists(),
+            "a refused request must not create a marker"
+        );
+    }
+
+    #[test]
     fn provisioning_refuses_a_disabled_tpm_and_an_existing_vault() {
         let disabled = TpmSettings {
             enabled: false,
