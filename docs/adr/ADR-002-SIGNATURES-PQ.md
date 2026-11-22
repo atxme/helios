@@ -5,13 +5,14 @@
 la clé WireGuard et des manifestes de binaires Helios. Ne concerne pas l'échange de
 clés (ADR-001 §2, déjà post-quantique via ML-KEM-1024).
 
-## État d’implémentation au 2026-07-19
+## État d’implémentation au 2026-11-22
 
 | Lot | État | Preuve principale |
 |---|---|---|
 | Enveloppe hybride et trousseau | fait | `aether::sig`, tests anti-downgrade et Ed25519 strict |
-| Billet TPM v2 | fait | `helios-tpm::reseal_ticket`, rupture v1 sans fallback |
-| Récupération WireGuard | bloqué | arbitrage compteur fichier / NV TPM requis |
+| Billet TPM v3 (compteur NV) | fait | `helios-tpm::reseal_ticket`, `anti_rollback::consume` ; rupture v2 sans fallback |
+| Compteur NV anti-rejeu | fait sous TPM simulé | `helios-tpm::anti_rollback`, index `0x01804847` ; recette sur TPM réel à faire |
+| Récupération WireGuard | fait | `helios-escrow` (HESC v2, cérémonie hors ligne), `helios-tpm::wg_recovery`, `gateway_key::try_recovery` ; recette sur TPM réel à faire |
 | Outil éditeur | fait | `helios-publisher`, auto-vérification et tests CLI |
 
 `GET /api/trust` expose la politique et les empreintes réellement compilées.
@@ -99,7 +100,7 @@ On le généralise :
 octets_signés = DOMAINE_ARTEFACT ‖ version_format ‖ payload_canonique
 ```
 
-Chaque type d'artefact a son domaine (`helios-tpm-reseal-v2`,
+Chaque type d'artefact a son domaine (`helios-tpm-reseal-v3`,
 `helios-wg-recovery-v1`, …) : une signature de billet ne peut pas être rejouée
 comme signature de fichier de récupération. Le payload est sérialisé de façon
 **canonique** (ordre des champs fixe, pas de JSON re-sérialisé à la volée) —
@@ -119,7 +120,7 @@ cumuler :
 
 * **compteur monotone** — obligatoire, comme l'anti-rollback du billet : un
   fichier de version ≤ courante est refusé. Voir **l'amendement 2** sur la nature
-  exacte de ce compteur, qui reste à trancher ;
+  exacte de ce compteur, tranchée le 22 novembre 2026 (compteur NV du TPM) ;
 * **empreinte PCR** — **optionnelle** (« si présent, doit correspondre »). La
   version initiale de cet ADR la rendait obligatoire : c'était une erreur, voir
   **l'amendement 1**.
@@ -206,6 +207,28 @@ Deux réponses admissibles, à choisir au lot 3 et à documenter :
 
 Ne pas laisser l'implémentation trancher implicitement.
 
+**Tranché le 22 novembre 2026 : option 2, compteur NV du TPM.** Un seul compteur
+remplace `TpmState.version` pour les trois artefacts (billet de rescellement,
+restauration firmware, fichier de récupération WireGuard) : un index NV de type
+compteur, `anti_rollback_nv_index = 0x0180_4847`, défini propriétaire en lecture
+et écriture, `no_da`, sans politique d'autorisation. Le fichier `TpmState` et son
+rôle de compteur disparaissent ; aucun repli n'est conservé.
+
+Règle de consommation, commune aux trois artefacts :
+
+* un artefact est valide **si et seulement si** son `counter` est **égal** à la
+  valeur courante du compteur NV ;
+* la gateway **incrémente le compteur avant d'agir**, de sorte qu'un artefact ne
+  sert qu'une fois ; un arrêt entre l'incrément et l'action le grille sans rien
+  accorder ;
+* un compteur illisible ou absent **refuse** l'artefact, sans jamais bloquer le
+  démarrage de `heliosd`.
+
+Une même démarche consomme plusieurs artefacts dans un démarrage : le billet
+vise `C`, puis la récupération `C+1`. Détail de la conception :
+[spec F5](../superpowers/specs/2026-11-22-f5-recuperation-signee-design.md), §5.1
+et §5.2.
+
 ### Amendement 3 — `key_epoch` doit être dans les octets signés
 
 La première rédaction plaçait `key_epoch` dans l'enveloppe mais **hors** des
@@ -235,9 +258,11 @@ est gardé comme test de non-régression.
 
 ### Domaines de séparation
 
-Le domaine actuel est `helios-tpm-reseal-v1` : conserver le préfixe complet.
+Le domaine initial était `helios-tpm-reseal-v1` : conserver le préfixe complet.
 
-* billet de rescellement → `helios-tpm-reseal-v2`
+* billet de rescellement → `helios-tpm-reseal-v3` (champ `counter`, amendement 2) ;
+  `v2` le portait avec le champ `version`, `v1` était Ed25519 seul
+* restauration firmware → `helios-firmware-recovery-v2` (champ `counter`)
 * fichier de récupération → `helios-wg-recovery-v1`
 
 ### Hors périmètre
@@ -248,23 +273,22 @@ Le domaine actuel est `helios-tpm-reseal-v1` : conserver le préfixe complet.
 
 ### Amendement 5 — restauration firmware planifiée (1er octobre 2026)
 
-L'artefact `helios-firmware-recovery-v1` autorise exclusivement la restauration
+L'artefact `helios-firmware-recovery-v2` autorise exclusivement la restauration
 du secret racine existant depuis une sauvegarde opérateur préparée avant une
 mise à jour firmware. Il est distinct du billet et de la récupération
 WireGuard historique ; leurs domaines ne sont pas interchangeables.
 
-**Choix explicite pour ce parcours : réutiliser `TpmState.version`**, partagé
-avec les billets, avec ancre de l'ancien blob et engagement du secret. Le
-compteur doit strictement croître avant toute substitution du blob. Le système
-de fichiers qui le porte doit être protégé contre le rollback. Ce choix
-n'apporte **pas** une résistance matérielle au rejeu d'une image complète du
-disque : restaurer ensemble compteur et ancien blob contourne la monotonie.
-Une telle garantie exige un compteur NV TPM et reste absente de ce parcours.
-La signature et l'engagement empêchent cependant l'injection d'un secret
+**Compteur de ce parcours, depuis le 22 novembre 2026 : le compteur NV du TPM**
+(amendement 2), partagé avec les billets et les récupérations WireGuard, avec
+ancre de l'ancien blob et engagement du secret. Le compteur doit être égal à la
+valeur signée avant toute substitution du blob, puis il est incrémenté. Il
+n'est plus stocké sur le système de fichiers : restaurer ensemble un compteur et
+un ancien blob ne contourne plus la monotonie, puisque le compteur vit dans le
+TPM. La signature et l'engagement empêchent aussi l'injection d'un secret
 arbitraire avec une autorisation destinée à un autre secret.
 
-Cette décision explicite l'hypothèse pour la maintenance planifiée ; elle ne
-lève pas le blocage de la récupération WireGuard historique. L'éditeur doit
+Cette décision explicite l'hypothèse pour la maintenance planifiée ; la
+récupération WireGuard suit la même règle de compteur. L'éditeur doit
 protéger ses clés et n'autoriser que les requêtes issues d'une préparation
 nominale de la gateway concernée. Voir [ADR-007](ADR-007-FENETRE-DE-MISE-A-JOUR.md)
 et [MAINTENANCE.md](../MAINTENANCE.md).
@@ -327,7 +351,9 @@ courants.
 ## Migration
 
 Rien n'est déployé : **rupture nette**, pas de période de tolérance. Les billets
-Ed25519 seuls (`helios-tpm-reseal-v1`) sont refusés ; le nouveau format est `v2`.
+Ed25519 seuls (`helios-tpm-reseal-v1`) sont refusés. Le passage au compteur NV
+(lot compteur, 22 novembre 2026) suit la même règle : la signature `v2` n'est
+plus vérifiée, le billet est `v3`, sans période de double acceptation.
 Une période de double acceptation serait précisément une fenêtre de downgrade.
 
 ## Ce que cela ne protège pas
@@ -348,7 +374,7 @@ Une période de double acceptation serait précisément une fenêtre de downgrad
 |---|---|---|
 | 1 | `aether::sig` : enveloppe (`key_epoch` **signé**, amendement 3), suite hybride, trousseau compilé, vérification anti-downgrade + tests dédiés | — |
 | 2 | Billet de rescellement → enveloppe `v2` ; `ed25519-dalek` retiré de `helios-tpm` ; **tests existants portés** (amendement 4) | lot 1 |
-| 3 | Fichier de récupération signé : compteur obligatoire + PCR optionnel (amendement 1), câblage `gateway_key` | lot 1 + **trancher l'amendement 2** |
+| 3 | **Fait** (22 novembre 2026). Fichier de récupération signé : compteur obligatoire + PCR optionnel (amendement 1), câblage `gateway_key` | lot 1 + amendement 2 tranché |
 | 4 | Outil éditeur de signature (hors gateway) et documentation opérateur | lot 1 |
 
 Les lots 1 à 3 sont entièrement testables sur WSL2 : c'est de la crypto pure,

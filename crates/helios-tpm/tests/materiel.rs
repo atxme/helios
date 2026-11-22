@@ -323,12 +323,6 @@ fn an_update_window_is_armed_then_revoked_on_the_tpm() {
     std::fs::remove_dir_all(&dir).expect("cleanup");
 }
 
-/// The anti-rollback counter moves forward on the TPM and only there: each
-/// `advance` survives a new connection, and the value never goes back.
-///
-/// Uses the disposable index `0x01804848`, distinct from the production
-/// counter `0x01804847`. The index survives the trial; remove it with
-/// `tpm2_nvundefine 0x01804848` if the machine is not disposable.
 /// Both counter trials use the same disposable index: serialised, so that one
 /// never undefines the counter the other is measuring.
 static COUNTER_INDEX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -429,6 +423,12 @@ fn a_defined_but_unincremented_counter_is_completed_on_the_tpm() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The anti-rollback counter moves forward on the TPM and only there: each
+/// `advance` survives a new connection, and the value never goes back.
+///
+/// Uses the disposable index `0x01804848`, distinct from the production
+/// counter `0x01804847`. The index survives the trial; remove it with
+/// `tpm2_nvundefine 0x01804848` if the machine is not disposable.
 #[test]
 fn the_anti_rollback_counter_only_moves_forward_on_the_tpm() {
     if !hardware_requested("anti-rollback NV counter") {

@@ -29,11 +29,15 @@
 //! # Recovery without SSH: escrow
 //!
 //! When the PCRs change, resealing generates a **new** secret and the vault
-//! becomes undecipherable. [`helios_escrow`] covers this case: a
-//! copy of the key, encrypted to the operator's public key, is written on
-//! every sealing. The operator opens it offline, deposits the key into a
-//! recovery file delivered **with the OTA bundle** — the same channel as the
-//! resealing ticket — and the gateway reseals it at startup.
+//! becomes undecipherable. [`helios_escrow`] covers this case: a copy of the
+//! key, encrypted to the operator's public key (HESC v2, which also carries in
+//! clear the anti-rollback counter and the gateway's public key), is written
+//! on every sealing. The operator prepares a request offline, the publisher
+//! signs it for the counter in force, and the operator assembles the recovery
+//! file `/var/lib/helios/wg-key.recovery`, which is deposited out of band.
+//! At startup, and only when the vault is undecipherable, the gateway checks
+//! the publisher's authorization against the counter, spends the counter,
+//! reseals the key, and erases the file. See [`helios_escrow::recovery`].
 //!
 //! Without escrow configured (`escrow_public_key` absent), the key is
 //! permanently lost in this case and recovery becomes manual again.

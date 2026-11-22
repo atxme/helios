@@ -71,17 +71,42 @@ chiffrée vers cette clé. Sans séquestre, un changement de PCR — nouveau noy
 bootloader ou firmware — perd l'identité **définitivement**.
 
 Le jour où c'est arrivé : récupérer `/var/lib/helios/wg-key.escrow`, puis
+préparer la requête, hors ligne :
 
 ```sh
-helios escrow open --escrow wg-key.escrow \
+helios escrow prepare-recovery --escrow wg-key.escrow \
   --private-key ~/helios-escrow/escrow-private.key \
+  --output wg-recovery-request.json
+```
+
+La commande affiche la clé **publique** de l'identité et le compteur à faire
+signer ; elle n'écrit aucune clé privée. Cette clé publique doit être celle que
+les clients connaissent déjà. Si elle diffère, ce séquestre n'est pas celui de
+cette gateway : ne pas aller plus loin.
+
+L'éditeur signe `wg-recovery-request.json` avec `helios-publisher wg-recovery`
+([PUBLISHER-SIGNING.md](PUBLISHER-SIGNING.md)) et renvoie
+`wg-recovery-authorization.json`. L'opérateur assemble alors le fichier à
+déposer :
+
+```sh
+helios escrow assemble-recovery --escrow wg-key.escrow \
+  --private-key ~/helios-escrow/escrow-private.key \
+  --request wg-recovery-request.json \
+  --authorization wg-recovery-authorization.json \
   --output wg-key.recovery
 ```
 
-La commande affiche la clé **publique** retrouvée, pas le secret : elle doit
-être celle que les clients connaissent déjà. Si elle diffère, ce séquestre n'est
-pas celui de cette gateway — ne pas le déposer. Sinon, poser le fichier dans
-`/var/lib/helios/wg-key.recovery` et redémarrer : la gateway rescelle et efface.
+Cette étape rouvre le séquestre et vérifie l'autorisation avant toute écriture :
+une autorisation pour une autre gateway, pour un autre compteur ou une requête
+modifiée est refusée. `wg-key.recovery` contient la clé privée **en clair**.
+Le poser dans `/var/lib/helios/wg-key.recovery` par l'accès hors bande, puis
+redémarrer : la gateway ne le lit que si son coffre est indéchiffrable, le
+rescelle et l'efface.
+
+La même cérémonie est disponible dans Orion, onglet *Astra › Rotations*, au-dessus
+du panneau des rotations : bloc « Récupérer l'identité de la gateway », qui
+fait les deux étapes par sélection de fichiers, sans tunnel.
 
 ## 2 bis. Mettre à jour l'OS de la gateway
 

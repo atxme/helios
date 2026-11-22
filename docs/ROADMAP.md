@@ -87,7 +87,7 @@ est bloqué ou risque d'être refait. Une décision ne se prend pas depuis le d�
 
 | # | Décision | Source | Débloque |
 | --- | --- | --- | --- |
-| D1 | **Compteur anti-rejeu** : fichier ou NV TPM (si NV TPM, validation matérielle requise) | ADR-002 amendement 2, ADR-006 « Rollback complet » | fichier de récupération WireGuard signé (F5) ; claim de fraîcheur des coffres |
+| D1 | **Tranché le 22 novembre 2026 : compteur monotone en NV du TPM** (option 2 d'ADR-002 amendement 2), unique pour le billet, la restauration firmware et la récupération WireGuard, en remplacement de `TpmState.version`. Validation sur TPM réel à faire (recette « Q. F5 ») | ADR-002 amendement 2, ADR-006 « Rollback complet » | fichier de récupération WireGuard signé (F5, implémenté) ; claim de fraîcheur des coffres |
 | D5 | **Tranché le 21 novembre 2026 : résolveur public joint par le tunnel**, pas de résolveur sur la passerelle. Option C : la passerelle propose un résolveur (`client_dns`, défaut DNS4EU non filtré, `86.54.11.100` et `86.54.11.200`), chaque poste peut le remplacer dans Orion. Accepté : DNS4EU applique les blocages judiciaires français, et les requêtes sortent par la passerelle, en France | README, `helios-firewall/src/ruleset.rs`, ADR-006 ; spec `docs/superpowers/specs/2026-11-21-f7-dns-tunnel-design.md` | confidentialité des noms résolus (F7) : débloqué |
 | D6 | Activation de l'anti-spoof `fib` en multi-uplink / policy routing | FIREWALL-V2 « Capacités » | encodeur déjà livré |
 | D7 | Acceptation ICMPv6 Packet Too Big scopée par interface | FIREWALL-V2, ETUDE-IPV6 §9.1 | après observation V5 |
@@ -109,7 +109,7 @@ reste alors à faire à part.
 | F2 | **Fusionné dans `main` le 23 octobre 2026.** **Enrôlement sans transport de clé privée** : invitation signée sous `CA-PQ` par credential matériel, demande produite et scellée par Orion, document signé en retour ; `helios enroll` (identité émise sur le poste opérateur) est retiré. DPAPI, YubiKey et le parcours Windows restent à valider sur poste réel | v5 §15 ; `docs/superpowers/specs/2026-10-19-enrolement-v5-design.md` | : | Code : fait. Poste Windows : à valider |
 | F3 | **Fusionné dans `main` le 23 octobre 2026.** État terminal `revoked` porté par le même sérialiseur que le slot, génération incrémentée | v5 §11.1 | : | **Oui** |
 | F4 | **Fusionné dans `main` le 23 octobre 2026.** Retrait de la **valeur de négociation** `classic` de `ProtectionMode` (protocole v5 côté gateway) : migration de `network.toml` et de l'octet `mode_id = 0` du bloc de négociation dans le manifeste de coffre. **Ne touche pas au profil Orion `type = classic`**, le profil WireGuard générique sans négociation, que v5 §19 conserve comme chemin produit distinct (`ProfileKind::Classic`, octet de type `1`, import wg-quick) | v5 §19 | : | **Oui** |
-| F5 | Fichier de récupération WireGuard signé ML-DSA-65 + Ed25519 | ADR-002 lot 3 | D1 | **Oui**, après D1 |
+| F5 | **Implémenté sur `feat/f5-recovery-signed`** (22 novembre 2026) : fichier de récupération WireGuard signé ML-DSA-65 + Ed25519, compteur NV du TPM (D1). Recette matérielle « Q. F5 » à faire | ADR-002 lot 3 | D1 (tranché) | **Oui**, recette TPM |
 | F6 | Profil Orion **`nomade`** : relier `ProfileMode`, IKM `profile_root_key ‖ passphrase_key`, re-saisie après veille. **Fusionné dans `main` le 20 novembre 2026** ; validation Windows à faire (le code Windows n'a été compilé que par la CI ; recette : MANUAL-TESTING, « O. F6 ») | ADR-006 « Limites connues » | : | **Oui** |
 | F7 | DNS tunnelé côté Orion et gateway. **Fusionné dans `main` le 22 novembre 2026 (Helios 4.1.0, Orion 5.1.0)** : `client_dns` et `GET /api/client/dns` côté gateway, DNS des postes côté Orion (manifeste v9), banc netns et recette « P. F7 ». Recette Windows à faire | ADR-001 amendement « DNS des postes », ADR-006 | D5 (tranché) | **Oui**, recette Windows |
 
@@ -213,7 +213,7 @@ Faisable maintenant (sans matériel)
   F15 reproductible
 
 Faisable en code, validation sur cible à planifier
-  F5 (après D1) · F7 (fusionné, recette Windows « P. F7 ») · F12 libsecret · F13 NSIS
+  F5 (implémenté sur `feat/f5-recovery-signed`, recette TPM « Q. F5 » à faire) · F7 (fusionné, recette Windows « P. F7 ») · F12 libsecret · F13 NSIS
 
 Bloqué par matériel ou cible (hors WSL2)
   V1 · V3 · V4 · V5 · V6 · V7 · T4 DPAPI · T6 prise réelle · D9 signature EV

@@ -387,9 +387,11 @@ Valider avec accès console :
   distingue ce chemin d'un succès apparent, et il n'est pas observable en WSL2 ;
 - séquestre, circuit complet : `helios escrow keygen` sur le poste
   opérateur, `escrow_public_key` déclarée, séquestre écrit par la gateway au
-  scellement, `helios escrow open` hors ligne, dépôt du fichier de
-  récupération, redémarrage — l'identité doit être restaurée, rescellée, et le
-  fichier de récupération effacé ;
+  scellement, `helios escrow prepare-recovery` puis `assemble-recovery` hors
+  ligne (ou la cérémonie Orion, onglet Astra › Rotations), signature par
+  `helios-publisher wg-recovery`, dépôt du fichier de récupération, redémarrage
+  — l'identité doit être restaurée, rescellée, et le fichier de récupération
+  effacé ;
 - admission : la VIP dérivée par `heliosd peer add` est bien celle que le client
   reçoit à l'enrôlement, et l'ajout d'un pair n'efface ni la clé scellée ni les
   PSK des pairs déjà connectés — vérifier par `wg show` que leurs slots restent
@@ -596,6 +598,28 @@ Le même test accepte `HELIOS_TPM_TCTI=swtpm:host=127.0.0.1,port=2321`. Il
 valide alors le vrai chemin ESAPI — politique de lecture NV sans `OWNERREAD`,
 écrasement et impossibilité de ressusciter le secret avec le seul
 marqueur disque — sans prétendre mesurer Secure Boot ni les PCR d'une cible.
+
+L'essai du **compteur anti-rejeu** (F5) fait partie du même fichier. Il définit
+l'index jetable `0x01804848` (le compteur de production est `0x01804847`) et
+vérifie que le compteur ne recule pas d'une connexion à l'autre. Il laisse
+l'index en place ; le retirer avec `tpm2_nvundefine 0x01804848` si la machine
+n'est pas jetable. Il ne prouve pas qu'une suppression puis une recréation de
+l'index ne fait pas reculer le compteur : cette propriété, attendue de la
+spécification TPM 2.0, reste à confirmer sur TPM réel (recette « Q. F5 » de [MANUAL-TESTING.md](MANUAL-TESTING.md)).
+
+Les essais matériels **s'exécutent en série**, sur un seul TPM ou un seul
+swtpm, avec `--test-threads=1`. En parallèle, les essais se disputent les
+contextes d'objets du TPM et échouent avec « out of memory for object
+contexts » :
+
+```sh
+HELIOS_TPM_MATERIEL=1 \
+HELIOS_TPM_TCTI=swtpm:host=127.0.0.1,port=2321 \
+  cargo test -p helios-tpm --features tpm --test materiel -- --test-threads=1
+```
+
+Sur une cible réelle, omettre `HELIOS_TPM_TCTI` : le test utilise alors
+`/dev/tpmrm0`.
 
 ### Renouvellement du PSK à chaud (V1)
 
@@ -1004,7 +1028,9 @@ inscrite dans le blob, ce à quoi le TPM répond `TPM2_RC_POLICY_FAIL`.
 L'essai de fenêtre est l'exception explicite : il définit et écrit l'index NV
 jetable `0x01804846`, puis en écrase le payload sans supprimer l'index. Cette
 trace ne contient plus de secret, mais persiste jusqu'à
-`tpm2_nvundefine 0x01804846` sur une cible non jetable.
+`tpm2_nvundefine 0x01804846` sur une cible non jetable. L'essai du compteur
+anti-rejeu définit de même l'index jetable `0x01804848`, à retirer avec
+`tpm2_nvundefine 0x01804848`.
 
 Restent manuels : les **billets de rescellement** (rejeu, altération, PCR
 optionnel), qui supposent un changement de PCR donc un redémarrage contrôlé.

@@ -109,6 +109,76 @@ Les paquets Secure Boot classés PCR 0/7 sont refusés si le TPM est actif : ils
 ne sont pas couverts par la fenêtre OS. Mettre à jour le paquet `fwupd` ne
 flashe pas les firmwares proposés par celui-ci.
 
+## Billet de rescellement et récupération WireGuard
+
+Le compteur anti-rejeu est le compteur NV du TPM (index `0x01804847`). Il sert aux
+billets de rescellement, aux restaurations firmware et aux récupérations
+WireGuard. Un artefact n'est valide que si son `counter` est **égal** à la valeur
+courante du compteur, et la gateway l'incrémente **avant** d'agir : un artefact ne
+sert qu'une fois. Le compteur se lit sans le modifier :
+
+```sh
+sudo heliosd tpm counter-status
+cat /var/lib/helios/anti-rollback.json
+```
+
+`heliosd` écrit `anti-rollback.json` à chaque démarrage, avec la valeur
+(`{"counter": N}`) ou la cause de son indisponibilité (`{"counter": null,
+"error": …}`). Ce fichier est informatif : la gateway ne le lit jamais comme
+autorité. Un compteur illisible fait refuser les trois artefacts, sans empêcher
+`heliosd` de démarrer.
+
+**Billet après un changement de PCR.** Le descellement échoue, et un billet
+valide pour la valeur courante permet de resceller le même secret.
+
+```sh
+# Sur la gateway : la requête publique (compteur C et ancre du blob scellé)
+sudo heliosd tpm prepare-reseal > reseal-request.json
+```
+
+L'éditeur signe cette requête avec `helios-publisher reseal-ticket` (voir
+[PUBLISHER-SIGNING.md](security/PUBLISHER-SIGNING.md)), et le billet est déposé
+dans `/var/lib/helios/reseal-ticket.json`. Au démarrage, le billet est consommé :
+le compteur passe de `C` à `C+1`.
+
+**Récupération WireGuard, si le coffre reste indéchiffrable.** La gateway n'a
+plus sa clé, donc le poste opérateur fait la préparation hors ligne, avec le
+séquestre `wg-key.escrow` et la clé privée de séquestre :
+
+```sh
+helios escrow prepare-recovery --escrow wg-key.escrow \
+  --private-key ~/helios-escrow/escrow-private.key \
+  --output wg-recovery-request.json
+```
+
+La commande affiche la clé publique de l'identité et le compteur à signer, par
+défaut celui du séquestre plus un. L'éditeur signe `wg-recovery-request.json`
+avec `helios-publisher wg-recovery`, puis l'opérateur assemble le fichier à
+déposer :
+
+```sh
+helios escrow assemble-recovery --escrow wg-key.escrow \
+  --private-key ~/helios-escrow/escrow-private.key \
+  --request wg-recovery-request.json \
+  --authorization wg-recovery-authorization.json \
+  --output wg-key.recovery
+```
+
+Cette étape refuse une autorisation pour une autre gateway ou un autre compteur
+avant toute écriture. Le fichier `wg-key.recovery` porte la clé privée en clair :
+le déposer dans `/var/lib/helios/wg-key.recovery`, par l'accès hors bande, puis
+redémarrer. La gateway ne lit ce fichier que si son coffre est indéchiffrable ;
+elle le rescelle, puis l'efface.
+
+Le séquestre peut être en retard sur le TPM : il ne porte que la valeur du
+dernier démarrage qui a ouvert le coffre. Avant de signer, vérifier la valeur sur
+la gateway (`anti-rollback.json`) si elle est joignable.
+
+**Ordre dans un même démarrage.** Quand un billet et une récupération sont
+consommés au même démarrage, le billet vise `C` et la récupération `C+1`. Le
+billet est consommé d'abord (`C` → `C+1`), la récupération ensuite (`C+1` → `C+2`).
+L'éditeur signe donc le billet pour `C` et le fichier de récupération pour `C+1`.
+
 ## Firmware : préparation, installation et redémarrage
 
 Le parcours s'exécute **depuis un poste opérateur Linux distinct**. Cela conserve
@@ -207,8 +277,9 @@ Le plan, la sauvegarde et la clé opérateur restent nécessaires.
 
 Le compteur est avancé **avant** le remplacement du blob. Une coupure entre ces
 écritures consomme l'autorisation sans perdre la sauvegarde : l'éditeur doit
-signer la même requête avec une `version` supérieure au compteur courant,
-l'opérateur reprend avec cette nouvelle autorisation. Les autres champs doivent
+signer la même requête pour la valeur suivante (`counter` égal au compteur
+courant, soit la valeur de l'autorisation consommée plus un), l'opérateur reprend
+avec cette nouvelle autorisation. Les autres champs doivent
 rester identiques. Une réponse perdue après restauration est récupérable avec
 l'autorisation initiale : le descellement nominal vérifie que le même secret
 est déjà présent, sans rejouer le rescellement.
