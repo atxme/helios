@@ -1,32 +1,11 @@
 use super::{tests::Scratch, *};
+#[cfg(not(windows))]
+use crate::commands::test_support::command_app;
 use crate::commands::test_support::scripted_engine;
 use orion_engine::ProfileView;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::Mutex;
-
-#[cfg(not(windows))]
-fn command_app(client: orion_engine::client::EngineClient) -> tauri::App<tauri::test::MockRuntime> {
-    use crate::{operator::location::VaultLocation, AppState};
-    use std::sync::Arc;
-    use tauri::Manager;
-
-    let app = tauri::test::mock_app();
-    assert!(app.manage(AppState {
-        client,
-        pending_profile_paths: Mutex::new(VecDeque::new()),
-        operator: Default::default(),
-        vault_location: VaultLocation::at(std::env::temp_dir().join(format!(
-            "orion-profile-command-settings-{}",
-            std::process::id()
-        ))),
-        chain_opened: Arc::default(),
-        quitting: Default::default(),
-        tunnel_taken_down: Default::default(),
-        engine_lost: Default::default(),
-    }));
-    app
-}
 
 fn profile_draft() -> ProfileDraft {
     ProfileDraft {

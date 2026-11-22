@@ -1,6 +1,77 @@
 use super::*;
+#[cfg(not(windows))]
+use crate::commands::test_support::command_app;
 use crate::commands::test_support::scripted_engine;
 use orion_core::{SpeedTestMode, SpeedTestResult};
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn state_backed_application_commands_dispatch_through_tauri_state() {
+    let (client, mut engine) = scripted_engine().await;
+    let app = command_app(client);
+
+    let (state, ()) = tokio::join!(
+        get_state(app.state()),
+        engine.reply(|command| {
+            assert!(matches!(command, EngineCommand::GetState));
+            Ok(EngineReply::State("up".into()))
+        }),
+    );
+    assert_eq!(state.as_deref(), Ok("up"));
+
+    let (backend, ()) = tokio::join!(
+        backend_kind(app.state()),
+        engine.reply(|command| {
+            assert!(matches!(command, EngineCommand::BackendKind));
+            Ok(EngineReply::Backend("wireguard".into()))
+        }),
+    );
+    assert_eq!(backend.as_deref(), Ok("wireguard"));
+
+    let (adapter, ()) = tokio::join!(
+        adapter_is_up(app.state()),
+        engine.reply(|command| {
+            assert!(matches!(command, EngineCommand::AdapterIsUp));
+            Ok(EngineReply::Flag(true))
+        }),
+    );
+    assert_eq!(adapter, Ok(true));
+
+    let (about, ()) = tokio::join!(
+        about_orion(app.state()),
+        engine.reply(|command| {
+            assert!(matches!(command, EngineCommand::AboutOrion));
+            Ok(EngineReply::About(AboutView {
+                version: "4.8.12".into(),
+                backend: "wireguard".into(),
+                profile_extension: "orion".into(),
+                log_path: None,
+            }))
+        }),
+    );
+    assert_eq!(about.expect("about command result").version, "4.8.12");
+
+    let (support, ()) = tokio::join!(
+        key_negotiation_support(app.state()),
+        engine.reply(|command| {
+            assert!(matches!(command, EngineCommand::KeyNegotiationSupport));
+            Ok(EngineReply::KeyNegotiation(KeyNegotiationSupport {
+                identity_store: true,
+            }))
+        }),
+    );
+    assert!(support.expect("support command result").identity_store);
+
+    let (speedtest, ()) = tokio::join!(
+        run_speed_test(app.state(), "udp".into()),
+        engine.reply(|command| {
+            assert!(matches!(command, EngineCommand::RunSpeedTest { mode } if mode == "udp"));
+            Ok(EngineReply::Unit)
+        }),
+    );
+    assert!(matches!(speedtest, Err(error) if error == unexpected_engine_reply()));
+    drop(app);
+}
 
 #[tokio::test]
 async fn a_failed_tunnel_can_still_have_its_adapter_mounted() {
@@ -114,6 +185,104 @@ async fn a_backend_label_is_not_accepted_as_a_tunnel_state() {
         engine.reply(|_| Ok(EngineReply::Backend("dry-run".into()))),
     );
     assert_eq!(state, Err(unexpected_engine_reply()));
+}
+
+#[tokio::test]
+async fn application_diagnostics_reject_unrelated_replies_and_preserve_engine_errors() {
+    let (client, mut engine) = scripted_engine().await;
+
+    let (backend, ()) = tokio::join!(
+        backend_kind_from(&client),
+        engine.reply(|_| Ok(EngineReply::Flag(false))),
+    );
+    assert_eq!(backend, Err(unexpected_engine_reply()));
+
+    let (adapter, ()) = tokio::join!(
+        adapter_is_up_from(&client),
+        engine.reply(|_| Ok(EngineReply::Backend("kernel".into()))),
+    );
+    assert_eq!(adapter, Err(unexpected_engine_reply()));
+
+    let (about, ()) = tokio::join!(
+        about_orion_from(&client),
+        engine.reply(|_| Ok(EngineReply::Unit)),
+    );
+    assert!(matches!(about, Err(error) if error == unexpected_engine_reply()));
+
+    let (support, ()) = tokio::join!(
+        key_negotiation_support_from(&client),
+        engine.reply(|_| Ok(EngineReply::Backend("kernel".into()))),
+    );
+    assert!(matches!(support, Err(error) if error == unexpected_engine_reply()));
+
+    const ENGINE_ERROR: &str = "diagnostics unavailable";
+    let (state, ()) = tokio::join!(
+        get_state_from(&client),
+        engine.reply(|command| {
+            assert!(matches!(command, EngineCommand::GetState));
+            Err(ENGINE_ERROR.into())
+        }),
+    );
+    assert_eq!(state, Err(ENGINE_ERROR.into()));
+
+    let (backend, ()) = tokio::join!(
+        backend_kind_from(&client),
+        engine.reply(|command| {
+            assert!(matches!(command, EngineCommand::BackendKind));
+            Err(ENGINE_ERROR.into())
+        }),
+    );
+    assert_eq!(backend, Err(ENGINE_ERROR.into()));
+
+    let (adapter, ()) = tokio::join!(
+        adapter_is_up_from(&client),
+        engine.reply(|command| {
+            assert!(matches!(command, EngineCommand::AdapterIsUp));
+            Err(ENGINE_ERROR.into())
+        }),
+    );
+    assert_eq!(adapter, Err(ENGINE_ERROR.into()));
+
+    let (about, ()) = tokio::join!(
+        about_orion_from(&client),
+        engine.reply(|command| {
+            assert!(matches!(command, EngineCommand::AboutOrion));
+            Err(ENGINE_ERROR.into())
+        }),
+    );
+    assert!(matches!(about, Err(error) if error == ENGINE_ERROR));
+
+    let (support, ()) = tokio::join!(
+        key_negotiation_support_from(&client),
+        engine.reply(|command| {
+            assert!(matches!(command, EngineCommand::KeyNegotiationSupport));
+            Err(ENGINE_ERROR.into())
+        }),
+    );
+    assert!(matches!(support, Err(error) if error == ENGINE_ERROR));
+}
+
+#[tokio::test]
+async fn speed_test_rejects_an_unrelated_reply_and_preserves_engine_errors() {
+    let (client, mut engine) = scripted_engine().await;
+
+    let (wrong, ()) = tokio::join!(
+        run_speed_test_from(&client, "full".into()),
+        engine.reply(|command| {
+            assert!(matches!(command, EngineCommand::RunSpeedTest { mode } if mode == "full"));
+            Ok(EngineReply::Unit)
+        }),
+    );
+    assert_eq!(wrong, Err(unexpected_engine_reply()));
+
+    let (failed, ()) = tokio::join!(
+        run_speed_test_from(&client, "invalid".into()),
+        engine.reply(|command| {
+            assert!(matches!(command, EngineCommand::RunSpeedTest { mode } if mode == "invalid"));
+            Err("unsupported speed test mode".into())
+        }),
+    );
+    assert_eq!(failed, Err("unsupported speed test mode".into()));
 }
 
 #[tokio::test]

@@ -31,6 +31,29 @@ pub(crate) async fn scripted_engine() -> (EngineClient, ScriptedEngine) {
     (client, ScriptedEngine { reader, writer })
 }
 
+/// Builds a mock Tauri app with the command state used by IPC entrypoint tests.
+#[cfg(not(windows))]
+pub(super) fn command_app(client: EngineClient) -> tauri::App<tauri::test::MockRuntime> {
+    use crate::{operator::location::VaultLocation, AppState};
+    use std::sync::Arc;
+    use tauri::Manager;
+
+    let app = tauri::test::mock_app();
+    assert!(app.manage(AppState {
+        client,
+        pending_profile_paths: Default::default(),
+        operator: Default::default(),
+        vault_location: VaultLocation::at(
+            std::env::temp_dir().join(format!("orion-command-settings-{}", std::process::id()))
+        ),
+        chain_opened: Arc::default(),
+        quitting: Default::default(),
+        tunnel_taken_down: Default::default(),
+        engine_lost: Default::default(),
+    }));
+    app
+}
+
 impl ScriptedEngine {
     pub(crate) async fn reply(
         &mut self,
