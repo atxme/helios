@@ -1821,8 +1821,9 @@ par défaut `86.54.11.100` et `86.54.11.200`.
     « non appliqué : le profil ne capture pas tout le trafic » ; l'enregistrement
     reste possible.
 163. **[cible] La passerelle ne propose pas de DNS.** Sur la passerelle, mettre
-    `client_dns = []` dans `network.toml`, puis recharger sa configuration (chemin de
-    rechargement à chaud). Reconnecter le profil `helios` en tunnel complet.
+    `client_dns = []` dans `network.toml`, puis recharger sa configuration : le
+    rechargement à chaud de `heliosd` suffit (la route lit la configuration réseau
+    courante), puis reconnecter Orion. Reconnecter le profil `helios` en tunnel complet.
     Attendu : aucune règle `.` dans `Get-DnsClientNrptPolicy` ; le panneau de posture
     affiche « DNS local : la passerelle ne propose pas de DNS par le tunnel ». La
     résolution fonctionne par le DNS local. Remettre `client_dns` absent ensuite.

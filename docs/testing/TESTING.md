@@ -718,7 +718,9 @@ un verdict PASS ou FAIL par ligne :
   lui, l'API n'est pas ouverte sur le tunnel. La variante « `client_dns = []` »
   ou « `allow_client_internet = false` » (réponse vide) n'est **pas** dans le
   banc : elle exigerait de redémarrer `heliosd` sur une autre configuration. Elle
-  est couverte par les tests unitaires de la route (`helios-api`, `security_tests`) ;
+  est couverte par les tests unitaires de la route (`helios-api`, `security_tests`).
+  Aucune règle du banc n'est propre à l'UDP/53 : la sonde UDP générique (§12.6)
+  couvre donc le DNS à travers le tunnel et le NAT, sans cas particulier ;
 - arrêt : `heliosd` journalise l'arrêt fail-closed, la table survit et plus
   rien ne sort vers Internet ;
 - aucune clé privée dans le journal du démon.
