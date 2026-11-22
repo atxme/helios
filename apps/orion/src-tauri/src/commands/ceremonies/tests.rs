@@ -1,6 +1,113 @@
 use super::*;
 use orion_engine::ProfileView;
 
+#[cfg(not(windows))]
+#[tokio::test]
+async fn ceremony_begin_commands_reject_invalid_gestures_before_opening_a_session() {
+    use crate::commands::{
+        begin_enrollment_ceremony, begin_issuer_ceremony, operator_ceremony_status,
+        test_support::command_app,
+    };
+    use crate::operator::{EnrollmentGesture, IssuerGesture};
+    use tauri::Manager;
+
+    let (client, engine) = engine_replies([
+        (Query::State, Ok(EngineReply::State("down".into()))),
+        (Query::Config, Ok(EngineReply::Config(selected_profile()))),
+    ])
+    .await;
+    let app = command_app(client);
+    let state = app.state::<crate::AppState>();
+
+    assert_eq!(
+        begin_enrollment_ceremony(
+            state.clone(),
+            EnrollmentGesture::Invite {
+                valid_for_hours: 4,
+                allow_readmission: false,
+                name: "../outside".into(),
+                gateway_pq_certificate: None,
+            },
+        )
+        .await
+        .expect_err("invalid invitation name is refused"),
+        "le nom de l'invitation tient en 1 à 64 caractères parmi lettres, chiffres, « . », « _ » et « - »"
+    );
+    assert_eq!(
+        begin_issuer_ceremony(
+            state.clone(),
+            IssuerGesture::AuthorizeIssuerOffline {
+                request: "  \n".into(),
+            },
+        )
+        .await
+        .expect_err("empty issuer request is refused"),
+        "la demande de délégation est vide ou trop grande (256 Kio au plus)"
+    );
+    assert!(operator_ceremony_status(state)
+        .await
+        .expect("status read")
+        .is_none());
+    engine.await.expect("scripted engine");
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn peers_overview_command_uses_state_and_keeps_gateway_data_unreachable_offline() {
+    use crate::commands::{
+        operator_artifacts, operator_ceremony_status, operator_peers_overview,
+        test_support::command_app,
+    };
+    use orion_core::operator_rotations::Reach;
+    use tauri::Manager;
+
+    let fixture = selected_profile();
+    let (client, engine) = engine_replies([
+        (Query::Config, Ok(EngineReply::Config(fixture.clone()))),
+        (Query::State, Ok(EngineReply::State("down".into()))),
+        (Query::Config, Ok(EngineReply::Config(fixture))),
+    ])
+    .await;
+    let app = command_app(client);
+    let state = app.state::<crate::AppState>();
+    let overview = operator_peers_overview(state.clone())
+        .await
+        .expect("offline peers overview");
+
+    assert!(matches!(overview.certificates, Reach::Unreachable));
+    assert!(matches!(overview.admitted, Reach::Unreachable));
+    assert!(matches!(overview.astra_revoked, Reach::Unreachable));
+    assert!(matches!(overview.pending_revocations, Reach::Unreachable));
+    assert!(overview.own_key.is_none());
+    assert!(operator_ceremony_status(state.clone())
+        .await
+        .expect("ceremony status")
+        .is_none());
+    assert!(operator_artifacts(state)
+        .await
+        .expect("ceremony artifacts")
+        .is_empty());
+    engine.await.expect("scripted engine");
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn peers_overview_command_rejects_a_mismatched_engine_reply() {
+    use crate::commands::{operator_peers_overview, test_support::command_app};
+    use tauri::Manager;
+
+    let (client, engine) =
+        engine_replies([(Query::Config, Ok(EngineReply::State("down".into())))]).await;
+    let app = command_app(client);
+    assert_eq!(
+        operator_peers_overview(app.state::<crate::AppState>())
+            .await
+            .expect_err("wrong config reply refused"),
+        unexpected_engine_reply()
+    );
+    engine.await.expect("scripted engine");
+}
+
 const REFUSAL: &str = "Connectez d'abord le profil de la gateway, avec un pair administrateur : \
                        l'admission passe par le tunnel.";
 
