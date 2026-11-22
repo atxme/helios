@@ -716,3 +716,264 @@ async fn certificates_accepts_an_inventory_with_rotations_pending() {
         .unwrap()
         .starts_with("GET /api/certificates HTTP/1.1\r\n"));
 }
+
+#[test]
+fn trust_warns_when_development_keys_are_enabled_without_publisher_keys() {
+    let text = render_trust(
+        &ui(),
+        &TrustView {
+            required_algs: Vec::new(),
+            publisher_keys: Vec::new(),
+            development_keys: true,
+            reseal_domain: "test-reseal".into(),
+            reseal_format_version: 3,
+        },
+    );
+    assert!(text.contains("(all required)"), "{text}");
+    assert!(
+        text.contains("development publisher keys are trusted"),
+        "{text}"
+    );
+    assert!(
+        text.contains("TPM reseal    test-reseal · format 3"),
+        "{text}"
+    );
+    assert!(!text.contains("Publisher"), "{text}");
+}
+
+#[test]
+fn release_shows_unknown_active_version_pending_activation_and_empty_staging() {
+    let text = render_release(
+        &ui(),
+        &UpdateStatus {
+            highest_confirmed_sequence: 42,
+            active_version: None,
+            staged: Vec::new(),
+            activation_pending: Some(43),
+            channel: "stable".into(),
+            target: "x86_64-unknown-linux-gnu".into(),
+        },
+    );
+    assert!(
+        text.contains("heliosd unknown · stable · x86_64-unknown-linux-gnu"),
+        "{text}"
+    );
+    assert!(text.contains("sequence 42"), "{text}");
+    assert!(text.contains("sequence 43 pending"), "{text}");
+    assert!(text.contains("Staged        none"), "{text}");
+}
+
+#[test]
+fn release_marks_the_confirmed_boundary_as_superseded() {
+    let mut view = healthy().release.unwrap();
+    view.highest_confirmed_sequence = 42;
+    view.staged = vec![helios_update::FinalizedRelease {
+        release_sequence: 42,
+        version: "1.13.0".into(),
+        sha256: "abcdef0123456789".into(),
+    }];
+    let text = render_release(&ui(), &view);
+    assert!(text.contains("superseded — cannot be activated"), "{text}");
+    assert!(!text.contains("ready to activate"), "{text}");
+}
+
+#[test]
+fn doctor_warns_for_simulation_disabled_tpm_low_memory_and_high_temperature() {
+    let mut inputs = healthy();
+    inputs.status.as_mut().unwrap().dry_run = true;
+    inputs.health = Ok(HealthView {
+        uptime_seconds: None,
+        load: None,
+        cpu_count: None,
+        memory_total_bytes: Some(100),
+        memory_available_bytes: Some(9),
+        temperature_celsius: Some(85.0),
+        tpm: Some(TpmView {
+            kind: "disabled".into(),
+            preserved_vaults: true,
+        }),
+    });
+    let checks = diagnose(&inputs);
+    let find = |label: &str| checks.iter().find(|check| check.label == label).unwrap();
+    assert_eq!(find("Mode").level, Level::Warn);
+    assert_eq!(find("TPM").level, Level::Warn);
+    assert_eq!(find("Memory").level, Level::Warn);
+    assert_eq!(find("Temperature").level, Level::Warn);
+}
+
+#[test]
+fn doctor_treats_missing_firewall_and_release_reads_as_failures() {
+    let mut inputs = healthy();
+    inputs.firewall = Err("firewall endpoint unavailable".into());
+    inputs.release = Err("release endpoint unavailable".into());
+    let checks = diagnose(&inputs);
+    let find = |label: &str| checks.iter().find(|check| check.label == label).unwrap();
+    assert_eq!(find("Firewall").level, Level::Fail);
+    assert_eq!(find("Firewall").detail, "firewall endpoint unavailable");
+    assert_eq!(find("Release").level, Level::Fail);
+    assert_eq!(find("Release").detail, "release endpoint unavailable");
+    assert!(render_doctor(&ui(), &checks).contains("2 failed, 0 warnings"));
+}
+
+#[test]
+fn doctor_warns_for_a_missing_trust_domain_and_pending_release() {
+    let mut inputs = healthy();
+    inputs.domain = Ok(None);
+    inputs.release.as_mut().unwrap().activation_pending = Some(2);
+    let checks = diagnose(&inputs);
+    let find = |label: &str| checks.iter().find(|check| check.label == label).unwrap();
+    assert_eq!(find("Certificates").level, Level::Warn);
+    assert_eq!(
+        find("Certificates").detail,
+        "no trust domain on this gateway"
+    );
+    assert_eq!(find("Release").level, Level::Warn);
+    assert!(find("Release")
+        .detail
+        .contains("activation of sequence 2 pending"));
+}
+
+#[tokio::test]
+async fn trust_fetches_and_decodes_the_read_only_trust_view() {
+    let body = json!({
+        "required_algs": ["ml-dsa-65"],
+        "publisher_keys": [],
+        "development_keys": false,
+        "reseal_domain": "helios-tpm-reseal-v2",
+        "reseal_format_version": 2
+    });
+    let (base, server) = crate::tests::one_response_server("200 OK", body.to_string()).await;
+    super::trust(&loopback_client(), &base)
+        .await
+        .expect("read trust settings");
+    assert!(server
+        .await
+        .unwrap()
+        .starts_with("GET /api/trust HTTP/1.1\r\n"));
+}
+
+#[tokio::test]
+async fn trust_propagates_an_http_refusal() {
+    let (base, server) =
+        crate::tests::one_response_server("403 Forbidden", "trust unavailable").await;
+    let error = super::trust(&loopback_client(), &base)
+        .await
+        .expect_err("refuse an unavailable trust view");
+    assert!(error.to_string().contains("403 Forbidden"), "{error:#}");
+    assert!(server
+        .await
+        .unwrap()
+        .starts_with("GET /api/trust HTTP/1.1\r\n"));
+}
+
+#[tokio::test]
+async fn release_fetches_and_decodes_the_read_only_update_view() {
+    let body = serde_json::to_string(&healthy().release.unwrap()).unwrap();
+    let (base, server) = crate::tests::one_response_server("200 OK", body).await;
+    super::release(&loopback_client(), &base)
+        .await
+        .expect("read update status");
+    assert!(server
+        .await
+        .unwrap()
+        .starts_with("GET /api/update HTTP/1.1\r\n"));
+}
+
+#[tokio::test]
+async fn release_propagates_an_http_refusal() {
+    let (base, server) =
+        crate::tests::one_response_server("503 Service Unavailable", "update unavailable").await;
+    let error = super::release(&loopback_client(), &base)
+        .await
+        .expect_err("refuse an unavailable update view");
+    assert!(
+        error.to_string().contains("503 Service Unavailable"),
+        "{error:#}"
+    );
+    assert!(server
+        .await
+        .unwrap()
+        .starts_with("GET /api/update HTTP/1.1\r\n"));
+}
+
+#[tokio::test]
+async fn firewall_propagates_an_http_refusal_without_applying_rules() {
+    let (base, server) =
+        crate::tests::one_response_server("503 Service Unavailable", "rules unavailable").await;
+    let error = super::firewall(&loopback_client(), &base, false)
+        .await
+        .expect_err("unavailable rules cannot be reported as a successful inspection");
+    assert!(
+        error.to_string().contains("503 Service Unavailable"),
+        "{error:#}"
+    );
+    assert!(server
+        .await
+        .unwrap()
+        .starts_with("GET /api/firewall/rules HTTP/1.1\r\n"));
+}
+
+#[tokio::test]
+async fn status_peers_and_network_fetch_their_expected_routes() {
+    let network = json!({
+        "wan_ifaces": [],
+        "lan_ifaces": [],
+        "allow_ssh_from": [],
+        "admin_ifaces": [],
+        "admin_iface": "helios0",
+        "wg_iface": "helios0",
+        "wg_private_key_configured": true,
+        "wg_public_key": "test-public-key",
+        "wg_address": "100.64.0.1/32",
+        "wg_listen_port": 51820,
+        "key_negotiation_port": null,
+        "peers": []
+    });
+    let (base, server) = crate::tests::http_response_sequence([
+        ("200 OK", status_json(Vec::new()).to_string()),
+        ("200 OK", status_json(Vec::new()).to_string()),
+        ("200 OK", network.to_string()),
+    ])
+    .await;
+    let client = loopback_client();
+    super::status(&client, &base).await.expect("read status");
+    super::peers(&client, &base).await.expect("read peer list");
+    super::network(&client, &base)
+        .await
+        .expect("read network config");
+    let requests = server.await.expect("all inspection requests");
+    let routes = requests
+        .iter()
+        .map(|request| request.lines().next().expect("request line"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        routes,
+        [
+            "GET /api/status HTTP/1.1",
+            "GET /api/status HTTP/1.1",
+            "GET /api/network HTTP/1.1",
+        ]
+    );
+}
+
+#[test]
+fn firewall_summary_explains_dry_run_and_keeps_accept_rules_visible() {
+    let text = render_firewall(
+        &ui(),
+        &FirewallView {
+            rules: r#"table inet helios {
+ chain input {
+ type filter hook input priority filter; policy accept;
+ iifname "lo" accept  # local only
+ }
+}"#
+            .into(),
+            default_verdict: "accept".into(),
+            dry_run: true,
+        },
+    );
+    assert!(text.contains("default accept · dry-run"), "{text}");
+    assert!(text.contains("Incoming"), "{text}");
+    assert!(text.contains("allow"), "{text}");
+    assert!(text.contains("local only"), "{text}");
+}
