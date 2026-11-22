@@ -16,7 +16,7 @@
 # `libudev1` à l'exécution, pour un conteneur sans port USB. Astra transporte
 # et sauvegarde le coffre ; il ne l'ouvre pas.
 
-FROM rust:1.92-bookworm AS build
+FROM rust:1.100-trixie AS build
 
 # aws-lc-rs non-FIPS se compile en statique avec `cc` et des bindings
 # pré-générés : ni CMake, ni Go, ni Ninja, ni bindgen.
@@ -41,7 +41,7 @@ RUN test -f "$HELIOS_PUBLISHER_KEYRING_PATH" || { \
     }
 RUN cargo build --release -p astra
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 # UID fixe : le volume d'état lui appartient, et un UID attribué à la volée
 # rendrait un volume restauré illisible après reconstruction de l'image.

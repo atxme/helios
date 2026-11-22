@@ -39,7 +39,7 @@ jobs:
     # sans machine Windows manuelle.
     runs-on: [self-hosted, windows, x64, orion-signing]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Le runner est une station de signature, pas une machine jetable. Rust
       # stable, Node 24, le SDK Windows et signtool y sont préinstallés ; ne pas
@@ -139,7 +139,7 @@ jobs:
             ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path -Leaf $_.Path) } |
             Tee-Object -FilePath (Join-Path $bundle "SHA256SUMS")
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: installateur-orion-windows-signe
           path: |
@@ -155,12 +155,12 @@ jobs:
     env:
       CARGO_BUILD_JOBS: 2
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: actions/setup-node@v4
+      - uses: dtolnay/rust-toolchain@1.100.0
+      - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 26
           cache: npm
           cache-dependency-path: web/package-lock.json
 
@@ -203,7 +203,7 @@ jobs:
 
       # Artefacts **non signés** : à télécharger sur le poste éditeur, signer
       # avec `helios-publisher bundle`, puis archiver avec `cargo xtask pack`.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bundle-gateway
           path: |
