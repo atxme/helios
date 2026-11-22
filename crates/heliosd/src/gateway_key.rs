@@ -94,8 +94,8 @@ fn recovery_path() -> String {
 /// they can open it. The gateway itself is unable to — that is the point.
 const ESCROW_PATH: &str = "/var/lib/helios/wg-key.escrow";
 
-/// Recovery file, delivered by the operator with the OTA bundle — the same
-/// channel as the resealing ticket, hence **no SSH required**.
+/// Recovery file, deposited by the operator out of band. It is **not**
+/// delivered with the OTA bundle: the bundle carries no recovery material.
 ///
 /// A frame of `helios_escrow::recovery`: the publisher's authorization, then
 /// the WireGuard private key. Consumed **only once**, and only if the vault is
@@ -293,13 +293,20 @@ fn try_recovery(secret: &helios_tpm::SecretKey, tpm: &TpmSettings) -> Option<Sec
                 .store(secret, &context, text.as_bytes())
                 .map_err(|e| e.to_string())
         });
-    if let Err(cause) = resealed {
-        error!(
-            "could not reseal the recovered key after its counter was spent ({cause}) — \
-             the recovery file is left in place and cannot be used again"
-        );
-        return None;
-    }
+    let sealed = match resealed {
+        Ok(()) => true,
+        Err(cause) => {
+            // The key is used for this boot only. Erasing the file below is what
+            // keeps the counter from being spent twice.
+            error!(
+                "the recovered key is NOT sealed: its counter is spent and the recovery \
+                 file is erased ({cause}). The tunnel comes up on this boot only. The next \
+                 start will need a new authorization for the counter now in force \
+                 (`heliosd tpm counter-status`)"
+            );
+            false
+        }
+    };
 
     // Then erases: the key must not stay in the clear on disk longer than
     // this startup. A deletion failure is an anomaly to report loudly.
@@ -311,7 +318,9 @@ fn try_recovery(secret: &helios_tpm::SecretKey, tpm: &TpmSettings) -> Option<Sec
         ),
     }
 
-    warn!("WireGuard identity restored from escrow and resealed");
+    if sealed {
+        warn!("WireGuard identity restored from escrow and resealed");
+    }
     Some(SecretString::new(text.as_str()))
 }
 
@@ -441,7 +450,7 @@ pub fn resolve(network: &NetworkConfig, boot: &BootDecision, tpm: &TpmSettings) 
                          {ESCROW_PATH} with the operator's private key, obtain the \
                          publisher-signed authorization for the counter in force, and \
                          deposit the frame (authorization and private key) into this file, \
-                         delivered with the OTA bundle, then restart."
+                         deposited out of band (never with the OTA bundle), then restart."
                     );
                 }
                 Err(e) => warn!("could not read the vault: {e}"),
@@ -1121,7 +1130,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         feature = "tpm",
-        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
     )]
     fn a_signed_recovery_for_the_current_counter_is_resealed_and_erased() {
         if run_isolated_identity_scenario(
@@ -1167,7 +1176,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         feature = "tpm",
-        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
     )]
     fn an_unsigned_or_foreign_recovery_is_left_in_place() {
         if run_isolated_identity_scenario("an_unsigned_or_foreign_recovery_is_left_in_place") {
@@ -1246,7 +1255,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         feature = "tpm",
-        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
     )]
     fn a_recovery_for_another_counter_is_refused() {
         if run_isolated_identity_scenario("a_recovery_for_another_counter_is_refused") {
@@ -1276,7 +1285,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         feature = "tpm",
-        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
     )]
     fn a_consumed_recovery_cannot_be_replayed() {
         if run_isolated_identity_scenario("a_consumed_recovery_cannot_be_replayed") {
@@ -1317,7 +1326,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         feature = "tpm",
-        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
     )]
     fn an_invalid_recovery_frame_is_left_in_place() {
         if run_isolated_identity_scenario("an_invalid_recovery_frame_is_left_in_place") {
@@ -1348,7 +1357,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         feature = "tpm",
-        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
     )]
     fn a_recovery_file_without_a_locked_vault_is_not_consumed_or_used() {
         if run_isolated_identity_scenario(
@@ -1391,10 +1400,12 @@ mod tests {
     #[test]
     #[cfg_attr(
         feature = "tpm",
-        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
     )]
-    fn a_reseal_failure_after_an_accepted_recovery_burns_it() {
-        if run_isolated_identity_scenario("a_reseal_failure_after_an_accepted_recovery_burns_it") {
+    fn a_reseal_failure_after_an_accepted_recovery_erases_it_and_restores_this_boot() {
+        if run_isolated_identity_scenario(
+            "a_reseal_failure_after_an_accepted_recovery_erases_it_and_restores_this_boot",
+        ) {
             return;
         }
         let dir = identity_dir();
@@ -1425,13 +1436,11 @@ mod tests {
             &BootDecision::Unsealed(current.clone()),
             &tpm,
         );
-        assert_eq!(first.origin, KeyOrigin::Missing);
-        assert!(first.private_key.is_empty());
-        assert_eq!(
-            std::fs::read(&recovery).expect("file"),
-            frame,
-            "the file stays"
-        );
+        // The counter is spent, so the key is used for this boot even though it
+        // could not be sealed; the file is erased so it cannot be used again.
+        assert_eq!(first.origin, KeyOrigin::Recovered);
+        assert_eq!(first.private_key.expose(), private_key);
+        assert!(!recovery.exists(), "the recovery file is erased");
         assert_eq!(
             anti_rollback::current(&tpm).expect("counter"),
             counter + 1,
@@ -1457,7 +1466,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         feature = "tpm",
-        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
     )]
     fn rotation_advances_the_counter_and_invalidates_an_older_authorization() {
         if run_isolated_identity_scenario(
@@ -1495,7 +1504,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         feature = "tpm",
-        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
     )]
     fn an_update_escrows_the_counter_after_the_rotation() {
         if run_isolated_identity_scenario("an_update_escrows_the_counter_after_the_rotation") {
@@ -1536,7 +1545,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         feature = "tpm",
-        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
     )]
     fn the_escrow_carries_the_counter_and_the_public_key() {
         let (operator_private_key, operator_public_key) =

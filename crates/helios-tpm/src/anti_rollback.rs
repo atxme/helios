@@ -33,9 +33,10 @@ pub fn advance(cfg: &TpmSettings) -> Result<u64> {
 /// Consumes an artifact issued for counter value `artifact`: accepted only if
 /// it equals the TPM counter, which is then incremented and returned.
 ///
-/// Callers must serialise consumption. The read and the increment are two TPM
-/// commands, so two concurrent consumptions of the same value could both pass
-/// the read. The verification path consumes at one point, under one lock.
+/// Consumption takes no lock. The read and the increment are two TPM commands,
+/// so two concurrent consumptions of the same value can both pass the read.
+/// The second increment then returns `artifact + 2`, which the `next == artifact
+/// + 1` check below refuses: concurrent consumers fail closed.
 ///
 /// A value that does not match is refused and publishes nothing: a replayed or
 /// forged artifact must not overwrite the public status. A failure to read or

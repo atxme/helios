@@ -366,7 +366,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         feature = "tpm",
-        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
     )]
     fn the_reseal_request_carries_the_counter_and_the_blob_anchor() {
         let directory = tempfile::tempdir().expect("temporary directory");
