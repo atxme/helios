@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "aether"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "aws-lc-rs",
  "aws-lc-sys",
@@ -2283,7 +2283,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "helios"
-version = "4.0.1"
+version = "4.1.0"
 dependencies = [
  "aether",
  "aether-key-negotiation",
@@ -2317,7 +2317,7 @@ dependencies = [
 
 [[package]]
 name = "helios-api"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "aether",
  "anyhow",
@@ -2358,7 +2358,7 @@ dependencies = [
 
 [[package]]
 name = "helios-firewall"
-version = "1.18.0"
+version = "1.18.1"
 dependencies = [
  "aether",
  "async-trait",
@@ -2454,7 +2454,7 @@ dependencies = [
 
 [[package]]
 name = "heliosd"
-version = "4.0.1"
+version = "4.1.0"
 dependencies = [
  "aether",
  "aether-key-negotiation",
@@ -3862,7 +3862,7 @@ dependencies = [
 
 [[package]]
 name = "orion"
-version = "5.0.1"
+version = "5.1.0"
 dependencies = [
  "aether",
  "aether-fido",
@@ -3887,7 +3887,7 @@ dependencies = [
 
 [[package]]
 name = "orion-core"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "aether",
  "aether-fido",
@@ -3924,7 +3924,7 @@ dependencies = [
 
 [[package]]
 name = "orion-engine"
-version = "1.14.1"
+version = "1.15.0"
 dependencies = [
  "aether",
  "async-trait",
