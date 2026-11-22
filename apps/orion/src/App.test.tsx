@@ -312,6 +312,21 @@ describe('App interactions', () => {
     expect(screen.queryByRole('button', { name: 'close-posture' })).toBeNull()
   })
 
+  it('says in the header chip when DNS leaves the tunnel', () => {
+    mocks.useClient.mockReturnValue(
+      client({
+        state: 'up',
+        adapterUp: true,
+        dns: { check: { status: 'left', reason: 'gateway_declines' }, proposalUnread: false },
+      }),
+    )
+    render(<App />)
+
+    expect(
+      screen.getByRole('button', { name: /DNS hors du tunnel/ }).getAttribute('aria-label'),
+    ).toContain('DNS hors du tunnel')
+  })
+
   it('opens the profile view when an associated file was imported', async () => {
     mocks.useClient.mockReturnValue(client({ pathImportedProfile: { name: 'associated' } }))
     render(<App />)

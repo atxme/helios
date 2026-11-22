@@ -197,7 +197,7 @@ export default function App() {
       cancelled = true
     }
   }, [postureAnchor])
-  const posture = postureMeta(c.state, c.adapterUp)
+  const posture = postureMeta(c.state, c.adapterUp, dnsLeavesFullTunnel(c.dns))
 
   useEffect(() => {
     if (c.pathImportedProfile) setView('profiles')
