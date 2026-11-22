@@ -364,6 +364,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        feature = "tpm",
+        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+    )]
     fn the_reseal_request_carries_the_counter_and_the_blob_anchor() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = |name: &str| directory.path().join(name).to_string_lossy().into_owned();

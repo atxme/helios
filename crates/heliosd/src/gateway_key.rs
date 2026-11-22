@@ -438,9 +438,10 @@ pub fn resolve(network: &NetworkConfig, boot: &BootDecision, tpm: &TpmSettings) 
                     }
                     warn!(
                         "no usable recovery file in {RECOVERY_PATH}. Open the escrow \
-                         {ESCROW_PATH} with the operator's private key, deposit the \
-                         recovered key into this file (delivered with the OTA bundle, \
-                         like the resealing ticket) and restart."
+                         {ESCROW_PATH} with the operator's private key, obtain the \
+                         publisher-signed authorization for the counter in force, and \
+                         deposit the frame (authorization and private key) into this file, \
+                         delivered with the OTA bundle, then restart."
                     );
                 }
                 Err(e) => warn!("could not read the vault: {e}"),
@@ -1118,6 +1119,10 @@ mod tests {
     /// the counter is spent, the key is resealed under the current secret, and
     /// the file is erased.
     #[test]
+    #[cfg_attr(
+        feature = "tpm",
+        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+    )]
     fn a_signed_recovery_for_the_current_counter_is_resealed_and_erased() {
         if run_isolated_identity_scenario(
             "a_signed_recovery_for_the_current_counter_is_resealed_and_erased",
@@ -1160,6 +1165,10 @@ mod tests {
     /// Only the publisher-signed, key-bound authorization is accepted. Each
     /// refusal leaves the file in place and the counter where it was.
     #[test]
+    #[cfg_attr(
+        feature = "tpm",
+        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+    )]
     fn an_unsigned_or_foreign_recovery_is_left_in_place() {
         if run_isolated_identity_scenario("an_unsigned_or_foreign_recovery_is_left_in_place") {
             return;
@@ -1235,6 +1244,10 @@ mod tests {
 
     /// An authorization for another counter value is refused, and nothing moves.
     #[test]
+    #[cfg_attr(
+        feature = "tpm",
+        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+    )]
     fn a_recovery_for_another_counter_is_refused() {
         if run_isolated_identity_scenario("a_recovery_for_another_counter_is_refused") {
             return;
@@ -1261,6 +1274,10 @@ mod tests {
     /// Once spent, the same file cannot restore the identity again, even after
     /// the vault is lost once more.
     #[test]
+    #[cfg_attr(
+        feature = "tpm",
+        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+    )]
     fn a_consumed_recovery_cannot_be_replayed() {
         if run_isolated_identity_scenario("a_consumed_recovery_cannot_be_replayed") {
             return;
@@ -1298,6 +1315,10 @@ mod tests {
 
     /// A frame that does not decode is ignored and left for correction.
     #[test]
+    #[cfg_attr(
+        feature = "tpm",
+        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+    )]
     fn an_invalid_recovery_frame_is_left_in_place() {
         if run_isolated_identity_scenario("an_invalid_recovery_frame_is_left_in_place") {
             return;
@@ -1325,6 +1346,10 @@ mod tests {
     /// vault the recovery path is never reached: no consumption, no counter
     /// movement, in either case.
     #[test]
+    #[cfg_attr(
+        feature = "tpm",
+        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+    )]
     fn a_recovery_file_without_a_locked_vault_is_not_consumed_or_used() {
         if run_isolated_identity_scenario(
             "a_recovery_file_without_a_locked_vault_is_not_consumed_or_used",
@@ -1364,6 +1389,10 @@ mod tests {
     /// stays, the counter has moved, and a replay of the same file is refused.
     #[cfg(unix)]
     #[test]
+    #[cfg_attr(
+        feature = "tpm",
+        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+    )]
     fn a_reseal_failure_after_an_accepted_recovery_burns_it() {
         if run_isolated_identity_scenario("a_reseal_failure_after_an_accepted_recovery_burns_it") {
             return;
@@ -1426,6 +1455,10 @@ mod tests {
     /// Rotation spends a counter value, so an authorization issued before it
     /// no longer validates.
     #[test]
+    #[cfg_attr(
+        feature = "tpm",
+        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+    )]
     fn rotation_advances_the_counter_and_invalidates_an_older_authorization() {
         if run_isolated_identity_scenario(
             "rotation_advances_the_counter_and_invalidates_an_older_authorization",
@@ -1460,6 +1493,10 @@ mod tests {
     /// A key update escrows the counter value it leaves in place, after the
     /// rotation.
     #[test]
+    #[cfg_attr(
+        feature = "tpm",
+        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+    )]
     fn an_update_escrows_the_counter_after_the_rotation() {
         if run_isolated_identity_scenario("an_update_escrows_the_counter_after_the_rotation") {
             return;
@@ -1497,6 +1534,10 @@ mod tests {
     /// The escrow records the counter and the public key of the identity it
     /// carries, so the operator can check a recovery against them.
     #[test]
+    #[cfg_attr(
+        feature = "tpm",
+        ignore = "needs the simulated TPM backend; the real backend is covered by the materiel suite"
+    )]
     fn the_escrow_carries_the_counter_and_the_public_key() {
         let (operator_private_key, operator_public_key) =
             helios_escrow::generate_operator_keypair().expect("operator keypair");

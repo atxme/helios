@@ -34,3 +34,9 @@ echo '==> aether sans la feature de signature'
 
 echo '==> Tests Rust, toutes les features'
 "$repo_root/scripts/wsl-cargo" test --workspace --all-features
+
+echo '==> Tests heliosd, features par défaut'
+# La feature `tpm` remplace le TPM simulé par le matériel réel : les tests qui
+# exigent le simulateur sont alors ignorés dans le passage précédent. Ce passage
+# les exécute avec le simulateur ; le matériel est couvert par la suite matériel.
+"$repo_root/scripts/wsl-cargo" test -p heliosd
