@@ -43,6 +43,9 @@ export function useClient() {
   const [error, setError] = useState<string | null>(null)
   const [pathImportedProfile, setPathImportedProfile] = useState<ClientProfile | null>(null)
   const upSinceRef = useRef<number | null>(null)
+  // The profile whose DNS verdict is held. Connecting another one starts it
+  // over; reconnecting the same one, or a stale handshake, does not.
+  const dnsProfileRef = useRef<string | null>(null)
 
   const pushLog = useCallback((level: string, message: string) => {
     const ts = new Date().toLocaleTimeString('fr-FR', {
@@ -190,6 +193,12 @@ export function useClient() {
     // The new configuration is read back again; the previous verdict would
     // describe a tunnel that is being replaced.
     setCapture(null)
+    // A profile switch without `down` mounts another gateway on the adapter
+    // still up: the previous proposal and its unread flag do not describe it.
+    if (name !== undefined && name !== dnsProfileRef.current) {
+      dnsProfileRef.current = name
+      setDns({ check: null, proposalUnread: false })
+    }
     try {
       await api.connect(name)
       return 'done'

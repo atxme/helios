@@ -214,6 +214,30 @@ describe('useClient', () => {
     expect(result.current.dns).toEqual({ check: null, proposalUnread: false })
   })
 
+  // A profile switch without `down` mounts the next gateway on the adapter
+  // still up: the verdict and the unread flag of the previous one describe
+  // another gateway. Reconnecting the same profile keeps them.
+  it('starts the DNS verdict over when another profile connects', async () => {
+    api.connect.mockResolvedValue(undefined)
+    const { result } = renderHook(() => useClient())
+    await waitFor(() => expect(result.current.selectedProfile?.name).toBe('portable'))
+    await act(() => result.current.connect('portable'))
+
+    const applied = {
+      status: 'applied' as const,
+      servers: ['1.0.0.1'],
+      origin: 'gateway' as const,
+    }
+    act(() => emit({ type: 'dns', dns: applied }))
+    act(() => emit({ type: 'dns', dns: { status: 'proposal_unread', reason: 'refusée' } }))
+
+    await act(() => result.current.connect('portable'))
+    expect(result.current.dns).toEqual({ check: applied, proposalUnread: true })
+
+    await act(() => result.current.connect('bureau'))
+    expect(result.current.dns).toEqual({ check: null, proposalUnread: false })
+  })
+
   // The notification area connects a profile, which selects it. The window may
   // be open behind that menu: without this reread it would keep displaying the
   // profile the selection has just left.
