@@ -124,7 +124,9 @@ fn remember_or_recall(
         }
         Ok(ordered)
     });
-    let mut known = known.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut known = known
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     match ordered {
         Ok(ordered) => {
             known.insert(endpoint.to_string(), ordered.clone());

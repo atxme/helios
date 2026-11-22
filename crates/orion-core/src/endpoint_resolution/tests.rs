@@ -547,8 +547,7 @@ fn an_empty_lookup_recalls_the_last_known_addresses() {
         Ok(addrs(&["203.0.113.10:51821"])),
     )
     .unwrap();
-    let recalled =
-        remember_or_recall(&cache, "gateway.example:51821", Ok(Vec::new())).unwrap();
+    let recalled = remember_or_recall(&cache, "gateway.example:51821", Ok(Vec::new())).unwrap();
     assert_eq!(recalled, addrs(&["203.0.113.10:51821"]));
     assert_eq!(
         cache.lock().unwrap().get("gateway.example:51821"),
@@ -560,8 +559,7 @@ fn an_empty_lookup_recalls_the_last_known_addresses() {
 #[test]
 fn an_empty_lookup_without_memory_names_the_endpoint() {
     let cache = Mutex::new(HashMap::new());
-    let error =
-        remember_or_recall(&cache, "gateway.example:51821", Ok(Vec::new())).unwrap_err();
+    let error = remember_or_recall(&cache, "gateway.example:51821", Ok(Vec::new())).unwrap_err();
     assert_eq!(
         format!("{error:#}"),
         "gateway.example:51821 resolved to no usable address"
