@@ -977,3 +977,223 @@ fn firewall_summary_explains_dry_run_and_keeps_accept_rules_visible() {
     assert!(text.contains("allow"), "{text}");
     assert!(text.contains("local only"), "{text}");
 }
+
+#[test]
+fn status_distinguishes_installed_and_degraded_ipv6() {
+    let mut payload = status_json(Vec::new());
+    payload["ipv6"] = json!("installed");
+    let view = serde_json::from_value(payload.clone()).unwrap();
+    let text = render_status(&ui(), &view);
+    assert!(text.contains("  IPv6          installed\n"), "{text}");
+
+    payload["ipv6"] = json!({"unavailable": {
+        "reason": "tunnel_mtu_too_small", "tunnel_mtu": 1200, "minimum": 1280
+    }});
+    let view = serde_json::from_value(payload).unwrap();
+    let text = render_status(&ui(), &view);
+    assert!(
+        text.contains("unavailable — IPv4 only (degraded)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("1200 bytes is below the 1280 bytes"),
+        "{text}"
+    );
+}
+
+#[test]
+fn status_reports_tunnel_policy_and_negotiated_peer() {
+    let mut peer = gateway_peers().remove(0);
+    peer["last_handshake_age_seconds"] = json!(0);
+    peer["post_quantum"] = json!(true);
+    let mut payload = status_json(vec![peer]);
+    payload["state"] = json!("up");
+    payload["wg_peers"] = json!(["branch-site"]);
+    payload["split_tunnel_cidrs"] = json!(["192.0.2.0/24"]);
+    payload["mss_clamp"] = json!(1380);
+    payload["captive_portal_gateway"] = json!("192.0.2.1");
+    let view = serde_json::from_value(payload).unwrap();
+    let text = render_status(&ui(), &view);
+    for expected in [
+        "Site-to-site  branch-site",
+        "Split tunnel  192.0.2.0/24",
+        "MSS clamp     1380",
+        "Captive portal 192.0.2.1",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in {text}");
+    }
+    assert!(
+        text.lines()
+            .any(|line| line.contains("poste-windows") && line.contains("ML-KEM")),
+        "{text}"
+    );
+}
+
+#[test]
+fn network_reports_missing_identity_and_counts_only_complete_certificate_pins() {
+    let mut peer = json!({
+        "name": "full-pin", "public_key": "peer-1", "address": "100.64.0.2/32",
+        "preshared_key_configured": false, "admin": true,
+        "key_negotiation_certificate_sha256": "test-tls-fingerprint",
+        "key_negotiation_pq_certificate_sha256": "test-pq-fingerprint",
+        "minimum_key_negotiation_mode": "ml_kem",
+    });
+    let paired = peer.clone();
+    peer["name"] = json!("partial-pin");
+    peer["public_key"] = json!("peer-2");
+    peer["address"] = json!("100.64.0.3/32");
+    peer["key_negotiation_pq_certificate_sha256"] = serde_json::Value::Null;
+    peer["preshared_key_configured"] = json!(true);
+    peer["minimum_key_negotiation_mode"] = serde_json::Value::Null;
+    peer["admin"] = json!(false);
+    let view = serde_json::from_value(json!({
+        "wan_ifaces": [], "lan_ifaces": [], "allow_ssh_from": [],
+        "wg_iface": "helios0", "wg_private_key_configured": false,
+        "wg_address": "100.64.0.1/32", "wg_listen_port": 51820,
+        "peers": [paired, peer],
+    }))
+    .unwrap();
+    let text = render_network(&ui(), &view);
+    for expected in [
+        "private key missing",
+        "no tunnel interface: unreachable remotely",
+        "2 admitted · 1 admin · 1 with pinned negotiation certificates · 1 with a static PSK · 1 plain WireGuard, no negotiation",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in {text}");
+    }
+}
+
+#[test]
+fn certificates_distinguish_unusable_issuer_from_near_expiry_and_future_validity() {
+    let mut view = certificates();
+    view.peers.truncate(3);
+    for (peer, (name, phase)) in view.peers.iter_mut().zip([
+        ("critical-peer", ValidityPhase::Critical),
+        ("warning-peer", ValidityPhase::Warning),
+        ("future-peer", ValidityPhase::NotYetValid),
+    ]) {
+        peer.name = name.into();
+        peer.phase = phase;
+        peer.not_after = view.now_unix + 2 * 86_400;
+    }
+    let issuer = view.issuer.as_mut().unwrap();
+    issuer.not_after = view.now_unix + 86_400;
+    let text = render_certificates(&ui(), &view);
+    assert!(
+        text.contains("epoch 1 not usable — clients cannot renew"),
+        "{text}"
+    );
+    assert!(text.contains("3 total · 1 valid · 2 expiring"), "{text}");
+    let rows: Vec<_> = text.lines().filter(|line| line.contains("gen 1")).collect();
+    assert_eq!(rows.len(), 3, "{text}");
+    assert!(
+        rows[0].contains("critical-peer") && rows[0].contains("expires in 2 d"),
+        "{text}"
+    );
+    assert!(
+        rows[1].contains("warning-peer") && rows[1].contains("expires in 2 d"),
+        "{text}"
+    );
+    assert!(
+        rows[2].contains("future-peer") && rows[2].contains("not yet valid"),
+        "{text}"
+    );
+
+    let check = certificates_check(&view);
+    assert_eq!(check.level, Level::Fail);
+    assert_eq!(check.detail, "issuer not usable — clients cannot renew");
+
+    view.issuer.as_mut().unwrap().usable = true;
+    let text = render_certificates(&ui(), &view);
+    assert!(text.contains("epoch 1 · expires in 1 d 00 h"), "{text}");
+}
+
+#[test]
+fn doctor_distinguishes_a_down_tunnel_from_an_unvalidated_tpm() {
+    let mut inputs = healthy();
+    inputs.status.as_mut().unwrap().state = "down".into();
+    inputs.health.as_mut().unwrap().tpm = None;
+    let checks = diagnose(&inputs);
+    let find = |label: &str| checks.iter().find(|check| check.label == label).unwrap();
+    assert_eq!(find("API").level, Level::Ok);
+    assert_eq!(find("Tunnel").level, Level::Fail);
+    assert_eq!(find("Tunnel").detail, "down · 2/17 peers online");
+    assert_eq!(find("TPM").level, Level::Warn);
+    assert_eq!(find("TPM").detail, "boot integrity not validated");
+}
+
+#[test]
+fn health_and_doctor_report_lost_sealed_vaults() {
+    let mut inputs = healthy();
+    let health = inputs.health.as_mut().unwrap();
+    health.tpm.as_mut().unwrap().preserved_vaults = false;
+    health.temperature_celsius = Some(85.0);
+    let text = render_health(&ui(), health);
+    assert!(
+        text.contains("unsealed · sealed vaults NOT preserved"),
+        "{text}"
+    );
+    assert!(text.contains("85.0 °C"), "{text}");
+
+    let checks = diagnose(&inputs);
+    let find = |label: &str| checks.iter().find(|check| check.label == label).unwrap();
+    assert_eq!(find("TPM").level, Level::Fail);
+    assert_eq!(
+        find("TPM").detail,
+        "unsealed: the sealed vaults were not preserved this boot"
+    );
+    assert_eq!(find("Temperature").level, Level::Warn);
+}
+
+#[tokio::test]
+async fn health_fetches_the_health_route_and_propagates_invalid_payloads() {
+    let (base, server) = crate::tests::http_response_sequence([
+        ("200 OK", json!({"uptime_seconds": 60}).to_string()),
+        (
+            "200 OK",
+            json!({"uptime_seconds": "one minute"}).to_string(),
+        ),
+    ])
+    .await;
+    let client = loopback_client();
+    health(&client, &base)
+        .await
+        .expect("accept a partial health reading");
+    let error = health(&client, &base)
+        .await
+        .expect_err("reject a malformed reading");
+    assert!(format!("{error:#}").contains("/api/health"), "{error:#}");
+    let requests = server.await.expect("both health requests completed");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.starts_with("GET /api/health HTTP/1.1\r\n")),
+        "{requests:?}"
+    );
+}
+
+#[test]
+fn log_rendering_preserves_plain_messages_and_wraps_long_unicode_words() {
+    let line = "2026-10-07T20:20:45 heliosd[1]: Started gateway";
+    let text = render_log_line(&ui(), line, true);
+    assert_eq!(text, "  10-07 20:20:45         Started gateway\n");
+
+    let word = "é".repeat(45);
+    let line = format!("2026-10-07T20:20:45 heliosd[1]: DEBUG {word}");
+    let text = render_log_line(&Ui::plain(Some(46)), &line, true);
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.len(), 3, "{text}");
+    assert!(lines[0].contains("DEBUG"), "{text}");
+    assert!(
+        lines.iter().all(|line| line.chars().count() <= 46),
+        "{text}"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .flat_map(|line| line.chars())
+            .filter(|&character| character == 'é')
+            .count(),
+        45
+    );
+}
