@@ -5,6 +5,29 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+#[cfg(not(windows))]
+fn command_app(client: orion_engine::client::EngineClient) -> tauri::App<tauri::test::MockRuntime> {
+    use crate::{operator::location::VaultLocation, AppState};
+    use std::sync::Arc;
+    use tauri::Manager;
+
+    let app = tauri::test::mock_app();
+    assert!(app.manage(AppState {
+        client,
+        pending_profile_paths: Mutex::new(VecDeque::new()),
+        operator: Default::default(),
+        vault_location: VaultLocation::at(std::env::temp_dir().join(format!(
+            "orion-profile-command-settings-{}",
+            std::process::id()
+        ))),
+        chain_opened: Arc::default(),
+        quitting: Default::default(),
+        tunnel_taken_down: Default::default(),
+        engine_lost: Default::default(),
+    }));
+    app
+}
+
 fn profile_draft() -> ProfileDraft {
     ProfileDraft {
         name: "gateway".into(),
@@ -641,4 +664,276 @@ async fn staging_refuses_mismatched_replies_and_preserves_validation_errors() {
                 .await;
         }
     );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn get_config_command_forwards_the_engine_view_and_rejects_other_replies() {
+    let (client, mut engine) = scripted_engine().await;
+    let app = command_app(client);
+    let state = app.state::<crate::AppState>();
+    let expected = ConfigView {
+        profiles: vec![],
+        selected: Some("picked".into()),
+        locked: vec![orion_engine::LockedProfileView {
+            name: "sealed".into(),
+            client_public_key: "client public".into(),
+            peer_public_key: "gateway public".into(),
+        }],
+        vault_error: None,
+    };
+    let (result, ()) = tokio::join!(get_config(state), async move {
+        engine
+            .reply(|command| {
+                assert!(matches!(command, EngineCommand::GetConfig));
+                Ok(EngineReply::Config(expected.clone()))
+            })
+            .await;
+    });
+    let view = result.expect("configuration view");
+    assert_eq!(view.selected.as_deref(), Some("picked"));
+    assert_eq!(view.locked[0].name, "sealed");
+    drop(app);
+
+    let (client, mut engine) = scripted_engine().await;
+    let app = command_app(client);
+    let (result, ()) = tokio::join!(get_config(app.state()), async move {
+        engine
+            .reply(|command| {
+                assert!(matches!(command, EngineCommand::GetConfig));
+                Ok(EngineReply::Unit)
+            })
+            .await;
+    });
+    assert_eq!(
+        result.expect_err("reject a mismatched reply"),
+        unexpected_engine_reply()
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn import_profile_command_preserves_document_name_and_engine_outcome() {
+    let (client, mut engine) = scripted_engine().await;
+    let app = command_app(client);
+    let outcome = imported_reply("from-file");
+    let EngineReply::Imported(expected) = outcome.clone() else {
+        unreachable!()
+    };
+    let (result, ()) = tokio::join!(
+        import_profile(app.state(), "opaque document".into(), "chosen.conf".into()),
+        async move {
+            engine
+                .reply(|command| {
+                    assert_import_command(command, "chosen.conf", "opaque document");
+                    Ok(outcome)
+                })
+                .await;
+        }
+    );
+    let imported = result.expect("import outcome");
+    assert_eq!(imported.profile.name, expected.profile.name);
+    assert_eq!(imported.notices, expected.notices);
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn import_profile_path_command_consumes_queued_path_and_forwards_only_file_data() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("queued.orion");
+    std::fs::write(&path, "queued contents").expect("write associated profile");
+    let (client, mut engine) = scripted_engine().await;
+    let app = command_app(client);
+    app.state::<crate::AppState>()
+        .pending_profile_paths
+        .lock()
+        .expect("pending paths")
+        .push_back(path);
+    let outcome = imported_reply("queued");
+    let (result, ()) = tokio::join!(import_profile_path(app.state(), None), async move {
+        engine
+            .reply(|command| {
+                assert_import_command(command, "queued.orion", "queued contents");
+                Ok(outcome)
+            })
+            .await;
+    });
+    assert_eq!(
+        result
+            .expect("queued import")
+            .expect("path was queued")
+            .profile
+            .name,
+        "queued"
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn import_profile_path_command_returns_none_without_contacting_the_engine() {
+    let (client, _engine) = scripted_engine().await;
+    let app = command_app(client);
+    assert!(import_profile_path(app.state(), None)
+        .await
+        .expect("empty queue is not an error")
+        .is_none());
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn vault_posture_commands_keep_read_and_explicit_waiver_distinct() {
+    let (client, mut engine) = scripted_engine().await;
+    let app = command_app(client);
+    tokio::join!(
+        async {
+            let current = vault_posture(app.state()).await.expect("current posture");
+            assert!(current.volume_protected);
+            assert!(!current.unencrypted_volume_waived);
+            let waived = allow_unencrypted_volume(app.state())
+                .await
+                .expect("explicit volume waiver");
+            assert!(!waived.volume_protected);
+            assert!(waived.unencrypted_volume_waived);
+        },
+        async move {
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::VaultPosture));
+                    Ok(posture(true, false))
+                })
+                .await;
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::AllowUnencryptedVolume));
+                    Ok(posture(false, true))
+                })
+                .await;
+        }
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn key_commands_route_user_input_and_only_return_public_material() {
+    let (client, mut engine) = scripted_engine().await;
+    let app = command_app(client);
+    let private = "private fixture";
+    let psk = "PSK fixture";
+    tokio::join!(
+        async {
+            assert_eq!(
+                generate_private_key(app.state()).await,
+                Ok("generated public".into())
+            );
+            assert_eq!(
+                adopt_private_key(app.state(), private.into()).await,
+                Ok("adopted public".into())
+            );
+            adopt_preshared_key(app.state(), psk.into())
+                .await
+                .expect("adopt PSK");
+            discard_staged_key(app.state()).await.expect("discard key");
+            discard_staged_psk(app.state()).await.expect("discard PSK");
+        },
+        async move {
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::GeneratePrivateKey));
+                    Ok(EngineReply::PublicKey("generated public".into()))
+                })
+                .await;
+            engine
+                .reply(|command| {
+                    let EngineCommand::AdoptPrivateKey { private_key } = command else {
+                        panic!("adopt key")
+                    };
+                    assert_eq!(private_key.expose(), private);
+                    Ok(EngineReply::PublicKey("adopted public".into()))
+                })
+                .await;
+            engine
+                .reply(|command| {
+                    let EngineCommand::AdoptPresharedKey { preshared_key } = command else {
+                        panic!("adopt PSK")
+                    };
+                    assert_eq!(preshared_key.expose(), psk);
+                    Ok(EngineReply::Unit)
+                })
+                .await;
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::DiscardStagedKey));
+                    Ok(EngineReply::Unit)
+                })
+                .await;
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::DiscardStagedPsk));
+                    Ok(EngineReply::Unit)
+                })
+                .await;
+        }
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn ssh_command_wrapper_preserves_optional_profile_selection_and_engine_error() {
+    let (client, mut engine) = scripted_engine().await;
+    let app = command_app(client);
+    tokio::join!(
+        async {
+            let command = ssh_command(app.state(), Some("secondary".into())).await;
+            assert_eq!(command.as_deref(), Ok("ssh operator@gateway.example"));
+            assert_eq!(
+                ssh_command(app.state(), None).await,
+                Err("profile has no SSH destination".into())
+            );
+        },
+        async move {
+            engine
+                .reply(|command| {
+                    let EngineCommand::SshCommand { name: Some(name) } = command else {
+                        panic!("expected SSH lookup for a named profile");
+                    };
+                    assert_eq!(name, "secondary");
+                    Ok(EngineReply::SshCommand(
+                        "ssh operator@gateway.example".into(),
+                    ))
+                })
+                .await;
+            engine
+                .reply(|command| {
+                    assert!(matches!(command, EngineCommand::SshCommand { name: None }));
+                    Err("profile has no SSH destination".into())
+                })
+                .await;
+        }
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn validate_profile_command_forwards_the_draft_and_field_issues() {
+    let (client, mut engine) = scripted_engine().await;
+    let app = command_app(client);
+    let mut draft = profile_draft();
+    draft.name = "edited-name".into();
+    let expected = ProfileIssues {
+        name: Some("already exists".into()),
+        ..Default::default()
+    };
+    let reply = expected.clone();
+    let (result, ()) = tokio::join!(validate_profile(app.state(), draft), async move {
+        engine
+            .reply(|command| {
+                let EngineCommand::ValidateProfile { draft } = command else {
+                    panic!("validate profile")
+                };
+                assert_eq!(draft.name, "edited-name");
+                Ok(EngineReply::Issues(reply))
+            })
+            .await;
+    });
+    assert_eq!(result, Ok(expected));
 }
