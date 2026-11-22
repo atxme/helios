@@ -111,6 +111,7 @@ pub(super) fn gateway_test_profile(url: &str, peer_key: String) -> ProfileView {
         has_private_key: false,
         has_static_psk: false,
         ipv6_uncaptured_full_tunnel: false,
+        dns: None,
     }
 }
 
