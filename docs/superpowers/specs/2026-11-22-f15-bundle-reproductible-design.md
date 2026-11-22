@@ -36,6 +36,9 @@ recoder dans 3 mois ».
   (22 novembre 2026).
 - **Approche 1 retenue : conteneur de build figé dans le dépôt** (§4),
   22 novembre 2026.
+- **Monter en même temps les versions de travail** (22 novembre 2026) : les
+  toolchains et les outils de CI passent aux dernières versions stables (§5.11).
+  Les dépendances Rust et npm n'en font pas partie.
 
 ## 3. Objectifs, non-objectifs, anti-objectifs
 
@@ -123,11 +126,10 @@ l'image. Tout ce qu'elle tire est épinglé :
   `libtss2-dev`, `libudev-dev`, plus `git`, `ca-certificates`, `curl`, `xz-utils`
   (et ce que bindgen demande, s'il est encore utilisé, à vérifier).
 - **Rust :** `rustup-init` téléchargé et vérifié par SHA-256, toolchain
-  exacte installée en profil minimal. Version : **1.99.0** (celle du poste au
-  22 novembre 2026). Le MSRV du workspace (`rust-version = "1.95"`) et la CI
-  de validation n'en sont pas affectés.
-- **Node :** archive officielle `node-v24.x.y-linux-x64.tar.xz` vérifiée par
-  SHA-256, version exacte. `npm` est celui qu'elle embarque.
+  exacte installée en profil minimal. Version : **1.100.0** (stable du
+  9 novembre 2026), la même que le MSRV et la CI (§5.11).
+- **Node :** archive officielle `node-v26.13.1-linux-x64.tar.xz` (LTS
+  « Lithium »), vérifiée par SHA-256. `npm` est celui qu'elle embarque.
 
 Les versions et empreintes sont des `ARG` en tête du Dockerfile : monter de
 toolchain, c'est changer ces lignes, rien d'autre.
@@ -169,7 +171,7 @@ copiée dans `target/bundle/` lui appartienne.
 
 - **Chemins :** `RUSTFLAGS` porte `--remap-path-prefix=/helios/src=/helios`
   et `--remap-path-prefix=/helios/cargo=/cargo`. `trim-paths` n'est pas stable
-  dans Cargo 1.99 (vérifié le 22 novembre 2026 : « feature `trim-paths` is
+  dans Cargo 1.99 ni 1.100 (vérifié le 22 novembre 2026 : « feature `trim-paths` is
   required ») ; à reconsidérer quand il le sera. Les chemins de la bibliothèque
   standard sont déjà `/rustc/<hash>`.
 - **`SOURCE_DATE_EPOCH` :** la date du commit (`git log -1 --format=%ct`),
@@ -300,10 +302,10 @@ contraire, ce sont des choix de conception, pas des décisions de l'utilisateur.
   --native` recompile le crate xtask de l'arbre exporté, avec la toolchain
   épinglée. Les `RUSTFLAGS` de remappage s'appliquent aussi à cette compilation,
   sans effet sur le bundle.
-- **Rust 1.99.0 pour les binaires livrés,** au lieu du 1.95.0 du job de release
-  actuel. Il n'existe pas de `rust-toolchain.toml` à la racine : l'image est la
-  seule autorité pour les builds de livraison. Le MSRV 1.95 reste vérifié par
-  `regression.yml`.
+- **Rust 1.100.0 pour les binaires livrés** comme pour le MSRV (§5.11). Il
+  n'existe pas de `rust-toolchain.toml` à la racine : l'image est la seule
+  autorité pour les builds de livraison, et la concordance des épingles est
+  vérifiée (§5.11).
 - **Moteur de conteneur.** Docker avec démon (*rootful*), utilisateur dans le
   groupe `docker` : c'est le cas du poste de l'opérateur (vérifié le
   22 novembre 2026) et du runner `ubuntu-24.04`. Docker sans démon root
@@ -326,12 +328,46 @@ contraire, ce sont des choix de conception, pas des décisions de l'utilisateur.
   confrontation à un manifeste publié. Sur un tag, c'est le même contrôle sur
   le commit du tag.
 
+### 5.11 Les versions de travail
+
+Dernières versions stables au 22 novembre 2026, relevées par `rustup check` et
+`nodejs.org/dist/index.json` :
+
+| Outil | Avant | Après | Où |
+| --- | --- | --- | --- |
+| Rust (livraison) | 1.95.0 (release), 1.99 (poste) | **1.100.0** | `tools/build-env/Dockerfile` |
+| MSRV | 1.95 | **1.100** | `Cargo.toml` (`rust-version`), `scripts/setup-dev.sh` (`RUST_MIN`) |
+| Rust (CI) | `dtolnay/rust-toolchain@1.95.0` | **`@1.100.0`** | `regression.yml`, `release.yml` |
+| Node | 24 | **26.13.1** (conteneur), **26** (CI) | Dockerfile, `actions/setup-node` |
+| `engines` | `^22.22.2 \|\| ^24.15.0 \|\| >=26.0.0` | **`>=26.0.0`** | `web/package.json`, `apps/orion/package.json` |
+| Image Astra | `rust:1.92-bookworm` | **`rust:1.100-trixie`** (ou la base de `tools/build-env`) | `deploy/astra/Dockerfile` |
+| Actions GitHub | `checkout@v4`, `setup-node@v4`, `upload-artifact@v4` | dernière majeure de chacune | tous les workflows |
+
+Restent hors de ce tableau : le nightly du fuzz (`dtolnay/rust-toolchain@nightly`),
+qui suit déjà la dernière version ; la toolchain `+stable` préinstallée de la
+station de signature Windows d'Orion (lot Orion) ; les dépendances Rust et npm
+(mémoire « deps-held-back » : `rustables` 0.9 reste bloqué).
+
+**Une seule vérité.** Un contrôle de `scripts/check.sh` échoue si la version
+Rust du Dockerfile, le `rust-version` du workspace, `RUST_MIN` et les épingles
+`dtolnay/rust-toolchain@<x.y.z>` des workflows ne concordent pas (au niveau
+`x.y`), ou si la majeure Node de la CI diffère de celle du Dockerfile. Monter
+de version devient : changer ces lignes, et le contrôle dit lesquelles on a
+oubliées.
+
+**Conséquences à absorber dans le lot :**
+
+- Les nouveaux avertissements de `clippy -D warnings` sous 1.100 sont corrigés
+  dans le code ; pas de `allow` global pour les faire taire.
+- Le poste passe à 1.100 (`rustup update stable`) et à Node 26 (`nvm`) ;
+  le cache Cargo sera reconstruit.
+- La régression complète repasse verte sous 1.100.
+
 ## 6. Contraintes
 
-- Rust : toolchain **1.99.0** dans le conteneur ; MSRV du workspace inchangé
-  (1.95).
-- Node : la version exacte retenue doit satisfaire `web/package.json`
-  (`^22.22.2 || ^24.15.0 || >=26.0.0`).
+- Rust : **1.100.0** partout (conteneur, `rust-version`, CI, `setup-dev.sh`).
+- Node : **26.13.1** dans le conteneur, **26** dans la CI ; `engines` de
+  `web/` et d'`apps/orion/` exige `>=26`.
 - Trousseau : jamais de clé privée dans le conteneur ; le trousseau public est
   monté en lecture seule. Le refus du trousseau de développement en release
   (`aether/build.rs`) reste en vigueur.
