@@ -18,7 +18,7 @@ import { GatewayRecoveryBlock } from './GatewayRecoveryBlock'
 const SENTENCES: Record<RecoveryRefusalCode, string> = {
   escrow_unreadable: 'Séquestre illisible avec cette clé.',
   legacy_escrow:
-    "Séquestre d'un ancien format : redémarrez la gateway pour qu'elle l'écrive au nouveau format, puis recommencez.",
+    "Séquestre d'un ancien format, qui ne porte pas le compteur : il faut le séquestre réécrit par la gateway après son passage à F5 (voir MAINTENANCE, « Passage au compteur NV »).",
   escrow_inconsistent: "Le séquestre ne correspond pas à la clé qu'il contient.",
   counter_unknown: 'Valeur du compteur inconnue : lisez-la sur la gateway et saisissez-la.',
   authorization_invalid: "Autorisation non valide : signature manquante ou d'un autre éditeur.",
@@ -26,6 +26,8 @@ const SENTENCES: Record<RecoveryRefusalCode, string> = {
   request_mismatch:
     'Cette autorisation ne correspond pas à la requête préparée (autre valeur de compteur ou autre gateway).',
   frame_malformed: 'Fichier de récupération mal formé.',
+  request_malformed: 'Requête préparée illisible ou mal formée.',
+  platform_unsupported: "Cette cérémonie n'existe que sous Windows.",
 }
 
 const ORIGIN_AFTER_TICKET =
@@ -129,6 +131,17 @@ describe('GatewayRecoveryBlock', () => {
     expect(artifacts.saveArtifact).not.toHaveBeenCalled()
   })
 
+  it('shows a fixed sentence, never the text of an unexpected failure', async () => {
+    api.gatewayRecoveryAssemble.mockRejectedValueOnce(new Error('C:\\secret\\path'))
+    render(<GatewayRecoveryBlock />)
+
+    await fillAssemble()
+    fireEvent.click(assembleStep().getByRole('button', { name: 'Assembler le fichier' }))
+
+    await waitFor(() => expect(block().getByText('Erreur inattendue.')).toBeTruthy())
+    expect(block().queryByText(/secret/)).toBeNull()
+  })
+
   it('shows no error when the operator cancels a dialog', async () => {
     api.gatewayRecoveryPrepare.mockResolvedValue(null)
     api.gatewayRecoveryAssemble.mockResolvedValue(null)
@@ -160,6 +173,6 @@ describe('GatewayRecoveryBlock', () => {
       expect(artifacts.saveArtifact).not.toHaveBeenCalled()
       unmount()
     }
-    expect(codes).toHaveLength(8)
+    expect(codes).toHaveLength(10)
   })
 })

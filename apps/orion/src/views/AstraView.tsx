@@ -395,8 +395,8 @@ export function AstraView({
     />
   )
 
-  // Beside the gateway identity block of the rotations: recovery needs no vault, so it is
-  // shown whether or not one is open.
+  // Shown above the rotations panel: recovery needs no vault, so it is shown whether or
+  // not one is open.
   const rotations = (
     <>
       <GatewayRecoveryBlock />

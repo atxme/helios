@@ -16,7 +16,7 @@ import { MAX_FILE_BYTES, readFileText } from './readFileText'
 const REFUSAL_SENTENCES: Record<RecoveryRefusalCode, string> = {
   escrow_unreadable: 'Séquestre illisible avec cette clé.',
   legacy_escrow:
-    "Séquestre d'un ancien format : redémarrez la gateway pour qu'elle l'écrive au nouveau format, puis recommencez.",
+    "Séquestre d'un ancien format, qui ne porte pas le compteur : il faut le séquestre réécrit par la gateway après son passage à F5 (voir MAINTENANCE, « Passage au compteur NV »).",
   escrow_inconsistent: "Le séquestre ne correspond pas à la clé qu'il contient.",
   counter_unknown: 'Valeur du compteur inconnue : lisez-la sur la gateway et saisissez-la.',
   authorization_invalid: "Autorisation non valide : signature manquante ou d'un autre éditeur.",
@@ -24,6 +24,8 @@ const REFUSAL_SENTENCES: Record<RecoveryRefusalCode, string> = {
   request_mismatch:
     'Cette autorisation ne correspond pas à la requête préparée (autre valeur de compteur ou autre gateway).',
   frame_malformed: 'Fichier de récupération mal formé.',
+  request_malformed: 'Requête préparée illisible ou mal formée.',
+  platform_unsupported: "Cette cérémonie n'existe que sous Windows.",
 }
 
 const COUNTER_ORIGIN: Record<RecoveryPrepared['counter_source'], string> = {
@@ -45,10 +47,10 @@ function refusalOf(cause: unknown): RecoveryRefusalCode | null {
   return typeof code === 'string' && code in REFUSAL_SENTENCES ? (code as RecoveryRefusalCode) : null
 }
 
-function failureSentence(cause: unknown, prefix: string): string {
+/** A refusal's sentence. Anything else is a failure of the call itself: its text is never shown. */
+function failureSentence(cause: unknown): string {
   const code = refusalOf(cause)
-  if (code) return REFUSAL_SENTENCES[code]
-  return `${prefix} : ${cause instanceof Error ? cause.message : String(cause)}`
+  return code ? REFUSAL_SENTENCES[code] : 'Erreur inattendue.'
 }
 
 /** The file a file field holds, if any. */
@@ -104,7 +106,7 @@ function PrepareStep({ onPrepared }: { onPrepared: (prepared: RecoveryPrepared |
     } catch (cause) {
       setPrepared(null)
       onPrepared(null)
-      setError(failureSentence(cause, 'Préparation impossible'))
+      setError(failureSentence(cause))
     } finally {
       setBusy(false)
     }
@@ -198,13 +200,18 @@ function AssembleStep({ prepared }: { prepared: RecoveryPrepared | null }) {
   // An uploaded request wins; otherwise the one prepared in step 1 of this session.
   const request = uploadedRequest ?? prepared?.request.contents ?? null
 
-  const pick = async (file: File | null, set: (text: string) => void) => {
+  // A cleared file input clears what it held.
+  const pick = async (file: File | null, set: (text: string | null) => void) => {
     setError(null)
-    if (!file) return
+    if (!file) {
+      set(null)
+      return
+    }
     try {
       set(await readFileText(file))
     } catch (cause) {
-      setError(failureSentence(cause, 'Lecture impossible'))
+      set(null)
+      setError(failureSentence(cause))
     }
   }
 
@@ -220,7 +227,7 @@ function AssembleStep({ prepared }: { prepared: RecoveryPrepared | null }) {
       if (assembled === null) return
       setFileName(assembled.file_name)
     } catch (cause) {
-      setError(failureSentence(cause, 'Assemblage impossible'))
+      setError(failureSentence(cause))
     } finally {
       setBusy(false)
     }

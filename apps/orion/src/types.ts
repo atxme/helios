@@ -1165,6 +1165,8 @@ export type RecoveryRefusalCode =
   | 'foreign_gateway'
   | 'request_mismatch'
   | 'frame_malformed'
+  | 'request_malformed'
+  | 'platform_unsupported'
 
 /**
  * Une opération qui attend l'opérateur, telle qu'une liste peut la nommer.
