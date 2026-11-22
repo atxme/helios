@@ -91,7 +91,10 @@ récupération. Si un billet de rescellement est consommé dans le même démarr
 la récupération vise la valeur suivante : billet pour `C`, récupération pour
 `C+1`. `prepare-recovery` propose `C+1` par défaut, d'après le séquestre ;
 l'opérateur vérifie la valeur sur la gateway (`heliosd tpm counter-status`) avant
-de signer.
+de signer. Sans billet dans le même démarrage (coffre perdu simplement), la
+valeur à passer avec `--counter` est le compteur courant `C`, et non `C+1` ; dans
+Orion, la même valeur va dans le champ facultatif « Valeur du compteur (lue sur la
+gateway) ».
 
 Les deux signatures couvrent exactement :
 

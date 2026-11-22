@@ -128,8 +128,11 @@ cat /var/lib/helios/anti-rollback.json
 autorité. Un compteur illisible fait refuser les trois artefacts, sans empêcher
 `heliosd` de démarrer.
 
-**Billet après un changement de PCR.** Le descellement échoue, et un billet
-valide pour la valeur courante permet de resceller le même secret.
+**Billet après un changement de PCR.** Le descellement échoue. Un billet valide
+pour la valeur courante autorise la gateway à sceller un **nouveau** secret sur
+les PCR courants ; les coffres existants sont alors perdus. Le fichier de
+récupération WireGuard (`C+1`, ci-dessous) devient donc nécessaire dès qu'un
+séquestre est configuré.
 
 ```sh
 # Sur la gateway : la requête publique (compteur C et ancre du blob scellé)
@@ -141,9 +144,10 @@ L'éditeur signe cette requête avec `helios-publisher reseal-ticket` (voir
 dans `/var/lib/helios/reseal-ticket.json`. Au démarrage, le billet est consommé :
 le compteur passe de `C` à `C+1`.
 
-**Récupération WireGuard, si le coffre reste indéchiffrable.** La gateway n'a
-plus sa clé, donc le poste opérateur fait la préparation hors ligne, avec le
-séquestre `wg-key.escrow` et la clé privée de séquestre :
+**Récupération WireGuard, sans billet ou après un billet.** Si le coffre est
+indéchiffrable (après un billet, il l'est toujours), la gateway n'a plus sa clé :
+le poste opérateur fait la préparation hors ligne, avec le séquestre
+`wg-key.escrow` et la clé privée de séquestre :
 
 ```sh
 helios escrow prepare-recovery --escrow wg-key.escrow \
@@ -152,7 +156,11 @@ helios escrow prepare-recovery --escrow wg-key.escrow \
 ```
 
 La commande affiche la clé publique de l'identité et le compteur à signer, par
-défaut celui du séquestre plus un. L'éditeur signe `wg-recovery-request.json`
+défaut celui du séquestre plus un. Ce défaut ne vaut qu'après un billet dans le
+même démarrage ; sans billet (coffre perdu simplement), la valeur à passer avec
+`--counter` est le compteur courant `C`, lu dans `anti-rollback.json` ou avec
+`heliosd tpm counter-status`. Dans Orion, la même valeur va dans le champ
+facultatif « Valeur du compteur (lue sur la gateway) ». L'éditeur signe `wg-recovery-request.json`
 avec `helios-publisher wg-recovery`, puis l'opérateur assemble le fichier à
 déposer :
 
