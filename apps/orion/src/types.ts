@@ -1150,6 +1150,11 @@ export interface RecoveryPrepared {
   request: OperatorArtifact
 }
 
+/** Le fichier de récupération écrit : son nom seul. Le contenu ne quitte jamais Orion. */
+export interface RecoveryAssembled {
+  file_name: string
+}
+
 /** Codes fermés de refus de la récupération ; aucun texte libre ne traverse. */
 export type RecoveryRefusalCode =
   | 'escrow_unreadable'

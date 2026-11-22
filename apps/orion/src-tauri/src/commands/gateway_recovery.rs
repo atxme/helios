@@ -5,6 +5,16 @@
 //! The commands run in the unprivileged UI process. They need neither
 //! elevation nor an open operator vault: they read only what the operator
 //! hands over. Refusals cross as closed codes; no key and no free text does.
+//!
+//! The escrow private key is chosen in a native dialog and read here; the
+//! recovery frame, which holds the gateway's WireGuard private key, is written
+//! here, to a path chosen in a native save dialog. Neither crosses IPC, JS or
+//! the DOM (ADR-006 §5). Off Windows the dialogs do not exist, so both commands
+//! refuse with `platform_unsupported`.
+
+// Off Windows the ceremony refuses before any of its pure steps run: they are
+// compiled and tested everywhere, and only the dialog wiring is Windows-only.
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 
 use aether::sig::{SignedWireGuardRecovery, WireGuardRecoveryPayload};
 use base64::Engine as _;
@@ -14,6 +24,11 @@ use serde::Serialize;
 use zeroize::Zeroizing;
 
 use crate::operator::{ArtifactEncoding, OperatorArtifact};
+
+#[cfg(any(windows, test))]
+use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 
 const B64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
@@ -42,6 +57,13 @@ pub struct RecoveryPrepared {
     pub request: OperatorArtifact,
 }
 
+/// The recovery frame was written: the name of the file chosen, and nothing
+/// else. The frame itself never leaves this process.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct RecoveryAssembled {
+    pub file_name: String,
+}
+
 /// A refusal of the ceremony, as the window reads it: a closed code, with no
 /// free text.
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -55,6 +77,8 @@ pub enum RecoveryRefusalView {
     ForeignGateway,
     RequestMismatch,
     FrameMalformed,
+    RequestMalformed,
+    PlatformUnsupported,
 }
 
 impl From<RecoveryError> for RecoveryRefusalView {
@@ -72,47 +96,76 @@ impl From<RecoveryError> for RecoveryRefusalView {
     }
 }
 
-/// Opens the escrow and prepares the request the publisher signs.
+/// Opens the escrow with the operator's key, chosen in a dialog, and prepares
+/// the request the publisher signs.
 ///
-/// `counter` is optional: without it, the escrow's counter plus one is used.
-/// `expected_pcr_digest` is 64 hex digits when given.
+/// `None` when the operator cancels the key dialog. `counter` is optional:
+/// without it, the escrow's counter plus one is used. `expected_pcr_digest` is
+/// 64 hex digits when given.
 #[tauri::command]
 pub(crate) async fn gateway_recovery_prepare(
+    window: tauri::Window,
     escrow_b64: String,
-    escrow_private_key: String,
     counter: Option<u64>,
     expected_pcr_digest: Option<String>,
-) -> Result<RecoveryPrepared, RecoveryRefusalView> {
-    let escrow = decode_escrow(&escrow_b64)?;
-    let operator_key = decode_operator_key(&escrow_private_key)?;
-    let digest = decode_pcr_digest(expected_pcr_digest)?;
-    prepare_recovery(&escrow, &operator_key, counter, digest)
+) -> Result<Option<RecoveryPrepared>, RecoveryRefusalView> {
+    #[cfg(windows)]
+    {
+        let escrow = decode_escrow(&escrow_b64)?;
+        let digest = decode_pcr_digest(expected_pcr_digest)?;
+        let Some(key) = read_escrow_key(&window).await? else {
+            return Ok(None);
+        };
+        prepare_with_key(&escrow, &key, counter, digest).map(Some)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, escrow_b64, counter, expected_pcr_digest);
+        Err(RecoveryRefusalView::PlatformUnsupported)
+    }
 }
 
-/// Verifies the publisher's authorization against the escrow and returns the
-/// recovery frame, as `wg-key.recovery`, base64 encoded for the window.
+/// Verifies the publisher's authorization against the escrow, then asks where
+/// to write `wg-key.recovery` and writes it, owner-only and atomically.
 ///
 /// `request` is the JSON text of the prepared request; `authorization` is the
-/// JSON the publisher returned.
+/// JSON the publisher returned. `None` when the operator cancels either dialog;
+/// nothing is written when cancelled or refused. Every refusal happens before
+/// the output dialog opens.
 #[tauri::command]
 pub(crate) async fn gateway_recovery_assemble(
+    window: tauri::Window,
     escrow_b64: String,
-    escrow_private_key: String,
     request: String,
     authorization: String,
-) -> Result<OperatorArtifact, RecoveryRefusalView> {
-    let escrow = decode_escrow(&escrow_b64)?;
-    let operator_key = decode_operator_key(&escrow_private_key)?;
-    assemble_recovery(&escrow, &operator_key, &request, &authorization)
+) -> Result<Option<RecoveryAssembled>, RecoveryRefusalView> {
+    #[cfg(windows)]
+    {
+        let escrow = decode_escrow(&escrow_b64)?;
+        let Some(key) = read_escrow_key(&window).await? else {
+            return Ok(None);
+        };
+        let frame = assemble_frame(&escrow, &key, &request, &authorization)?;
+        let Some(target) = pick_output(&window).await? else {
+            return Ok(None);
+        };
+        write_frame(&target, &frame).map(Some)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, escrow_b64, request, authorization);
+        Err(RecoveryRefusalView::PlatformUnsupported)
+    }
 }
 
-fn prepare_recovery(
+#[cfg(any(windows, test))]
+fn prepare_with_key(
     escrow: &[u8],
-    operator_key: &[u8],
+    key: &[u8],
     counter: Option<u64>,
     expected_pcr_digest: Option<[u8; 32]>,
 ) -> Result<RecoveryPrepared, RecoveryRefusalView> {
-    let request = recovery::prepare(escrow, operator_key, counter, expected_pcr_digest)?;
+    let request = recovery::prepare(escrow, key, counter, expected_pcr_digest)?;
     let contents = serde_json::to_string_pretty(&request.payload)
         .map_err(|_| RecoveryRefusalView::FrameMalformed)?;
     Ok(RecoveryPrepared {
@@ -131,31 +184,118 @@ fn prepare_recovery(
     })
 }
 
-fn assemble_recovery(
+/// Runs the core `assemble`: every refusal of the ceremony is raised here.
+#[cfg(any(windows, test))]
+fn assemble_frame(
     escrow: &[u8],
-    operator_key: &[u8],
+    key: &[u8],
     request: &str,
     authorization: &str,
-) -> Result<OperatorArtifact, RecoveryRefusalView> {
+) -> Result<Zeroizing<Vec<u8>>, RecoveryRefusalView> {
     let request: WireGuardRecoveryPayload =
-        serde_json::from_str(request).map_err(|_| RecoveryRefusalView::FrameMalformed)?;
+        serde_json::from_str(request).map_err(|_| RecoveryRefusalView::RequestMalformed)?;
     let authorization: SignedWireGuardRecovery = serde_json::from_str(authorization)
         .map_err(|_| RecoveryRefusalView::AuthorizationInvalid)?;
-    let frame = recovery::assemble(escrow, operator_key, &request, &authorization)?;
-    Ok(OperatorArtifact {
-        file_name: RECOVERY_FILE.to_string(),
-        contents: B64.encode(frame.as_slice()),
-        encoding: ArtifactEncoding::Base64,
-        fingerprint: None,
+    Ok(recovery::assemble(escrow, key, &request, &authorization)?)
+}
+
+/// Writes the frame at `target`, owner-only and atomically, and names the file.
+#[cfg(any(windows, test))]
+fn write_frame(target: &Path, frame: &[u8]) -> Result<RecoveryAssembled, RecoveryRefusalView> {
+    aether::private_file::write_private_atomic(target, frame).map_err(|error| {
+        tracing::error!(%error, "écriture du fichier de récupération impossible");
+        RecoveryRefusalView::FrameMalformed
+    })?;
+    let file_name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Ok(RecoveryAssembled { file_name })
+}
+
+/// Assembles and writes in one step, for the tests: the command itself opens
+/// the output dialog between the two.
+#[cfg(test)]
+fn assemble_to(
+    escrow: &[u8],
+    key: &[u8],
+    request: &str,
+    authorization: &str,
+    target: &Path,
+) -> Result<RecoveryAssembled, RecoveryRefusalView> {
+    let frame = assemble_frame(escrow, key, request, authorization)?;
+    write_frame(target, &frame)
+}
+
+/// Shows a dialog on its own thread, as the vault dialogs do: it sets that
+/// thread's COM apartment, which a pooled worker would carry into other work.
+/// `None` when the operator cancels; a dialog that fails is logged and reported.
+#[cfg(windows)]
+async fn pick_on_thread(
+    window: &tauri::Window,
+    thread: &'static str,
+    pick: impl FnOnce(isize) -> Result<Option<PathBuf>, String> + Send + 'static,
+) -> Result<Option<PathBuf>, String> {
+    let owner = super::ceremonies::owner_window(window);
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name(thread.into())
+        .spawn(move || {
+            let _ = sender.send(pick(owner));
+        })
+        .map_err(|error| format!("boîte de dialogue de récupération : {error}"))?;
+    receiver
+        .await
+        .map_err(|_| "la boîte de dialogue de récupération s'est arrêtée".to_string())?
+}
+
+/// Asks for the escrow private key and reads it, as `helios escrow keygen`
+/// writes it. The bytes are wiped when this returns; the path never leaves here.
+#[cfg(windows)]
+async fn read_escrow_key(
+    window: &tauri::Window,
+) -> Result<Option<Zeroizing<Vec<u8>>>, RecoveryRefusalView> {
+    let picked = pick_on_thread(window, "orion-recovery-key", |owner| {
+        crate::operator::location::pick_escrow_key(owner)
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "boîte de la clé de séquestre en échec");
+        RecoveryRefusalView::EscrowUnreadable
+    })?;
+    let Some(path) = picked else {
+        return Ok(None);
+    };
+    let bytes = Zeroizing::new(std::fs::read(&path).map_err(|error| {
+        tracing::error!(%error, "clé de séquestre illisible");
+        RecoveryRefusalView::EscrowUnreadable
+    })?);
+    let text = std::str::from_utf8(&bytes).map_err(|_| RecoveryRefusalView::EscrowUnreadable)?;
+    decode_operator_key(text).map(Some)
+}
+
+/// Asks where to write the frame. `None` when the operator cancels.
+#[cfg(windows)]
+async fn pick_output(window: &tauri::Window) -> Result<Option<PathBuf>, RecoveryRefusalView> {
+    let proposed = PathBuf::from(RECOVERY_FILE);
+    pick_on_thread(window, "orion-recovery-output", move |owner| {
+        crate::operator::location::pick_recovery_output(owner, &proposed)
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "boîte d'enregistrement du fichier de récupération en échec");
+        RecoveryRefusalView::FrameMalformed
     })
 }
 
+#[cfg(any(windows, test))]
 fn decode_escrow(text: &str) -> Result<Vec<u8>, RecoveryRefusalView> {
     B64.decode(text.trim())
         .map_err(|_| RecoveryRefusalView::EscrowUnreadable)
 }
 
 /// Reads the operator's escrow private key, as `helios escrow keygen` writes it.
+#[cfg(any(windows, test))]
 fn decode_operator_key(text: &str) -> Result<Zeroizing<Vec<u8>>, RecoveryRefusalView> {
     let key = Zeroizing::new(
         B64.decode(text.trim())
@@ -167,12 +307,13 @@ fn decode_operator_key(text: &str) -> Result<Zeroizing<Vec<u8>>, RecoveryRefusal
     Ok(key)
 }
 
+#[cfg(any(windows, test))]
 fn decode_pcr_digest(text: Option<String>) -> Result<Option<[u8; 32]>, RecoveryRefusalView> {
     text.map(|text| {
         hex::decode(text.trim())
             .ok()
             .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-            .ok_or(RecoveryRefusalView::FrameMalformed)
+            .ok_or(RecoveryRefusalView::RequestMalformed)
     })
     .transpose()
 }
@@ -234,6 +375,25 @@ mod tests {
         }
     }
 
+    /// A directory of its own per test, removed when the test ends.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let directory =
+                std::env::temp_dir().join(format!("orion-recovery-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&directory);
+            std::fs::create_dir_all(&directory).expect("scratch directory");
+            Self(directory)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn code_of(error: &RecoveryError) -> &'static str {
         match error {
             RecoveryError::EscrowUnreadable => "escrow_unreadable",
@@ -251,7 +411,7 @@ mod tests {
     fn prepare_returns_the_public_request_only() {
         let fx = fixture(Some(5));
 
-        let prepared = prepare_recovery(&fx.escrow, &fx.operator_private[..], None, None).unwrap();
+        let prepared = prepare_with_key(&fx.escrow, &fx.operator_private[..], None, None).unwrap();
 
         assert_eq!(prepared.counter, 6);
         assert_eq!(prepared.counter_source, CounterOrigin::EscrowAfterTicket);
@@ -277,10 +437,10 @@ mod tests {
     #[test]
     fn assemble_returns_the_frame_for_the_request_it_was_prepared_for() {
         let fx = fixture(Some(5));
-        let prepared = prepare_recovery(&fx.escrow, &fx.operator_private[..], None, None).unwrap();
+        let prepared = prepare_with_key(&fx.escrow, &fx.operator_private[..], None, None).unwrap();
         let authorization = authorization_json(payload(6, wg_public(&fx.wg_private)));
 
-        let artifact = assemble_recovery(
+        let frame = assemble_frame(
             &fx.escrow,
             &fx.operator_private[..],
             &prepared.request.contents,
@@ -288,21 +448,76 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(artifact.file_name, RECOVERY_FILE);
-        assert_eq!(artifact.encoding, ArtifactEncoding::Base64);
-        let frame = B64.decode(&artifact.contents).unwrap();
         let (_, key) = recovery::decode_recovery_frame(&frame).unwrap();
         assert_eq!(key.as_slice(), &fx.wg_private);
     }
 
     #[test]
+    fn assemble_writes_the_frame_owner_only_and_returns_no_key_bytes() {
+        let fx = fixture(Some(5));
+        let prepared = prepare_with_key(&fx.escrow, &fx.operator_private[..], None, None).unwrap();
+        let authorization = authorization_json(payload(6, wg_public(&fx.wg_private)));
+        let scratch = Scratch::new("owner-only");
+        let target = scratch.0.join(RECOVERY_FILE);
+
+        let assembled = assemble_to(
+            &fx.escrow,
+            &fx.operator_private[..],
+            &prepared.request.contents,
+            &authorization,
+            &target,
+        )
+        .unwrap();
+
+        assert_eq!(assembled.file_name, RECOVERY_FILE);
+        let written = std::fs::read(&target).unwrap();
+        let (_, key) = recovery::decode_recovery_frame(&written).unwrap();
+        assert_eq!(key.as_slice(), &fx.wg_private);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let serialized = serde_json::to_string(&assembled).unwrap();
+        assert!(!serialized.contains(&B64.encode(fx.wg_private)));
+        assert!(!serialized.contains(&B64.encode(fx.operator_private.as_slice())));
+        assert_eq!(
+            serde_json::to_value(&assembled).unwrap(),
+            json!({ "file_name": RECOVERY_FILE })
+        );
+    }
+
+    #[test]
+    fn a_refused_assembly_writes_nothing() {
+        let fx = fixture(Some(5));
+        let prepared = prepare_with_key(&fx.escrow, &fx.operator_private[..], None, None).unwrap();
+        let other_gateway = wg_public(&fixture(None).wg_private);
+        let authorization = authorization_json(payload(6, other_gateway));
+        let scratch = Scratch::new("refused");
+        let target = scratch.0.join(RECOVERY_FILE);
+
+        let refusal = assemble_to(
+            &fx.escrow,
+            &fx.operator_private[..],
+            &prepared.request.contents,
+            &authorization,
+            &target,
+        )
+        .unwrap_err();
+
+        assert_eq!(refusal, RecoveryRefusalView::ForeignGateway);
+        assert!(!target.exists());
+    }
+
+    #[test]
     fn assemble_maps_a_foreign_authorization_to_its_refusal_code() {
         let fx = fixture(Some(5));
-        let prepared = prepare_recovery(&fx.escrow, &fx.operator_private[..], None, None).unwrap();
+        let prepared = prepare_with_key(&fx.escrow, &fx.operator_private[..], None, None).unwrap();
         let other_gateway = wg_public(&fixture(None).wg_private);
         let authorization = authorization_json(payload(6, other_gateway));
 
-        let refusal = assemble_recovery(
+        let refusal = assemble_frame(
             &fx.escrow,
             &fx.operator_private[..],
             &prepared.request.contents,
@@ -322,10 +537,10 @@ mod tests {
         let fx = fixture(Some(5));
         // The operator prepared the request for counter 6; the publisher signed 7.
         let prepared =
-            prepare_recovery(&fx.escrow, &fx.operator_private[..], Some(6), None).unwrap();
+            prepare_with_key(&fx.escrow, &fx.operator_private[..], Some(6), None).unwrap();
         let authorization = authorization_json(payload(7, wg_public(&fx.wg_private)));
 
-        let refusal = assemble_recovery(
+        let refusal = assemble_frame(
             &fx.escrow,
             &fx.operator_private[..],
             &prepared.request.contents,
@@ -343,21 +558,21 @@ mod tests {
     #[test]
     fn unparseable_json_maps_to_its_refusal_code() {
         let fx = fixture(Some(5));
-        let prepared = prepare_recovery(&fx.escrow, &fx.operator_private[..], None, None).unwrap();
+        let prepared = prepare_with_key(&fx.escrow, &fx.operator_private[..], None, None).unwrap();
         let authorization = authorization_json(payload(6, wg_public(&fx.wg_private)));
 
         assert_eq!(
-            assemble_recovery(
+            assemble_frame(
                 &fx.escrow,
                 &fx.operator_private[..],
                 "not json",
                 &authorization
             )
             .unwrap_err(),
-            RecoveryRefusalView::FrameMalformed
+            RecoveryRefusalView::RequestMalformed
         );
         assert_eq!(
-            assemble_recovery(
+            assemble_frame(
                 &fx.escrow,
                 &fx.operator_private[..],
                 &prepared.request.contents,
@@ -365,6 +580,41 @@ mod tests {
             )
             .unwrap_err(),
             RecoveryRefusalView::AuthorizationInvalid
+        );
+    }
+
+    #[test]
+    fn an_invalid_pcr_digest_is_a_malformed_request() {
+        assert_eq!(
+            decode_pcr_digest(Some("not hex".to_string())).unwrap_err(),
+            RecoveryRefusalView::RequestMalformed
+        );
+    }
+
+    #[test]
+    fn an_operator_key_must_be_base64_of_the_key_length() {
+        let key = B64.encode([7u8; KEY_LEN]);
+        assert_eq!(
+            decode_operator_key(&format!("  {key}\n"))
+                .unwrap()
+                .as_slice(),
+            &[7u8; KEY_LEN]
+        );
+        assert_eq!(
+            decode_operator_key(&B64.encode([7u8; KEY_LEN - 1])).unwrap_err(),
+            RecoveryRefusalView::EscrowUnreadable
+        );
+        assert_eq!(
+            decode_operator_key("not base64!").unwrap_err(),
+            RecoveryRefusalView::EscrowUnreadable
+        );
+    }
+
+    #[test]
+    fn an_escrow_must_be_base64() {
+        assert_eq!(
+            decode_escrow("not base64!").unwrap_err(),
+            RecoveryRefusalView::EscrowUnreadable
         );
     }
 
@@ -383,6 +633,37 @@ mod tests {
         for error in errors {
             let code = code_of(&error);
             let view = RecoveryRefusalView::from(error);
+            assert_eq!(
+                serde_json::to_value(&view).unwrap(),
+                json!({ "refusal": code })
+            );
+        }
+    }
+
+    #[test]
+    fn every_refusal_view_has_a_closed_code() {
+        let views = [
+            (RecoveryRefusalView::EscrowUnreadable, "escrow_unreadable"),
+            (RecoveryRefusalView::LegacyEscrow, "legacy_escrow"),
+            (
+                RecoveryRefusalView::EscrowInconsistent,
+                "escrow_inconsistent",
+            ),
+            (RecoveryRefusalView::CounterUnknown, "counter_unknown"),
+            (
+                RecoveryRefusalView::AuthorizationInvalid,
+                "authorization_invalid",
+            ),
+            (RecoveryRefusalView::ForeignGateway, "foreign_gateway"),
+            (RecoveryRefusalView::RequestMismatch, "request_mismatch"),
+            (RecoveryRefusalView::FrameMalformed, "frame_malformed"),
+            (RecoveryRefusalView::RequestMalformed, "request_malformed"),
+            (
+                RecoveryRefusalView::PlatformUnsupported,
+                "platform_unsupported",
+            ),
+        ];
+        for (view, code) in views {
             assert_eq!(
                 serde_json::to_value(&view).unwrap(),
                 json!({ "refusal": code })

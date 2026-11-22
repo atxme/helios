@@ -8,7 +8,7 @@ import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
 
 import * as api from '../../api'
-import type { OperatorArtifact, RecoveryPrepared, RecoveryRefusalCode } from '../../types'
+import type { RecoveryPrepared, RecoveryRefusalCode } from '../../types'
 import { saveArtifact } from './ArtifactDownloads'
 import { MAX_FILE_BYTES, readFileText } from './readFileText'
 
@@ -32,8 +32,9 @@ const COUNTER_ORIGIN: Record<RecoveryPrepared['counter_source'], string> = {
     "Valeur déduite du séquestre, en supposant qu'un billet a été consommé. Vérifiez anti-rollback.json sur la gateway.",
 }
 
-const DEPOSIT_REMINDER =
-  "À déposer dans /var/lib/helios/wg-key.recovery par l'accès hors bande, puis redémarrer heliosd. Ce fichier contient la clé privée en clair : supprimez-le après usage."
+/** What the operator does with the file Orion wrote. Only its name is shown. */
+const depositReminder = (fileName: string) =>
+  `Fichier enregistré : ${fileName}. À déposer dans /var/lib/helios/wg-key.recovery par l'accès hors bande, puis redémarrer heliosd. Ce fichier contient la clé privée en clair : supprimez-le après usage.`
 
 const COUNTER_INVALID = 'Valeur du compteur invalide : un entier positif est attendu.'
 
@@ -81,9 +82,8 @@ const BUTTON_SX = { minHeight: 30, fontSize: 11.5, textTransform: 'none' } as co
  * Step 1: opens the escrow with the operator's key and prepares the public
  * request the publisher signs. The key and the escrow stay in this step.
  */
-function PrepareStep({ onPrepared }: { onPrepared: (prepared: RecoveryPrepared) => void }) {
+function PrepareStep({ onPrepared }: { onPrepared: (prepared: RecoveryPrepared | null) => void }) {
   const [escrowFile, setEscrowFile] = useState<File | null>(null)
-  const [escrowKey, setEscrowKey] = useState('')
   const [counterText, setCounterText] = useState('')
   const [busy, setBusy] = useState(false)
   const [prepared, setPrepared] = useState<RecoveryPrepared | null>(null)
@@ -96,11 +96,14 @@ function PrepareStep({ onPrepared }: { onPrepared: (prepared: RecoveryPrepared) 
     try {
       const counter = parseCounter(counterText)
       const escrowB64 = await readEscrowBase64(escrowFile)
-      const result = await api.gatewayRecoveryPrepare(escrowB64, escrowKey, counter)
+      // `null`: the operator cancelled the key dialog. Nothing is shown and nothing is an error.
+      const result = await api.gatewayRecoveryPrepare(escrowB64, counter)
+      if (result === null) return
       setPrepared(result)
       onPrepared(result)
     } catch (cause) {
       setPrepared(null)
+      onPrepared(null)
       setError(failureSentence(cause, 'Préparation impossible'))
     } finally {
       setBusy(false)
@@ -124,16 +127,6 @@ function PrepareStep({ onPrepared }: { onPrepared: (prepared: RecoveryPrepared) 
         />
         <TextField
           size="small"
-          type="password"
-          label="Clé de séquestre"
-          autoComplete="off"
-          value={escrowKey}
-          onChange={(event) => setEscrowKey(event.target.value)}
-          fullWidth
-          sx={FIELD_SX}
-        />
-        <TextField
-          size="small"
           label="Valeur du compteur (lue sur la gateway)"
           value={counterText}
           onChange={(event) => setCounterText(event.target.value)}
@@ -147,12 +140,15 @@ function PrepareStep({ onPrepared }: { onPrepared: (prepared: RecoveryPrepared) 
             size="small"
             variant="outlined"
             color="inherit"
-            disabled={busy || !escrowFile || escrowKey === ''}
+            disabled={busy || !escrowFile}
             onClick={() => void prepare()}
             sx={BUTTON_SX}
           >
             Préparer la requête
           </Button>
+          <Typography color="text.secondary" sx={{ fontSize: 11, mt: 0.5 }}>
+            La clé de séquestre est choisie dans une boîte Windows et lue par Orion : elle ne passe jamais par cette page.
+          </Typography>
         </Box>
       </Stack>
       {prepared && (
@@ -193,11 +189,10 @@ function PrepareStep({ onPrepared }: { onPrepared: (prepared: RecoveryPrepared) 
  */
 function AssembleStep({ prepared }: { prepared: RecoveryPrepared | null }) {
   const [escrowFile, setEscrowFile] = useState<File | null>(null)
-  const [escrowKey, setEscrowKey] = useState('')
   const [uploadedRequest, setUploadedRequest] = useState<string | null>(null)
   const [authorization, setAuthorization] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
-  const [assembled, setAssembled] = useState(false)
+  const [fileName, setFileName] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   // An uploaded request wins; otherwise the one prepared in step 1 of this session.
@@ -217,17 +212,13 @@ function AssembleStep({ prepared }: { prepared: RecoveryPrepared | null }) {
     if (!escrowFile || request === null || authorization === null) return
     setBusy(true)
     setError(null)
-    setAssembled(false)
+    setFileName(null)
     try {
       const escrowB64 = await readEscrowBase64(escrowFile)
-      const artifact: OperatorArtifact = await api.gatewayRecoveryAssemble(
-        escrowB64,
-        escrowKey,
-        request,
-        authorization,
-      )
-      saveArtifact(artifact)
-      setAssembled(true)
+      // `null`: the operator cancelled a dialog. Nothing was written; nothing is shown.
+      const assembled = await api.gatewayRecoveryAssemble(escrowB64, request, authorization)
+      if (assembled === null) return
+      setFileName(assembled.file_name)
     } catch (cause) {
       setError(failureSentence(cause, 'Assemblage impossible'))
     } finally {
@@ -247,16 +238,6 @@ function AssembleStep({ prepared }: { prepared: RecoveryPrepared | null }) {
           label="Séquestre (wg-key.escrow)"
           slotProps={{ inputLabel: { shrink: true } }}
           onChange={(event) => setEscrowFile(pickedFile(event.target))}
-          fullWidth
-          sx={FIELD_SX}
-        />
-        <TextField
-          size="small"
-          type="password"
-          label="Clé de séquestre"
-          autoComplete="off"
-          value={escrowKey}
-          onChange={(event) => setEscrowKey(event.target.value)}
           fullWidth
           sx={FIELD_SX}
         />
@@ -292,7 +273,7 @@ function AssembleStep({ prepared }: { prepared: RecoveryPrepared | null }) {
             size="small"
             variant="outlined"
             color="inherit"
-            disabled={busy || !escrowFile || escrowKey === '' || request === null || authorization === null}
+            disabled={busy || !escrowFile || request === null || authorization === null}
             onClick={() => void assemble()}
             sx={BUTTON_SX}
           >
@@ -300,9 +281,9 @@ function AssembleStep({ prepared }: { prepared: RecoveryPrepared | null }) {
           </Button>
         </Box>
       </Stack>
-      {assembled && (
+      {fileName && (
         <Alert severity="info" variant="outlined" sx={{ mt: 1.25, fontSize: 11.5 }}>
-          {DEPOSIT_REMINDER}
+          {depositReminder(fileName)}
         </Alert>
       )}
       {error && (

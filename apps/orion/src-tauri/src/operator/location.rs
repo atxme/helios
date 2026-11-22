@@ -365,6 +365,48 @@ const EXPORT_DIALOG: SaveDialog = SaveDialog {
     failure: "la boîte d'export du coffre a échoué",
 };
 
+/// The dialog that chooses the escrow private key. It reads, so no overwrite prompt.
+#[cfg(windows)]
+const ESCROW_KEY_DIALOG: SaveDialog = SaveDialog {
+    title: "Choisir la clé de séquestre",
+    filter: "Clé de séquestre (*.key)\0*.key\0Tous les fichiers (*.*)\0*.*\0\0",
+    extension: "key",
+    flags: 0,
+    failure: "la boîte de choix de la clé de séquestre a échoué",
+};
+
+/// The dialog that chooses where the recovery frame is written.
+#[cfg(windows)]
+const RECOVERY_DIALOG: SaveDialog = SaveDialog {
+    title: "Enregistrer le fichier de récupération",
+    filter: "Fichier de récupération (*.recovery)\0*.recovery\0\0",
+    extension: "recovery",
+    // The frame is written: Windows asks before replacing a file.
+    flags: windows_sys::Win32::UI::Controls::Dialogs::OFN_OVERWRITEPROMPT,
+    failure: "la boîte d'enregistrement du fichier de récupération a échoué",
+};
+
+/// Asks the operator which file holds the escrow private key, in a dialog owned by
+/// `owner`. `None` when the operator cancels. The same thread rules as [`pick`] apply.
+#[cfg(windows)]
+pub fn pick_escrow_key(owner: isize) -> Result<Option<PathBuf>, String> {
+    save_dialog(owner, &ESCROW_KEY_DIALOG, None, "")
+}
+
+/// Asks where to write the recovery frame, in a dialog owned by `owner`, proposing the
+/// file name of `proposed`. `None` when the operator cancels. The same thread rules as
+/// [`pick`] apply.
+#[cfg(windows)]
+pub fn pick_recovery_output(owner: isize, proposed: &Path) -> Result<Option<PathBuf>, String> {
+    let name = proposed
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            "le nom proposé pour le fichier de récupération n'est pas du texte".to_string()
+        })?;
+    save_dialog(owner, &RECOVERY_DIALOG, proposed.parent(), name)
+}
+
 /// Asks the operator where the vault is, in a save dialog owned by `owner`.
 ///
 /// A save dialog rather than an open one: the vault may not exist yet, and

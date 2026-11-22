@@ -20,6 +20,7 @@ import type {
   VaultCopyOutcome,
   OperatorStatus,
   OperatorArtifact,
+  RecoveryAssembled,
   RecoveryPrepared,
   DomainDefaults,
   EnrollmentGesture,
@@ -382,28 +383,24 @@ export const operatorArtifacts = () => invoke<OperatorArtifact[]>('operator_arti
  * Prépare la requête de récupération depuis le séquestre (processus IHM : sans
  * élévation ni coffre opérateur). La clé de séquestre ne sort pas de cet appel.
  */
-export const gatewayRecoveryPrepare = (
-  escrowB64: string,
-  escrowPrivateKey: string,
-  counter: number | null,
-) =>
-  invoke<RecoveryPrepared>('gateway_recovery_prepare', {
+/**
+ * Ouvre le séquestre avec la clé choisie dans une boîte native, et prépare la requête
+ * publique. `null` si l'opérateur annule. La clé ne transite jamais par l'IHM.
+ */
+export const gatewayRecoveryPrepare = (escrowB64: string, counter: number | null) =>
+  invoke<RecoveryPrepared | null>('gateway_recovery_prepare', {
     escrowB64,
-    escrowPrivateKey,
     counter,
     expectedPcrDigest: null,
   })
 
-/** Assemble `wg-key.recovery` à partir de la requête préparée et de l'autorisation signée. */
-export const gatewayRecoveryAssemble = (
-  escrowB64: string,
-  escrowPrivateKey: string,
-  request: string,
-  authorization: string,
-) =>
-  invoke<OperatorArtifact>('gateway_recovery_assemble', {
+/**
+ * Assemble `wg-key.recovery` : la clé est choisie dans une boîte native, le fichier est
+ * écrit par Orion à l'emplacement choisi. Seul son nom revient. `null` si l'opérateur annule.
+ */
+export const gatewayRecoveryAssemble = (escrowB64: string, request: string, authorization: string) =>
+  invoke<RecoveryAssembled | null>('gateway_recovery_assemble', {
     escrowB64,
-    escrowPrivateKey,
     request,
     authorization,
   })
