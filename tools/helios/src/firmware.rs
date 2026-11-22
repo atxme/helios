@@ -1022,6 +1022,70 @@ impl PlanLock {
 mod tests {
     use super::*;
     const ID: &str = "5bc922b7bd1adb5b6f99592611404036bd9f42d0";
+    fn sealed_fixture(dir: &tempfile::TempDir) -> (PathBuf, FirmwareBackup) {
+        let key = [7u8; 32];
+        let secret = [9u8; 32];
+        let anchor = [1u8; 32];
+        let key_path = dir.path().join("operator.key");
+        std::fs::write(&key_path, B64.encode(key)).unwrap();
+        let private = x25519_dalek::StaticSecret::from(key);
+        let public = x25519_dalek::PublicKey::from(&private);
+        let backup = FirmwareBackup {
+            request: aether::sig::FirmwareRecoveryPayload {
+                version: 1,
+                sealed_blob_anchor: anchor,
+                secret_commitment: firmware_recovery::commitment(&anchor, &secret),
+                device_id: ID.into(),
+                target_version: "2023".into(),
+            },
+            encrypted_secret: helios_escrow::seal_to_operator(public.as_bytes(), &secret).unwrap(),
+        };
+        (key_path, backup)
+    }
+
+    #[test]
+    fn inventory_filtering_validates_every_device_before_hiding_unavailable_updates() {
+        let bytes = format!(
+            r#"{{"Devices":[{{"DeviceId":"{ID}","Name":"UEFI","Version":"2022","Releases":[]}},{{"DeviceId":"{ID}","Name":"DBX","Version":"2022","Releases":[{{"Version":"2023"}}]}}]}}"#
+        );
+        assert_eq!(parse_inventory(bytes.as_bytes(), true).unwrap().len(), 1);
+        assert_eq!(parse_inventory(bytes.as_bytes(), false).unwrap().len(), 2);
+
+        let malformed_hidden_device = format!(
+            r#"{{"Devices":[{{"DeviceId":"{ID}","Name":"UEFI","Version":"2022","Releases":[]}},{{"DeviceId":"bad","Name":"DBX","Version":"2022","Releases":[]}}]}}"#
+        );
+        assert!(parse_inventory(malformed_hidden_device.as_bytes(), true).is_err());
+        let empty_release = format!(
+            r#"{{"Devices":[{{"DeviceId":"{ID}","Name":"UEFI","Version":"2022","Releases":[{{"Version":" "}}]}}]}}"#
+        );
+        assert!(parse_inventory(empty_release.as_bytes(), true).is_err());
+    }
+
+    #[test]
+    fn maintenance_helpers_bound_plan_reads_and_reject_unsupported_versions() {
+        let (_dir, path, plan, _) = transaction(false);
+        assert!(read_bounded(&path, 1).is_err());
+
+        let mut invalid_version: serde_json::Value = serde_json::to_value(plan).unwrap();
+        invalid_version["format_version"] = serde_json::json!(2);
+        std::fs::write(&path, serde_json::to_vec(&invalid_version).unwrap()).unwrap();
+        assert!(load_plan(&path)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("unsupported firmware plan version"));
+    }
+
+    #[test]
+    fn ssh_target_parser_separates_a_port_and_rejects_ambiguous_whitespace() {
+        let gateway = SshGateway::new("operator@gateway:2222").unwrap();
+        assert_eq!(gateway.target, "operator@gateway");
+        assert_eq!(gateway.port.as_deref(), Some("2222"));
+        assert!(SshGateway::new(" operator@gateway").is_err());
+        assert!(SshGateway::new("operator@gateway ").is_err());
+        assert!(SshGateway::new("not a target").is_err());
+    }
+
     #[test]
     fn malformed_inventory_is_unknown_and_device_selection_is_exact() {
         assert!(parse_inventory(br#"{"Devices":[]}"#, true)
@@ -1147,6 +1211,8 @@ mod tests {
         identity_calls: usize,
         reboot_on_identity: Option<usize>,
         sealed: bool,
+        inventory_ok: bool,
+        export_backup: Option<FirmwareBackup>,
         events: Vec<String>,
         preflight_ok: bool,
         preflight_calls: usize,
@@ -1180,6 +1246,7 @@ mod tests {
             Ok(self.sealed)
         }
         fn inventory(&mut self, _: bool) -> Result<Vec<FirmwareDevice>> {
+            anyhow::ensure!(self.inventory_ok, "fwupd inventory unavailable");
             Ok(vec![FirmwareDevice {
                 id: ID.into(),
                 name: "UEFI CA".into(),
@@ -1192,7 +1259,9 @@ mod tests {
             }])
         }
         fn export(&mut self, _: &[u8], _: &str, _: &str) -> Result<FirmwareBackup> {
-            anyhow::bail!("export not called in transaction tests")
+            self.export_backup
+                .take()
+                .context("export not called in transaction tests")
         }
         fn preflight(&mut self, _: &[u8]) -> Result<()> {
             self.preflight_calls += 1;
@@ -1251,6 +1320,8 @@ mod tests {
                 identity_calls: 0,
                 reboot_on_identity: None,
                 sealed,
+                inventory_ok: true,
+                export_backup: None,
                 events: vec![],
                 preflight_ok: true,
                 preflight_calls: 0,
@@ -1372,6 +1443,127 @@ mod tests {
             assert!(!path.exists());
             assert!(!path.with_extension("request.json").exists());
         }
+    }
+
+    #[test]
+    fn prepare_propagates_inventory_failure_without_creating_a_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("maintenance.json");
+        let mut gateway = FakeGateway::new(false);
+        gateway.inventory_ok = false;
+
+        let error = prepare(TARGET, ID, "2023", &path, None, |_| Ok(gateway)).unwrap_err();
+
+        assert!(error.to_string().contains("fwupd inventory unavailable"));
+        assert!(!path.exists());
+        assert!(!path.with_extension("request.json").exists());
+    }
+
+    #[test]
+    fn prepare_rejects_a_backup_for_another_firmware_context_before_writing_a_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("maintenance.json");
+        let key_path = dir.path().join("operator.key");
+        std::fs::write(&key_path, B64.encode([7u8; 32])).unwrap();
+        let backup = FirmwareBackup {
+            request: aether::sig::FirmwareRecoveryPayload {
+                version: 1,
+                sealed_blob_anchor: [1; 32],
+                secret_commitment: [2; 32],
+                device_id: "5bc922b7bd1adb5b6f99592611404036bd9f42d1".into(),
+                target_version: "2023".into(),
+            },
+            encrypted_secret: vec![],
+        };
+        let mut gateway = FakeGateway::new(true);
+        gateway.export_backup = Some(backup);
+
+        let error =
+            prepare(TARGET, ID, "2023", &path, Some(&key_path), |_| Ok(gateway)).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("gateway exported another firmware context"));
+        assert!(!path.exists());
+        assert!(!path.with_extension("request.json").exists());
+    }
+
+    #[test]
+    fn prepare_propagates_request_write_failure_after_saving_the_recovery_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("maintenance.json");
+        let (key_path, backup) = sealed_fixture(&dir);
+        let request_path = path.with_extension("request.json");
+        std::fs::write(&request_path, b"reserved request file").unwrap();
+        let mut gateway = FakeGateway::new(true);
+        gateway.export_backup = Some(backup);
+
+        let error =
+            prepare(TARGET, ID, "2023", &path, Some(&key_path), |_| Ok(gateway)).unwrap_err();
+
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::AlreadyExists),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(request_path).unwrap(),
+            b"reserved request file"
+        );
+    }
+
+    #[test]
+    fn prepare_publishes_only_the_verified_request_and_keeps_the_secret_encrypted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("maintenance.json");
+        let (key_path, backup) = sealed_fixture(&dir);
+        let expected_request = serde_json::to_value(&backup.request).unwrap();
+        let expected_backup = serde_json::to_value(&backup).unwrap();
+        let mut gateway = FakeGateway::new(true);
+        gateway.export_backup = Some(backup);
+
+        prepare(TARGET, ID, "2023", &path, Some(&key_path), |_| Ok(gateway)).unwrap();
+
+        let plan = load_plan(&path).unwrap();
+        let saved_backup = serde_json::to_value(plan.backup.unwrap()).unwrap();
+        let saved_request: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.with_extension("request.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved_backup, expected_backup);
+        assert_eq!(saved_request, expected_request);
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains(&B64.encode([9u8; 32])));
+        assert!(
+            !std::fs::read_to_string(path.with_extension("request.json"))
+                .unwrap()
+                .contains(&B64.encode([9u8; 32]))
+        );
+    }
+
+    #[test]
+    fn update_rechecks_gateway_identity_after_confirmation_and_before_stopping() {
+        let (_dir, path, _, mut gateway) = transaction(false);
+        gateway.reboot_on_identity = Some(3);
+        let before = std::fs::read(&path).unwrap();
+        let error = maintain(
+            &path,
+            None,
+            None,
+            MaintenanceMode::Update { yes: true },
+            10,
+            |_| Ok(gateway),
+            |_| panic!("explicit consent must bypass the prompt"),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("rebooted or changed during confirmation"));
+        assert!(load_plan(&path).unwrap().phase == Phase::Prepared);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]
