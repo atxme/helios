@@ -2,6 +2,8 @@ use super::*;
 use helios_firewall::FirewallCapabilities;
 use std::sync::atomic::AtomicUsize;
 
+mod lifecycle;
+
 struct ObservedPeersBackend {
     peers: Option<Vec<PeerStatus>>,
 }
@@ -304,10 +306,12 @@ async fn shutdown_applies_the_down_posture_before_removing_wireguard_even_on_err
 }
 
 fn run_readiness_test_child(test_name: &str, path: &std::path::Path) {
+    let config = tempfile::tempdir().expect("isolated configuration directory");
     let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
         .args(["--exact", test_name, "--nocapture"])
         .env("HELIOS_TEST_READY_CHILD", "1")
         .env("HELIOS_READY_PATH", path)
+        .env("HELIOS_NETWORK_CONFIG", config.path().join("network.toml"))
         .status()
         .expect("isolated readiness test starts");
     assert!(status.success(), "isolated readiness test must succeed");
