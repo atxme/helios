@@ -36,6 +36,7 @@ const profile: ClientProfile = {
   // URL is neither required nor consulted.
   heliosd_url: null,
   ssh_target: null,
+  dns: null,
   key_negotiation: null,
 }
 

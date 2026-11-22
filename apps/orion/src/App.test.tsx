@@ -95,6 +95,7 @@ function client(overrides: Record<string, unknown> = {}) {
     adapterUp: false,
     selectedProfile: null,
     psk: null,
+    dns: { check: null, proposalUnread: false },
     backend: 'dry-run',
     pathImportedProfile: null,
     error: null,
@@ -309,6 +310,21 @@ describe('App interactions', () => {
     fireEvent.click(screen.getByRole('button', { name: /Ouvrir le détail de la posture/ }))
     fireEvent.click(screen.getByRole('button', { name: 'close-posture' }))
     expect(screen.queryByRole('button', { name: 'close-posture' })).toBeNull()
+  })
+
+  it('says in the header chip when DNS leaves the tunnel', () => {
+    mocks.useClient.mockReturnValue(
+      client({
+        state: 'up',
+        adapterUp: true,
+        dns: { check: { status: 'left', reason: 'gateway_declines' }, proposalUnread: false },
+      }),
+    )
+    render(<App />)
+
+    expect(
+      screen.getByRole('button', { name: /DNS hors du tunnel/ }).getAttribute('aria-label'),
+    ).toContain('DNS hors du tunnel')
   })
 
   it('opens the profile view when an associated file was imported', async () => {

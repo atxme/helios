@@ -15,12 +15,14 @@ use serde::{Deserialize, Serialize};
 use crate::certificates::TrustUpdateRefusalStatus;
 use crate::AppState;
 
+mod client_dns;
 mod commands;
 mod firewall;
 mod network;
 mod peers;
 mod status;
 
+pub use client_dns::*;
 pub use commands::*;
 pub use firewall::*;
 pub use network::*;

@@ -45,6 +45,7 @@ const portable: ClientProfile = {
   persistent_keepalive: 25,
   heliosd_url: 'http://100.64.0.1:8080',
   ssh_target: null,
+  dns: null,
   key_negotiation: null,
 }
 
@@ -188,6 +189,53 @@ describe('useClient', () => {
     act(() => emit({ type: 'capture', capture: { status: 'complete' } }))
     await act(() => result.current.connect('portable'))
     expect(result.current.capture).toBeNull()
+  })
+
+  // A late proposal must not overwrite the resolvers actually applied: it only
+  // says the gateway's answer was not read. A new connection starts clean.
+  it('keeps the DNS verdict when a proposal is unread, and clears both at down', async () => {
+    const { result } = renderHook(() => useClient())
+    await waitFor(() => expect(result.current.selectedProfile?.name).toBe('portable'))
+    expect(result.current.dns).toEqual({ check: null, proposalUnread: false })
+
+    const applied = {
+      status: 'applied' as const,
+      servers: ['86.54.11.100', '86.54.11.200'],
+      origin: 'default' as const,
+    }
+    act(() => emit({ type: 'dns', dns: applied }))
+    act(() => emit({ type: 'dns', dns: { status: 'proposal_unread', reason: 'refusée' } }))
+    expect(result.current.dns).toEqual({ check: applied, proposalUnread: true })
+
+    act(() => emit({ type: 'state_changed', state: 'failed' }))
+    expect(result.current.dns).toEqual({ check: applied, proposalUnread: true })
+
+    act(() => emit({ type: 'state_changed', state: 'down' }))
+    expect(result.current.dns).toEqual({ check: null, proposalUnread: false })
+  })
+
+  // A profile switch without `down` mounts the next gateway on the adapter
+  // still up: the verdict and the unread flag of the previous one describe
+  // another gateway. Reconnecting the same profile keeps them.
+  it('starts the DNS verdict over when another profile connects', async () => {
+    api.connect.mockResolvedValue(undefined)
+    const { result } = renderHook(() => useClient())
+    await waitFor(() => expect(result.current.selectedProfile?.name).toBe('portable'))
+    await act(() => result.current.connect('portable'))
+
+    const applied = {
+      status: 'applied' as const,
+      servers: ['1.0.0.1'],
+      origin: 'gateway' as const,
+    }
+    act(() => emit({ type: 'dns', dns: applied }))
+    act(() => emit({ type: 'dns', dns: { status: 'proposal_unread', reason: 'refusée' } }))
+
+    await act(() => result.current.connect('portable'))
+    expect(result.current.dns).toEqual({ check: applied, proposalUnread: true })
+
+    await act(() => result.current.connect('bureau'))
+    expect(result.current.dns).toEqual({ check: null, proposalUnread: false })
   })
 
   // The notification area connects a profile, which selects it. The window may

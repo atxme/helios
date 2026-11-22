@@ -550,8 +550,8 @@ async fn no_frame_carries_a_passphrase() {
 }
 
 #[test]
-fn the_protocol_version_is_3() {
-    assert_eq!(PROTOCOL_VERSION, 3);
+fn the_protocol_version_is_4() {
+    assert_eq!(PROTOCOL_VERSION, 4);
 }
 
 // # Lock state machine

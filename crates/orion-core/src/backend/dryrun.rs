@@ -8,11 +8,13 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use aether::client_dns::ClientDnsProposal;
 use aether::{SecretString, TunnelState};
 use async_trait::async_trait;
 
 use crate::config::ClientProfile;
-use crate::events::ClientEvent;
+use crate::dns::{decide, DnsDecision};
+use crate::events::{ClientEvent, DnsCheck};
 
 use super::{EventSink, VpnBackend};
 
@@ -38,6 +40,18 @@ pub struct DryRunBackend {
     fail_rekey: AtomicBool,
     /// Simulated bytes sent plus received since the peer was registered.
     transfer: AtomicU64,
+    /// The resolver proposal the gateway sent, with the name of the profile it
+    /// came from, until `down` forgets it.
+    gateway_dns: std::sync::Mutex<Option<(String, ClientDnsProposal)>>,
+    /// Last DNS decision applied to the simulated resolver.
+    #[cfg_attr(not(test), allow(dead_code))]
+    dns_applied: std::sync::Mutex<Option<DnsDecision>>,
+    /// `true` = the simulated resolver refuses every decision (tests only).
+    #[cfg(test)]
+    fail_set_dns: AtomicBool,
+    /// Calls that reached the simulated resolver (tests only).
+    #[cfg(test)]
+    dns_calls: AtomicU64,
 }
 
 impl Default for DryRunBackend {
@@ -50,6 +64,12 @@ impl Default for DryRunBackend {
             rekeyed: std::sync::Mutex::new(Vec::new()),
             fail_rekey: AtomicBool::new(false),
             transfer: AtomicU64::new(0),
+            gateway_dns: std::sync::Mutex::new(None),
+            dns_applied: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fail_set_dns: AtomicBool::new(false),
+            #[cfg(test)]
+            dns_calls: AtomicU64::new(0),
         }
     }
 }
@@ -94,6 +114,87 @@ impl DryRunBackend {
         self.transfer
             .store(bytes.unwrap_or(NO_COUNTER), Ordering::SeqCst);
     }
+
+    /// Last DNS decision applied to the simulated resolver, if any.
+    #[cfg(test)]
+    pub fn last_dns_decision(&self) -> Option<DnsDecision> {
+        self.dns_applied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How many decisions reached the simulated resolver (tests only).
+    #[cfg(test)]
+    pub fn dns_driver_calls(&self) -> u64 {
+        self.dns_calls.load(Ordering::SeqCst)
+    }
+
+    /// Makes every following DNS decision fail, as a driver refusing it would
+    /// (tests only).
+    #[cfg(test)]
+    pub fn fail_set_dns(&self, fail: bool) {
+        self.fail_set_dns.store(fail, Ordering::SeqCst);
+    }
+
+    /// The simulated resolver: records the decision, or refuses it.
+    fn set_dns(&self, decision: &DnsDecision) -> anyhow::Result<()> {
+        #[cfg(test)]
+        self.dns_calls.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        if self.fail_set_dns.load(Ordering::SeqCst) {
+            anyhow::bail!("[dry-run] résolveurs refusés par le pilote");
+        }
+        *self
+            .dns_applied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(decision.clone());
+        Ok(())
+    }
+
+    /// Applies `decision` and reports the verdict, as the real backend does.
+    /// A refusal is an event, never an error: the adapter stays mounted.
+    fn apply_dns(&self, decision: &DnsDecision, sink: &EventSink) {
+        let check = match self.set_dns(decision) {
+            Ok(()) => decision.check(),
+            Err(e) => DnsCheck::Failed {
+                reason: format!("résolveurs DNS non appliqués : {e}"),
+            },
+        };
+        sink(ClientEvent::dns(check));
+    }
+
+    /// The retained proposal for `profile`, copied out of the lock. A proposal
+    /// retained for another profile describes another gateway: it is dropped,
+    /// never applied to this one.
+    fn retained_for(&self, profile: &ClientProfile) -> Option<ClientDnsProposal> {
+        let mut retained = self
+            .gateway_dns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(retained.as_ref(), Some((name, _)) if *name == profile.name) {
+            return retained.as_ref().map(|(_, proposal)| proposal.clone());
+        }
+        *retained = None;
+        None
+    }
+
+    /// Are `decision`'s servers the ones already applied? Then the driver is
+    /// not called again: the same list written twice opens a window with no
+    /// rule on Windows, for nothing.
+    fn already_applied(&self, decision: &DnsDecision) -> bool {
+        let applied = self
+            .dns_applied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        matches!(
+            (decision, applied.as_ref()),
+            (
+                DnsDecision::Apply { servers: wanted, .. },
+                Some(DnsDecision::Apply { servers: current, .. }),
+            ) if wanted == current
+        )
+    }
 }
 
 #[async_trait]
@@ -124,6 +225,11 @@ impl VpnBackend for DryRunBackend {
             ),
         ));
 
+        // The resolvers are set on the mounted adapter, as the real backend
+        // does, before the handshake can be attempted.
+        let decision = decide(profile, self.retained_for(profile).as_ref());
+        self.apply_dns(&decision, sink);
+
         tokio::time::sleep(self.negotiate_delay).await;
 
         // 2. Simulated failure: returns an error WITHOUT touching the adapter.
@@ -148,8 +254,41 @@ impl VpnBackend for DryRunBackend {
         Ok(())
     }
 
+    async fn apply_gateway_dns(
+        &self,
+        profile: &ClientProfile,
+        proposal: ClientDnsProposal,
+        sink: &EventSink,
+    ) -> anyhow::Result<()> {
+        // A proposal that lands once the adapter is down is stale: the next
+        // `up` asks the gateway again.
+        // The check and the store happen under the lock `down` also takes, so a
+        // `down` cannot interleave between them.
+        let mut retained = self
+            .gateway_dns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.adapter_up.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        *retained = Some((profile.name.clone(), proposal));
+        let decision = decide(profile, retained.as_ref().map(|(_, proposal)| proposal));
+        if self.already_applied(&decision) {
+            sink(ClientEvent::dns(decision.check()));
+            return Ok(());
+        }
+        self.apply_dns(&decision, sink);
+        Ok(())
+    }
+
     async fn down(&self, sink: &EventSink) -> anyhow::Result<()> {
+        let mut retained = self
+            .gateway_dns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.adapter_up.store(false, Ordering::SeqCst);
+        *retained = None;
+        drop(retained);
         self.handshake_age_secs
             .store(NO_HANDSHAKE, Ordering::SeqCst);
         sink(ClientEvent::log("info", "[dry-run] adaptateur démonté"));
@@ -204,7 +343,7 @@ impl VpnBackend for DryRunBackend {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
@@ -271,6 +410,249 @@ mod tests {
             backend.adapter_is_up(),
             "the adapter must survive a handshake failure"
         );
+    }
+
+    /// A Helios profile that passes the data-plane checks, on the signed
+    /// client fixture: ML-KEM mode, and the PSK a committed negotiation leaves
+    /// in place. Signing needs `certificate-signing`, as in `config`'s tests.
+    #[cfg(feature = "certificate-signing")]
+    pub(crate) fn helios() -> ClientProfile {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+
+        let domain = crate::test_domain::domain();
+        // The fixture's own validity window is pinned to 2023 and `validate`
+        // reads the real clock: the gateway leaf is reissued to be valid now,
+        // by the same CA-PQ.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after 1970")
+            .as_secs();
+        let mut leaf = domain.gateway_leaf.clone();
+        leaf.not_before_unix = now - 3_600;
+        leaf.not_after_unix = now + 10 * 86_400;
+        leaf.ml_dsa_87_signature.clear();
+        let leaf = aether::key_negotiation::issue_pq_certificate(leaf, &domain.ca_pq_private)
+            .expect("gateway leaf");
+
+        let mut settings = crate::test_domain::settings(&domain);
+        settings.gateway_pq_certificate =
+            STANDARD.encode(serde_json::to_vec(&leaf).expect("gateway leaf"));
+        let mut helios = profile();
+        helios.profile_type = Some(crate::config::ProfileKind::HeliosKeyNegotiation);
+        helios.peer_public_key = crate::test_domain::gateway_key().to_base64();
+        helios.key_negotiation = Some(settings);
+        helios.preshared_key = Some("cGVlcnBza3BlZXJwc2twZWVycHNrcGVlcnBzazEyMw==".into());
+        helios.preshared_key_is_negotiated = true;
+        helios
+    }
+
+    fn dns_events(log: &Arc<Mutex<Vec<ClientEvent>>>) -> Vec<DnsCheck> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                ClientEvent::Dns { dns } => Some(dns.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "certificate-signing")]
+    #[tokio::test]
+    async fn up_applies_the_default_then_the_gateway_proposal() {
+        let backend = DryRunBackend {
+            negotiate_delay: Duration::ZERO,
+            ..DryRunBackend::default()
+        };
+        let (sink, log) = collector();
+        let helios = helios();
+        backend.up(&helios, &sink).await.unwrap();
+        assert_eq!(
+            backend.last_dns_decision(),
+            Some(DnsDecision::Apply {
+                servers: aether::client_dns::DEFAULT_CLIENT_DNS.to_vec(),
+                origin: crate::dns::DnsOrigin::Default,
+            })
+        );
+
+        backend
+            .apply_gateway_dns(
+                &helios,
+                ClientDnsProposal {
+                    servers: vec!["1.0.0.1".parse().unwrap()],
+                },
+                &sink,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.last_dns_decision(),
+            Some(DnsDecision::Apply {
+                servers: vec!["1.0.0.1".parse().unwrap()],
+                origin: crate::dns::DnsOrigin::Gateway,
+            })
+        );
+        assert_eq!(
+            dns_events(&log).last(),
+            Some(&DnsCheck::Applied {
+                servers: vec!["1.0.0.1".parse().unwrap()],
+                origin: crate::dns::DnsOrigin::Gateway,
+            })
+        );
+    }
+
+    #[cfg(feature = "certificate-signing")]
+    #[tokio::test]
+    async fn down_forgets_the_gateway_proposal() {
+        let backend = DryRunBackend {
+            negotiate_delay: Duration::ZERO,
+            ..DryRunBackend::default()
+        };
+        let (sink, _log) = collector();
+        let helios = helios();
+        backend.up(&helios, &sink).await.unwrap();
+        backend
+            .apply_gateway_dns(
+                &helios,
+                ClientDnsProposal {
+                    servers: vec!["1.0.0.1".parse().unwrap()],
+                },
+                &sink,
+            )
+            .await
+            .unwrap();
+        backend.down(&sink).await.unwrap();
+        backend.up(&helios, &sink).await.unwrap();
+
+        assert_eq!(
+            backend.last_dns_decision(),
+            Some(DnsDecision::Apply {
+                servers: aether::client_dns::DEFAULT_CLIENT_DNS.to_vec(),
+                origin: crate::dns::DnsOrigin::Default,
+            })
+        );
+    }
+
+    /// A proposal that arrives after the tunnel went down (a fetch that was
+    /// in flight when the task was aborted) must not be retained or applied.
+    #[cfg(feature = "certificate-signing")]
+    #[tokio::test]
+    async fn a_late_proposal_after_down_is_ignored() {
+        let backend = DryRunBackend {
+            negotiate_delay: Duration::ZERO,
+            ..DryRunBackend::default()
+        };
+        let (sink, log) = collector();
+        let helios = helios();
+        backend.up(&helios, &sink).await.unwrap();
+        backend.down(&sink).await.unwrap();
+        let decision_before = backend.last_dns_decision();
+        let events_before = dns_events(&log).len();
+
+        backend
+            .apply_gateway_dns(
+                &helios,
+                ClientDnsProposal {
+                    servers: vec!["1.0.0.1".parse().unwrap()],
+                },
+                &sink,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(backend.last_dns_decision(), decision_before);
+        assert_eq!(dns_events(&log).len(), events_before);
+    }
+
+    /// A profile switch without `down` mounts the next profile with the
+    /// retained proposal of the previous gateway: it is not carried over.
+    #[cfg(feature = "certificate-signing")]
+    #[tokio::test]
+    async fn a_proposal_retained_for_another_profile_is_not_carried_into_the_next_mount() {
+        let backend = DryRunBackend {
+            negotiate_delay: Duration::ZERO,
+            ..DryRunBackend::default()
+        };
+        let (sink, _log) = collector();
+        let first = helios();
+        backend.up(&first, &sink).await.unwrap();
+        backend
+            .apply_gateway_dns(
+                &first,
+                ClientDnsProposal {
+                    servers: vec!["1.0.0.1".parse().unwrap()],
+                },
+                &sink,
+            )
+            .await
+            .unwrap();
+
+        let second = ClientProfile {
+            name: "autre passerelle".into(),
+            ..helios()
+        };
+        backend.up(&second, &sink).await.unwrap();
+
+        assert_eq!(
+            backend.last_dns_decision(),
+            Some(DnsDecision::Apply {
+                servers: aether::client_dns::DEFAULT_CLIENT_DNS.to_vec(),
+                origin: crate::dns::DnsOrigin::Default,
+            })
+        );
+    }
+
+    /// A proposal equal to the servers already on the adapter is reported as
+    /// the gateway's, without a second call to the driver.
+    #[cfg(feature = "certificate-signing")]
+    #[tokio::test]
+    async fn an_identical_gateway_proposal_does_not_reach_the_driver_again() {
+        let backend = DryRunBackend {
+            negotiate_delay: Duration::ZERO,
+            ..DryRunBackend::default()
+        };
+        let (sink, log) = collector();
+        let helios = helios();
+        backend.up(&helios, &sink).await.unwrap();
+        let calls_after_up = backend.dns_driver_calls();
+
+        backend
+            .apply_gateway_dns(
+                &helios,
+                ClientDnsProposal {
+                    servers: aether::client_dns::DEFAULT_CLIENT_DNS.to_vec(),
+                },
+                &sink,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(backend.dns_driver_calls(), calls_after_up);
+        assert_eq!(
+            dns_events(&log).last(),
+            Some(&DnsCheck::Applied {
+                servers: aether::client_dns::DEFAULT_CLIENT_DNS.to_vec(),
+                origin: crate::dns::DnsOrigin::Gateway,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dns_failure_does_not_fail_up() {
+        let backend = DryRunBackend {
+            negotiate_delay: Duration::ZERO,
+            ..DryRunBackend::default()
+        };
+        backend.fail_set_dns(true);
+        let (sink, log) = collector();
+        backend.up(&profile(), &sink).await.unwrap();
+
+        assert!(backend.adapter_is_up());
+        assert!(matches!(
+            dns_events(&log).as_slice(),
+            [DnsCheck::Failed { reason }] if reason.contains("pilote")
+        ));
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-import type { ClientProfile, ProtectionMode, PskKind, TunnelState } from '../types'
+import type { ClientProfile, DnsState, ProtectionMode, PskKind, TunnelState } from '../types'
 
 export interface StateMeta {
   label: string
@@ -109,7 +109,34 @@ const BLOCKED_VIVID = '#3B82F6'
 const EXPOSED = '#A8501B'
 const EXPOSED_VIVID = '#F97316'
 
-export function postureMeta(state: TunnelState, adapterUp: boolean): PostureMeta {
+/**
+ * Do DNS queries leave the tunnel while the profile is a full tunnel?
+ *
+ * True for `failed`, and for the two `left` reasons that only happen on a
+ * full capture (`gateway_declines`, `no_resolver`). `not_full_tunnel` is
+ * false: the profile does not claim a full tunnel, so nothing is betrayed.
+ */
+export function dnsLeavesFullTunnel(dns: DnsState): boolean {
+  const { check } = dns
+  if (check === null) return false
+  if (check.status === 'failed') return true
+  return (
+    check.status === 'left' &&
+    (check.reason === 'gateway_declines' || check.reason === 'no_resolver')
+  )
+}
+
+/**
+ * `dnsLeavesTunnel`: DNS queries leave the tunnel although the profile is a
+ * full tunnel (see `dnsLeavesFullTunnel`). The label and colours do not
+ * change, since the routed traffic is still protected; the detail says where
+ * the DNS goes, so « Protégé » is never shown without that qualification.
+ */
+export function postureMeta(
+  state: TunnelState,
+  adapterUp: boolean,
+  dnsLeavesTunnel = false,
+): PostureMeta {
   if (!adapterUp) {
     return {
       posture: 'exposed',
@@ -123,9 +150,9 @@ export function postureMeta(state: TunnelState, adapterUp: boolean): PostureMeta
     return {
       posture: 'protected',
       label: 'Protégé',
-      // "Tout" would be a word too many: DNS queries leave outside the
-      // tunnel, a documented limit the posture panel states in full.
-      detail: 'Trafic routé par la gateway.',
+      detail: dnsLeavesTunnel
+        ? 'Trafic routé par la gateway, DNS hors du tunnel.'
+        : 'Trafic routé par la gateway.',
       color: UP,
       accent: UP_VIVID,
     }

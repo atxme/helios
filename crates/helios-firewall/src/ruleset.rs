@@ -48,15 +48,14 @@
 //! does not follow the tunnel state, because an upgrade happens when the
 //! tunnel is down.
 //!
-//! # Known limitation: DNS is not tunneled
+//! # Client DNS
 //!
-//! Even with `allow_client_internet` active, the client keeps its own
-//! resolver: its DNS queries leave outside the tunnel and reveal the names it
-//! looks up, while the rest of its traffic is protected. What would unblock
-//! this: a resolver field in the `orion-profile` document — which
-//! `orion-core` currently rejects, including the `DNS` key of a `wg-quick`
-//! file — and the choice of a resolver reachable inside the tunnel. See
-//! ADR-004 batch 5.
+//! The ruleset has no DNS rule of its own. The gateway proposes a resolver to
+//! admitted peers (`GET /api/client/dns`, empty when `allow_client_internet`
+//! is off), and Orion sends the client's queries there through the tunnel.
+//! Those queries are ordinary client traffic: the forward and NAT rules of
+//! `allow_client_internet` carry them, and nothing here opens port 53 for
+//! clients. See ADR-001, amendment « DNS des postes ».
 
 mod administration;
 mod astra_channel;

@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use aether::TunnelState;
 use orion_core::{
-    backend::EventSink, vault::PromptPurpose, ClientConfig, ClientEvent, ClientProfile,
+    backend::EventSink, dns::follow_gateway_proposal, dns::PROPOSAL_RETRY_DELAY,
+    vault::PromptPurpose, ClientConfig, ClientEvent, ClientProfile, ProfileKind,
 };
 use tokio::sync::Mutex;
 
@@ -118,6 +119,16 @@ impl EngineService {
         let trust_asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let renewal_task = Arc::clone(&self.certificate_renewal_task);
         let renewal_controller = Arc::clone(&self.controller);
+        // The gateway's resolver proposal: a Helios profile whose gateway is
+        // reachable through the tunnel, asked once per connection like trust.
+        // Captured before the profile moves into the controller.
+        let dns_target = (profile.kind() == ProfileKind::HeliosKeyNegotiation)
+            .then(|| profile.heliosd_url.clone())
+            .flatten()
+            .map(|url| (profile.duplicate(), url));
+        let dns_asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dns_task_slot = Arc::clone(&self.gateway_dns_task);
+        let dns_controller = Arc::clone(&self.controller);
         let renewal_sessions = Arc::clone(&self.renewals);
         let negotiated_profile = profile.name.clone();
         let config = Arc::clone(&self.config);
@@ -144,6 +155,32 @@ impl EngineService {
                     TunnelState::Up => {
                         if let Some(url) = heliosd_url.clone() {
                             telemetry.start(url, events.sink());
+                        }
+                        if let (Some((dns_profile, url)), false) = (
+                            dns_target.as_ref(),
+                            dns_asked.swap(true, std::sync::atomic::Ordering::SeqCst),
+                        ) {
+                            let controller = Arc::clone(&dns_controller);
+                            let profile = dns_profile.duplicate();
+                            let url = url.clone();
+                            let dns_sink = events.sink();
+                            let task = tokio::spawn(async move {
+                                follow_gateway_proposal(
+                                    &controller,
+                                    &profile,
+                                    &url,
+                                    PROPOSAL_RETRY_DELAY,
+                                    &dns_sink,
+                                )
+                                .await;
+                            });
+                            if let Some(previous) = dns_task_slot
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .replace(task)
+                            {
+                                previous.abort();
+                            }
                         }
                         if let (Some(settings), Some(url), false) = (
                             trust_settings.clone(),
@@ -172,6 +209,18 @@ impl EngineService {
                     }
                     TunnelState::Down | TunnelState::Failed => {
                         telemetry.stop();
+                        // The adapter stays mounted on `Failed`, and a `Failed -> Up`
+                        // recovery reads the proposal retained by the DNS task: only
+                        // `Down` ends it.
+                        if matches!(state, TunnelState::Down) {
+                            if let Some(task) = dns_task_slot
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take()
+                            {
+                                task.abort();
+                            }
+                        }
                         if let Some(task) = renewal_task
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -267,6 +316,16 @@ impl EngineService {
             .take();
         if let Some(poll) = poll {
             poll.abort();
+        }
+        // After the poll: a late `Up` from the poll would otherwise spawn a DNS
+        // task that nothing aborts.
+        if let Some(task) = self
+            .gateway_dns_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
         }
         self.controller
             .disconnect(sink)

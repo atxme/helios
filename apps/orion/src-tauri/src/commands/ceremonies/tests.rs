@@ -15,6 +15,7 @@ fn profile(name: &str, heliosd_url: Option<&str>) -> ProfileView {
         persistent_keepalive: 25,
         heliosd_url: heliosd_url.map(str::to_string),
         ssh_target: None,
+        dns: None,
         key_negotiation: None,
         mode: "service".into(),
         profile_type: "classic".into(),

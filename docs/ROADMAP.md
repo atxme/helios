@@ -88,7 +88,7 @@ est bloqué ou risque d'être refait. Une décision ne se prend pas depuis le d�
 | # | Décision | Source | Débloque |
 | --- | --- | --- | --- |
 | D1 | **Compteur anti-rejeu** : fichier ou NV TPM (si NV TPM, validation matérielle requise) | ADR-002 amendement 2, ADR-006 « Rollback complet » | fichier de récupération WireGuard signé (F5) ; claim de fraîcheur des coffres |
-| D5 | **DNS des clients** non tunnelé, même avec `allow_client_internet` | README, `helios-firewall/src/ruleset.rs`, ADR-006 | confidentialité des noms résolus (F7) |
+| D5 | **Tranché le 21 novembre 2026 : résolveur public joint par le tunnel**, pas de résolveur sur la passerelle. Option C : la passerelle propose un résolveur (`client_dns`, défaut DNS4EU non filtré, `86.54.11.100` et `86.54.11.200`), chaque poste peut le remplacer dans Orion. Accepté : DNS4EU applique les blocages judiciaires français, et les requêtes sortent par la passerelle, en France | README, `helios-firewall/src/ruleset.rs`, ADR-006 ; spec `docs/superpowers/specs/2026-11-21-f7-dns-tunnel-design.md` | confidentialité des noms résolus (F7) : débloqué |
 | D6 | Activation de l'anti-spoof `fib` en multi-uplink / policy routing | FIREWALL-V2 « Capacités » | encodeur déjà livré |
 | D7 | Acceptation ICMPv6 Packet Too Big scopée par interface | FIREWALL-V2, ETUDE-IPV6 §9.1 | après observation V5 |
 | D8 | Authentification de `POST /v1/campaigns` sur l'origine publique | ROTATION-CERTIFICATS §11.6, §12.5 | boutons de campagne dans la console ; aujourd'hui volontairement refusé |
@@ -111,7 +111,7 @@ reste alors à faire à part.
 | F4 | **Fusionné dans `main` le 23 octobre 2026.** Retrait de la **valeur de négociation** `classic` de `ProtectionMode` (protocole v5 côté gateway) : migration de `network.toml` et de l'octet `mode_id = 0` du bloc de négociation dans le manifeste de coffre. **Ne touche pas au profil Orion `type = classic`**, le profil WireGuard générique sans négociation, que v5 §19 conserve comme chemin produit distinct (`ProfileKind::Classic`, octet de type `1`, import wg-quick) | v5 §19 | : | **Oui** |
 | F5 | Fichier de récupération WireGuard signé ML-DSA-65 + Ed25519 | ADR-002 lot 3 | D1 | **Oui**, après D1 |
 | F6 | Profil Orion **`nomade`** : relier `ProfileMode`, IKM `profile_root_key ‖ passphrase_key`, re-saisie après veille. **Fusionné dans `main` le 20 novembre 2026** ; validation Windows à faire (le code Windows n'a été compilé que par la CI ; recette : MANUAL-TESTING, « O. F6 ») | ADR-006 « Limites connues » | : | **Oui** |
-| F7 | DNS tunnelé côté Orion et gateway | ADR-006, `ruleset.rs` | D5 | **Oui**, après D5 |
+| F7 | DNS tunnelé côté Orion et gateway. **Fusionné dans `main` le 22 novembre 2026 (Helios 4.1.0, Orion 5.1.0)** : `client_dns` et `GET /api/client/dns` côté gateway, DNS des postes côté Orion (manifeste v9), banc netns et recette « P. F7 ». Recette Windows à faire | ADR-001 amendement « DNS des postes », ADR-006 | D5 (tranché) | **Oui**, recette Windows |
 
 La veille confirme la direction retenue en F1 : Rosenpass alimente le même slot
 PSK de WireGuard avec une rotation fréquente, et NetBird a dû forcer une
@@ -208,12 +208,12 @@ de générations ou de délégation :
 ```text
 Faisable maintenant (sans matériel)
   outillage headless Orion · T2 · T4 compilation · T5 · T6 mesure
-  D1, D5 à D8 arbitrages
+  D1, D6 à D8 arbitrages (D5 tranché le 21 novembre 2026)
   F14 Orion seul binaire client (enrôlement v5 d'abord), après F11
   F15 reproductible
 
 Faisable en code, validation sur cible à planifier
-  F5 (après D1) · F7 (après D5) · F12 libsecret · F13 NSIS
+  F5 (après D1) · F7 (fusionné, recette Windows « P. F7 ») · F12 libsecret · F13 NSIS
 
 Bloqué par matériel ou cible (hors WSL2)
   V1 · V3 · V4 · V5 · V6 · V7 · T4 DPAPI · T6 prise réelle · D9 signature EV

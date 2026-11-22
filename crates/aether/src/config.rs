@@ -205,6 +205,14 @@ pub struct NetworkConfig {
     /// for what this covers — and what it does not cover, namely DNS.
     #[serde(default)]
     pub allow_client_internet: bool,
+    /// DNS resolvers proposed to Helios clients, reached through the tunnel.
+    ///
+    /// Absent means [`crate::client_dns::DEFAULT_CLIENT_DNS`]; an empty list
+    /// proposes nothing. Applied only when a client's profile captures all of
+    /// IPv4, and only with [`Self::allow_client_internet`]. See
+    /// [`crate::client_dns::validate_resolvers`] for what is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_dns: Option<Vec<Ipv4Addr>>,
     /// Answers ICMP on the tunnel interface. See
     /// [`crate::FirewallPolicy::allow_tunnel_icmp`] for why this one defaults
     /// to open while everything else here defaults to closed.
@@ -474,6 +482,10 @@ struct PersistedNetworkConfig<'a> {
     admin_ifaces: &'a [String],
     allow_dhcp_on_wan: bool,
     allow_client_internet: bool,
+    /// Written only when present, so a file that never set it comes back
+    /// byte for byte.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_dns: Option<&'a [Ipv4Addr]>,
     allow_tunnel_icmp: bool,
     allow_gateway_egress: bool,
     allow_ssh_over_tunnel: bool,
@@ -533,6 +545,7 @@ impl<'a> PersistedNetworkConfig<'a> {
             admin_ifaces: &config.admin_ifaces,
             allow_dhcp_on_wan: config.allow_dhcp_on_wan,
             allow_client_internet: config.allow_client_internet,
+            client_dns: config.client_dns.as_deref(),
             allow_tunnel_icmp: config.allow_tunnel_icmp,
             allow_gateway_egress: config.allow_gateway_egress,
             allow_ssh_over_tunnel: config.allow_ssh_over_tunnel,
@@ -872,6 +885,7 @@ impl NetworkConfig {
             admin_ifaces: self.admin_ifaces.clone(),
             allow_dhcp_on_wan: self.allow_dhcp_on_wan,
             allow_client_internet: self.allow_client_internet,
+            client_dns: self.client_dns.clone(),
             allow_tunnel_icmp: self.allow_tunnel_icmp,
             allow_gateway_egress: self.allow_gateway_egress,
             allow_ssh_over_tunnel: self.allow_ssh_over_tunnel,
@@ -1127,10 +1141,27 @@ impl NetworkConfig {
         )))
     }
 
+    /// The resolver proposal for this configuration: nothing when clients may
+    /// not reach the Internet, otherwise the configured list or the default.
+    pub fn client_dns_proposal(&self) -> crate::client_dns::ClientDnsProposal {
+        let servers = if !self.allow_client_internet {
+            Vec::new()
+        } else {
+            self.client_dns
+                .clone()
+                .unwrap_or_else(|| crate::client_dns::DEFAULT_CLIENT_DNS.to_vec())
+        };
+        crate::client_dns::ClientDnsProposal { servers }
+    }
+
     /// Validates relationships that cannot be expressed by serde defaults.
     pub fn validate(&self) -> Result<()> {
         self.validate_peer_identities()?;
         self.validate_peer_vips_v6()?;
+        if let Some(servers) = &self.client_dns {
+            crate::client_dns::validate_resolvers(servers)
+                .map_err(|error| HeliosError::Config(format!("client_dns: {error}")))?;
+        }
         // `auto` means « enumerate them all », so it cannot sit beside a name:
         // the two readings — « these, plus whatever you find » and « just
         // these » — differ, and a firewall built on the wrong one is a gateway

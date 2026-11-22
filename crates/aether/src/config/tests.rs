@@ -1015,3 +1015,58 @@ fn a_missing_network_file_has_nothing_to_migrate() {
         assert!(!path.exists(), "a migration must not create the file");
     });
 }
+
+#[test]
+fn client_dns_refuses_private_and_ipv6_entries() {
+    let toml = r#"
+            wan_iface = "eth0"
+            wg_private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            client_dns = ["192.168.1.1"]
+        "#;
+    let cfg: NetworkConfig = toml::from_str(toml).unwrap();
+    let error = cfg.validate().unwrap_err().to_string();
+    assert!(
+        error.contains("client_dns") && error.contains("192.168.1.1"),
+        "the refusal must name the field and the address: {error}"
+    );
+
+    let toml = toml.replace("192.168.1.1", "2001:db8::1");
+    assert!(
+        toml::from_str::<NetworkConfig>(&toml).is_err(),
+        "an IPv6 resolver does not deserialize"
+    );
+}
+
+#[test]
+fn proposal_follows_config_and_internet_flag() {
+    use crate::client_dns::DEFAULT_CLIENT_DNS;
+    use std::net::Ipv4Addr;
+
+    let proposal = |toml: &str| {
+        let cfg: NetworkConfig = toml::from_str(toml).unwrap();
+        cfg.client_dns_proposal().servers
+    };
+    let defaults = DEFAULT_CLIENT_DNS.to_vec();
+
+    assert_eq!(proposal("allow_client_internet = true"), defaults);
+    assert_eq!(
+        proposal("allow_client_internet = true\nclient_dns = [\"1.1.1.1\"]"),
+        vec![Ipv4Addr::new(1, 1, 1, 1)]
+    );
+    assert!(proposal("allow_client_internet = true\nclient_dns = []").is_empty());
+    assert!(proposal("allow_client_internet = false\nclient_dns = [\"1.1.1.1\"]").is_empty());
+}
+
+#[test]
+fn client_dns_is_written_back_only_when_set() {
+    let set = NetworkConfig {
+        client_dns: Some(vec![Ipv4Addr::new(1, 1, 1, 1)]),
+        ..NetworkConfig::default()
+    };
+    let raw = toml::to_string_pretty(&PersistedNetworkConfig::new(&set, false)).unwrap();
+    assert!(raw.contains("client_dns = [\"1.1.1.1\"]"), "{raw}");
+
+    let unset = NetworkConfig::default();
+    let raw = toml::to_string_pretty(&PersistedNetworkConfig::new(&unset, false)).unwrap();
+    assert!(!raw.contains("client_dns"), "{raw}");
+}

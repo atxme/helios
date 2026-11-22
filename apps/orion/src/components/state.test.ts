@@ -27,6 +27,7 @@ const profile = (over: Partial<ClientProfile> = {}): ClientProfile => ({
   persistent_keepalive: 25,
   heliosd_url: null,
   ssh_target: null,
+  dns: null,
   key_negotiation: null,
   ...over,
 })
@@ -62,6 +63,15 @@ describe('Orion UI state', () => {
     for (const state of ['down', 'connecting', 'failed', 'captive_portal'] as const) {
       expect(postureMeta(state, true).posture).toBe('blocked')
     }
+  })
+
+  it('says in the headline that DNS leaves the tunnel, without changing the label', () => {
+    const plain = postureMeta('up', true)
+    const leaking = postureMeta('up', true, true)
+    expect(leaking.label).toBe('Protégé')
+    expect(leaking.color).toBe(plain.color)
+    expect(leaking.detail).toBe('Trafic routé par la gateway, DNS hors du tunnel.')
+    expect(plain.detail).toBe('Trafic routé par la gateway.')
   })
 
   it('does not confuse a static PSK with a PQC PSK', () => {

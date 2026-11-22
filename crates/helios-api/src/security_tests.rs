@@ -380,6 +380,75 @@ async fn get_network_is_redacted_in_the_real_router() {
     );
 }
 
+/// The resolver proposal is served to admitted peers only.
+#[tokio::test]
+async fn client_dns_is_refused_to_an_unknown_source() {
+    const URI: &str = "/api/client/dns";
+
+    let (unknown_state, _cmd_rx) = state();
+    let mut unknown = Request::builder().uri(URI).body(Body::empty()).unwrap();
+    unknown.extensions_mut().insert(ConnectInfo(
+        "100.64.9.9:4242".parse::<SocketAddr>().unwrap(),
+    ));
+    let response = router(unknown_state).oneshot(unknown).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn client_dns_serves_the_default_to_a_peer() {
+    const URI: &str = "/api/client/dns";
+
+    let (app_state, _cmd_rx) = state();
+    app_state.network.write().await.allow_client_internet = true;
+    let mut request = Request::builder().uri(URI).body(Body::empty()).unwrap();
+    request.extensions_mut().insert(ConnectInfo(
+        "100.64.1.2:4242".parse::<SocketAddr>().unwrap(),
+    ));
+    let response = router(app_state).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({"servers": ["86.54.11.100", "86.54.11.200"]})
+    );
+}
+
+#[tokio::test]
+async fn client_dns_is_empty_without_client_internet() {
+    const URI: &str = "/api/client/dns";
+
+    let (app_state, _cmd_rx) = state();
+    let mut request = Request::builder().uri(URI).body(Body::empty()).unwrap();
+    request.extensions_mut().insert(ConnectInfo(
+        "100.64.1.2:4242".parse::<SocketAddr>().unwrap(),
+    ));
+    let response = router(app_state).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json, serde_json::json!({"servers": []}));
+}
+
+#[tokio::test]
+async fn network_view_shows_client_dns() {
+    let (app_state, _cmd_rx) = state();
+    app_state.network.write().await.client_dns = Some(vec![std::net::Ipv4Addr::new(1, 1, 1, 1)]);
+    let response = router(app_state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/network")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["client_dns"], serde_json::json!(["1.1.1.1"]));
+}
+
 #[tokio::test]
 async fn mutations_refuse_form_posts_and_posts_without_json_type() {
     for content_type in [

@@ -5,6 +5,7 @@
 //! an output path, and a secret enters only through [`SecretInput`].
 
 use std::fmt;
+use std::net::Ipv4Addr;
 
 use aether::certificates::approval::AstraRenewalApproval;
 use orion_core::certificate_approval::{ApprovalManifest, ApprovalMaterial};
@@ -119,6 +120,11 @@ pub struct ProfileDraft {
     pub persistent_keepalive: u16,
     pub heliosd_url: Option<String>,
     pub ssh_target: Option<String>,
+    /// Resolvers the tunnel sets. `None` = no choice written: the gateway's
+    /// proposal on a Helios profile, no resolver on a classic one. Judged by
+    /// `validate` and `inspect_profile`, never trimmed here.
+    #[serde(default)]
+    pub dns: Option<Vec<Ipv4Addr>>,
     pub key_negotiation: Option<KeyNegotiationSettings>,
     /// Adopts the key sitting in the engine's single staged-key slot.
     ///

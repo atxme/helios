@@ -1,5 +1,7 @@
 //! The network configuration view, its replacement and the gateway WireGuard key.
 
+use std::net::Ipv4Addr;
+
 use super::*;
 
 /// Public view of the network configuration.
@@ -26,6 +28,9 @@ pub struct NetworkConfigView {
     /// Exposed for the same reason as `allow_dhcp_on_wan`: a view that
     /// omitted it would reset it to `false` on the first reload from the UI.
     pub allow_client_internet: bool,
+    /// Resolvers configured for clients. `null` means the default applies
+    /// (see `aether::client_dns`), not that no resolver is proposed.
+    pub client_dns: Option<Vec<Ipv4Addr>>,
     pub admin_iface: Option<String>,
     pub split_tunnel_cidrs: Vec<String>,
     pub wg_iface: String,
@@ -71,6 +76,7 @@ impl From<&NetworkConfig> for NetworkConfigView {
             admin_ifaces: config.admin_ifaces.clone(),
             allow_dhcp_on_wan: config.allow_dhcp_on_wan,
             allow_client_internet: config.allow_client_internet,
+            client_dns: config.client_dns.clone(),
             admin_iface: config.admin_iface.clone(),
             split_tunnel_cidrs: config.split_tunnel_cidrs.clone(),
             wg_iface: config.wg_iface.clone(),

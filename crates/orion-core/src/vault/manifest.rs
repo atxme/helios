@@ -25,24 +25,34 @@
 
 use zeroize::Zeroizing;
 
+use std::net::Ipv4Addr;
+
 use super::{codec, codec::Cursor, VaultError};
 use crate::config::{ClientProfile, KeyNegotiationSettings, ProfileKind};
+use aether::client_dns::{validate_resolvers, CLIENT_DNS_MAX};
 use aether::key_negotiation::ProtectionMode;
 
-/// Version written today for a profile carrying an IPv6 address. Any
-/// version not listed below is refused, never guessed.
+/// Version written today for a profile carrying a DNS choice. Any version
+/// not listed below is refused, never guessed.
 ///
-/// It appends `address_v6`, and it is written **only** when the profile has
-/// one: a profile without it is still sealed as
-/// [`MANIFEST_VERSION_WITHOUT_ADDRESS_V6`], byte for byte as before. The
-/// absent value writes nothing, so an IPv4-only profile stays readable by an
-/// Orion that predates the field, and only a profile that would lose an
-/// address when read by such an Orion is refused by it (`ADRESSAGE-IPV6.md`
-/// §8 — the same line the `orion-profile` document draws).
-const MANIFEST_VERSION: u8 = 8;
+/// After the fields every version carries, it writes an `address_v6`
+/// presence byte and its text if present, then the DNS list: a count byte,
+/// then four bytes per resolver. It is written **only** when the profile has
+/// a DNS choice. Otherwise the encoder picks
+/// [`MANIFEST_VERSION_WITHOUT_DNS`] or [`MANIFEST_VERSION_WITHOUT_ADDRESS_V6`],
+/// byte for byte as before. An absent choice writes nothing, so a profile
+/// without one stays readable by an Orion that predates the field, and only a
+/// profile that would lose its choice when read by such an Orion is refused
+/// by it (the same line `ADRESSAGE-IPV6.md` §8 draws for `address_v6`).
+const MANIFEST_VERSION: u8 = 9;
 
-/// Version written for a profile without an IPv6 address: everything of
-/// today except the trailing `address_v6`.
+/// Version written for a profile with an IPv6 address and no DNS choice:
+/// everything of the previous version, with `address_v6` as its trailing
+/// text.
+const MANIFEST_VERSION_WITHOUT_DNS: u8 = 8;
+
+/// Version written for a profile without an IPv6 address or a DNS choice:
+/// everything of today except the trailing `address_v6`.
 const MANIFEST_VERSION_WITHOUT_ADDRESS_V6: u8 = 7;
 
 /// Previous version, still readable: it lacks the trailing `ssh_target`.
@@ -173,8 +183,12 @@ pub struct ProfileManifest {
     /// **Secret**, when a static PSK is in use.
     pub preshared_key: Option<aether::SecretString>,
     pub address: Option<String>,
-    /// Present only in a manifest of `MANIFEST_VERSION`.
+    /// Present only in a manifest of version 8 or later.
     pub address_v6: Option<String>,
+    /// Resolvers for the tunnel, present only in a manifest of
+    /// `MANIFEST_VERSION`. Not part of [`Self::security_digest`]: like the
+    /// endpoint, it is a sealed setting and not a security event (ADR-006 §2).
+    pub dns: Option<Vec<Ipv4Addr>>,
     pub allowed_ips: String,
     pub persistent_keepalive: u16,
     pub heliosd_url: Option<String>,
@@ -209,6 +223,7 @@ impl ProfileManifest {
                 .map(aether::SecretString::duplicate),
             address: profile.address.clone(),
             address_v6: profile.address_v6.clone(),
+            dns: profile.dns.clone(),
             allowed_ips: profile.allowed_ips.clone(),
             persistent_keepalive: profile.persistent_keepalive,
             heliosd_url: profile.heliosd_url.clone(),
@@ -234,6 +249,7 @@ impl ProfileManifest {
                 .map(aether::SecretString::duplicate),
             address: self.address.clone(),
             address_v6: self.address_v6.clone(),
+            dns: self.dns.clone(),
             allowed_ips: self.allowed_ips.clone(),
             persistent_keepalive: self.persistent_keepalive,
             heliosd_url: self.heliosd_url.clone(),
@@ -317,10 +333,10 @@ impl ProfileManifest {
     /// Encodes into a bounded, zeroizing buffer.
     pub fn encode(&self) -> Result<Zeroizing<Vec<u8>>, VaultError> {
         let mut out = Zeroizing::new(Vec::with_capacity(1024));
-        out.push(if self.address_v6.is_some() {
-            MANIFEST_VERSION
-        } else {
-            MANIFEST_VERSION_WITHOUT_ADDRESS_V6
+        out.push(match (&self.dns, &self.address_v6) {
+            (Some(_), _) => MANIFEST_VERSION,
+            (None, Some(_)) => MANIFEST_VERSION_WITHOUT_DNS,
+            (None, None) => MANIFEST_VERSION_WITHOUT_ADDRESS_V6,
         });
         out.extend_from_slice(&self.generation.0.to_be_bytes());
         codec::put(&mut out, self.name.as_bytes())?;
@@ -371,10 +387,30 @@ impl ProfileManifest {
                 }
             }
         }
-        // Last, and only in the version that carries it: see
+        // Last, and only in the versions that carry them: see
         // [`MANIFEST_VERSION`].
-        if let Some(address_v6) = &self.address_v6 {
-            codec::put(&mut out, address_v6.as_bytes())?;
+        match &self.dns {
+            None => {
+                if let Some(address_v6) = &self.address_v6 {
+                    codec::put(&mut out, address_v6.as_bytes())?;
+                }
+            }
+            Some(servers) => {
+                check_dns_list(servers)?;
+                match &self.address_v6 {
+                    None => out.push(0),
+                    Some(address_v6) => {
+                        out.push(1);
+                        codec::put(&mut out, address_v6.as_bytes())?;
+                    }
+                }
+                let count = u8::try_from(servers.len())
+                    .map_err(|_| VaultError::ManifestEncoding("too many DNS resolvers".into()))?;
+                out.push(count);
+                for server in servers {
+                    out.extend_from_slice(&server.octets());
+                }
+            }
         }
         if out.len() > MAX_MANIFEST_BYTES {
             return Err(VaultError::ManifestTooLarge(out.len()));
@@ -390,6 +426,7 @@ impl ProfileManifest {
         let mut cursor = Cursor::new(bytes);
         let version = cursor.byte()?;
         if version != MANIFEST_VERSION
+            && version != MANIFEST_VERSION_WITHOUT_DNS
             && version != MANIFEST_VERSION_WITHOUT_ADDRESS_V6
             && version != MANIFEST_VERSION_WITHOUT_GATEWAY_EPOCHS
             && version != MANIFEST_VERSION_WITHOUT_CREDENTIAL_BINDINGS
@@ -510,18 +547,37 @@ impl ProfileManifest {
                 )))
             }
         };
-        // Written last, by the one version that carries it. Never empty there:
-        // that version is only chosen when the value exists.
-        let address_v6 = if version > MANIFEST_VERSION_WITHOUT_ADDRESS_V6 {
-            let text = cursor.text()?;
-            if text.is_empty() {
-                return Err(VaultError::ManifestEncoding(
-                    "empty address_v6 in a manifest that exists to carry one".into(),
-                ));
+        // Written last, by the versions that carry them. Never empty where a
+        // version carries it: that version is only chosen when the value exists.
+        let (address_v6, dns) = if version == MANIFEST_VERSION {
+            let address_v6 = match cursor.byte()? {
+                0 => None,
+                1 => Some(present_address_v6(cursor.text()?)?),
+                other => {
+                    return Err(VaultError::ManifestEncoding(format!(
+                        "invalid address_v6 presence byte {other}"
+                    )))
+                }
+            };
+            let count = usize::from(cursor.byte()?);
+            if count > CLIENT_DNS_MAX {
+                return Err(VaultError::ManifestEncoding(format!(
+                    "{count} DNS resolvers declared, {CLIENT_DNS_MAX} at most"
+                )));
             }
-            Some(text)
+            let mut servers = Vec::with_capacity(count);
+            for _ in 0..count {
+                servers.push(Ipv4Addr::from(cursor.array::<4>()?));
+            }
+            check_dns_list(&servers)?;
+            (address_v6, Some(servers))
         } else {
-            None
+            let address_v6 = if version > MANIFEST_VERSION_WITHOUT_ADDRESS_V6 {
+                Some(present_address_v6(cursor.text()?)?)
+            } else {
+                None
+            };
+            (address_v6, None)
         };
         // Trailing bytes mean the encoder and decoder disagree. Ignoring them
         // is how a format silently forks.
@@ -535,6 +591,7 @@ impl ProfileManifest {
             preshared_key,
             address,
             address_v6,
+            dns,
             allowed_ips,
             persistent_keepalive,
             heliosd_url,
@@ -543,6 +600,29 @@ impl ProfileManifest {
             key_negotiation,
         })
     }
+}
+
+/// An `address_v6` that a version declares present must not be empty.
+fn present_address_v6(text: String) -> Result<String, VaultError> {
+    if text.is_empty() {
+        return Err(VaultError::ManifestEncoding(
+            "empty address_v6 in a manifest that exists to carry one".into(),
+        ));
+    }
+    Ok(text)
+}
+
+/// The DNS list of a manifest that carries one: at least one resolver, and
+/// what [`validate_resolvers`] accepts. Checked on both sides, so an encoder
+/// never seals a list the decoder would refuse.
+fn check_dns_list(servers: &[Ipv4Addr]) -> Result<(), VaultError> {
+    if servers.is_empty() {
+        return Err(VaultError::ManifestEncoding(
+            "empty DNS list in a manifest that exists to carry one".into(),
+        ));
+    }
+    validate_resolvers(servers)
+        .map_err(|error| VaultError::ManifestEncoding(format!("DNS list refused: {error}")))
 }
 
 /// Explicit identifiers rather than `as u8` on the enum: reordering the enum
@@ -626,6 +706,7 @@ mod tests {
             preshared_key: Some("cHNr".into()),
             address: Some("100.64.1.2/32".into()),
             address_v6: None,
+            dns: None,
             allowed_ips: "0.0.0.0/0".into(),
             persistent_keepalive: 25,
             heliosd_url: Some("http://100.64.0.1:8080".into()),
@@ -970,13 +1051,10 @@ mod tests {
         ));
     }
 
-    /// A profile without an IPv6 address is sealed exactly as before the
-    /// field existed: same version byte, same bytes. Built by hand in the v7
-    /// layout, for the reason given on the v1 test — the encoder agreeing
-    /// with itself proves nothing about the bytes an older Orion reads.
-    #[test]
-    fn a_profile_without_ipv6_is_sealed_in_the_previous_layout() {
-        let source = profile();
+    /// The version 7 layout, built byte for byte rather than derived from the
+    /// encoder, for the reason given on the v1 test: the encoder agreeing with
+    /// itself proves nothing about the bytes an older Orion reads.
+    fn v7_bytes(source: &ClientProfile) -> Vec<u8> {
         let settings = negotiation();
         let mut v7: Vec<u8> = Vec::new();
         v7.push(MANIFEST_VERSION_WITHOUT_ADDRESS_V6);
@@ -1009,6 +1087,100 @@ mod tests {
         codec::put(&mut v7, settings.gateway_pq_certificate.as_bytes()).unwrap();
         codec::put(&mut v7, settings.identity.as_bytes()).unwrap();
         v7.push(0); // no trust material
+        v7
+    }
+
+    /// The layout of every profile sealed before DNS existed, with or without
+    /// an IPv6 address: byte for byte, not derived from the encoder.
+    #[test]
+    fn a_profile_without_dns_encodes_as_before() {
+        let plain = profile();
+        let encoded = ProfileManifest::from_profile(&plain, SecurityGeneration(3))
+            .encode()
+            .expect("encode");
+        assert_eq!(encoded.as_slice(), v7_bytes(&plain).as_slice());
+
+        let mut dual = profile();
+        dual.address_v6 = Some("fd3c:91a2:7e04::2/128".into());
+        let mut v8 = v7_bytes(&dual);
+        v8[0] = MANIFEST_VERSION_WITHOUT_DNS;
+        codec::put(&mut v8, b"fd3c:91a2:7e04::2/128").unwrap();
+        let encoded = ProfileManifest::from_profile(&dual, SecurityGeneration(3))
+            .encode()
+            .expect("encode");
+        assert_eq!(encoded.as_slice(), v8.as_slice());
+    }
+
+    #[test]
+    fn dns_round_trips_with_and_without_address_v6() {
+        let resolvers = vec![
+            Ipv4Addr::new(86, 54, 11, 100),
+            Ipv4Addr::new(86, 54, 11, 200),
+        ];
+        for with_v6 in [false, true] {
+            for with_dns in [false, true] {
+                let mut source = profile();
+                source.address_v6 = with_v6.then(|| "fd3c:91a2:7e04::2/128".to_string());
+                source.dns = with_dns.then(|| resolvers.clone());
+                let encoded = ProfileManifest::from_profile(&source, SecurityGeneration(5))
+                    .encode()
+                    .expect("encode");
+                assert_eq!(
+                    encoded[0] == MANIFEST_VERSION,
+                    with_dns,
+                    "only a DNS choice moves the manifest to version 9"
+                );
+                let rebuilt = ProfileManifest::decode(&encoded)
+                    .expect("decode")
+                    .to_profile();
+                assert_eq!(
+                    rebuilt.address_v6, source.address_v6,
+                    "v6={with_v6} dns={with_dns}"
+                );
+                assert_eq!(rebuilt.dns, source.dns, "v6={with_v6} dns={with_dns}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_dns_list_is_refused_in_v9() {
+        let mut forged = v7_bytes(&profile());
+        forged[0] = MANIFEST_VERSION;
+        forged.push(0); // no address_v6
+        forged.push(0); // zero resolvers
+        assert!(matches!(
+            ProfileManifest::decode(&forged),
+            Err(VaultError::ManifestEncoding(_))
+        ));
+
+        let mut empty = profile();
+        empty.dns = Some(Vec::new());
+        assert!(ProfileManifest::from_profile(&empty, SecurityGeneration(1))
+            .encode()
+            .is_err());
+    }
+
+    #[test]
+    fn a_dns_list_above_the_maximum_is_refused_in_v9() {
+        let mut forged = v7_bytes(&profile());
+        forged[0] = MANIFEST_VERSION;
+        forged.push(0);
+        forged.push((CLIENT_DNS_MAX + 1) as u8);
+        for _ in 0..=CLIENT_DNS_MAX {
+            forged.extend_from_slice(&[1, 1, 1, 1]);
+        }
+        assert!(matches!(
+            ProfileManifest::decode(&forged),
+            Err(VaultError::ManifestEncoding(_))
+        ));
+    }
+
+    /// A profile without an IPv6 address is sealed exactly as before the
+    /// field existed: same version byte, same bytes.
+    #[test]
+    fn a_profile_without_ipv6_is_sealed_in_the_previous_layout() {
+        let source = profile();
+        let v7 = v7_bytes(&source);
 
         let encoded = ProfileManifest::from_profile(&source, SecurityGeneration(3))
             .encode()
@@ -1029,7 +1201,7 @@ mod tests {
         let encoded = ProfileManifest::from_profile(&dual, SecurityGeneration(4))
             .encode()
             .expect("encode");
-        assert_eq!(encoded[0], MANIFEST_VERSION);
+        assert_eq!(encoded[0], MANIFEST_VERSION_WITHOUT_DNS);
 
         let decoded = ProfileManifest::decode(&encoded).expect("decode");
         let rebuilt = decoded.to_profile();
@@ -1050,7 +1222,7 @@ mod tests {
             .encode()
             .expect("encode");
         let mut forged = encoded.to_vec();
-        forged[0] = MANIFEST_VERSION;
+        forged[0] = MANIFEST_VERSION_WITHOUT_DNS;
         codec::put(&mut forged, b"").unwrap();
         assert!(matches!(
             ProfileManifest::decode(&forged),
