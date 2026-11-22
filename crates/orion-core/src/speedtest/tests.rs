@@ -482,9 +482,183 @@ fn serve_direct_tcp_for_test(mut stream: TcpStream) {
         }
         stream.shutdown(Shutdown::Write).expect("tcp shutdown");
     } else {
+        let mut meter = aether::speedtest::TcpReceiveMeter::new(Instant::now(), duration);
         let mut buffer = vec![0u8; 64 * 1024];
-        while stream.read(&mut buffer).expect("tcp upload") != 0 {}
+        loop {
+            let read = stream.read(&mut buffer).expect("tcp upload");
+            if read == 0 {
+                break;
+            }
+            meter.record(read, Instant::now());
+        }
+        write_upload_summary(&mut stream, mode, duration, session, meter.finish());
     }
+}
+
+fn write_upload_summary(
+    stream: &mut TcpStream,
+    mode: u8,
+    duration: u16,
+    session: u64,
+    counters: aether::speedtest::TcpReceiveCounters,
+) {
+    let mut summary =
+        tcp_control(aether::speedtest::TCP_KIND_SUMMARY, mode, duration, session).to_vec();
+    summary.extend_from_slice(&counters.encode());
+    stream.write_all(&summary).expect("tcp summary");
+}
+
+/// Serves one upload stream, then reports `counters` whatever it received.
+fn serve_upload_reporting(
+    stream: TcpStream,
+    counters: Option<aether::speedtest::TcpReceiveCounters>,
+) {
+    serve_upload_reporting_after(stream, counters, Duration::ZERO)
+}
+
+/// As [`serve_upload_reporting`], holding the summary back for `delay`: the
+/// time a real gateway takes to read what Orion's send buffers still held.
+fn serve_upload_reporting_after(
+    mut stream: TcpStream,
+    counters: Option<aether::speedtest::TcpReceiveCounters>,
+    delay: Duration,
+) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("tcp timeout");
+    let mut hello = [0u8; aether::speedtest::TCP_CONTROL_BYTES];
+    stream.read_exact(&mut hello).expect("tcp hello");
+    let (_, mode, duration, session) = parse_tcp_control(&hello).expect("hello frame");
+    stream
+        .write_all(&tcp_control(
+            aether::speedtest::TCP_KIND_READY,
+            mode,
+            duration,
+            session,
+        ))
+        .expect("tcp ready");
+    let mut go = [0u8; aether::speedtest::TCP_CONTROL_BYTES];
+    stream.read_exact(&mut go).expect("tcp go");
+    let mut buffer = vec![0u8; 64 * 1024];
+    while stream.read(&mut buffer).expect("tcp upload") != 0 {}
+    std::thread::sleep(delay);
+    if let Some(counters) = counters {
+        write_upload_summary(&mut stream, mode, duration, session, counters);
+    }
+}
+
+/// While the gateway's count is awaited nothing more is sent, so a live rate
+/// would only sink. The screen keeps the last live frame; the one frame that
+/// closes the leg is the result's.
+#[test]
+fn no_live_upload_frame_is_emitted_while_the_summary_is_awaited() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("tcp listener");
+    let address = listener.local_addr().expect("tcp address");
+    let reported = aether::speedtest::TcpReceiveCounters {
+        total_bytes: 200_000,
+        measured_bytes: 125_000,
+        window: Duration::from_secs(1),
+    };
+    let server = std::thread::spawn(move || {
+        let mut handlers = Vec::new();
+        for _ in 0..aether::speedtest::SPEEDTEST_TCP_STREAMS {
+            let (stream, _) = listener.accept().expect("tcp connection");
+            handlers.push(std::thread::spawn(move || {
+                serve_upload_reporting_after(stream, Some(reported), Duration::from_millis(1_200))
+            }));
+        }
+        for handler in handlers {
+            handler.join().expect("tcp handler");
+        }
+    });
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&frames);
+    super::raw::measure_raw_tcp_with_progress_for_test(
+        address,
+        aether::speedtest::SPEEDTEST_MODE_UPLOAD,
+        1,
+        Arc::new(move |update| captured.lock().unwrap().push(update)),
+    )
+    .expect("upload measured");
+    server.join().expect("tcp server");
+    let frames = frames.lock().unwrap();
+    let (last, live) = frames.split_last().expect("progress frames");
+    assert!(
+        (last.current_mbps - 4.0).abs() < 1e-9,
+        "{}",
+        last.current_mbps
+    );
+    assert!(
+        live.iter().all(|frame| frame.fraction < 1.0),
+        "a live frame was emitted past the leg: {live:?}"
+    );
+}
+
+/// The upload figure is the gateway's, not what Orion queued: a sender's count
+/// includes its send buffer, and read as a faster path than the one measured.
+#[test]
+fn the_upload_rate_is_the_one_the_gateway_received() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("tcp listener");
+    let address = listener.local_addr().expect("tcp address");
+    // 1 Mb over one second per stream: 4 Mb/s whatever loopback carried.
+    let reported = aether::speedtest::TcpReceiveCounters {
+        total_bytes: 200_000,
+        measured_bytes: 125_000,
+        window: Duration::from_secs(1),
+    };
+    let server = std::thread::spawn(move || {
+        let mut handlers = Vec::new();
+        for _ in 0..aether::speedtest::SPEEDTEST_TCP_STREAMS {
+            let (stream, _) = listener.accept().expect("tcp connection");
+            handlers.push(std::thread::spawn(move || {
+                serve_upload_reporting(stream, Some(reported))
+            }));
+        }
+        for handler in handlers {
+            handler.join().expect("tcp handler");
+        }
+    });
+    let measurement =
+        super::raw::measure_raw_tcp_for_test(address, aether::speedtest::SPEEDTEST_MODE_UPLOAD, 1)
+            .expect("upload measured");
+    server.join().expect("tcp server");
+    assert!(
+        (measurement.mbps - 4.0).abs() < 1e-9,
+        "{}",
+        measurement.mbps
+    );
+    assert_eq!(
+        measurement.bytes,
+        200_000 * aether::speedtest::SPEEDTEST_TCP_STREAMS as u64
+    );
+}
+
+/// Without the gateway's count there is no upload figure: falling back to the
+/// bytes queued locally would bring back the overestimate silently.
+#[test]
+fn an_upload_without_the_gateway_summary_is_an_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("tcp listener");
+    let address = listener.local_addr().expect("tcp address");
+    let server = std::thread::spawn(move || {
+        let mut handlers = Vec::new();
+        for _ in 0..aether::speedtest::SPEEDTEST_TCP_STREAMS {
+            let (stream, _) = listener.accept().expect("tcp connection");
+            handlers.push(std::thread::spawn(move || {
+                serve_upload_reporting(stream, None)
+            }));
+        }
+        for handler in handlers {
+            handler.join().expect("tcp handler");
+        }
+    });
+    let error =
+        super::raw::measure_raw_tcp_for_test(address, aether::speedtest::SPEEDTEST_MODE_UPLOAD, 1)
+            .expect_err("no summary, no figure");
+    server.join().expect("tcp server");
+    assert!(
+        matches!(&error, SpeedTestError::Transport(detail) if detail.contains("décompte")),
+        "{error:?}"
+    );
 }
 
 async fn serve_one_request(mut stream: tokio::net::TcpStream, paths: Arc<Mutex<Vec<String>>>) {

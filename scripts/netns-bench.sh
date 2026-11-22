@@ -11,7 +11,8 @@
 # WireGuard interface. `cl` is a plain kernel WireGuard peer driven by `wg`,
 # admitted through the local administration socket with the production CLI.
 #
-#   bash scripts/netns-bench.sh     # build, run every scenario, tear down
+#   bash scripts/netns-bench.sh                # build, run every scenario, tear down
+#   bash scripts/netns-bench.sh --throughput   # plus Orion's speedtest against iperf3
 #
 # The namespaces live as long as the unshare process: nothing survives the run.
 # On failure the working directory (daemon log, ruleset) is kept and printed.
@@ -29,6 +30,7 @@ REPO="$PWD"
 for arg in "$@"; do
     case "$arg" in
         --inner) ;;
+        --throughput) export HELIOS_BENCH_THROUGHPUT=1 ;;
         *) echo "argument inconnu : $arg" >&2; exit 2 ;;
     esac
 done
@@ -40,13 +42,20 @@ if [ "${1:-}" != "--inner" ]; then
     source scripts/cargo-budget.sh
     helios_budget_enter "$PWD"
 
-    for tool in ip wg nft unshare ping python3 curl; do
+    tools=(ip wg nft unshare ping python3 curl)
+    [ -n "${HELIOS_BENCH_THROUGHPUT:-}" ] && tools+=(iperf3)
+    for tool in "${tools[@]}"; do
         command -v "$tool" > /dev/null || { echo "outil absent : $tool" >&2; exit 2; }
     done
 
     echo "==> Construction (heliosd netlink + wireguard, helios)"
     cargo build --quiet -p heliosd --features netlink,wireguard -p helios
+    if [ -n "${HELIOS_BENCH_THROUGHPUT:-}" ]; then
+        echo "==> Construction (speedtest brut d'Orion)"
+        cargo build --quiet -p orion-core --example raw_speedtest
+    fi
     BIN="${CARGO_TARGET_DIR:-$REPO/target}/debug"
+    export HELIOS_BENCH_SPEEDTEST="$BIN/examples/raw_speedtest"
 
     TMP="$(mktemp -d)"
     export HELIOS_BENCH_BIN="$BIN" HELIOS_BENCH_TMP="$TMP"
@@ -99,8 +108,10 @@ in_net() { ip netns exec net "$@"; }
 
 DAEMON_PID=""
 SERVER_PID=""
+IPERF_PID=""
 teardown() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
+    [ -n "$IPERF_PID" ] && kill "$IPERF_PID" 2>/dev/null || true
     if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
         kill "$DAEMON_PID" 2>/dev/null || true
         wait "$DAEMON_PID" 2>/dev/null || true
@@ -177,6 +188,7 @@ wg_address = "100.64.0.1/10"
 wg_address_v6 = "$ULA_PREFIX::1/64"
 wg_listen_port = $PORT
 allow_client_internet = true
+${HELIOS_BENCH_THROUGHPUT:+iperf_port = 5202}
 
 [[peers]]
 name = "bench"
@@ -344,6 +356,39 @@ check "§12.14 anti-spoofing : source hors AllowedIPs jetée par WireGuard" spoo
 
 check "§12.8 ND : voisin IPv6 du WAN résolu sous politique drop" \
     sh -c "ip netns exec gw ping -6 -c1 -W2 2001:db8:1::254 > /dev/null; ip netns exec gw ip -6 neigh show dev wan0 | grep -q 2001:db8:1::254"
+
+if [ -n "${HELIOS_BENCH_THROUGHPUT:-}" ]; then
+    echo "==> Débit : speedtest d'Orion contre iperf3 (kernel WireGuard, veth)"
+    # iperf3 is the reference that shares no code with the speedtest. Both
+    # count received bytes over four streams with TCP's warm-up left out:
+    # `-O 2 -t 8` is the speedtest's 10-second leg minus its 2-second warm-up.
+    # Sequential, never concurrent: on veth both are CPU-bound, and running
+    # them together would measure how they share the processor.
+    ip netns exec gw iperf3 --server --port 5202 --bind 100.64.0.1 > "$TMP/iperf3.server.log" 2>&1 &
+    IPERF_PID=$!
+    sleep 1
+    in_cl iperf3 -c 100.64.0.1 -p 5202 -P 4 -O 2 -t 8 -J > "$TMP/iperf3.up.json" || true
+    in_cl iperf3 -c 100.64.0.1 -p 5202 -P 4 -O 2 -t 8 -J -R > "$TMP/iperf3.down.json" || true
+    kill "$IPERF_PID" 2> /dev/null || true
+    IPERF_PID=""
+    in_cl "$HELIOS_BENCH_SPEEDTEST" tcp 10 > "$TMP/speedtest.json" 2> "$TMP/speedtest.log" || true
+    # Same path, same counting: beyond this gap one of the two measures
+    # something else. Wide enough for the noise of a shared CPU.
+    within_tolerance() {
+        python3 - "$TMP/iperf3.$1.json" "$TMP/speedtest.json" "$2" "$TMP/throughput.txt" <<'PY'
+import json, sys
+iperf = json.load(open(sys.argv[1]))["end"]["sum_received"]["bits_per_second"] / 1e6
+speedtest = json.load(open(sys.argv[2]))[sys.argv[3]]
+gap = abs(speedtest - iperf) / iperf
+with open(sys.argv[4], "a") as out:
+    print(f"      {sys.argv[3]} : iperf3 {iperf:.0f} Mb/s, speedtest {speedtest:.0f} Mb/s, écart {gap:.0%}", file=out)
+sys.exit(0 if gap <= 0.15 else 1)
+PY
+    }
+    check "débit montant : speedtest à ±15 % d'iperf3" within_tolerance up tcp_upload_mbps
+    check "débit descendant : speedtest à ±15 % d'iperf3" within_tolerance down tcp_download_mbps
+    cat "$TMP/throughput.txt" 2> /dev/null || echo "      mesures illisibles : $TMP/speedtest.log, $TMP/iperf3.*.json"
+fi
 
 echo "==> Endpoint IPv6 (§12.10)"
 bring_up_client "[$GW_V6]:$PORT"
