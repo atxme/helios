@@ -55,6 +55,8 @@ enum Command {
         #[arg(long, value_parser = positive_u64)]
         version: u64,
         #[arg(long, value_parser = parse_digest)]
+        sealed_blob_anchor: [u8; 32],
+        #[arg(long, value_parser = parse_digest)]
         expected_pcr_digest: Option<[u8; 32]>,
         #[arg(long)]
         ed25519_private_key: PathBuf,
@@ -167,6 +169,7 @@ fn main() -> Result<()> {
         Command::ResealTicket {
             key_epoch,
             version,
+            sealed_blob_anchor,
             expected_pcr_digest,
             ed25519_private_key,
             ml_dsa_65_private_key,
@@ -175,6 +178,7 @@ fn main() -> Result<()> {
         } => sign_reseal_ticket(
             key_epoch,
             version,
+            sealed_blob_anchor,
             expected_pcr_digest,
             &ed25519_private_key,
             &ml_dsa_65_private_key,
@@ -343,6 +347,7 @@ fn keygen(key_epoch: u32, output_dir: &Path) -> Result<()> {
 fn sign_reseal_ticket(
     key_epoch: u32,
     version: u64,
+    sealed_blob_anchor: [u8; 32],
     expected_pcr_digest: Option<[u8; 32]>,
     ed25519_path: &Path,
     ml_dsa_65_path: &Path,
@@ -376,7 +381,8 @@ fn sign_reseal_ticket(
 
     let ticket = signer
         .sign(ResealPayload {
-            version,
+            counter: version,
+            sealed_blob_anchor,
             expected_pcr_digest,
         })
         .context("hybrid signature of the ticket")?;

@@ -43,6 +43,8 @@ fn full_cycle_produces_a_hybrid_ticket_and_refuses_any_overwrite() {
     let sign = publisher()
         .args([
             "reseal-ticket",
+            "--sealed-blob-anchor",
+            "0000000000000000000000000000000000000000000000000000000000000000",
             "--key-epoch",
             "9",
             "--version",
@@ -66,7 +68,7 @@ fn full_cycle_produces_a_hybrid_ticket_and_refuses_any_overwrite() {
 
     let json: serde_json::Value = serde_json::from_slice(&fs::read(&ticket).unwrap()).unwrap();
     assert_eq!(json["key_epoch"], 9);
-    assert_eq!(json["payload"]["version"], 42);
+    assert_eq!(json["payload"]["counter"], 42);
     assert!(json["payload"]["expected_pcr_digest"].is_null());
     let algorithms: HashSet<_> = json["signatures"]
         .as_array()
@@ -80,6 +82,8 @@ fn full_cycle_produces_a_hybrid_ticket_and_refuses_any_overwrite() {
     let overwrite_ticket = publisher()
         .args([
             "reseal-ticket",
+            "--sealed-blob-anchor",
+            "0000000000000000000000000000000000000000000000000000000000000000",
             "--key-epoch",
             "9",
             "--version",
@@ -117,6 +121,8 @@ fn security_arguments_reject_zero_and_malformed_pcr_digest() {
     let malformed = publisher()
         .args([
             "reseal-ticket",
+            "--sealed-blob-anchor",
+            "0000000000000000000000000000000000000000000000000000000000000000",
             "--key-epoch",
             "1",
             "--version",
@@ -217,7 +223,7 @@ fn firmware_recovery_command_signs_the_exact_public_request_and_refuses_overwrit
     let request_path = root.path().join("request.json");
     let output = root.path().join("authorization.json");
     let request = FirmwareRecoveryPayload {
-        version: 4,
+        counter: 4,
         sealed_blob_anchor: [1; 32],
         secret_commitment: [2; 32],
         device_id: "5bc922b7bd1adb5b6f99592611404036bd9f42d0".into(),

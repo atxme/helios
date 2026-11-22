@@ -113,7 +113,7 @@ fn export_with(
         .checked_add(1)
         .ok_or_else(|| refused("anti-replay counter exhausted"))?;
     let request = FirmwareRecoveryPayload {
-        version,
+        counter: version,
         sealed_blob_anchor: anchor,
         secret_commitment: commitment(&anchor, root.as_bytes()),
         device_id,
@@ -166,9 +166,9 @@ fn check_anchor_and_version(
     request: &FirmwareRecoveryPayload,
 ) -> Result<()> {
     let current = store.load_state()?.version;
-    if request.version <= current {
+    if request.counter <= current {
         return Err(TpmError::TicketRollback {
-            ticket: request.version,
+            ticket: request.counter,
             current,
         });
     }
@@ -237,7 +237,7 @@ fn restore_with(
     check_secret(&authorization.payload, verified.as_bytes())?;
     provisioning::disarm_window(tpm, store)?;
     let mut state = store.load_state()?;
-    state.version = authorization.payload.version;
+    state.version = authorization.payload.counter;
     // Counter first: interruption between these writes consumes authorization,
     // rather than permitting replay. Recovery then requires a newer signed
     // authorization; the encrypted backup still contains the original root.

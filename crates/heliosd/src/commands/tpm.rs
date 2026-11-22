@@ -297,7 +297,7 @@ mod tests {
         }
         let auth = aether::sig::SignedFirmwareRecovery {
             payload: aether::sig::FirmwareRecoveryPayload {
-                version: 1,
+                counter: 1,
                 sealed_blob_anchor: [1; 32],
                 secret_commitment: [2; 32],
                 device_id: "5bc922b7bd1adb5b6f99592611404036bd9f42d0".into(),

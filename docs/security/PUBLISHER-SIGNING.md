@@ -39,6 +39,7 @@ aucune sécurité.
 
 ```sh
 cargo run -p helios-publisher -- reseal-ticket \
+  --sealed-blob-anchor "SHA256_HEX_DU_BLOB" \
   --key-epoch 1 \
   --version 42 \
   --ed25519-private-key /chemin/hors-ligne/helios-publisher-epoch-1/ed25519-private.pk8 \

@@ -263,7 +263,12 @@ pub fn signing_bytes<P: ArtifactPayload>(payload: &P, key_epoch: u32) -> Vec<u8>
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResealPayload {
-    pub version: u64,
+    pub counter: u64,
+    #[serde(
+        serialize_with = "serialize_digest",
+        deserialize_with = "deserialize_digest"
+    )]
+    pub sealed_blob_anchor: [u8; 32],
     #[serde(
         default,
         serialize_with = "serialize_optional_digest",
@@ -273,11 +278,12 @@ pub struct ResealPayload {
 }
 
 impl ArtifactPayload for ResealPayload {
-    const DOMAIN: &'static [u8] = b"helios-tpm-reseal-v2";
-    const FORMAT_VERSION: u32 = 2;
+    const DOMAIN: &'static [u8] = b"helios-tpm-reseal-v3";
+    const FORMAT_VERSION: u32 = 3;
 
     fn encode_canonical(&self, output: &mut Vec<u8>) {
-        output.extend_from_slice(&self.version.to_be_bytes());
+        output.extend_from_slice(&self.counter.to_be_bytes());
+        output.extend_from_slice(&self.sealed_blob_anchor);
         match self.expected_pcr_digest {
             Some(digest) => {
                 output.push(1);
@@ -295,7 +301,7 @@ pub type SignedResealTicket = SignedEnvelope<ResealPayload>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FirmwareRecoveryPayload {
-    pub version: u64,
+    pub counter: u64,
     #[serde(
         serialize_with = "serialize_digest",
         deserialize_with = "deserialize_digest"
@@ -312,9 +318,6 @@ pub struct FirmwareRecoveryPayload {
 
 impl FirmwareRecoveryPayload {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.version == 0 {
-            return Err("firmware recovery version must be positive");
-        }
         if self.device_id.len() != 40 || !self.device_id.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("invalid firmware device identifier");
         }
@@ -333,11 +336,11 @@ impl FirmwareRecoveryPayload {
 }
 
 impl ArtifactPayload for FirmwareRecoveryPayload {
-    const DOMAIN: &'static [u8] = b"helios-firmware-recovery-v1";
-    const FORMAT_VERSION: u32 = 1;
+    const DOMAIN: &'static [u8] = b"helios-firmware-recovery-v2";
+    const FORMAT_VERSION: u32 = 2;
 
     fn encode_canonical(&self, output: &mut Vec<u8>) {
-        output.extend_from_slice(&self.version.to_be_bytes());
+        output.extend_from_slice(&self.counter.to_be_bytes());
         output.extend_from_slice(&self.sealed_blob_anchor);
         output.extend_from_slice(&self.secret_commitment);
         encode_string(output, &self.device_id);
@@ -346,6 +349,74 @@ impl ArtifactPayload for FirmwareRecoveryPayload {
 }
 
 pub type SignedFirmwareRecovery = SignedEnvelope<FirmwareRecoveryPayload>;
+
+/// Authorizes the restoration of the WireGuard gateway key sealed in
+/// `wg-key.sealed`: the publisher vouches for the public half, and only the
+/// holder of the matching private key can use the file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireGuardRecoveryPayload {
+    pub counter: u64,
+    #[serde(
+        serialize_with = "serialize_base64_key",
+        deserialize_with = "deserialize_base64_key"
+    )]
+    pub gateway_public_key: [u8; 32],
+    #[serde(
+        default,
+        serialize_with = "serialize_optional_digest",
+        deserialize_with = "deserialize_optional_digest"
+    )]
+    pub expected_pcr_digest: Option<[u8; 32]>,
+}
+
+impl ArtifactPayload for WireGuardRecoveryPayload {
+    const DOMAIN: &'static [u8] = b"helios-wg-recovery-v1";
+    const FORMAT_VERSION: u32 = 1;
+
+    fn encode_canonical(&self, output: &mut Vec<u8>) {
+        output.extend_from_slice(&self.counter.to_be_bytes());
+        output.extend_from_slice(&self.gateway_public_key);
+        match self.expected_pcr_digest {
+            Some(digest) => {
+                output.push(1);
+                output.extend_from_slice(&digest);
+            }
+            None => output.push(0),
+        }
+    }
+}
+
+pub type SignedWireGuardRecovery = SignedEnvelope<WireGuardRecoveryPayload>;
+
+/// Rejection of a WireGuard recovery file.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WireGuardRecoveryError {
+    #[error("recovery signature rejected: {0}")]
+    Signature(SignatureError),
+    #[error("recovery key does not match the authorized gateway public key")]
+    ForeignKey,
+}
+
+/// Verifies the hybrid signatures, then binds the file to the private key
+/// at hand: the X25519 public key derived from `private_key` must be the
+/// one the publisher signed.
+pub fn verify_wireguard_recovery(
+    envelope: &SignedWireGuardRecovery,
+    keyring: &[PublisherPublicKeys],
+    private_key: &[u8; 32],
+) -> Result<(), WireGuardRecoveryError> {
+    envelope
+        .verify(keyring)
+        .map_err(WireGuardRecoveryError::Signature)?;
+    let private_key = zeroize::Zeroizing::new(*private_key);
+    let secret = x25519_dalek::StaticSecret::from(*private_key);
+    let public = x25519_dalek::PublicKey::from(&secret);
+    if public.as_bytes() != &envelope.payload.gateway_public_key {
+        return Err(WireGuardRecoveryError::ForeignKey);
+    }
+    Ok(())
+}
 
 /// Signed metadata of a distributable `heliosd` binary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -542,6 +613,25 @@ where
         .ok()
         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
         .ok_or_else(|| serde::de::Error::custom("invalid SHA-256 hex"))
+}
+
+fn serialize_base64_key<S>(key: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&STANDARD.encode(key))
+}
+
+fn deserialize_base64_key<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let encoded = String::deserialize(deserializer)?;
+    STANDARD
+        .decode(encoded)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(|| serde::de::Error::custom("invalid WireGuard key base64"))
 }
 
 fn serialize_optional_digest<S>(digest: &Option<[u8; 32]>, serializer: S) -> Result<S::Ok, S::Error>

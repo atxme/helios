@@ -386,7 +386,8 @@ mod tests {
         let signer = PublisherSigner::from_seed_material(1, &DEV_ED_SEED, &DEV_ML_SEED).unwrap();
         let ticket = signer
             .sign(ResealPayload {
-                version,
+                counter: version,
+                sealed_blob_anchor: [0; 32],
                 expected_pcr_digest,
             })
             .unwrap();

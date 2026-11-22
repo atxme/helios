@@ -690,12 +690,12 @@ fn maintain<G: Gateway>(
         // A counter-first interrupted restore can need a newer authorization;
         // its root, device and version context must remain exactly identical.
         let mut expected = backup.request.clone();
-        expected.version = auth.payload.version;
+        expected.counter = auth.payload.counter;
         anyhow::ensure!(
-            auth.payload == expected && auth.payload.version >= backup.request.version,
+            auth.payload == expected && auth.payload.counter >= backup.request.counter,
             "authorization differs from the prepared backup"
         );
-        backup.request.version = auth.payload.version;
+        backup.request.counter = auth.payload.counter;
         let recovered = recover(
             backup,
             private_path.context("TPM recovery requires --private-key on this workstation")?,
@@ -1277,7 +1277,7 @@ mod tests {
         let gateway = FakeGateway::new(sealed);
         let backup = sealed.then(|| FirmwareBackup {
             request: aether::sig::FirmwareRecoveryPayload {
-                version: 1,
+                counter: 1,
                 sealed_blob_anchor: [1; 32],
                 secret_commitment: [2; 32],
                 device_id: ID.into(),
@@ -1954,7 +1954,7 @@ esac
 
             let backup = FirmwareBackup {
                 request: aether::sig::FirmwareRecoveryPayload {
-                    version: 1,
+                    counter: 1,
                     sealed_blob_anchor: [1; 32],
                     secret_commitment: [2; 32],
                     device_id: ID.into(),

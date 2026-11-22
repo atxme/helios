@@ -18,7 +18,7 @@ impl ResealTicket {
     }
 
     pub(crate) const fn version(&self) -> u64 {
-        self.envelope.payload.version
+        self.envelope.payload.counter
     }
 
     /// Verifies the hybrid AND, the signed epoch, anti-replay, then the optional PCR binding.
@@ -46,9 +46,9 @@ impl ResealTicket {
             .map_err(|_| TpmError::TicketInvalidSignature)?;
 
         let payload = &self.envelope.payload;
-        if payload.version <= current_version {
+        if payload.counter <= current_version {
             return Err(TpmError::TicketRollback {
-                ticket: payload.version,
+                ticket: payload.counter,
                 current: current_version,
             });
         }
@@ -78,7 +78,8 @@ mod tests {
         let public_keys = signer.public_keys();
         let envelope = signer
             .sign(ResealPayload {
-                version,
+                counter: version,
+                sealed_blob_anchor: [0; 32],
                 expected_pcr_digest,
             })
             .unwrap();
