@@ -38,6 +38,7 @@
 //! Without escrow configured (`escrow_public_key` absent), the key is
 //! permanently lost in this case and recovery becomes manual again.
 
+use std::io::Read;
 use std::path::PathBuf;
 
 use aether::{NetworkConfig, SecretString};
@@ -45,7 +46,6 @@ use helios_escrow::recovery::{decode_recovery_frame, MAX_RECOVERY_FRAME};
 use helios_tpm::{
     anti_rollback, wg_recovery, BootDecision, KeystoreError, SealedKeystore, TpmError, TpmSettings,
 };
-use std::io::Read;
 use tracing::{error, info, warn};
 use zeroize::Zeroizing;
 
@@ -273,6 +273,7 @@ fn try_recovery(secret: &helios_tpm::SecretKey, tpm: &TpmSettings) -> Option<Sec
         }
     };
     // Every refusal happens before the counter is spent: the file stays.
+    // `resolve` runs once at startup, so callers are serialised, as `consume` requires.
     if let Err(e) = wg_recovery::accept(tpm, &authorization, &key) {
         warn!("recovery file refused ({e}) — left in place, the identity is not restored");
         return None;
@@ -1316,8 +1317,9 @@ mod tests {
         );
     }
 
-    /// Without a locked vault the recovery file is never read: no consumption,
-    /// no counter movement.
+    /// The recovery file is never read while the vault opens, and without a
+    /// vault the recovery path is never reached: no consumption, no counter
+    /// movement, in either case.
     #[test]
     fn a_recovery_file_without_a_locked_vault_is_not_consumed_or_used() {
         if run_isolated_identity_scenario(
@@ -1327,19 +1329,94 @@ mod tests {
         }
         let dir = identity_dir();
         let tpm = tpm_in(&dir);
-        let _ = boot_secret(&tpm);
+        let current = boot_secret(&tpm);
         let counter = anti_rollback::current(&tpm).expect("counter");
         let (private_key, public_key) = keypair();
         let recovery = PathBuf::from(recovery_path());
         let frame = frame_of(&signed_recovery(counter, &public_key), &private_key);
         std::fs::write(&recovery, &frame).expect("operator recovery file");
 
+        // No vault at all.
         let resolved = resolve(&NetworkConfig::default(), &BootDecision::Disabled, &tpm);
-
         assert_eq!(resolved.origin, KeyOrigin::Missing);
         assert!(resolved.private_key.is_empty());
         assert_eq!(std::fs::read(&recovery).expect("file"), frame);
         assert_eq!(anti_rollback::current(&tpm).expect("counter"), counter);
+
+        // A vault that opens under the current secret: the file is never read.
+        seal_vault(&current, &private_key);
+        let resolved = resolve(
+            &NetworkConfig::default(),
+            &BootDecision::Unsealed(current),
+            &tpm,
+        );
+        assert_eq!(resolved.origin, KeyOrigin::Sealed);
+        assert_eq!(resolved.private_key.expose(), private_key.as_str());
+        assert_eq!(std::fs::read(&recovery).expect("file"), frame);
+        assert_eq!(anti_rollback::current(&tpm).expect("counter"), counter);
+    }
+
+    /// A reseal that fails after the counter was spent: the recovery file
+    /// stays, the counter has moved, and a replay of the same file is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_reseal_failure_after_an_accepted_recovery_burns_it() {
+        if run_isolated_identity_scenario("a_reseal_failure_after_an_accepted_recovery_burns_it") {
+            return;
+        }
+        let dir = identity_dir();
+        let tpm = tpm_in(&dir);
+        let (private_key, public_key, current) = lost_vault(&dir);
+        // The vault path becomes a symbolic link to the old vault. It still
+        // opens under the previous secret, while the atomic write refuses a
+        // symbolic link at its destination: the reseal fails without root.
+        let vault = dir.join("wg-key.sealed");
+        let old = dir.join("previous-vault.sealed");
+        std::fs::rename(&vault, &old).expect("move the old vault");
+        std::os::unix::fs::symlink(&old, &vault).expect("symbolic link");
+        let context = identity_context(&private_key).expect("context");
+        assert!(
+            keystore()
+                .store(&current, &context, private_key.as_bytes())
+                .is_err(),
+            "the reseal must fail for this scenario to mean anything"
+        );
+
+        let counter = anti_rollback::current(&tpm).expect("counter");
+        let recovery = PathBuf::from(recovery_path());
+        let frame = frame_of(&signed_recovery(counter, &public_key), &private_key);
+        std::fs::write(&recovery, &frame).expect("operator recovery file");
+
+        let first = resolve(
+            &NetworkConfig::default(),
+            &BootDecision::Unsealed(current.clone()),
+            &tpm,
+        );
+        assert_eq!(first.origin, KeyOrigin::Missing);
+        assert!(first.private_key.is_empty());
+        assert_eq!(
+            std::fs::read(&recovery).expect("file"),
+            frame,
+            "the file stays"
+        );
+        assert_eq!(
+            anti_rollback::current(&tpm).expect("counter"),
+            counter + 1,
+            "the counter is spent"
+        );
+
+        let replay = resolve(
+            &NetworkConfig::default(),
+            &BootDecision::Unsealed(current),
+            &tpm,
+        );
+        assert_eq!(replay.origin, KeyOrigin::Missing, "the replay is refused");
+        assert!(replay.private_key.is_empty(), "no key is adopted");
+        assert_eq!(
+            anti_rollback::current(&tpm).expect("counter"),
+            counter + 1,
+            "the replay does not advance the counter again"
+        );
     }
 
     /// Rotation spends a counter value, so an authorization issued before it
