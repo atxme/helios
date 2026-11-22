@@ -126,6 +126,9 @@ pub struct EngineService {
     /// with the connection so reconnecting cannot leave stale tasks racing a
     /// newer profile.
     certificate_renewal_task: Arc<StdMutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// The read of the gateway's DNS proposal, started once per connection.
+    /// Cancelled with the connection, like the renewal timer above.
+    gateway_dns_task: Arc<StdMutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Recoveries of expired identities in progress (§7.5).
     ///
     /// A separate map, for the same reason Astra keeps a separate store: a
@@ -356,6 +359,7 @@ impl EngineService {
             last_certificate_error: Arc::new(Mutex::new(std::collections::HashMap::new())),
             renewals: Arc::new(Mutex::new(std::collections::HashMap::new())),
             certificate_renewal_task: Arc::new(StdMutex::new(None)),
+            gateway_dns_task: Arc::new(StdMutex::new(None)),
             recoveries: Arc::new(Mutex::new(std::collections::HashMap::new())),
             app_version,
             passphrases,

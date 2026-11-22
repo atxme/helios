@@ -176,9 +176,26 @@ admin_iface = "helios0"
 #   sysctl -w net.ipv4.ip_forward=1     # à rendre permanent dans /etc/sysctl.d/
 #   AllowedIPs = 0.0.0.0/0              # côté client, sinon il ne route rien
 #
-# Limite : le DNS n'est PAS tunnelé. Le client garde son résolveur, donc ses
-# requêtes sortent hors du tunnel et révèlent les noms consultés.
 # allow_client_internet = true
+
+# ── Résolveur proposé aux postes (client_dns) ────────────────────────────────
+# Ce que la gateway propose à chaque poste pour résoudre les noms par le
+# tunnel. Lu par Orion à chaque connexion : changer cette ligne atteint tout le
+# parc sans réémettre de profil. Sans cette clé, le défaut est DNS4EU non
+# filtré (86.54.11.100 et 86.54.11.200).
+#
+# Trois sens :
+#   absente          : DNS4EU non filtré (le défaut)
+#   client_dns = ["203.0.113.53"]   : cette liste, de 1 à 3 adresses (exemple)
+#   client_dns = []                 : rien proposé ; le poste garde son DNS local
+#
+# Adresses IPv4 publiques seulement, sans doublon. Une adresse privée, CGNAT,
+# de bouclage ou une IPv6 fait refuser le chargement de network.toml : elle
+# n'est jamais corrigée en silence.
+#
+# Une liste vide ou `allow_client_internet = false` ne propose rien : le
+# résolveur ne serait pas joignable par le tunnel.
+# client_dns = ["86.54.11.100", "86.54.11.200"]
 
 # ── Sortie propre de la gateway ──────────────────────────────────────────────
 # Fermé par défaut, comme tout le reste — mais c'est celui dont l'absence se

@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Mutex;
 
 use super::*;
 
@@ -476,5 +478,90 @@ fn a_family_fallback_is_a_named_warning() {
             "endpoint gateway.example:51821 : IPv4 {V4} retenu après IPv6 {V6} sans réponse, \
              tentative annulée"
         )
+    );
+}
+
+/// A lookup that succeeds is stored and returned, in candidate order.
+#[test]
+fn a_successful_lookup_is_remembered_and_returned() {
+    let cache = Mutex::new(HashMap::new());
+    let resolved = remember_or_recall(
+        &cache,
+        "gateway.example:51821",
+        Ok(addrs(&["203.0.113.10:51821", "203.0.113.11:51821"])),
+    )
+    .unwrap();
+    assert_eq!(
+        resolved,
+        addrs(&["203.0.113.10:51821", "203.0.113.11:51821"])
+    );
+    assert_eq!(
+        cache.lock().unwrap().get("gateway.example:51821"),
+        Some(&resolved)
+    );
+}
+
+/// A failed lookup for a host seen before returns the last addresses that
+/// resolved, not the error: the tunnel that is being repaired cannot resolve
+/// its own gateway name through itself.
+#[test]
+fn a_failed_lookup_recalls_the_last_known_addresses() {
+    let cache = Mutex::new(HashMap::new());
+    remember_or_recall(
+        &cache,
+        "gateway.example:51821",
+        Ok(addrs(&["203.0.113.10:51821"])),
+    )
+    .unwrap();
+    let recalled = remember_or_recall(
+        &cache,
+        "gateway.example:51821",
+        Err(anyhow::anyhow!("resolving gateway.example:51821")),
+    )
+    .unwrap();
+    assert_eq!(recalled, addrs(&["203.0.113.10:51821"]));
+}
+
+/// A failed lookup with nothing remembered keeps its error.
+#[test]
+fn a_failed_lookup_without_memory_keeps_the_error() {
+    let cache = Mutex::new(HashMap::new());
+    let error = remember_or_recall(
+        &cache,
+        "gateway.example:51821",
+        Err(anyhow::anyhow!("resolving gateway.example:51821")),
+    )
+    .unwrap_err();
+    assert_eq!(format!("{error:#}"), "resolving gateway.example:51821");
+    assert!(cache.lock().unwrap().is_empty());
+}
+
+/// An empty answer is a failed lookup too: it recalls the remembered
+/// addresses instead of replacing them with nothing.
+#[test]
+fn an_empty_lookup_recalls_the_last_known_addresses() {
+    let cache = Mutex::new(HashMap::new());
+    remember_or_recall(
+        &cache,
+        "gateway.example:51821",
+        Ok(addrs(&["203.0.113.10:51821"])),
+    )
+    .unwrap();
+    let recalled = remember_or_recall(&cache, "gateway.example:51821", Ok(Vec::new())).unwrap();
+    assert_eq!(recalled, addrs(&["203.0.113.10:51821"]));
+    assert_eq!(
+        cache.lock().unwrap().get("gateway.example:51821"),
+        Some(&addrs(&["203.0.113.10:51821"]))
+    );
+}
+
+/// An empty answer with nothing remembered keeps today's wording.
+#[test]
+fn an_empty_lookup_without_memory_names_the_endpoint() {
+    let cache = Mutex::new(HashMap::new());
+    let error = remember_or_recall(&cache, "gateway.example:51821", Ok(Vec::new())).unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        "gateway.example:51821 resolved to no usable address"
     );
 }

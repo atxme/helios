@@ -507,3 +507,29 @@ fn secrets_masked_in_debug() {
     );
     assert!(!dump.contains("PSK_SECRET"), "the PSK leaks into logs");
 }
+
+/// The DNS choice is checked where the profile is validated: an empty list
+/// proposes nothing, which is not a choice, and a non-public resolver is
+/// refused rather than corrected.
+#[test]
+fn profile_validate_refuses_an_empty_or_private_dns() {
+    let mut profile = ClientProfile {
+        name: "poste".into(),
+        endpoint: "203.0.113.10:51820".into(),
+        private_key: "cHJpdmF0ZQ==".into(),
+        peer_public_key: "cHVibGlj".into(),
+        ..ClientProfile::default()
+    };
+    profile
+        .validate()
+        .expect("a complete profile without a DNS choice is valid");
+
+    profile.dns = Some(vec![]);
+    assert!(profile.validate().is_err(), "an empty DNS list is refused");
+
+    profile.dns = Some(vec![std::net::Ipv4Addr::new(10, 0, 0, 1)]);
+    assert!(profile.validate().is_err(), "a private resolver is refused");
+
+    profile.dns = Some(aether::client_dns::DEFAULT_CLIENT_DNS.to_vec());
+    profile.validate().expect("the default resolvers are valid");
+}

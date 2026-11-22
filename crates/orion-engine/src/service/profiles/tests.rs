@@ -36,6 +36,7 @@ fn draft(name: &str) -> ProfileDraft {
         clear_preshared_key: false,
         use_staged_psk: false,
         ssh_target: None,
+        dns: None,
         nomad: false,
     }
 }
@@ -302,4 +303,69 @@ fn a_static_psk_is_set_or_cleared_only_on_an_explicit_intent() {
             .preshared_key,
         None
     );
+}
+
+/// The resolver choice goes into the profile, reaches the view the screen
+/// reads back, and survives a reload from the view's JSON.
+#[test]
+fn a_draft_resolver_list_is_saved_and_read_back() {
+    let mut edit = draft("poste");
+    edit.dns = Some(vec!["1.1.1.1".parse().expect("ipv4")]);
+    let merged = merge_draft(edit, Some(&profile("poste")), None, None).expect("merge");
+    assert_eq!(
+        merged.dns.as_deref(),
+        Some(&["1.1.1.1".parse().expect("ipv4")][..])
+    );
+
+    let json = serde_json::to_value(ProfileView::from(&merged)).expect("serialise");
+    assert_eq!(json["dns"], serde_json::json!(["1.1.1.1"]), "{json}");
+}
+
+/// The screen sends `dns` as a list of dotted quads; an absent one is no choice.
+#[test]
+fn a_payload_carries_the_resolvers_and_an_absent_one_is_none() {
+    let with: ProfileDraft = serde_json::from_value(serde_json::json!({
+        "name": "poste",
+        "endpoint": "203.0.113.10:51820",
+        "peer_public_key": "cHVibGlj",
+        "allowed_ips": "0.0.0.0/0",
+        "persistent_keepalive": 25,
+        "dns": ["86.54.11.100", "86.54.11.200"],
+    }))
+    .expect("payload with dns deserialises");
+    assert_eq!(with.dns.as_ref().map(Vec::len), Some(2));
+
+    let without: ProfileDraft = serde_json::from_value(serde_json::json!({
+        "name": "poste",
+        "endpoint": "203.0.113.10:51820",
+        "peer_public_key": "cHVibGlj",
+        "allowed_ips": "0.0.0.0/0",
+        "persistent_keepalive": 25,
+    }))
+    .expect("payload without dns deserialises");
+    assert_eq!(without.dns, None);
+    let merged = merge_draft(without, Some(&profile("poste")), None, None).expect("merge");
+    assert_eq!(merged.dns, None);
+}
+
+/// A refused list is reported on the `dns` field alone, and the profile
+/// validation that save runs refuses it by naming the DNS.
+#[test]
+fn a_refused_resolver_list_is_reported_on_the_dns_field() {
+    for (servers, reported) in [
+        (vec![], true),
+        (vec!["192.168.1.1".parse().expect("ipv4")], true),
+        (vec!["86.54.11.100".parse().expect("ipv4"); 2], true),
+        (vec!["86.54.11.100".parse().expect("ipv4")], false),
+    ] {
+        let mut edit = draft("poste");
+        edit.dns = Some(servers.clone());
+        let merged = merge_draft(edit, Some(&profile("poste")), None, None).expect("merge");
+        let issues = orion_core::inspect_profile(&merged);
+        assert_eq!(issues.dns.is_some(), reported, "{servers:?} -> {issues:?}");
+        if reported {
+            let refused = merged.validate().expect_err("save refuses it");
+            assert!(refused.to_string().contains("DNS"), "{refused}");
+        }
+    }
 }

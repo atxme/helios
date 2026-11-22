@@ -1,9 +1,20 @@
 //! The single-peer `wg-quick` format: what is applied, what is reported as
 //! not applied, and what is refused.
 
+use std::net::Ipv4Addr;
+
 use super::fixtures::{CLIENT_PRIVATE, GATEWAY_PUBLIC};
 use crate::profile_import::{complete_profile_import, parse_profile_import};
 use crate::ClientConfig;
+
+/// The entries a DNS notice names as not applied. The notice also echoes the
+/// whole `DNS =` line, so assertions on it must look at this segment only.
+fn refused_entries(notice: &str) -> &str {
+    let (_, rest) = notice
+        .split_once("non appliqué(s) par Orion : ")
+        .expect("la formule d'avis DNS");
+    rest.split_once(" — ").expect("la suite de l'avis").0
+}
 
 /// `wg-quick` has no notion of invitation: a file without `PrivateKey`
 /// is an incomplete file, and saying so early avoids a tunnel that never
@@ -74,10 +85,11 @@ fn an_ordinary_wireguard_file_imports_and_reports_what_is_not_applied() {
     let imported = parse_profile_import(&contents, "fournisseur.conf").expect("import");
     assert_eq!(imported.profile.endpoint, "host:51820");
     assert_eq!(imported.profile.address.as_deref(), Some("100.64.1.2/32"));
+    // `100.64.0.1` is CGNAT space, not a public resolver: the DNS notice
+    // leads, because notices are sorted and it is the first field read.
     assert_eq!(imported.notices.len(), 4);
-    // Sorted, so two imports of one file report the same thing in the same
-    // order.
     assert!(imported.notices[0].starts_with("DNS = 100.64.0.1"));
+    assert_eq!(imported.profile.dns, None);
     assert!(imported
         .notices
         .iter()
@@ -86,9 +98,91 @@ fn an_ordinary_wireguard_file_imports_and_reports_what_is_not_applied() {
         .notices
         .iter()
         .any(|notice| notice.contains("Table = off")));
-    // The DNS notice names the consequence, which is the documented limit
-    // the user has no other way to learn.
-    assert!(imported.notices[0].contains("hors du tunnel"));
+    // The DNS notice names the refused entry and the rule it broke.
+    assert_eq!(refused_entries(&imported.notices[0]), "100.64.0.1");
+    assert!(imported.notices[0].contains("seuls les résolveurs IPv4 publics"));
+}
+
+/// The `DNS =` line of a wg-quick file becomes the profile's resolvers, in
+/// the order written, with no notice about it.
+#[test]
+fn a_dns_line_becomes_the_profile_dns() {
+    let contents = format!(
+        "[Interface]\nPrivateKey={CLIENT_PRIVATE}\nAddress=100.64.1.2/32\nDNS = 86.54.11.100, 1.1.1.1\n\
+         [Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820"
+    );
+    let imported = parse_profile_import(&contents, "dns.conf").expect("import");
+    assert_eq!(
+        imported.profile.dns,
+        Some(vec![
+            Ipv4Addr::new(86, 54, 11, 100),
+            Ipv4Addr::new(1, 1, 1, 1)
+        ])
+    );
+    assert!(!imported.notices.iter().any(|notice| notice.contains("DNS")));
+}
+
+/// IPv4 entries are kept; the IPv6 literal and the search domain are named,
+/// not silently dropped.
+#[test]
+fn a_dns_line_keeps_ipv4_and_names_the_rest() {
+    let contents = format!(
+        "[Interface]\nPrivateKey={CLIENT_PRIVATE}\nAddress=100.64.1.2/32\nDNS = 1.1.1.1, 2606:4700::1111, corp.example\n\
+         [Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820"
+    );
+    let imported = parse_profile_import(&contents, "dns.conf").expect("import");
+    assert_eq!(imported.profile.dns, Some(vec![Ipv4Addr::new(1, 1, 1, 1)]));
+    let dns_notices: Vec<&String> = imported
+        .notices
+        .iter()
+        .filter(|notice| notice.starts_with("DNS ="))
+        .collect();
+    assert_eq!(dns_notices.len(), 1, "notices: {:?}", imported.notices);
+    assert_eq!(
+        refused_entries(dns_notices[0]),
+        "2606:4700::1111, corp.example"
+    );
+}
+
+/// Without a public IPv4 resolver there is nothing to apply: the profile
+/// keeps none, and the line is named.
+#[test]
+fn a_dns_line_without_ipv4_stays_a_notice() {
+    let contents = format!(
+        "[Interface]\nPrivateKey={CLIENT_PRIVATE}\nAddress=100.64.1.2/32\nDNS = 2606:4700::1111\n\
+         [Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820"
+    );
+    let imported = parse_profile_import(&contents, "dns.conf").expect("import");
+    assert_eq!(imported.profile.dns, None);
+    assert_eq!(imported.notices.len(), 1, "notices: {:?}", imported.notices);
+    assert_eq!(refused_entries(&imported.notices[0]), "2606:4700::1111");
+}
+
+/// Private and duplicate IPv4 entries, and a fourth resolver, are refused by
+/// the same rules as the gateway's list, and each one is named.
+#[test]
+fn a_dns_line_applies_the_resolver_rules_entry_by_entry() {
+    let contents = format!(
+        "[Interface]\nPrivateKey={CLIENT_PRIVATE}\nAddress=100.64.1.2/32\n\
+         DNS = 10.0.0.1, 1.1.1.1, 1.1.1.1, 8.8.8.8, 9.9.9.9, 4.4.4.4\n\
+         [Peer]\nPublicKey={GATEWAY_PUBLIC}\nEndpoint=host:51820"
+    );
+    let imported = parse_profile_import(&contents, "dns.conf").expect("import");
+    assert_eq!(
+        imported.profile.dns,
+        Some(vec![
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::new(8, 8, 8, 8),
+            Ipv4Addr::new(9, 9, 9, 9),
+        ])
+    );
+    let notice = imported
+        .notices
+        .iter()
+        .find(|notice| notice.starts_with("DNS ="))
+        .expect("un avis DNS");
+    // The first 1.1.1.1 is kept; only its duplicate is named.
+    assert_eq!(refused_entries(notice), "10.0.0.1, 1.1.1.1, 4.4.4.4");
 }
 
 /// The one class where refusing is right: a command the configuration

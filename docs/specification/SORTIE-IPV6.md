@@ -119,8 +119,13 @@ Si l'opérateur la retient (§6), elle doit respecter :
 ### 3.3 Hors de portée
 
 - L'option D (préfixe global routé, DHCPv6-PD, proxy NDP).
-- Le DNS des clients : il n'est toujours pas tunnelisé (limite connue
-  ADR-004 lot 5). Cette spécification n'aggrave ni n'améliore ce point.
+- Un résolveur IPv6 pour les clients. Depuis F7 (21 novembre 2026), le DNS
+  d'un poste passe par le tunnel, mais la passerelle ne propose que des
+  résolveurs IPv4 : les requêtes vers ce résolveur sont des paquets IPv4, que le
+  forward et le NAT IPv4 portent. Le relais IPv6 de §3 reste inchangé. Un
+  résolveur IPv6 du réseau local, que le système pourrait encore interroger, n'est
+  pas remplacé et reste hors de ce lot. Voir
+  [ADR-001, amendement « DNS des postes »](../adr/ADR-001-WIREGUARD.md).
 - L'IPv6 du LAN (site-à-site) : le forward LAN vers WAN reste sans garde de
   famille (étude §13) ; une décision séparée est nécessaire.
 

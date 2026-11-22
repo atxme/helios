@@ -30,11 +30,13 @@ import {
   Upload,
 } from 'lucide-react'
 import * as api from '../api'
+import { clientDnsError, parseClientDns } from '../clientDns'
 import { readProfileDocument } from '../profileDocument'
 import { CopyButton } from '../components/CopyButton'
 import { EnrollmentPanel } from './EnrollmentPanel'
 import { modeAllowed, modeLevel, modeMeta, PROTECTION_MODES } from '../components/state'
 import {
+  capturesAllIpv4,
   leavesIpv6Uncaptured,
   matchPreset,
   presetPrefixes,
@@ -158,6 +160,9 @@ function blankProfile(): ClientProfile {
     persistent_keepalive: 25,
     heliosd_url: null,
     ssh_target: null,
+    // Nothing written: a Helios profile asks its gateway, a classic one
+    // declares no resolver.
+    dns: null,
     // No negotiation by default: its material comes from the operator, and a
     // block full of empty certificates would report itself faulty from the
     // first render. Adding one is one click away in the block below.
@@ -382,6 +387,12 @@ export function ProfilesView({
    */
   const [manualPrefixes, setManualPrefixes] = useState(false)
   /**
+   * «Personnalisé» was chosen for the DNS of a Helios profile, and no list is
+   * typed yet. Without it an empty field would read as «Proposé par la
+   * passerelle», the choice the user just left.
+   */
+  const [manualDns, setManualDns] = useState(false)
+  /**
    * «PSK statique» was chosen, before any key has been entered.
    *
    * Same reason as {@link manualPrefixes}: the rung cannot be read back from
@@ -460,6 +471,7 @@ export function ProfilesView({
       persistent_keepalive: profile.persistent_keepalive,
       heliosd_url: profile.heliosd_url,
       ssh_target: profile.ssh_target,
+      dns: profile.dns,
       key_negotiation: profile.key_negotiation,
       useStagedKey: stagedPublicKey !== null,
       clearPresharedKey: clearPsk,
@@ -517,6 +529,7 @@ export function ProfilesView({
     // *this* profile. The next one is read again, and what it actually holds
     // is what must light up.
     setManualPrefixes(false)
+    setManualDns(false)
     setWantsStaticPsk(false)
     setNomadChoice(false)
     setPasting(false)
@@ -1097,7 +1110,21 @@ export function ProfilesView({
     dropStagedPskFor(null)
   }
 
-  const invalid = kindChanged || Object.values(issues).some(Boolean)
+  // A Helios profile's DNS is the gateway's unless the user names resolvers;
+  // a classic profile has no gateway to ask, so its list is just the field.
+  const heliosProfile = draftKind === 'helios_key_negotiation'
+  const customDns = !heliosProfile || manualDns || draft.dns !== null
+  // The screen's own judgement first, it is immediate; the engine's refusal
+  // (`issues.dns`) only arrives once typing has settled, and covers the list
+  // as the core would store it.
+  const dnsError = !customDns
+    ? null
+    : (clientDnsError(draft.dns) ??
+      (heliosProfile && draft.dns === null ? 'Saisir une à trois adresses IPv4 publiques' : null) ??
+      issues.dns ??
+      null)
+
+  const invalid = kindChanged || Object.values(issues).some(Boolean) || dnsError !== null
   // Read from the value, except when the user has asked to write it himself:
   // a preset that stayed lit after the list was edited would describe a
   // profile that no longer exists, and a list matching no preset is by
@@ -1114,7 +1141,11 @@ export function ProfilesView({
   // *not* one of those: split tunnelling is a decision, not a defect. IPv6
   // leaving in clear is — nobody chose it.
   const advancedFlagged = Boolean(
-    issues.allowed_ips || issues.persistent_keepalive || issues.ssh_target || ipv6Uncaptured,
+    issues.allowed_ips ||
+      issues.persistent_keepalive ||
+      issues.ssh_target ||
+      dnsError ||
+      ipv6Uncaptured,
   )
 
   /**
@@ -1851,6 +1882,57 @@ export function ProfilesView({
                   value={draft.ssh_target ?? ''}
                   onChange={(value) => set('ssh_target', value || null)}
                 />
+              </Box>
+              {/* The resolvers the tunnel sets. A Helios profile asks its
+                  gateway unless the user names some; the field is only
+                  shown for «Personnalisé». Judged here as the engine would
+                  judge them on save. */}
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+                {heliosProfile && (
+                  <>
+                    <Typography
+                      id="dns-label"
+                      color="text.secondary"
+                      sx={{ fontSize: 11.5, fontWeight: 600 }}
+                    >
+                      DNS
+                    </Typography>
+                    <ToggleButtonGroup
+                      exclusive
+                      size="small"
+                      value={customDns ? 'custom' : 'gateway'}
+                      aria-labelledby="dns-label"
+                      onChange={(_event, next: 'gateway' | 'custom' | null) => {
+                        // `null` is the selected segment pressed again: nothing to change.
+                        if (next === 'custom') setManualDns(true)
+                        if (next === 'gateway') {
+                          setManualDns(false)
+                          if (draft.dns !== null) set('dns', null)
+                        }
+                      }}
+                      sx={{ '& .MuiToggleButton-root': SEGMENT_BUTTON }}
+                    >
+                      <ToggleButton value="gateway">Proposé par la passerelle</ToggleButton>
+                      <ToggleButton value="custom">Personnalisé</ToggleButton>
+                    </ToggleButtonGroup>
+                  </>
+                )}
+                {customDns && (
+                  <Field
+                    label="DNS"
+                    error={dnsError}
+                    placeholder="1 à 3 adresses IPv4, séparées par des virgules"
+                    value={draft.dns?.join(', ') ?? ''}
+                    onChange={(value) => set('dns', parseClientDns(value))}
+                  />
+                )}
+                {/* Non-blocking: the list is saved as typed. A split tunnel
+                    does not carry these resolvers, so they are not applied. */}
+                {draft.dns !== null && !issues.allowed_ips && !capturesAllIpv4(draft.allowed_ips) && (
+                  <Typography color="text.disabled" sx={{ fontSize: 10.5, lineHeight: 1.5 }}>
+                    non appliqué : le profil ne capture pas tout le trafic
+                  </Typography>
+                )}
               </Box>
             </Box>
           </Collapse>

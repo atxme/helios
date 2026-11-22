@@ -16,6 +16,7 @@ fn profile_draft() -> ProfileDraft {
         persistent_keepalive: 25,
         heliosd_url: None,
         ssh_target: None,
+        dns: None,
         key_negotiation: None,
         use_staged_key: true,
         clear_preshared_key: false,

@@ -74,14 +74,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aether::client_dns::ClientDnsProposal;
 use aether::TunnelState;
 use async_trait::async_trait;
 use defguard_wireguard_rs::{
-    key::Key, net::IpAddrMask, peer::Peer, InterfaceConfiguration, WGApi, WireguardInterfaceApi,
+    dns::DnsConfig, key::Key, net::IpAddrMask, peer::Peer, InterfaceConfiguration, WGApi,
+    WireguardInterfaceApi,
 };
 
 use crate::config::ClientProfile;
-use crate::events::{CaptureCheck, ClientEvent};
+use crate::dns::{decide, DnsDecision};
+use crate::events::{CaptureCheck, ClientEvent, DnsCheck};
 
 use super::{EventSink, VpnBackend};
 
@@ -113,6 +116,11 @@ pub struct WireGuardBackend {
     adapter_up: AtomicBool,
     /// Peer's public key, to find its stats in `read_interface_data`.
     peer_key: Mutex<Option<Key>>,
+    /// The resolver proposal the gateway sent, with the name of the profile it
+    /// came from, until `down` forgets it.
+    gateway_dns: Mutex<Option<(String, ClientDnsProposal)>>,
+    /// The decision last applied to the adapter's resolvers, until `down`.
+    dns_applied: Mutex<Option<DnsDecision>>,
 }
 
 impl WireGuardBackend {
@@ -129,6 +137,8 @@ impl WireGuardBackend {
             api: Mutex::new(api),
             adapter_up: AtomicBool::new(false),
             peer_key: Mutex::new(None),
+            gateway_dns: Mutex::new(None),
+            dns_applied: Mutex::new(None),
         })
     }
 
@@ -153,6 +163,31 @@ impl WireGuardBackend {
         self.peer_key
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Same reasoning for the retained proposal: an `Option`, nothing to corrupt.
+    fn gateway_dns(&self) -> std::sync::MutexGuard<'_, Option<(String, ClientDnsProposal)>> {
+        self.gateway_dns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Same reasoning for the applied decision.
+    fn dns_applied(&self) -> std::sync::MutexGuard<'_, Option<DnsDecision>> {
+        self.dns_applied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The retained proposal for `profile`. One retained for another profile
+    /// describes another gateway: it is dropped, never applied here.
+    fn retained_for(&self, profile: &ClientProfile) -> Option<ClientDnsProposal> {
+        let mut retained = self.gateway_dns();
+        if matches!(retained.as_ref(), Some((name, _)) if *name == profile.name) {
+            return retained.as_ref().map(|(_, proposal)| proposal.clone());
+        }
+        *retained = None;
+        None
     }
 
     /// Translates the profile into a `defguard` WireGuard peer.
@@ -658,6 +693,69 @@ fn assess_capture(
     CaptureCheck::Complete
 }
 
+/// Does a `Leave` keep the resolvers applied earlier on this adapter? On Linux
+/// defguard skips an empty list, so they stay until `down`. Elsewhere the same
+/// empty configuration clears them.
+fn leave_keeps_earlier_dns(
+    linux: bool,
+    decision: &DnsDecision,
+    previous: Option<&DnsDecision>,
+) -> bool {
+    linux
+        && matches!(decision, DnsDecision::Leave { .. })
+        && matches!(previous, Some(DnsDecision::Apply { .. }))
+}
+
+/// Reason of a Linux `Leave` that keeps the earlier resolvers (R9).
+const LINUX_EMPTY_LIST_REASON: &str = "liste vide non appliquée sous Linux : le DNS précédent \
+     reste jusqu'à la déconnexion";
+
+/// Applies a DNS decision to the adapter and reports the verdict. Returns the
+/// decision now on the adapter, or `None` when the driver refused it.
+///
+/// A refusal is an event, never an error: the adapter stays mounted whatever
+/// the resolvers do, and the user is told which ones were not set.
+fn apply_dns(
+    api: &WgApiImpl,
+    decision: &DnsDecision,
+    previous: Option<&DnsDecision>,
+    sink: &EventSink,
+) -> Option<DnsDecision> {
+    let servers: Vec<IpAddr> = match decision {
+        DnsDecision::Apply { servers, .. } => servers.iter().copied().map(IpAddr::V4).collect(),
+        // On Windows the same empty configuration clears the NRPT rule and the
+        // adapter's DNS; on Linux `leave_keeps_earlier_dns` decides below.
+        DnsDecision::Leave { .. } => Vec::new(),
+    };
+    let config = match decision {
+        DnsDecision::Apply { .. } => DnsConfig::full_tunnel(&servers),
+        DnsDecision::Leave { .. } => DnsConfig::default(),
+    };
+    let keeps_earlier = leave_keeps_earlier_dns(cfg!(target_os = "linux"), decision, previous);
+    match api.set_dns(&config) {
+        Ok(()) if keeps_earlier => {
+            sink(ClientEvent::log(
+                "warn",
+                format!("DNS du tunnel non modifié : {LINUX_EMPTY_LIST_REASON}"),
+            ));
+            sink(ClientEvent::dns(DnsCheck::Failed {
+                reason: LINUX_EMPTY_LIST_REASON.to_string(),
+            }));
+            previous.cloned()
+        }
+        Ok(()) => {
+            sink(ClientEvent::dns(decision.check()));
+            Some(decision.clone())
+        }
+        Err(e) => {
+            sink(ClientEvent::dns(DnsCheck::Failed {
+                reason: format!("résolveurs DNS refusés par le pilote : {e}"),
+            }));
+            None
+        }
+    }
+}
+
 /// What the user is told about a capture verdict.
 ///
 /// The verdict itself goes first, for the posture panel. A gap is then an
@@ -826,6 +924,10 @@ impl VpnBackend for WireGuardBackend {
             },
             &self.observe_capture(&api, &peer.public_key),
         );
+        let decision = decide(profile, self.retained_for(profile).as_ref());
+        let previous = self.dns_applied().clone();
+        let applied = apply_dns(&api, &decision, previous.as_ref(), sink);
+        *self.dns_applied() = applied;
         drop(api);
         for event in capture_events(&capture) {
             sink(event);
@@ -849,6 +951,8 @@ impl VpnBackend for WireGuardBackend {
         let result = api.remove_interface();
         self.adapter_up.store(false, Ordering::SeqCst);
         *self.peer_key() = None;
+        *self.gateway_dns() = None;
+        *self.dns_applied() = None;
         drop(api);
 
         sink(ClientEvent::log(
@@ -911,6 +1015,42 @@ impl VpnBackend for WireGuardBackend {
         Ok(())
     }
 
+    async fn apply_gateway_dns(
+        &self,
+        profile: &ClientProfile,
+        proposal: ClientDnsProposal,
+        sink: &EventSink,
+    ) -> anyhow::Result<()> {
+        // The API lock comes first, as in `down`: the check that the adapter
+        // is up and the store of the proposal cannot interleave with a `down`.
+        let api = self.api()?;
+        // A proposal that lands once the adapter is down is stale: the next
+        // `up` asks the gateway again.
+        if !self.adapter_up.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let mut retained = self.gateway_dns();
+        *retained = Some((profile.name.clone(), proposal));
+        let decision = decide(profile, retained.as_ref().map(|(_, proposal)| proposal));
+        drop(retained);
+        // The servers already on the adapter are not written again: on Windows
+        // that clears and rewrites the NRPT rule, with a window that has none.
+        let previous = self.dns_applied().clone();
+        if matches!(
+            (&decision, previous.as_ref()),
+            (
+                DnsDecision::Apply { servers: wanted, .. },
+                Some(DnsDecision::Apply { servers: current, .. }),
+            ) if wanted == current
+        ) {
+            sink(ClientEvent::dns(decision.check()));
+            return Ok(());
+        }
+        let applied = apply_dns(&api, &decision, previous.as_ref(), sink);
+        *self.dns_applied() = applied;
+        Ok(())
+    }
+
     async fn transfer_bytes(&self) -> Option<u64> {
         let peer_key = self.peer_key().clone()?;
         let host = self.api().ok()?.read_interface_data().ok()?;
@@ -949,6 +1089,25 @@ impl VpnBackend for WireGuardBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On Linux an empty list is skipped by defguard, so a `Leave` keeps the
+    /// resolvers applied earlier on the adapter. Anywhere else it clears them.
+    #[test]
+    fn a_leave_keeps_the_earlier_resolvers_only_on_linux_after_an_apply() {
+        use crate::dns::{DnsLeaveReason, DnsOrigin};
+        let leave = DnsDecision::Leave {
+            reason: DnsLeaveReason::GatewayDeclines,
+        };
+        let applied = DnsDecision::Apply {
+            servers: vec![Ipv4Addr::new(86, 54, 11, 100)],
+            origin: DnsOrigin::Default,
+        };
+        assert!(leave_keeps_earlier_dns(true, &leave, Some(&applied)));
+        assert!(!leave_keeps_earlier_dns(false, &leave, Some(&applied)));
+        assert!(!leave_keeps_earlier_dns(true, &leave, None));
+        assert!(!leave_keeps_earlier_dns(true, &leave, Some(&leave)));
+        assert!(!leave_keeps_earlier_dns(true, &applied, Some(&applied)));
+    }
 
     fn profile() -> ClientProfile {
         ClientProfile {

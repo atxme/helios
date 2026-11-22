@@ -711,6 +711,16 @@ un verdict PASS ou FAIL par ligne :
 - ETUDE-IPV6 §12 : IPv4 et IPv6 dans le tunnel, forward IPv4 vers Internet
   (NAT44) en ICMP, TCP et UDP, rejet de l'IPv6 tunnel → WAN (T21),
   anti-spoofing par `AllowedIPs`, résolution ND sous politique `drop` ;
+- F7 : depuis le pair admis, `GET /api/client/dns` sur `100.64.0.1:8080`, à
+  travers le tunnel, répond `{"servers":["86.54.11.100","86.54.11.200"]}` (le
+  défaut, `client_dns` absent dans `network.toml`, `allow_client_internet`
+  actif). Le banc configure `admin_iface = "helios0"` comme la production : sans
+  lui, l'API n'est pas ouverte sur le tunnel. La variante « `client_dns = []` »
+  ou « `allow_client_internet = false` » (réponse vide) n'est **pas** dans le
+  banc : elle exigerait de redémarrer `heliosd` sur une autre configuration. Elle
+  est couverte par les tests unitaires de la route (`helios-api`, `security_tests`).
+  Aucune règle du banc n'est propre à l'UDP/53 : la sonde UDP générique (§12.6)
+  couvre donc le DNS à travers le tunnel et le NAT, sans cas particulier ;
 - arrêt : `heliosd` journalise l'arrêt fail-closed, la table survit et plus
   rien ne sort vers Internet ;
 - aucune clé privée dans le journal du démon.
@@ -730,7 +740,10 @@ l'admission ni la négociation `ml_kem`. La clé de la gateway est la clé en cl
 héritée, comme dans `lab.sh`, et le TPM est désactivé.
 
 Non couverts : §12.9 (PMTU), §12.12 (DNS AAAA), §12.15 (`conntrack` absent de la
-machine), et tout ce qui demande du matériel ou WireGuard-NT. Le banc ne fait
+machine), et tout ce qui demande du matériel ou WireGuard-NT. Le client du banc
+est un `wg` nu : l'application du DNS par Orion (NRPT, `set_dns`) et sa lecture
+de la proposition ne sont exercées que sur cible Windows, par la recette
+« P. F7 » de [MANUAL-TESTING](MANUAL-TESTING.md). Le banc ne fait
 pas partie de `regression.sh`.
 
 **Défaut trouvé par le premier passage (18 octobre 2026), corrigé le même jour :

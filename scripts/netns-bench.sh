@@ -188,6 +188,9 @@ wg_address = "100.64.0.1/10"
 wg_address_v6 = "$ULA_PREFIX::1/64"
 wg_listen_port = $PORT
 allow_client_internet = true
+# The API is reachable through the tunnel only when admin_iface names it: a
+# peer reads /api/client/dns on 100.64.0.1:8080 through helios0, as in production.
+admin_iface = "helios0"
 ${HELIOS_BENCH_THROUGHPUT:+iperf_port = 5202}
 
 [[peers]]
@@ -328,6 +331,15 @@ PY
 }
 check "§12.5 TCP traversant le tunnel puis le NAT" echo_probe tcp
 check "§12.6 UDP traversant le tunnel puis le NAT" echo_probe udp
+
+# F7: an admitted peer reads the resolver it should use through the tunnel.
+# network.toml leaves client_dns absent, so the gateway proposes the default
+# (DNS4EU, unfiltered) while allow_client_internet is on.
+client_dns_default() {
+    in_cl curl -sf --max-time 5 http://100.64.0.1:8080/api/client/dns \
+        | python3 -c 'import json, sys; sys.exit(json.load(sys.stdin) != {"servers": ["86.54.11.100", "86.54.11.200"]})'
+}
+check "F7 la passerelle propose DNS4EU par le tunnel (défaut, client_dns absent)" client_dns_default
 
 # T21: IPv6 from the tunnel to a WAN is rejected in every state, no NAT66. A
 # reject answers at once, where a silent drop would time out.

@@ -158,7 +158,12 @@ Le contenu chiffré d'un profil Orion est un **manifeste de sécurité atomique*
 pas seulement ses deux secrets. Il porte la clé privée, le PSK statique éventuel,
 la clé publique gateway, les endpoints, `allowed_ips`, l'adresse, les CA et
 certificats épinglés, l'identité de négociation, le mode et le plancher
-anti-downgrade.
+anti-downgrade. Depuis le manifeste version 9 (21 novembre 2026), il porte aussi
+le résolveur DNS choisi par l'utilisateur, `dns`, facultatif. Le DNS proposé par
+la passerelle n'est pas stocké : il est lu à chaque connexion. Comme `allowed_ips`
+et l'endpoint, `dns` est authentifié par le conteneur mais n'entre pas dans
+l'empreinte de sécurité (`security_digest`), qui ne couvre que les PSK et la
+négociation de clé. Un manifeste version 8 se lit sans DNS.
 
 Un **registre Orion chiffré et authentifié** associe chaque `profile_id` à ses
 clés publiques attendues, son manifeste, son nom d'affichage et la sélection
@@ -792,9 +797,11 @@ remplace pas.
 * **Orion Linux reste sans stockage protégé.** Câbler Secret Service
   (`libsecret`) relève d'un lot distinct ; le refus explicite actuel reste le bon
   comportement en attendant. macOS est hors périmètre : Orion ne le cible pas.
-* **Le DNS d'un client reste hors tunnel** — limite documentée dans
-  `helios-firewall::ruleset`, orthogonale à celle-ci, et qui mérite son propre
-  arbitrage.
+* **Le DNS d'un poste passe par le tunnel depuis F7 (décision D5, 21 novembre
+  2026).** La passerelle propose un résolveur (`/api/client/dns`), et Orion
+  l'applique en tunnel complet. Ce qui reste ouvert : DoH/DoT, un résolveur sur
+  la passerelle, et le split DNS. Voir [ADR-001, amendement « DNS des
+  postes »](ADR-001-WIREGUARD.md).
 * **PBKDF2 n'a pas la dureté mémoire d'Argon2id.** Un adversaire disposant de GPU
   ou d'ASIC cassera une passphrase faible plus vite qu'il ne le ferait contre
   Argon2id à coût égal. Le compte d'itérations atténue, il ne compense pas. La

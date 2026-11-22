@@ -388,6 +388,9 @@ pub fn router(state: AppState) -> Router {
 
     let authenticated_peer = Router::new()
         .route("/api/provision", post(provision::provision))
+        // The resolvers this peer should use through the tunnel (D5 of F7).
+        // The path is shared with Orion through `aether::client_dns`.
+        .route(aether::client_dns::CLIENT_DNS_PATH, get(routes::client_dns))
         .route("/api/speedtest/ping", get(speedtest::ping))
         .route("/api/speedtest/download", get(speedtest::download))
         .route(

@@ -621,7 +621,8 @@ DPAPI a scellé l'identité.
   par révocation d'admission (`peer remove`), qui coupe au handshake suivant.
 - **L'analyse de trafic.** Le port de négociation est visible et identifiable ;
   il révèle qu'un client Helios se connecte, sans rien dire de la session.
-- **Le DNS du client**, toujours hors tunnel (voir `helios-firewall::ruleset`).
+- **Le DNS du client**, hors tunnel à la rédaction de cet ADR. Levé par F7 le
+  21 novembre 2026 : voir [ADR-001, amendement « DNS des postes »](ADR-001-WIREGUARD.md).
 
 ### Surface exposée
 

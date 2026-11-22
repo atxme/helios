@@ -666,6 +666,75 @@ en WSL2 : hors Windows, `seal`/`unseal` échouent explicitement
 clair. Débloquer Linux suppose `libsecret` ; macOS est hors périmètre. Voir
 [TESTING](../testing/TESTING.md).
 
+## Amendement du 21 novembre 2026 — DNS des postes
+
+> Décision D5 de la [feuille de route](../ROADMAP.md) : le DNS d'un poste en
+> tunnel complet passe par le tunnel. Conception détaillée dans
+> [F7](../superpowers/specs/2026-11-21-f7-dns-tunnel-design.md) ; ce qui suit
+> en fixe le contrat tel que livré.
+
+Jusqu'ici, un poste en tunnel complet gardait son résolveur local : ses requêtes
+DNS sortaient hors du tunnel, et le résolveur du réseau local voyait tous les
+noms consultés. Le départ de Quad9 de France, le 24 novembre 2026, a fixé deux
+exigences : le résolveur ne doit pas être figé dans une version d'Orion, et un
+changement doit atteindre tout le parc depuis un seul endroit.
+
+**Décision.** Le résolveur est un choix de la passerelle, et chaque poste peut
+le remplacer. La passerelle propose un résolveur par `GET /api/client/dns`
+(route de pair, derrière `require_peer`), et Orion le lit à chaque connexion.
+Le défaut est DNS4EU non filtré, `86.54.11.100` et `86.54.11.200`, défini une
+seule fois dans `aether`. Ce n'est pas un résolveur sur la passerelle, et ce
+n'est pas un champ du profil `.orion`, qui reste inchangé.
+
+Ce qui en découle, côté passerelle :
+
+- `network.toml`, clé `client_dns` : absente, la passerelle propose le défaut ;
+  une liste, elle propose cette liste ; `[]`, elle ne propose rien. Une liste
+  invalide fait refuser le chargement, jamais corrigée. Les adresses sont IPv4
+  publiques, sans doublon, au plus trois.
+- La réponse est `{"servers": [...]}`, vide si `client_dns = []` **ou** si
+  `allow_client_internet` est faux : le résolveur ne serait pas joignable par le
+  tunnel, et la résolution casserait.
+- Aucune règle de pare-feu nouvelle. Les requêtes DNS traversent le forward
+  `wg_iface → wan` et le NAT de `allow_client_internet`, qui les portent déjà.
+
+Ce qui en découle, côté Orion :
+
+- **Montage.** Un profil qui capture tout l'IPv4 (`Full` ou `Ipv4Only`) reçoit
+  un DNS dans cet ordre : le remplacement saisi par l'utilisateur ; sinon, pour
+  un profil Helios, le défaut ; sinon, pour un profil classique, la ligne `DNS =`
+  de son fichier wg-quick, réduite à ses adresses IPv4. Un profil qui ne capture
+  pas tout l'IPv4 ne reçoit aucun DNS, et un remplacement saisi dessus est
+  signalé « non appliqué ».
+- **Une fois `Up`**, un profil Helios lit la proposition, une fois par connexion,
+  avec une reprise bornée (cinq tentatives espacées de 3 s) tant que la lecture
+  échoue sur le réseau. Un 404 désigne une passerelle antérieure à la route : le
+  DNS du montage reste.
+  - Proposition non vide, sans remplacement : elle remplace le DNS appliqué.
+  - Proposition non vide, avec remplacement : rien ne change.
+  - Proposition vide : le DNS de l'adaptateur est retiré, **remplacement compris**,
+    et c'est signalé « la passerelle ne propose pas de DNS par le tunnel ». Le
+    poste revient à son DNS local, seule issue quand la passerelle ne route pas
+    vers Internet.
+- **Windows.** `defguard_wireguard_rs` pose la règle NRPT `.` vers les serveurs
+  de l'adaptateur, et la retire au retrait de l'interface. Rien de propre à
+  Orion n'a à la nettoyer.
+- **Linux, limite connue.** `defguard_wireguard_rs` 0.12.2 ignore une liste vide.
+  Un DNS appliqué plus tôt reste donc en place jusqu'à la déconnexion, quand la
+  passerelle se met à proposer une liste vide. Le journal l'écrit (`warn`).
+
+**Échec.** Un échec d'application du DNS ne démonte rien : le cycle de vie de
+l'adaptateur (§3 bis) ne change pas. Le tunnel reste monté, le DNS en échec
+apparaît en ambre dans le panneau de posture, et la règle est la même que pour
+un écart de capture (`CaptureCheck`). Un crash d'Orion laisse la règle NRPT en
+place, pointant vers un résolveur public que le poste joint en direct : la
+résolution continue.
+
+**Ce qui ne change pas.** Le cycle de vie de l'adaptateur (§3 bis), le
+fail-closed de la passerelle et le format du profil `.orion`. Restent hors de
+périmètre : le DNS sur IPv6, DoH/DoT, un résolveur sur la passerelle et le split
+DNS par domaine.
+
 ## Conséquences sur le workspace
 
 Chiffres vérifiés contre l'arbre au 2026-07-17.

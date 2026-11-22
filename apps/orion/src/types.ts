@@ -380,6 +380,13 @@ export interface ClientProfile {
    */
   ssh_target: string | null
   /**
+   * Resolvers the tunnel sets, IPv4 only.
+   *
+   * `null` = no choice written. On a Helios profile that means the gateway's
+   * proposal; on a classic one it means no resolver is declared.
+   */
+  dns: string[] | null
+  /**
    * Authenticated negotiation played before WireGuard is mounted.
    *
    * `null` = legacy path: a classic tunnel first, then a PQ PSK over the
@@ -423,6 +430,8 @@ export interface ProfileDraft {
   heliosd_url: string | null
   /** SSH destination inside the tunnel, `user@host`. `null` = no terminal. */
   ssh_target: string | null
+  /** Resolvers the tunnel sets, IPv4 only. `null` = no choice written. */
+  dns: string[] | null
   key_negotiation: KeyNegotiationSettings | null
   /**
    * Adopt the key staged by `generatePrivateKey` or `adoptPrivateKey`.
@@ -466,6 +475,11 @@ export interface ProfileIssues {
   persistent_keepalive: string | null
   heliosd_url: string | null
   ssh_target: string | null
+  /**
+   * Fault of the resolver list, as the engine refuses it: an empty list, or a
+   * resolver that is not public, repeated, or a fourth one.
+   */
+  dns: string | null
   /**
    * Fault of the key-negotiation block as a whole.
    *
@@ -512,11 +526,42 @@ export type CaptureCheck =
     }
   | { status: 'unverified'; reason: string }
 
+/** Where the applied resolvers came from — mirror of `orion_core::dns::DnsOrigin`. */
+export type DnsOrigin = 'gateway' | 'default' | 'custom' | 'profile'
+
+/** Why the system resolvers stay in place — mirror of `orion_core::dns::DnsLeaveReason`. */
+export type DnsLeaveReason = 'not_full_tunnel' | 'gateway_declines' | 'no_resolver'
+
+/**
+ * What the mounted adapter did about its resolvers — mirror of
+ * `orion_core::events::DnsCheck`.
+ *
+ * `proposal_unread` is not a verdict on the resolvers: the default stays in
+ * place and only the gateway's proposal is missing. See {@link DnsState}.
+ */
+export type DnsCheck =
+  | { status: 'applied'; servers: string[]; origin: DnsOrigin }
+  | { status: 'left'; reason: DnsLeaveReason }
+  | { status: 'failed'; reason: string }
+  | { status: 'proposal_unread'; reason: string }
+
+/**
+ * The DNS line of the posture panel.
+ *
+ * `check` is the last verdict: `proposal_unread` never replaces it, it sets
+ * `proposalUnread` beside it. Only the tunnel going `down` clears both.
+ */
+export interface DnsState {
+  check: DnsCheck | null
+  proposalUnread: boolean
+}
+
 // Events pushed by the Rust backend (emit "helios://event").
 export type ClientEvent =
   | { type: 'state_changed'; state: TunnelState }
   | { type: 'protection'; psk: PskKind }
   | { type: 'capture'; capture: CaptureCheck }
+  | { type: 'dns'; dns: DnsCheck }
   | { type: 'renewal'; in_flight: boolean }
   | { type: 'log'; level: string; message: string }
   | { type: 'telemetry'; iface: string; rx_bps: number; tx_bps: number; rx_pps: number; tx_pps: number }

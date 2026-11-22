@@ -11,6 +11,7 @@
 
 pub mod certificates;
 
+pub mod client_dns;
 pub mod config;
 pub mod display_time;
 pub mod enroll;
