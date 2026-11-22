@@ -58,7 +58,7 @@ use std::{
 
 #[cfg(not(windows))]
 use orion_core::default_backend;
-use orion_core::{backend::EventSink, ClientEvent};
+use orion_core::{backend::EventSink, speedtest::SpeedTestProgress, ClientEvent};
 use orion_engine::client::EngineClient;
 use orion_engine::lifecycle::{EngineArgs, BAD_ARGUMENTS};
 #[cfg(not(windows))]
@@ -227,18 +227,28 @@ fn emit_sink(app: AppHandle) -> EventSink {
 ///
 /// Speedtest progress goes out on its own channel, as it always did. Every
 /// other event takes the path the commands the shell still serves use.
-fn relay_engine_events(app: AppHandle, mut events: tokio::sync::mpsc::Receiver<ClientEvent>) {
+fn relay_engine_events(app: AppHandle, events: tokio::sync::mpsc::Receiver<ClientEvent>) {
     let sink = emit_sink(app.clone());
-    tauri::async_runtime::spawn(async move {
-        while let Some(event) = events.recv().await {
-            match event {
-                ClientEvent::SpeedTest { progress } => {
-                    let _ = app.emit("helios://speedtest", &progress);
-                }
-                other => sink(other),
-            }
+    tauri::async_runtime::spawn(forward_engine_events(
+        events,
+        move |event| sink(event),
+        move |progress| {
+            let _ = app.emit("helios://speedtest", &progress);
+        },
+    ));
+}
+
+async fn forward_engine_events(
+    mut events: tokio::sync::mpsc::Receiver<ClientEvent>,
+    mut general: impl FnMut(ClientEvent),
+    mut speedtest: impl FnMut(SpeedTestProgress),
+) {
+    while let Some(event) = events.recv().await {
+        match event {
+            ClientEvent::SpeedTest { progress } => speedtest(progress),
+            other => general(other),
         }
-    });
+    }
 }
 
 /// Whether the loss of the engine is to be reported now.
@@ -266,9 +276,13 @@ fn engine_lost(app: &AppHandle) {
 /// Ends Orion when the engine's session ends, however it ends.
 fn exit_when_engine_closes(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        app.state::<AppState>().client.closed().await;
-        engine_lost(&app);
+        on_engine_session_closed(&app.state::<AppState>().client, || engine_lost(&app)).await;
     });
+}
+
+async fn on_engine_session_closed(client: &EngineClient, report: impl FnOnce()) {
+    client.closed().await;
+    report();
 }
 
 /// Ends Orion when the elevated engine's process ends.
@@ -834,3 +848,9 @@ mod quit_tests;
 
 #[cfg(test)]
 mod engine_loss_tests;
+
+#[cfg(test)]
+mod engine_event_tests;
+
+#[cfg(test)]
+mod logging_tests;

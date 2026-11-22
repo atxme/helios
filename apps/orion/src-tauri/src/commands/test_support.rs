@@ -13,13 +13,13 @@ use tokio::{
     net::TcpListener,
 };
 
-pub(super) struct ScriptedEngine {
+pub(crate) struct ScriptedEngine {
     reader: BufReader<ReadHalf<DuplexStream>>,
     writer: WriteHalf<DuplexStream>,
 }
 
 /// Opens an authenticated, framed engine session without starting a process.
-pub(super) async fn scripted_engine() -> (EngineClient, ScriptedEngine) {
+pub(crate) async fn scripted_engine() -> (EngineClient, ScriptedEngine) {
     let token = SessionToken::parse(&"a".repeat(64)).expect("fixture session token");
     let (ui, engine) = tokio::io::duplex(8192);
     let (client, _events) = connect(ui, &token).await.expect("start IPC client");
@@ -32,7 +32,7 @@ pub(super) async fn scripted_engine() -> (EngineClient, ScriptedEngine) {
 }
 
 impl ScriptedEngine {
-    pub(super) async fn reply(
+    pub(crate) async fn reply(
         &mut self,
         respond: impl FnOnce(EngineCommand) -> Result<EngineReply, String>,
     ) {

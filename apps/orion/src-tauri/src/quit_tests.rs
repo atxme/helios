@@ -85,3 +85,100 @@ fn a_second_quit_does_not_wait_again() {
     assert!(!first_teardown(&taken_down));
     assert!(!first_teardown(&taken_down));
 }
+
+#[test]
+fn shutdown_waits_for_the_session_to_close_even_when_the_engine_refuses_the_command() {
+    use crate::commands::test_support::scripted_engine;
+
+    let (client, mut engine) = tauri::async_runtime::block_on(scripted_engine());
+    let (received, ready) = std::sync::mpsc::channel();
+    let (close, release) = tokio::sync::oneshot::channel();
+    let server = tauri::async_runtime::spawn(async move {
+        engine
+            .reply(|request| {
+                assert!(matches!(request, EngineCommand::Shutdown));
+                Err("fixture refusal".into())
+            })
+            .await;
+        received.send(()).unwrap();
+        release.await.expect("test releases the engine");
+        drop(engine);
+    });
+
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::scope(|threads| {
+        threads.spawn(|| {
+            take_tunnel_down_blocking(&client, Duration::from_secs(5));
+            done.send(()).unwrap();
+        });
+        ready
+            .recv_timeout(Duration::from_secs(3))
+            .expect("Shutdown reaches engine");
+        let premature = finished.recv_timeout(Duration::from_millis(100));
+        close.send(()).unwrap();
+        assert!(matches!(
+            premature,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        finished
+            .recv_timeout(Duration::from_secs(3))
+            .expect("quit completes after closure");
+    });
+    tauri::async_runtime::block_on(server).expect("scripted engine task completed");
+    assert!(client.is_closed());
+}
+
+#[test]
+fn shutdown_returns_at_the_grace_deadline_when_the_engine_keeps_its_session_open() {
+    use crate::commands::test_support::scripted_engine;
+
+    let (client, mut engine) = tauri::async_runtime::block_on(scripted_engine());
+    let (close, release) = tokio::sync::oneshot::channel();
+    let server = tauri::async_runtime::spawn(async move {
+        engine
+            .reply(|request| {
+                assert!(matches!(request, EngineCommand::Shutdown));
+                Ok(EngineReply::Unit)
+            })
+            .await;
+        release
+            .await
+            .expect("test closes the engine after the grace bounds the wait");
+        drop(engine);
+    });
+
+    let grace = Duration::from_millis(300);
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::scope(|threads| {
+        threads.spawn(|| {
+            let started = std::time::Instant::now();
+            take_tunnel_down_blocking(&client, grace);
+            done.send(started.elapsed()).unwrap();
+        });
+        let elapsed = finished.recv_timeout(Duration::from_secs(3));
+        let was_open = !client.is_closed();
+        close.send(()).unwrap();
+        assert!(elapsed.expect("the grace period bounds shutdown") >= grace);
+        assert!(
+            was_open,
+            "the fixture engine is still connected at the deadline"
+        );
+    });
+    tauri::async_runtime::block_on(server).expect("Shutdown reached the scripted engine");
+}
+
+#[test]
+fn an_already_closed_session_needs_no_grace_period() {
+    use crate::commands::test_support::scripted_engine;
+
+    let (client, engine) = tauri::async_runtime::block_on(scripted_engine());
+    drop(engine);
+    tauri::async_runtime::block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), client.closed())
+            .await
+            .expect("engine closure observed");
+        // A second block_on here would panic: the closed fast path must return directly.
+        take_tunnel_down_blocking(&client, Duration::from_secs(5));
+    });
+    assert!(client.is_closed());
+}
