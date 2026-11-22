@@ -111,7 +111,7 @@ reste alors à faire à part.
 | F4 | **Fusionné dans `main` le 23 octobre 2026.** Retrait de la **valeur de négociation** `classic` de `ProtectionMode` (protocole v5 côté gateway) : migration de `network.toml` et de l'octet `mode_id = 0` du bloc de négociation dans le manifeste de coffre. **Ne touche pas au profil Orion `type = classic`**, le profil WireGuard générique sans négociation, que v5 §19 conserve comme chemin produit distinct (`ProfileKind::Classic`, octet de type `1`, import wg-quick) | v5 §19 | : | **Oui** |
 | F5 | Fichier de récupération WireGuard signé ML-DSA-65 + Ed25519 | ADR-002 lot 3 | D1 | **Oui**, après D1 |
 | F6 | Profil Orion **`nomade`** : relier `ProfileMode`, IKM `profile_root_key ‖ passphrase_key`, re-saisie après veille. **Fusionné dans `main` le 20 novembre 2026** ; validation Windows à faire (le code Windows n'a été compilé que par la CI ; recette : MANUAL-TESTING, « O. F6 ») | ADR-006 « Limites connues » | : | **Oui** |
-| F7 | DNS tunnelé côté Orion et gateway. **Implémenté sur la branche `feat/f7-dns-tunnel`** (non fusionnée) : `client_dns` et `GET /api/client/dns` côté gateway, DNS des postes côté Orion (manifeste v9), banc netns et recette « P. F7 ». Recette Windows à faire | ADR-001 amendement « DNS des postes », ADR-006 | D5 (tranché) | **Oui**, recette Windows |
+| F7 | DNS tunnelé côté Orion et gateway. **Fusionné dans `main` le 22 novembre 2026 (Helios 4.1.0, Orion 5.1.0)** : `client_dns` et `GET /api/client/dns` côté gateway, DNS des postes côté Orion (manifeste v9), banc netns et recette « P. F7 ». Recette Windows à faire | ADR-001 amendement « DNS des postes », ADR-006 | D5 (tranché) | **Oui**, recette Windows |
 
 La veille confirme la direction retenue en F1 : Rosenpass alimente le même slot
 PSK de WireGuard avec une rotation fréquente, et NetBird a dû forcer une
@@ -213,7 +213,7 @@ Faisable maintenant (sans matériel)
   F15 reproductible
 
 Faisable en code, validation sur cible à planifier
-  F5 (après D1) · F7 (code sur `feat/f7-dns-tunnel`, recette Windows) · F12 libsecret · F13 NSIS
+  F5 (après D1) · F7 (fusionné, recette Windows « P. F7 ») · F12 libsecret · F13 NSIS
 
 Bloqué par matériel ou cible (hors WSL2)
   V1 · V3 · V4 · V5 · V6 · V7 · T4 DPAPI · T6 prise réelle · D9 signature EV
