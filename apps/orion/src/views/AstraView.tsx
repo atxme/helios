@@ -18,6 +18,7 @@ import { journalLine } from './astra/rotationRows'
 import { ArtifactDownloads } from './astra/ArtifactDownloads'
 import { EnrollmentOperatorPanel } from './astra/EnrollmentOperatorPanel'
 import { VaultPanel } from './astra/VaultPanel'
+import { GatewayRecoveryBlock } from './astra/GatewayRecoveryBlock'
 import { KeyChangeCopy } from './astra/VaultCopy'
 import { GUTTER, MINT, PINE, RULE } from '../theme'
 import type {
@@ -394,18 +395,23 @@ export function AstraView({
     />
   )
 
+  // Beside the gateway identity block of the rotations: recovery needs no vault, so it is
+  // shown whether or not one is open.
   const rotations = (
-    <RotationsPanel
-      onCeremony={openCeremony}
-      onOverview={takeOverview}
-      fleetApprovedThisSession={fleetApproved}
-      renderStep={(context) => <RotationSteps {...context} />}
-      resumeStop={
-        automaticStop?.refusal
-          ? refusalSentence(automaticStop.refusal, journal, automaticStop.operation)
-          : null
-      }
-    />
+    <>
+      <GatewayRecoveryBlock />
+      <RotationsPanel
+        onCeremony={openCeremony}
+        onOverview={takeOverview}
+        fleetApprovedThisSession={fleetApproved}
+        renderStep={(context) => <RotationSteps {...context} />}
+        resumeStop={
+          automaticStop?.refusal
+            ? refusalSentence(automaticStop.refusal, journal, automaticStop.operation)
+            : null
+        }
+      />
+    </>
   )
 
   // A rotation signed and not finished has a deadline whether or not a session shows it.

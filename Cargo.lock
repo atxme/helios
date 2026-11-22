@@ -3874,6 +3874,8 @@ dependencies = [
  "astra-operator",
  "aws-lc-rs",
  "base64 0.23.1",
+ "helios-escrow",
+ "hex",
  "orion-core",
  "orion-engine",
  "serde",
@@ -3885,6 +3887,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",
+ "x25519-dalek",
  "xtask",
  "zeroize",
 ]

@@ -11,6 +11,7 @@ mod ceremonies;
 mod certificates;
 mod connection;
 mod enrollment;
+mod gateway_recovery;
 mod profiles;
 #[cfg(test)]
 mod test_support;
@@ -25,6 +26,7 @@ pub(crate) use ceremonies::*;
 pub(crate) use certificates::*;
 pub(crate) use connection::*;
 pub(crate) use enrollment::*;
+pub(crate) use gateway_recovery::*;
 pub(crate) use profiles::*;
 
 /// Lets the elevated engine take the foreground before a command that may open
