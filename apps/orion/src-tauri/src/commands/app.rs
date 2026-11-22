@@ -274,6 +274,64 @@ mod tests {
     }
 
     #[test]
+    fn an_export_at_the_byte_limit_preserves_the_whole_log() {
+        let scratch = Scratch::new();
+        let contents = "é".repeat(MAX_LOG_EXPORT_BYTES / 2);
+        assert_eq!(contents.len(), MAX_LOG_EXPORT_BYTES);
+
+        let path = export_logs_to(&scratch.0, "valid", &contents).expect("exact-size export");
+
+        assert_eq!(std::fs::read(path).unwrap(), contents.as_bytes());
+    }
+
+    #[test]
+    fn rejects_text_over_the_byte_limit_even_with_fewer_characters() {
+        let scratch = Scratch::new();
+        let directory = scratch.0.join("oversize");
+        let mut contents = "é".repeat(MAX_LOG_EXPORT_BYTES / 2);
+        contents.push('x');
+
+        let error = export_logs_to(&directory, "journal", &contents).unwrap_err();
+
+        assert_eq!(error, "journal trop volumineux pour être exporté");
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn an_export_creates_missing_destination_directories() {
+        let scratch = Scratch::new();
+        let directory = scratch.0.join("reports/orion");
+
+        let path = export_logs_to(&directory, "journal", "one line\n").expect("nested export");
+
+        assert_eq!(path, directory.join("journal.log"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "one line\n");
+    }
+
+    #[test]
+    fn reports_an_unwritable_log_destination_as_a_write_failure() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("session.log");
+        std::fs::create_dir(&path).expect("reserve the export name as a directory");
+
+        let error = export_logs_to(&scratch.0, "../session", "text").unwrap_err();
+
+        assert!(error.starts_with(&format!("écriture de {} : ", path.display())));
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn exporting_with_the_same_name_replaces_the_previous_contents() {
+        let scratch = Scratch::new();
+        let path = export_logs_to(&scratch.0, "journal", "older, longer text").unwrap();
+
+        let second = export_logs_to(&scratch.0, "journal", "new").unwrap();
+
+        assert_eq!(second, path);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "new");
+    }
+
+    #[test]
     fn reports_export_directory_creation_failures() {
         let scratch = Scratch::new();
         let blocking_file = scratch.0.join("file");
