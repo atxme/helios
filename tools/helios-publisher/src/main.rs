@@ -6,8 +6,9 @@ use std::{
 };
 
 use aether::sig::{
-    BinaryReleasePayload, FirmwareRecoveryPayload, PublisherPublicKeys, PublisherSigner,
-    ResealPayload, ED25519_PUBLIC_KEY_LEN, ML_DSA_65_PRIVATE_KEY_LEN, ML_DSA_65_PUBLIC_KEY_LEN,
+    ArtifactPayload, BinaryReleasePayload, FirmwareRecoveryPayload, PublisherPublicKeys,
+    PublisherSigner, ResealPayload, ResealRequest, SignedEnvelope, WireGuardRecoveryPayload,
+    ED25519_PUBLIC_KEY_LEN, ML_DSA_65_PRIVATE_KEY_LEN, ML_DSA_65_PUBLIC_KEY_LEN,
 };
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -48,14 +49,13 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Signs a TPM v2 resealing ticket with both algorithms.
+    /// Signs a TPM reseal ticket for a request prepared by the gateway.
     ResealTicket {
+        /// `ResealRequest` JSON written by `heliosd tpm prepare-reseal`.
+        #[arg(long)]
+        request: PathBuf,
         #[arg(long, value_parser = positive_u32)]
         key_epoch: u32,
-        #[arg(long, value_parser = positive_u64)]
-        version: u64,
-        #[arg(long, value_parser = parse_digest)]
-        sealed_blob_anchor: [u8; 32],
         #[arg(long, value_parser = parse_digest)]
         expected_pcr_digest: Option<[u8; 32]>,
         #[arg(long)]
@@ -63,6 +63,22 @@ enum Command {
         #[arg(long)]
         ml_dsa_65_private_key: PathBuf,
         /// Public keyring that will be compiled into the target firmware.
+        #[arg(long)]
+        keyring: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Signs the restoration of a WireGuard gateway key, off the gateway.
+    WgRecovery {
+        /// `WireGuardRecoveryPayload` JSON, signed exactly as provided.
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long, value_parser = positive_u32)]
+        key_epoch: u32,
+        #[arg(long)]
+        ed25519_private_key: PathBuf,
+        #[arg(long)]
+        ml_dsa_65_private_key: PathBuf,
         #[arg(long)]
         keyring: PathBuf,
         #[arg(long)]
@@ -151,15 +167,14 @@ fn main() -> Result<()> {
             let payload: FirmwareRecoveryPayload = serde_json::from_slice(&fs::read(&request)?)
                 .context("invalid firmware recovery request")?;
             payload.validate().map_err(anyhow::Error::msg)?;
-            let signer = load_signer(
+            sign_request(
+                payload,
                 key_epoch,
                 &ed25519_private_key,
                 &ml_dsa_65_private_key,
                 &keyring,
+                &output,
             )?;
-            let signed = signer.sign(payload)?;
-            signed.verify(&load_keyring(&keyring)?)?;
-            write_new(&output, &serde_json::to_vec_pretty(&signed)?, true)?;
             println!(
                 "Firmware recovery authorization written to {}",
                 output.display()
@@ -167,24 +182,59 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::ResealTicket {
+            request,
             key_epoch,
-            version,
-            sealed_blob_anchor,
             expected_pcr_digest,
             ed25519_private_key,
             ml_dsa_65_private_key,
             keyring,
             output,
-        } => sign_reseal_ticket(
+        } => {
+            let prepared: ResealRequest =
+                serde_json::from_slice(&fs::read(&request)?).context("invalid reseal request")?;
+            sign_request(
+                ResealPayload {
+                    counter: prepared.counter,
+                    sealed_blob_anchor: prepared.sealed_blob_anchor,
+                    expected_pcr_digest,
+                },
+                key_epoch,
+                &ed25519_private_key,
+                &ml_dsa_65_private_key,
+                &keyring,
+                &output,
+            )?;
+            println!(
+                "reseal ticket counter {}, epoch {key_epoch}, written to {}",
+                prepared.counter,
+                output.display()
+            );
+            Ok(())
+        }
+        Command::WgRecovery {
+            request,
             key_epoch,
-            version,
-            sealed_blob_anchor,
-            expected_pcr_digest,
-            &ed25519_private_key,
-            &ml_dsa_65_private_key,
-            &keyring,
-            &output,
-        ),
+            ed25519_private_key,
+            ml_dsa_65_private_key,
+            keyring,
+            output,
+        } => {
+            let payload: WireGuardRecoveryPayload = serde_json::from_slice(&fs::read(&request)?)
+                .context("invalid WireGuard recovery request")?;
+            sign_request(
+                payload,
+                key_epoch,
+                &ed25519_private_key,
+                &ml_dsa_65_private_key,
+                &keyring,
+                &output,
+            )?;
+            println!(
+                "WireGuard recovery authorization written to {}",
+                output.display()
+            );
+            Ok(())
+        }
         Command::BinaryRelease {
             key_epoch,
             release_sequence,
@@ -343,59 +393,25 @@ fn keygen(key_epoch: u32, output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn sign_reseal_ticket(
+/// Signs `payload` with both algorithms, checks the envelope against the
+/// public keyring, and writes it exclusively to `output`.
+fn sign_request<P: ArtifactPayload + Serialize>(
+    payload: P,
     key_epoch: u32,
-    version: u64,
-    sealed_blob_anchor: [u8; 32],
-    expected_pcr_digest: Option<[u8; 32]>,
     ed25519_path: &Path,
     ml_dsa_65_path: &Path,
     keyring_path: &Path,
     output: &Path,
-) -> Result<()> {
-    let ed25519 =
-        fs::read(ed25519_path).with_context(|| format!("reading {}", ed25519_path.display()))?;
-    let ml_dsa_65 = fs::read(ml_dsa_65_path)
-        .with_context(|| format!("reading {}", ml_dsa_65_path.display()))?;
-    if ml_dsa_65.len() != ML_DSA_65_PRIVATE_KEY_LEN {
-        bail!(
-            "ML-DSA-65 private key: {} bytes instead of {}",
-            ml_dsa_65.len(),
-            ML_DSA_65_PRIVATE_KEY_LEN
-        );
-    }
-    let signer = PublisherSigner::from_private_keys(key_epoch, &ed25519, &ml_dsa_65)
-        .context("loading publisher private keys")?;
-    let keyring = load_keyring(keyring_path)?;
-    let expected_keys = keyring
-        .iter()
-        .find(|keys| keys.key_epoch == key_epoch)
-        .with_context(|| format!("epoch {key_epoch} missing from the public keyring"))?;
-    let actual_keys = signer.public_keys();
-    if expected_keys.ed25519 != actual_keys.ed25519
-        || expected_keys.ml_dsa_65 != actual_keys.ml_dsa_65
-    {
-        bail!("private keys do not match epoch {key_epoch} of the public keyring");
-    }
-
-    let ticket = signer
-        .sign(ResealPayload {
-            counter: version,
-            sealed_blob_anchor,
-            expected_pcr_digest,
-        })
-        .context("hybrid signature of the ticket")?;
-    ticket
-        .verify(&keyring)
-        .context("self-verification of the produced ticket")?;
-    let json = serde_json::to_vec_pretty(&ticket).context("serializing the ticket")?;
-    write_new(output, &json, true)?;
-    println!(
-        "v2 ticket version {version}, epoch {key_epoch}, written to {}",
-        output.display()
-    );
-    Ok(())
+) -> Result<SignedEnvelope<P>> {
+    let signer = load_signer(key_epoch, ed25519_path, ml_dsa_65_path, keyring_path)?;
+    let signed = signer
+        .sign(payload)
+        .context("hybrid signature of the request")?;
+    signed
+        .verify(&load_keyring(keyring_path)?)
+        .context("self-verification of the produced authorization")?;
+    write_new(output, &serde_json::to_vec_pretty(&signed)?, true)?;
+    Ok(signed)
 }
 
 #[allow(clippy::too_many_arguments)]

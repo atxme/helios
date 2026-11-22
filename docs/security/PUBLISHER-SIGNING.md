@@ -35,22 +35,23 @@ un marqueur `development: true` : il est refusé en release même si son chemin
 est fourni explicitement. Ses clés privées sont publiques et il ne fournit
 aucune sécurité.
 
-## Signer un billet de rescellement v2
+## Signer un billet de rescellement v3
 
 ```sh
 cargo run -p helios-publisher -- reseal-ticket \
-  --sealed-blob-anchor "SHA256_HEX_DU_BLOB" \
+  --request reseal-request.json \
   --key-epoch 1 \
-  --version 42 \
   --ed25519-private-key /chemin/hors-ligne/helios-publisher-epoch-1/ed25519-private.pk8 \
   --ml-dsa-65-private-key /chemin/hors-ligne/helios-publisher-epoch-1/ml-dsa-65-private.bin \
   --keyring /chemin/public/publisher-keyring.json \
   --output reseal-ticket.json
 ```
 
-`--version` doit être strictement supérieur à la version déjà consommée par la
-gateway. `--expected-pcr-digest <64 caractères hex>` est facultatif ; s'il est
-présent, la gateway exige une correspondance exacte. L'outil refuse d'écraser
+`reseal-request.json` est le `ResealRequest` produit par `heliosd tpm
+prepare-reseal` sur la gateway : le compteur courant et l'ancre du blob scellé.
+L'outil signe ces deux valeurs telles quelles et refuse tout champ inconnu.
+`--expected-pcr-digest <64 caractères hex>` est facultatif ; s'il est présent,
+la gateway exige une correspondance exacte. L'outil refuse d'écraser
 un fichier existant, vérifie que les secrets correspondent à l'époque du
 trousseau, produit les deux signatures et auto-vérifie l'enveloppe avant
 l'écriture.
@@ -58,8 +59,9 @@ l'écriture.
 Les deux signatures couvrent exactement :
 
 ```text
-"helios-tpm-reseal-v2" || u32_be(2) || u32_be(key_epoch)
-  || u64_be(version) || présence_pcr || digest_pcr_si_présent
+"helios-tpm-reseal-v3" || u32_be(3) || u32_be(key_epoch)
+  || u64_be(counter) || ancre_blob (32 octets) || présence_pcr
+  || digest_pcr_si_présent
 ```
 
 Il n'existe aucun mode Ed25519 seul et aucun fallback vers

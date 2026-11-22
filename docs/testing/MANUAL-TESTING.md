@@ -186,9 +186,10 @@ Exercer le cycle dans un répertoire jetable, jamais avec une clé de production
 ```sh
 tmp_keys=$(mktemp -d)
 cargo run -p helios-publisher -- keygen --key-epoch 99 --output-dir "$tmp_keys/keys"
+printf '{"counter":1,"sealed_blob_anchor":"%064d"}\n' 0 > "$tmp_keys/request.json"
 cargo run -p helios-publisher -- reseal-ticket \
-  --key-epoch 99 --version 1 \
-  --sealed-blob-anchor "$(printf "%064d" 0)" \
+  --request "$tmp_keys/request.json" \
+  --key-epoch 99 \
   --ed25519-private-key "$tmp_keys/keys/ed25519-private.pk8" \
   --ml-dsa-65-private-key "$tmp_keys/keys/ml-dsa-65-private.bin" \
   --keyring "$tmp_keys/keys/publisher-keyring.json" \
