@@ -5,6 +5,9 @@ use aether::certificates::operator_session::{
 };
 use astra_operator::enrollment::InvitationRegistry;
 
+mod recovery;
+mod resumption;
+
 fn locator() -> OperationLocator {
     OperationLocator {
         kind: OperationKind::RecoverIdentity,

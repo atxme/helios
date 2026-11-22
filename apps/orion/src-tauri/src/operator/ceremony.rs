@@ -1869,6 +1869,16 @@ fn verify_key(
     publish: &mut dyn FnMut(OperatorStatus),
     vault_path: &Path,
 ) -> Result<(), String> {
+    verify_key_with(ceremony, presses, publish, vault_path, &connect_key)
+}
+
+fn verify_key_with(
+    ceremony: &mut Ceremony,
+    presses: &Receiver<Press>,
+    publish: &mut dyn FnMut(OperatorStatus),
+    vault_path: &Path,
+    connect: KeyConnector<'_>,
+) -> Result<(), String> {
     let (vault, fingerprint) = match load_with_fingerprint(vault_path) {
         Ok(loaded) => loaded,
         Err(error) => {
@@ -1890,7 +1900,7 @@ fn verify_key(
     let offered = ceremony.status();
     publish(offered.clone());
 
-    let Some(key) = open_key(ceremony, presses, publish, &offered)? else {
+    let Some(key) = open_key_with(ceremony, presses, publish, &offered, connect)? else {
         return Ok(());
     };
 
