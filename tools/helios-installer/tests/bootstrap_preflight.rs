@@ -138,3 +138,31 @@ fn bootstrap_archive_failures_report_the_rejected_input() {
         "not found",
     );
 }
+
+#[test]
+fn install_pending_refuses_missing_and_malformed_requests_without_switching() {
+    let fixture = Fixture::new();
+    fixture.assert_refused(&["install-pending"], "reading activation");
+
+    let staging = fixture.path().join("staging");
+    fs::create_dir(&staging).unwrap();
+    let request = staging.join("activate.json");
+    fs::write(&request, b"not an activation request").unwrap();
+    fixture.assert_refused(&["install-pending"], "reading activation");
+    assert_eq!(fs::read(request).unwrap(), b"not an activation request");
+    assert!(!fixture.path().join("current").exists());
+}
+
+#[test]
+fn install_pending_refuses_an_unstaged_release_before_consuming_the_request() {
+    let fixture = Fixture::new();
+    let staging = fixture.path().join("staging");
+    fs::create_dir(&staging).unwrap();
+    let request = staging.join("activate.json");
+    let body = br#"{"release_sequence":42,"requested_at_unix":0,"delay_seconds":0}"#;
+    fs::write(&request, body).unwrap();
+
+    fixture.assert_refused(&["install-pending"], "preparing the atomic switch");
+    assert_eq!(fs::read(request).unwrap(), body);
+    assert!(!fixture.path().join("current").exists());
+}

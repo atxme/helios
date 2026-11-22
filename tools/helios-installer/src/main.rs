@@ -177,24 +177,38 @@ fn install_pending() -> Result<()> {
 
     let guard =
         prepare_switch(&layout, request.release_sequence).context("preparing the atomic switch")?;
-    let outcome = activate_and_check(&layout, &guard);
+    finish_activation(
+        activate_and_check(&layout, &guard),
+        || guard.confirm(&layout.state_path).map_err(Into::into),
+        || restore(&layout, &guard),
+        &layout.activation_path,
+    )?;
+    println!(
+        "heliosd {} sequence {} confirmed",
+        guard.version, guard.sequence
+    );
+    Ok(())
+}
+
+fn finish_activation(
+    outcome: Result<()>,
+    confirm: impl FnOnce() -> Result<()>,
+    restore: impl FnOnce() -> Result<()>,
+    activation_path: &Path,
+) -> Result<()> {
     match outcome {
         Ok(()) => {
-            if let Err(error) = guard.confirm(&layout.state_path) {
-                clear_activation(&layout.activation_path)?;
-                restore(&layout, &guard).context("rollback after confirmation failure")?;
+            if let Err(error) = confirm() {
+                clear_activation(activation_path)?;
+                restore().context("rollback after confirmation failure")?;
                 return Err(error).context("persisting the confirmed sequence");
             }
-            clear_activation(&layout.activation_path)?;
-            println!(
-                "heliosd {} sequence {} confirmed",
-                guard.version, guard.sequence
-            );
+            clear_activation(activation_path)?;
             Ok(())
         }
         Err(error) => {
-            clear_activation(&layout.activation_path)?;
-            restore(&layout, &guard)
+            clear_activation(activation_path)?;
+            restore()
                 .with_context(|| format!("rollback of the previous binary after: {error:#}"))?;
             Err(error)
         }
@@ -403,6 +417,99 @@ mod tests {
             .contains("did not publish"));
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn activation_request(name: &str) -> (PathBuf, PathBuf) {
+        let root = test_directory(name);
+        fs::create_dir(&root).unwrap();
+        let request = root.join("activate.json");
+        fs::write(&request, b"fixture pending activation").unwrap();
+        (root, request)
+    }
+
+    #[test]
+    fn pending_activation_confirms_and_consumes_request() {
+        let (root, request) = activation_request("confirm");
+        let confirmed = std::cell::Cell::new(false);
+        finish_activation(
+            Ok(()),
+            || {
+                assert!(request.is_file(), "confirmation precedes consumption");
+                confirmed.set(true);
+                Ok(())
+            },
+            || panic!("a ready confirmed release must not be rolled back"),
+            &request,
+        )
+        .unwrap();
+        assert!(confirmed.get());
+        assert!(!request.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn readiness_failure_consumes_request_before_restoring_previous_release() {
+        let (root, request) = activation_request("readiness-rollback");
+        let restored = std::cell::Cell::new(false);
+        let error = finish_activation(
+            Err(anyhow::anyhow!("simulated readiness failure")),
+            || panic!("an unready release must not be confirmed"),
+            || {
+                assert!(!request.exists(), "consume before rollback");
+                restored.set(true);
+                Ok(())
+            },
+            &request,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "simulated readiness failure");
+        assert!(restored.get());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmation_failure_consumes_request_and_restores_previous_release() {
+        let (root, request) = activation_request("confirm-rollback");
+        let restored = std::cell::Cell::new(false);
+        let error = finish_activation(
+            Ok(()),
+            || bail!("simulated state write failure"),
+            || {
+                assert!(!request.exists(), "consume before rollback");
+                restored.set(true);
+                Ok(())
+            },
+            &request,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "persisting the confirmed sequence");
+        assert_eq!(
+            error.root_cause().to_string(),
+            "simulated state write failure"
+        );
+        assert!(restored.get());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rollback_failure_is_reported_after_request_is_consumed() {
+        let (root, request) = activation_request("rollback-failure");
+        let error = finish_activation(
+            Err(anyhow::anyhow!("simulated readiness failure")),
+            || panic!("an unready release must not be confirmed"),
+            || {
+                assert!(
+                    !request.exists(),
+                    "the failed rollback must not cause retry"
+                );
+                bail!("simulated rollback failure")
+            },
+            &request,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("simulated readiness failure"));
+        assert_eq!(error.root_cause().to_string(), "simulated rollback failure");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
