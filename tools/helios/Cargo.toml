@@ -1,6 +1,6 @@
 [package]
 name = "helios"
-version = "4.1.2"
+version = "5.0.0"
 edition.workspace = true
 authors.workspace = true
 default-run = "helios"
