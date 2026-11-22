@@ -8,8 +8,8 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::{
-    blob_store::BlobStore, boot_controller::open_tpm, provisioning, tpm_interface::TpmSealer,
-    Result, SecretKey, TpmError, TpmSettings,
+    anti_rollback, blob_store::BlobStore, boot_controller::open_tpm, provisioning,
+    tpm_interface::TpmSealer, Result, SecretKey, TpmError, TpmSettings,
 };
 
 /// Contains only public authorization context and an encrypted escrow.
@@ -107,13 +107,11 @@ fn export_with(
     // claiming this is a safe pre-maintenance export.
     let root = tpm.unseal(&blob)?;
     let anchor = Sha256::digest(blob.as_bytes()).into();
-    let version = store
-        .load_state()?
-        .version
-        .checked_add(1)
-        .ok_or_else(|| refused("anti-replay counter exhausted"))?;
+    // The authorization is spent by the restore that consumes this value, so
+    // the current counter is exactly the one it must name.
+    let counter = tpm.read_counter()?;
     let request = FirmwareRecoveryPayload {
-        version,
+        counter,
         sealed_blob_anchor: anchor,
         secret_commitment: commitment(&anchor, root.as_bytes()),
         device_id,
@@ -123,7 +121,7 @@ fn export_with(
     // A missing marker excludes a legitimate live OS window. Revoke any
     // orphaned NV copy by Owner, without reading a PCR-bound old index.
     provisioning::disarm_window(tpm, store)?;
-    let encrypted_secret = helios_escrow::seal_to_operator(public, root.as_bytes())
+    let encrypted_secret = helios_escrow::seal_secret_to_operator(public, root.as_bytes())
         .map_err(|e| refused(e.to_string()))?;
     Ok(FirmwareBackup {
         request,
@@ -147,7 +145,7 @@ pub fn preflight(cfg: &TpmSettings, authorization: &SignedFirmwareRecovery) -> R
     let mut tpm = open_tpm(cfg)?;
     validate_authorization(authorization)?;
     clean_state(&store)?;
-    check_anchor_and_version(&store, &authorization.payload)?;
+    check_anchor_and_counter(&mut tpm, &store, &authorization.payload)?;
     let blob = store.load_blob()?.ok_or(TpmError::MissingBlobOnField)?;
     let root = tpm.unseal(&blob)?;
     check_secret(&authorization.payload, root.as_bytes())?;
@@ -161,14 +159,17 @@ pub fn validate_authorization(authorization: &SignedFirmwareRecovery) -> Result<
     authorization.payload.validate().map_err(refused)
 }
 
-fn check_anchor_and_version(
+/// The authorization must name the counter the TPM holds now, and the blob on
+/// disk. Any other counter value means the authorization was already spent.
+fn check_anchor_and_counter(
+    tpm: &mut impl TpmSealer,
     store: &BlobStore<'_>,
     request: &FirmwareRecoveryPayload,
 ) -> Result<()> {
-    let current = store.load_state()?.version;
-    if request.version <= current {
-        return Err(TpmError::TicketRollback {
-            ticket: request.version,
+    let current = tpm.read_counter()?;
+    if request.counter != current {
+        return Err(TpmError::CounterMismatch {
+            artifact: request.counter,
             current,
         });
     }
@@ -226,7 +227,7 @@ fn restore_with(
         Err(TpmError::UnsealPolicyFail) => {}
         Err(error) => return Err(error),
     }
-    check_anchor_and_version(store, &authorization.payload)?;
+    check_anchor_and_counter(tpm, store, &authorization.payload)?;
     let bytes = Zeroizing::new(
         <[u8; 32]>::try_from(recovered).map_err(|_| refused("invalid root length"))?,
     );
@@ -236,12 +237,10 @@ fn restore_with(
     let verified = tpm.unseal(&replacement)?;
     check_secret(&authorization.payload, verified.as_bytes())?;
     provisioning::disarm_window(tpm, store)?;
-    let mut state = store.load_state()?;
-    state.version = authorization.payload.version;
-    // Counter first: interruption between these writes consumes authorization,
-    // rather than permitting replay. Recovery then requires a newer signed
-    // authorization; the encrypted backup still contains the original root.
-    store.store_state(&state)?;
+    // Counter first: an interruption after this point consumes the
+    // authorization rather than permitting replay. Recovery then requires a
+    // newer signed authorization; the encrypted backup still holds the root.
+    anti_rollback::consume(tpm, store.settings(), authorization.payload.counter)?;
     store.store_blob(&replacement)?;
     Ok(false)
 }
@@ -249,8 +248,16 @@ fn restore_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tpm_interface::DryRunTpm;
+    use crate::tpm_interface::{CounterState, DryRunTpm};
     use aether::sig::PublisherSigner;
+
+    /// The anti-rollback counter as the TPM holds it.
+    fn counter_value(counter: &CounterState) -> u64 {
+        DryRunTpm::with_digest([0; 32])
+            .sharing_counter(counter)
+            .read_counter()
+            .unwrap()
+    }
 
     fn setup() -> (
         tempfile::TempDir,
@@ -263,12 +270,18 @@ mod tests {
         let cfg = TpmSettings {
             enabled: true,
             sealed_blob_path: dir.path().join("root").to_str().unwrap().into(),
-            state_path: dir.path().join("state").to_str().unwrap().into(),
             ticket_path: dir.path().join("ticket").to_str().unwrap().into(),
             update_window_marker_path: dir.path().join("window").to_str().unwrap().into(),
+            counter_status_path: dir
+                .path()
+                .join("anti-rollback.json")
+                .to_str()
+                .unwrap()
+                .into(),
             ..TpmSettings::default()
         };
         let mut tpm = DryRunTpm::with_digest([1; 32]);
+        tpm.ensure_counter().unwrap();
         let root = SecretKey::generate().unwrap();
         BlobStore::new(&cfg)
             .store_blob(&tpm.seal(&root).unwrap())
@@ -283,7 +296,9 @@ mod tests {
         )
         .unwrap();
         let recovered =
-            helios_escrow::open_as_operator(private.as_slice(), &backup.encrypted_secret).unwrap();
+            helios_escrow::open_as_operator(private.as_slice(), &backup.encrypted_secret)
+                .unwrap()
+                .plaintext;
         (dir, cfg, tpm, backup, recovered)
     }
     fn sign(request: FirmwareRecoveryPayload) -> SignedFirmwareRecovery {
@@ -298,9 +313,16 @@ mod tests {
     }
     #[test]
     fn firmware_recovery_preserves_the_root_across_pcr_0_and_7_changes() {
-        let (_dir, cfg, _old, backup, recovered) = setup();
+        let (_dir, cfg, old, backup, recovered) = setup();
+        let counter = old.counter_handle();
+        assert_eq!(
+            backup.request.counter, 1,
+            "the backup carries the current counter"
+        );
         let auth = sign(backup.request);
-        let mut new = DryRunTpm::with_digest([9; 32]).with_window_digest([8; 32]);
+        let mut new = DryRunTpm::with_digest([9; 32])
+            .with_window_digest([8; 32])
+            .sharing_counter(&counter);
         assert!(!restore_with(&mut new, &BlobStore::new(&cfg), &auth, &recovered).unwrap());
         let store = BlobStore::new(&cfg);
         assert_eq!(
@@ -310,18 +332,65 @@ mod tests {
                 .as_slice(),
             recovered.as_slice()
         );
-        assert_eq!(store.load_state().unwrap().version, 1);
+        assert_eq!(
+            new.read_counter().unwrap(),
+            2,
+            "the restore spends the counter"
+        );
         assert!(restore_with(&mut new, &store, &auth, &recovered).unwrap());
-        let mut later = DryRunTpm::with_digest([10; 32]);
-        assert!(restore_with(&mut later, &store, &auth, &recovered).is_err());
+    }
+
+    #[test]
+    fn a_firmware_authorization_for_a_spent_counter_is_refused() {
+        let (_dir, cfg, old, backup, recovered) = setup();
+        let counter = old.counter_handle();
+        let auth = sign(backup.request);
+        let store = BlobStore::new(&cfg);
+        let mut first = DryRunTpm::with_digest([9; 32]).sharing_counter(&counter);
+        assert!(!restore_with(&mut first, &store, &auth, &recovered).unwrap());
+
+        // The same authorization on a later boot of another PCR state.
+        let mut later = DryRunTpm::with_digest([10; 32]).sharing_counter(&counter);
+        assert!(matches!(
+            restore_with(&mut later, &store, &auth, &recovered),
+            Err(TpmError::CounterMismatch {
+                artifact: 1,
+                current: 2
+            })
+        ));
     }
     #[test]
+    fn an_undefined_counter_refuses_the_restore_and_replaces_nothing() {
+        let (_dir, cfg, old, backup, recovered) = setup();
+        let counter = old.counter_handle();
+        let auth = sign(backup.request);
+        let store = BlobStore::new(&cfg);
+        let blob_before = std::fs::read(&cfg.sealed_blob_path).unwrap();
+        // The restoring TPM has no counter defined, so its value cannot be read.
+        let mut new = DryRunTpm::with_digest([9; 32]).with_window_digest([8; 32]);
+
+        let error = restore_with(&mut new, &store, &auth, &recovered).unwrap_err();
+
+        assert!(
+            matches!(error, TpmError::CounterUnavailable(_)),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&cfg.sealed_blob_path).unwrap(),
+            blob_before,
+            "the sealed root is not replaced"
+        );
+        assert_eq!(counter_value(&counter), 1, "no counter value is spent");
+    }
+
+    #[test]
     fn unauthenticated_wrong_root_and_stale_requests_never_replace_the_blob() {
-        let (_dir, cfg, _old, backup, recovered) = setup();
+        let (_dir, cfg, old, backup, recovered) = setup();
+        let counter = old.counter_handle();
         let store = BlobStore::new(&cfg);
         let before = store.load_blob().unwrap().unwrap();
         let auth = sign(backup.request);
-        let mut changed = DryRunTpm::with_digest([9; 32]);
+        let mut changed = DryRunTpm::with_digest([9; 32]).sharing_counter(&counter);
         let mut bad = auth.clone();
         bad.signatures.pop();
         assert!(restore_with(&mut changed, &store, &bad, &recovered).is_err());
@@ -329,10 +398,12 @@ mod tests {
         let mut bad = auth.clone();
         bad.payload.device_id.replace_range(..1, "0");
         assert!(restore_with(&mut changed, &store, &bad, &recovered).is_err());
-        let mut state = store.load_state().unwrap();
-        state.version = 1;
-        store.store_state(&state).unwrap();
-        assert!(restore_with(&mut changed, &store, &auth, &recovered).is_err());
+        // The authorization is spent once the counter has moved past it.
+        changed.increment_counter().unwrap();
+        assert!(matches!(
+            restore_with(&mut changed, &store, &auth, &recovered),
+            Err(TpmError::CounterMismatch { .. })
+        ));
         assert_eq!(
             before.as_bytes(),
             store.load_blob().unwrap().unwrap().as_bytes()
@@ -341,6 +412,7 @@ mod tests {
     #[test]
     fn export_requires_nominal_unseal_and_no_window_or_ticket() {
         let (_dir, cfg, mut old, backup, _recovered) = setup();
+        let counter = old.counter_handle();
         let (_, public) = helios_escrow::generate_operator_keypair().unwrap();
         let store = BlobStore::new(&cfg);
         let mut changed = DryRunTpm::with_digest([9; 32]);
@@ -365,7 +437,11 @@ mod tests {
             "2023".into()
         )
         .is_err());
-        assert!(store.load_state().unwrap().version == 0);
+        assert_eq!(
+            counter_value(&counter),
+            1,
+            "an export never spends the counter"
+        );
     }
     struct FaultTpm {
         inner: DryRunTpm,
@@ -400,10 +476,20 @@ mod tests {
             }
             self.inner.revoke_update_window()
         }
+        fn ensure_counter(&mut self) -> Result<()> {
+            self.inner.ensure_counter()
+        }
+        fn read_counter(&mut self) -> Result<u64> {
+            self.inner.read_counter()
+        }
+        fn increment_counter(&mut self) -> Result<u64> {
+            self.inner.increment_counter()
+        }
     }
     #[test]
     fn recovery_preserves_both_vaults_without_reading_the_old_nv_policy() {
-        let (dir, cfg, _old, backup, recovered) = setup();
+        let (dir, cfg, old, backup, recovered) = setup();
+        let counter = old.counter_handle();
         let old_root = SecretKey::from_bytes(recovered.as_slice().try_into().unwrap());
         let context = crate::Context::new().field("gateway", b"same identity");
         let wg = crate::SealedKeystore::new(dir.path().join("wg"), crate::DOMAIN_GATEWAY_WG_KEY);
@@ -418,7 +504,9 @@ mod tests {
             .unwrap();
         let auth = sign(backup.request);
         let mut new = FaultTpm {
-            inner: DryRunTpm::with_digest([9; 32]).with_window_digest([8; 32]),
+            inner: DryRunTpm::with_digest([9; 32])
+                .with_window_digest([8; 32])
+                .sharing_counter(&counter),
             fail_seal: false,
             fail_revoke: false,
         };
@@ -437,13 +525,14 @@ mod tests {
     }
     #[test]
     fn sealing_and_nv_errors_preserve_the_old_blob_and_unspent_counter() {
-        let (_dir, cfg, _old, backup, recovered) = setup();
+        let (_dir, cfg, old, backup, recovered) = setup();
+        let counter = old.counter_handle();
         let store = BlobStore::new(&cfg);
         let before = store.load_blob().unwrap().unwrap();
         let auth = sign(backup.request);
         for (fail_seal, fail_revoke) in [(true, false), (false, true)] {
             let mut tpm = FaultTpm {
-                inner: DryRunTpm::with_digest([9; 32]),
+                inner: DryRunTpm::with_digest([9; 32]).sharing_counter(&counter),
                 fail_seal,
                 fail_revoke,
             };
@@ -452,7 +541,7 @@ mod tests {
                 store.load_blob().unwrap().unwrap().as_bytes(),
                 before.as_bytes()
             );
-            assert_eq!(store.load_state().unwrap().version, 0);
+            assert_eq!(counter_value(&counter), 1);
         }
     }
 }

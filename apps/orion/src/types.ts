@@ -1140,6 +1140,34 @@ export interface OperatorArtifact {
   fingerprint?: string | null
 }
 
+/** La requête de récupération préparée depuis le séquestre : à faire signer, sans clé privée. */
+export interface RecoveryPrepared {
+  gateway_public_key: string
+  counter: number
+  /** `escrow_after_ticket` : compteur du séquestre plus un, à vérifier sur la gateway. */
+  counter_source: 'given' | 'escrow_after_ticket'
+  /** Le fichier `wg-recovery-request.json`. */
+  request: OperatorArtifact
+}
+
+/** Le fichier de récupération écrit : son nom seul. Le contenu ne quitte jamais Orion. */
+export interface RecoveryAssembled {
+  file_name: string
+}
+
+/** Codes fermés de refus de la récupération ; aucun texte libre ne traverse. */
+export type RecoveryRefusalCode =
+  | 'escrow_unreadable'
+  | 'legacy_escrow'
+  | 'escrow_inconsistent'
+  | 'counter_unknown'
+  | 'authorization_invalid'
+  | 'foreign_gateway'
+  | 'request_mismatch'
+  | 'frame_malformed'
+  | 'request_malformed'
+  | 'platform_unsupported'
+
 /**
  * Une opération qui attend l'opérateur, telle qu'une liste peut la nommer.
  *

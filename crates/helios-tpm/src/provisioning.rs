@@ -1,50 +1,74 @@
 //! Provisioning (TOFU), ticket-authorized resealing, and the update window.
 
 use crate::{
-    blob_store::{BlobStore, TpmState},
+    anti_rollback,
+    blob_store::BlobStore,
     reseal_ticket::ResealTicket,
     secret::SecretKey,
+    settings::TpmSettings,
     tpm_interface::TpmSealer,
     update_window::{anchor_of, WindowMarker, WindowPayload},
     Result, TpmError,
 };
 
 /// First boot in a trusted environment (factory): generates a secret,
-/// seals it against the current PCRs, persists blob + initial state.
+/// seals it against the current PCRs, persists the blob.
 pub(crate) fn provision<T: TpmSealer>(tpm: &mut T, store: &BlobStore<'_>) -> Result<SecretKey> {
     let secret = SecretKey::generate()?;
     let blob = tpm.seal(&secret)?;
     store.store_blob(&blob)?;
-    store.store_state(&TpmState { version: 0 })?;
     tracing::info!("TOFU provisioning completed — secret sealed on current PCR state");
     Ok(secret)
 }
 
 /// Post-OTA resealing: only succeeds if a valid signed ticket authorizes the
-/// operation. A **new** secret is generated and sealed on the new PCRs (the
-/// old one is unrecoverable since unseal failed); the ticket is consumed.
+/// operation. The ticket must be issued for the blob on disk and for the
+/// current anti-rollback counter; the counter is spent **before** the new
+/// secret is generated, so a reseal that fails afterwards cannot be replayed.
+/// A **new** secret is then sealed on the new PCRs (the old one is
+/// unrecoverable since unseal failed), and the ticket file is removed.
 pub(crate) fn reseal<T: TpmSealer>(tpm: &mut T, store: &BlobStore<'_>) -> Result<SecretKey> {
     let ticket: ResealTicket = store.load_ticket()?.ok_or(TpmError::UnsealFailedNoTicket)?;
 
     let current_pcr = tpm.current_pcr_digest()?;
-    let mut state = store.load_state()?;
+    let blob = store.load_blob()?.ok_or(TpmError::MissingBlobOnField)?;
+    let current_anchor = anchor_of(blob.as_bytes());
 
-    // Verifies publisher signature + anti-replay (version) + optional PCR binding.
-    ticket.verify(state.version, &current_pcr)?;
+    // Verifies the publisher signature, the blob anchor and the optional PCR binding.
+    ticket.verify(&current_pcr, &current_anchor)?;
+    anti_rollback::consume(tpm, store.settings(), ticket.counter())?;
 
     let secret = SecretKey::generate()?;
     let blob = tpm.seal(&secret)?;
     store.store_blob(&blob)?;
-
-    state.version = ticket.version();
-    store.store_state(&state)?;
     store.consume_ticket()?;
 
     tracing::warn!(
-        version = ticket.version(),
+        counter = ticket.counter(),
         "post-OTA resealing authorized by ticket — new secret sealed"
     );
     Ok(secret)
+}
+
+/// The request a gateway gives its publisher to obtain a reseal ticket: the
+/// counter value it holds now, and the anchor of the blob on disk.
+pub fn prepare_reseal_request(cfg: &TpmSettings) -> Result<aether::sig::ResealRequest> {
+    reseal_request_with(
+        &mut crate::boot_controller::open_tpm(cfg)?,
+        &BlobStore::new(cfg),
+    )
+}
+
+fn reseal_request_with<T: TpmSealer>(
+    tpm: &mut T,
+    store: &BlobStore<'_>,
+) -> Result<aether::sig::ResealRequest> {
+    let counter = tpm.read_counter()?;
+    let blob = store.load_blob()?.ok_or(TpmError::MissingBlobOnField)?;
+    Ok(aether::sig::ResealRequest {
+        counter,
+        sealed_blob_anchor: anchor_of(blob.as_bytes()),
+    })
 }
 
 /// Arms an update window carrying `secret` across one planned reboot.
@@ -161,4 +185,50 @@ pub(crate) fn consume_window<T: TpmSealer>(
          no vault was re-keyed"
     );
     Ok(payload.secret)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tpm_interface::DryRunTpm;
+
+    fn cfg(dir: &std::path::Path) -> TpmSettings {
+        TpmSettings {
+            sealed_blob_path: dir.join("sealed.key").to_string_lossy().into(),
+            ..TpmSettings::default()
+        }
+    }
+
+    #[test]
+    fn the_reseal_request_names_the_counter_and_the_blob_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg(dir.path());
+        let store = BlobStore::new(&cfg);
+        let mut tpm = DryRunTpm::with_digest([1; 32]);
+        provision(&mut tpm, &store).unwrap();
+        tpm.ensure_counter().unwrap();
+        tpm.increment_counter().unwrap();
+
+        let request = reseal_request_with(&mut tpm, &store).unwrap();
+
+        assert_eq!(request.counter, 2);
+        assert_eq!(
+            request.sealed_blob_anchor,
+            anchor_of(&std::fs::read(&cfg.sealed_blob_path).unwrap())
+        );
+    }
+
+    #[test]
+    fn a_reseal_request_without_a_counter_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg(dir.path());
+        let store = BlobStore::new(&cfg);
+        let mut tpm = DryRunTpm::with_digest([1; 32]);
+        provision(&mut tpm, &store).unwrap();
+
+        assert!(matches!(
+            reseal_request_with(&mut tpm, &store),
+            Err(TpmError::CounterUnavailable(_))
+        ));
+    }
 }

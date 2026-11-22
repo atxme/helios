@@ -56,6 +56,7 @@ impl Running {
             Arc::clone(&peers),
             Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
             helios_tpm::BootDecision::Disabled,
+            helios_tpm::TpmSettings::default(),
             Arc::new(AtomicBool::new(ready)),
             false,
         ));

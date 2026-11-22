@@ -831,6 +831,8 @@ fn main() {
             operator_vault_location,
             choose_vault_location,
             reset_vault_location,
+            gateway_recovery_prepare,
+            gateway_recovery_assemble,
         ])
         .build(tauri::generate_context!())
         .expect("error while launching Tauri")

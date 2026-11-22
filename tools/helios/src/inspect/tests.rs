@@ -314,8 +314,8 @@ fn trust_and_negotiation_labels_stay_in_their_column() {
             fingerprint: "a7e7ed37a0234a618af27106790e66d9".into(),
         }],
         development_keys: false,
-        reseal_domain: "helios-tpm-reseal-v2".into(),
-        reseal_format_version: 2,
+        reseal_domain: "helios-tpm-reseal-v3".into(),
+        reseal_format_version: 3,
     };
     let text = render_trust(&ui(), &view);
     assert!(
@@ -327,7 +327,7 @@ fn trust_and_negotiation_labels_stay_in_their_column() {
         "{text}"
     );
     assert!(
-        text.contains("  TPM reseal    helios-tpm-reseal-v2 · format 2\n"),
+        text.contains("  TPM reseal    helios-tpm-reseal-v3 · format 3\n"),
         "{text}"
     );
 }
@@ -839,8 +839,8 @@ async fn trust_fetches_and_decodes_the_read_only_trust_view() {
         "required_algs": ["ml-dsa-65"],
         "publisher_keys": [],
         "development_keys": false,
-        "reseal_domain": "helios-tpm-reseal-v2",
-        "reseal_format_version": 2
+        "reseal_domain": "helios-tpm-reseal-v3",
+        "reseal_format_version": 3
     });
     let (base, server) = crate::tests::one_response_server("200 OK", body.to_string()).await;
     super::trust(&loopback_client(), &base)

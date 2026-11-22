@@ -19,6 +19,10 @@
 //! gateway's window is never touched. The index survives the trial; remove it
 //! with `tpm2_nvundefine 0x01804846` if the machine is not disposable.
 //!
+//! The anti-rollback counter trial likewise defines a disposable counter,
+//! `0x01804848` (production: `0x01804847`), removable with
+//! `tpm2_nvundefine 0x01804848`.
+//!
 //! This is what distinguishes these trials from the RAUC cycle trials, which
 //! touched boot slots and could render the target unbootable.
 //!
@@ -44,6 +48,7 @@
 #![cfg(feature = "tpm")]
 
 use helios_tpm::{BootController, BootDecision, SealedKeystore, TpmSettings};
+use std::str::FromStr as _;
 
 /// Indicates whether hardware trials are requested.
 ///
@@ -72,7 +77,6 @@ fn settings(dir: &std::path::Path, allow_provisioning: bool) -> TpmSettings {
             .join("reseal-ticket.json")
             .to_string_lossy()
             .into_owned(),
-        state_path: dir.join("tpm-state.json").to_string_lossy().into_owned(),
         update_window_pcr_selection: vec![0, 7],
         update_window_marker_path: dir
             .join("update-window.marker")
@@ -82,6 +86,16 @@ fn settings(dir: &std::path::Path, allow_provisioning: bool) -> TpmSettings {
         // trial must never undefine the index a real gateway relies on.
         update_window_nv_index: 0x0180_4846,
         update_window_seconds: 300,
+        // The production counter index is reserved; the trial uses its own.
+        anti_rollback_nv_index: 0x0180_4847,
+        simulated_counter_path: dir
+            .join("simulated-nv-counter")
+            .to_string_lossy()
+            .into_owned(),
+        counter_status_path: dir
+            .join("anti-rollback.json")
+            .to_string_lossy()
+            .into_owned(),
     }
 }
 
@@ -307,4 +321,150 @@ fn an_update_window_is_armed_then_revoked_on_the_tpm() {
     BootController::cancel_update_window(&cfg).expect("removing restored marker");
 
     std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+/// Both counter trials use the same disposable index: serialised, so that one
+/// never undefines the counter the other is measuring.
+static COUNTER_INDEX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Disposable counter index, distinct from the production one.
+const DISPOSABLE_COUNTER_INDEX: u32 = 0x0180_4848;
+
+/// Removes the disposable counter if it is defined; a missing index is the
+/// normal starting state of a trial.
+fn undefine_disposable_counter(tcti: &str) {
+    use tss_esapi::{
+        handles::NvIndexTpmHandle, interface_types::resource_handles::Provision, Context,
+        TctiNameConf,
+    };
+    let mut ctx =
+        Context::new(TctiNameConf::from_str(tcti).expect("TCTI name")).expect("TPM context");
+    let tpm_handle = NvIndexTpmHandle::new(DISPOSABLE_COUNTER_INDEX).expect("NV index");
+    let Ok(object) = ctx.execute_without_session(|ctx| ctx.tr_from_tpm_public(tpm_handle.into()))
+    else {
+        return;
+    };
+    let handle = tss_esapi::handles::NvIndexHandle::from(object);
+    ctx.execute_with_nullauth_session(|ctx| ctx.nv_undefine_space(Provision::Owner, handle))
+        .expect("undefining the disposable counter");
+}
+
+/// Defines the disposable counter exactly as the gateway does, but without the
+/// first increment: the state a power cut leaves between the two commands.
+fn define_disposable_counter_without_increment(tcti: &str) {
+    use tss_esapi::{
+        attributes::NvIndexAttributesBuilder,
+        constants::nv_index_type::NvIndexType,
+        handles::NvIndexTpmHandle,
+        interface_types::{algorithm::HashingAlgorithm, resource_handles::Provision},
+        structures::{Digest, NvPublicBuilder},
+        Context, TctiNameConf,
+    };
+    let mut ctx =
+        Context::new(TctiNameConf::from_str(tcti).expect("TCTI name")).expect("TPM context");
+    let attributes = NvIndexAttributesBuilder::new()
+        .with_owner_write(true)
+        .with_owner_read(true)
+        .with_nv_index_type(NvIndexType::Counter)
+        .with_no_da(true)
+        .build()
+        .expect("NV attributes");
+    let public = NvPublicBuilder::new()
+        .with_nv_index(NvIndexTpmHandle::new(DISPOSABLE_COUNTER_INDEX).expect("NV index"))
+        .with_index_name_algorithm(HashingAlgorithm::Sha256)
+        .with_index_attributes(attributes)
+        .with_index_auth_policy(Digest::try_from(Vec::<u8>::new()).expect("empty digest"))
+        .with_data_area_size(8)
+        .build()
+        .expect("NV public");
+    ctx.execute_with_nullauth_session(|ctx| ctx.nv_define_space(Provision::Owner, None, public))
+        .expect("defining the disposable counter");
+}
+
+/// A counter defined but never incremented (power cut between the two
+/// commands) must be completed by `ensure`, not left unreadable forever.
+#[test]
+fn a_defined_but_unincremented_counter_is_completed_on_the_tpm() {
+    if !hardware_requested("anti-rollback counter completion") {
+        return;
+    }
+    let _serial = COUNTER_INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = disposable_dir("compteur-non-incremente");
+    let tcti = std::env::var("HELIOS_TPM_TCTI").unwrap_or_else(|_| "/dev/tpmrm0".into());
+    let cfg = TpmSettings {
+        anti_rollback_nv_index: DISPOSABLE_COUNTER_INDEX,
+        ..settings(&dir, false)
+    };
+
+    // A counter redefined after an undefine resumes from the highest value it
+    // reached: the TPM does not let an undefine roll it back. The expected
+    // value is therefore relative to the value read before the undefine.
+    let before = helios_tpm::anti_rollback::current(&cfg).ok().unwrap_or(0);
+    undefine_disposable_counter(&tcti);
+    define_disposable_counter_without_increment(&tcti);
+    assert!(
+        helios_tpm::anti_rollback::current(&cfg).is_err(),
+        "an unwritten counter must not be readable before ensure"
+    );
+
+    // ensure completes the owed first increment; advance adds its own.
+    let advanced = helios_tpm::anti_rollback::advance(&cfg)
+        .expect("advance must complete the unwritten counter");
+    assert_eq!(
+        advanced,
+        before + 2,
+        "ensure's first increment, then advance's own, from the preserved value"
+    );
+    assert_eq!(
+        helios_tpm::anti_rollback::current(&cfg).expect("reading the completed counter"),
+        advanced
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The anti-rollback counter moves forward on the TPM and only there: each
+/// `advance` survives a new connection, and the value never goes back.
+///
+/// Uses the disposable index `0x01804848`, distinct from the production
+/// counter `0x01804847`. The index survives the trial; remove it with
+/// `tpm2_nvundefine 0x01804848` if the machine is not disposable.
+#[test]
+fn the_anti_rollback_counter_only_moves_forward_on_the_tpm() {
+    if !hardware_requested("anti-rollback NV counter") {
+        return;
+    }
+    let _serial = COUNTER_INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = disposable_dir("compteur-anti-rollback");
+    let cfg = TpmSettings {
+        anti_rollback_nv_index: DISPOSABLE_COUNTER_INDEX,
+        ..settings(&dir, false)
+    };
+
+    let first =
+        helios_tpm::anti_rollback::advance(&cfg).expect("defining and advancing the counter");
+    assert_eq!(
+        helios_tpm::anti_rollback::current(&cfg).expect("reading the counter on a new connection"),
+        first,
+        "the counter must persist on the TPM across connections"
+    );
+
+    let second = helios_tpm::anti_rollback::advance(&cfg).expect("advancing the counter again");
+    assert_eq!(
+        second,
+        first + 1,
+        "each advance moves the counter by exactly one"
+    );
+    assert_eq!(
+        helios_tpm::anti_rollback::current(&cfg).expect("reading the counter after advance"),
+        second
+    );
+
+    let published: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&cfg.counter_status_path).expect("reading the published status"),
+    )
+    .expect("the status is JSON");
+    assert_eq!(published, serde_json::json!({ "counter": second }));
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

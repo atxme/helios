@@ -55,6 +55,8 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# Signatures de test avec les graines de développement, comme `helios-escrow`.
+aether = { workspace = true, features = ["publisher-signing"] }
 # Paused time makes cache-lock cancellation tests deterministic, as in Orion.
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"

@@ -20,9 +20,10 @@ pub(crate) fn init_key_negotiation(
     client_pq_ca: &std::path::Path,
     rotate: bool,
 ) -> anyhow::Result<()> {
-    let boot = unlock_tpm_for_offline_command(&TpmSettings::default())
+    let tpm = TpmSettings::default();
+    let boot = unlock_tpm_for_offline_command(&tpm)
         .context("unlocking the TPM vault for key-negotiation identity creation")?;
-    let resolved = gateway_key::resolve(network, &boot);
+    let resolved = gateway_key::resolve(network, &boot, &tpm);
     let gateway_wg_public_key = aether::wg::public_from_private(resolved.private_key.expose())
         .context("gateway WireGuard identity is unavailable")?;
     let result = key_negotiation::initialize(
@@ -136,7 +137,7 @@ pub(crate) fn init_identity(network: &NetworkConfig, rotate: bool) -> anyhow::Re
         )
     })?;
 
-    let public_key = gateway_key::initialize(network, &boot, rotate)
+    let public_key = gateway_key::initialize(network, &boot, rotate, &tpm)
         .map_err(|e| anyhow::anyhow!("could not initialize the identity: {e}"))?;
 
     println!("{public_key}");

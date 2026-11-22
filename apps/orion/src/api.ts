@@ -20,6 +20,8 @@ import type {
   VaultCopyOutcome,
   OperatorStatus,
   OperatorArtifact,
+  RecoveryAssembled,
+  RecoveryPrepared,
   DomainDefaults,
   EnrollmentGesture,
   IssuerGesture,
@@ -376,6 +378,32 @@ export const resetVaultLocation = () => invoke<VaultLocationView>('reset_vault_l
 
 /** Les fichiers produits par la session courante, que l'IHM enregistre. */
 export const operatorArtifacts = () => invoke<OperatorArtifact[]>('operator_artifacts')
+
+/**
+ * Prépare la requête de récupération depuis le séquestre (processus IHM : sans
+ * élévation ni coffre opérateur). La clé de séquestre ne sort pas de cet appel.
+ */
+/**
+ * Ouvre le séquestre avec la clé choisie dans une boîte native, et prépare la requête
+ * publique. `null` si l'opérateur annule. La clé ne transite jamais par l'IHM.
+ */
+export const gatewayRecoveryPrepare = (escrowB64: string, counter: number | null) =>
+  invoke<RecoveryPrepared | null>('gateway_recovery_prepare', {
+    escrowB64,
+    counter,
+    expectedPcrDigest: null,
+  })
+
+/**
+ * Assemble `wg-key.recovery` : la clé est choisie dans une boîte native, le fichier est
+ * écrit par Orion à l'emplacement choisi. Seul son nom revient. `null` si l'opérateur annule.
+ */
+export const gatewayRecoveryAssemble = (escrowB64: string, request: string, authorization: string) =>
+  invoke<RecoveryAssembled | null>('gateway_recovery_assemble', {
+    escrowB64,
+    request,
+    authorization,
+  })
 
 export const advanceOperatorCeremony = (action: OperatorAction, revision: number) =>
   invoke<OperatorStatus>('advance_operator_ceremony', { action, revision })

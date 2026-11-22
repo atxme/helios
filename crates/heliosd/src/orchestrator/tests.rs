@@ -1174,6 +1174,7 @@ async fn disconnection_tears_down_wireguard_and_re_engages_the_kill_switch() {
         &policy,
         // TPM disabled: this test does not perform a key rotation.
         &helios_tpm::BootDecision::Disabled,
+        &helios_tpm::TpmSettings::default(),
         &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
     )
     .await
@@ -1215,6 +1216,7 @@ async fn disconnect_firewall_refusal_still_tears_down_wireguard() {
         &internal_tx,
         &shared_policy,
         &helios_tpm::BootDecision::Disabled,
+        &helios_tpm::TpmSettings::default(),
         &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
     )
     .await;
@@ -1266,6 +1268,7 @@ async fn disconnect_wireguard_teardown_failure_is_reported() {
         &internal_tx,
         &shared_policy,
         &helios_tpm::BootDecision::Disabled,
+        &helios_tpm::TpmSettings::default(),
         &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
     )
     .await
@@ -1304,6 +1307,7 @@ async fn disconnect_reports_both_firewall_and_wireguard_teardown_failures() {
         &internal_tx,
         &shared_policy,
         &helios_tpm::BootDecision::Disabled,
+        &helios_tpm::TpmSettings::default(),
         &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
     )
     .await
@@ -1343,6 +1347,7 @@ async fn reload(
         &policy,
         // TPM disabled: a reload performs no key rotation.
         &helios_tpm::BootDecision::Disabled,
+        &helios_tpm::TpmSettings::default(),
         &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
     )
     .await
@@ -1389,6 +1394,7 @@ async fn reload_on_live_tunnel(
         &internal_tx,
         &shared_policy,
         &helios_tpm::BootDecision::Disabled,
+        &helios_tpm::TpmSettings::default(),
         &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
     )
     .await;
@@ -1826,6 +1832,7 @@ async fn run_command_with_mode(
         shared_policy,
         // TPM disabled: none of these commands rotates the gateway key.
         &helios_tpm::BootDecision::Disabled,
+        &helios_tpm::TpmSettings::default(),
         &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
     )
     .await;
@@ -1865,6 +1872,7 @@ async fn run_observed_command(
         &internal_tx,
         shared_policy,
         &helios_tpm::BootDecision::Disabled,
+        &helios_tpm::TpmSettings::default(),
         &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
     )
     .await;
@@ -2887,6 +2895,7 @@ async fn an_inferred_tunnel_state_on_the_external_channel_is_ignored() {
         &internal_tx,
         &shared_policy,
         &helios_tpm::BootDecision::Disabled,
+        &helios_tpm::TpmSettings::default(),
         &Arc::new(RwLock::new(Ipv6TunnelStatus::NotConfigured)),
     )
     .await

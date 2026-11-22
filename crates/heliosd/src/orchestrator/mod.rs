@@ -145,6 +145,7 @@ pub async fn run(
     // Held here and nowhere else: the TPM sealing secret must not transit
     // through the API crate. Only the orchestrator can seal.
     boot: helios_tpm::BootDecision,
+    tpm: helios_tpm::TpmSettings,
     api_ready: Arc<AtomicBool>,
     // `wan_iface = "auto"` in the file: the list in `shared_network` is then
     // the kernel's, and keeps following it (`uplinks`).
@@ -265,7 +266,7 @@ pub async fn run(
                     Some(c) => {
                         handle_external_cmd(
                             c, &shared_network, dry_run, wg.as_ref(), &shared_state, &event_tx,
-                            fw.as_ref(), &mut policy, &internal_tx, &shared_policy, &boot,
+                            fw.as_ref(), &mut policy, &internal_tx, &shared_policy, &boot, &tpm,
                             &shared_ipv6,
                         ).await?;
                     }
@@ -349,7 +350,7 @@ pub async fn run(
                     Some(cmd @ OrchestratorCmd::LoadNetworkConfig(_)) => {
                         handle_external_cmd(
                             cmd, &shared_network, dry_run, wg.as_ref(), &shared_state, &event_tx,
-                            fw.as_ref(), &mut policy, &internal_tx, &shared_policy, &boot,
+                            fw.as_ref(), &mut policy, &internal_tx, &shared_policy, &boot, &tpm,
                             &shared_ipv6,
                         ).await?;
                     }

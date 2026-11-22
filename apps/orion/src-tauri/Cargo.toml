@@ -28,6 +28,10 @@ astra-operator.workspace = true
 aether-fido.workspace = true
 orion-core = { path = "../../../crates/orion-core" }
 orion-engine = { path = "../../../crates/orion-engine" }
+# Séquestre et récupération hors ligne de l'identité WireGuard (`gateway_recovery`).
+helios-escrow.workspace = true
+base64.workspace = true
+hex.workspace = true
 # `StagedKey` tient une clé privée entre sa création et son enregistrement :
 # elle doit être effacée au `Drop`, pas seulement libérée (ADR-006 §5).
 zeroize = { workspace = true }
@@ -58,10 +62,12 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 # Exercise command entry points without a native window.
 tauri = { version = "2", features = ["test"] }
+# Signature de test d'une autorisation de récupération, avec les graines de développement.
+aether = { workspace = true, features = ["publisher-signing"] }
+# Dérive la clé publique d'une gateway de test pour sceller un séquestre.
+x25519-dalek.workspace = true
 # Une clé simulée signe de vraies assertions, celles que la cérémonie vérifie.
 aws-lc-rs.workspace = true
-# Chercher les ouvertures, sous leurs encodages, dans ce que reçoit la fenêtre.
-base64.workspace = true
 # Le domaine fini et les campagnes qu'Astra signerait, pour les tests de la révocation.
 # La feature n'existe que pour les tests : aucun build de production ne l'active.
 astra-operator = { workspace = true, features = ["test-fixtures"] }

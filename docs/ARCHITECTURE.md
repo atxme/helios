@@ -262,11 +262,12 @@ operator workstation, never on the gateway it rescues.
 ## Verified boot and update window
 
 `helios-tpm` seals the secret protecting the gateway's WireGuard identity against
-PCR 0/4/7. A v2 resealing ticket must carry two valid signatures over the same
+PCR 0/4/7. A v3 resealing ticket must carry two valid signatures over the same
 canonical bytes — Ed25519 **and** ML-DSA-65. The signed key epoch selects a
-compiled public keyring; its counter is mandatory and must strictly increase;
-its PCR binding is optional but must match when present. The v1 Ed25519-only
-format is refused with no fallback.
+compiled public keyring; its counter must equal the TPM NV counter in force, and
+the gateway increments it before acting. Its PCR binding is optional but must
+match when present. The v1 Ed25519-only and v2 formats are refused with no
+fallback.
 
 [ADR-007](adr/ADR-007-FENETRE-DE-MISE-A-JOUR.md) adds an update window that
 **carries** an integrity verdict across a planned reboot rather than
@@ -275,9 +276,10 @@ startup the nominal PCR 0/4/7 unseal always runs first, and its success revokes
 a window left armed. On consumption, the NV payload is overwritten only **after**
 the resealed blob is on disk and synced.
 
-WireGuard identity recovery is deliberately unfinished: the choice between a
-file-based `TpmState.version` and a TPM NV counter must be settled before ADR-002
-lot 3.
+WireGuard identity recovery uses the same anti-rollback counter: a signed
+recovery file is consumed only when its counter equals the TPM NV counter and
+the vault is undecipherable (see [ADR-002](adr/ADR-002-SIGNATURES-PQ.md),
+amendement 2).
 
 ## Application update
 

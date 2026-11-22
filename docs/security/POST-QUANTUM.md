@@ -7,7 +7,7 @@ au même risque et ne doivent pas être confondus.
 |---|---|---|---|
 | Secret de session WireGuard | ML-KEM-1024 + HKDF-SHA-512 | transcript ML-DSA-65 sur QUIC/TLS puis PSK WireGuard | de bout en bout ; scellement DPAPI non exerçable en WSL2 |
 | Identité de key-negotiation | ML-DSA-65 | certificat PQ applicatif et signatures requête/réponse/commit | implémenté |
-| Artefacts éditeur | ML-DSA-65 + Ed25519 | hybride AND obligatoire | billet TPM v2 implémenté ; récupération bloquée |
+| Artefacts éditeur | ML-DSA-65 + Ed25519 | hybride AND obligatoire | billet TPM v3, restauration firmware v2 et récupération WireGuard v1 implémentés, compteur anti-rejeu en NV du TPM |
 
 ## PSK WireGuard dérivé par ML-KEM
 
@@ -62,9 +62,9 @@ DOMAINE || version_format || key_epoch || payload_canonique
 inconnue est rejetée. Les structures JSON refusent les champs inconnus ; la
 sérialisation signée ne dépend pas de l’ordre JSON.
 
-Le billet de rescellement utilise le domaine `helios-tpm-reseal-v2`. Il porte un
-compteur obligatoire et un digest PCR optionnel. Le format
-`helios-tpm-reseal-v1` Ed25519 seul n’est jamais accepté.
+Le billet de rescellement utilise le domaine `helios-tpm-reseal-v3`. Il porte un
+compteur obligatoire et un digest PCR optionnel. Les formats `helios-tpm-reseal-v1`
+(Ed25519 seul) et `helios-tpm-reseal-v2` ne sont jamais acceptés.
 
 ## Backends et contrôles Ed25519 stricts
 

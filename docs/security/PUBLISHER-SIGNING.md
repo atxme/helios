@@ -35,21 +35,23 @@ un marqueur `development: true` : il est refusé en release même si son chemin
 est fourni explicitement. Ses clés privées sont publiques et il ne fournit
 aucune sécurité.
 
-## Signer un billet de rescellement v2
+## Signer un billet de rescellement v3
 
 ```sh
 cargo run -p helios-publisher -- reseal-ticket \
+  --request reseal-request.json \
   --key-epoch 1 \
-  --version 42 \
   --ed25519-private-key /chemin/hors-ligne/helios-publisher-epoch-1/ed25519-private.pk8 \
   --ml-dsa-65-private-key /chemin/hors-ligne/helios-publisher-epoch-1/ml-dsa-65-private.bin \
   --keyring /chemin/public/publisher-keyring.json \
   --output reseal-ticket.json
 ```
 
-`--version` doit être strictement supérieur à la version déjà consommée par la
-gateway. `--expected-pcr-digest <64 caractères hex>` est facultatif ; s'il est
-présent, la gateway exige une correspondance exacte. L'outil refuse d'écraser
+`reseal-request.json` est le `ResealRequest` produit par `heliosd tpm
+prepare-reseal` sur la gateway : le compteur courant et l'ancre du blob scellé.
+L'outil signe ces deux valeurs telles quelles et refuse tout champ inconnu.
+`--expected-pcr-digest <64 caractères hex>` est facultatif ; s'il est présent,
+la gateway exige une correspondance exacte. L'outil refuse d'écraser
 un fichier existant, vérifie que les secrets correspondent à l'époque du
 trousseau, produit les deux signatures et auto-vérifie l'enveloppe avant
 l'écriture.
@@ -57,12 +59,57 @@ l'écriture.
 Les deux signatures couvrent exactement :
 
 ```text
-"helios-tpm-reseal-v2" || u32_be(2) || u32_be(key_epoch)
-  || u64_be(version) || présence_pcr || digest_pcr_si_présent
+"helios-tpm-reseal-v3" || u32_be(3) || u32_be(key_epoch)
+  || u64_be(counter) || ancre_blob (32 octets) || présence_pcr
+  || digest_pcr_si_présent
 ```
 
 Il n'existe aucun mode Ed25519 seul et aucun fallback vers
 `helios-tpm-reseal-v1`.
+
+## Signer une récupération WireGuard
+
+```sh
+cargo run -p helios-publisher -- wg-recovery \
+  --request wg-recovery-request.json \
+  --key-epoch 1 \
+  --ed25519-private-key /chemin/hors-ligne/helios-publisher-epoch-1/ed25519-private.pk8 \
+  --ml-dsa-65-private-key /chemin/hors-ligne/helios-publisher-epoch-1/ml-dsa-65-private.bin \
+  --keyring /chemin/public/publisher-keyring.json \
+  --output wg-recovery-authorization.json
+```
+
+`wg-recovery-request.json` est la requête écrite par `helios escrow
+prepare-recovery` sur le poste opérateur, à partir du séquestre `wg-key.escrow`
+(un `WireGuardRecoveryPayload` : `counter`, `gateway_public_key` et
+`expected_pcr_digest` facultatif). L'éditeur ne voit jamais la clé privée
+WireGuard : la requête est publique. L'outil signe ce JSON tel quel, refuse tout
+champ inconnu et n'écrase jamais un fichier existant.
+
+Le `counter` signé doit être celui que la gateway attend au moment de la
+récupération. `prepare-recovery` propose, par défaut, le compteur du séquestre
+plus un : ce défaut vaut dès qu'un billet de rescellement a été consommé depuis
+l'écriture du séquestre, y compris quand le billet et la récupération sont
+consommés à deux démarrages différents. Dans ce cas, le billet vise `C` et la
+récupération `C+1`. Sans billet consommé depuis (coffre perdu simplement), la
+valeur à passer avec `--counter` est le compteur courant `C`, et non `C+1`. La
+valeur à préférer est toujours celle lue sur la gateway (`heliosd tpm
+counter-status` ou `anti-rollback.json`), à passer avec `--counter` ; dans Orion,
+la même valeur va dans le champ facultatif « Valeur du compteur (lue sur la
+gateway) ».
+
+Les deux signatures couvrent exactement :
+
+```text
+"helios-wg-recovery-v1" || u32_be(1) || u32_be(key_epoch)
+  || u64_be(counter) || clé_publique_gateway (32 octets) || présence_pcr
+  || digest_pcr_si_présent
+```
+
+La gateway n'accepte cette autorisation que si son `counter` égale la valeur
+courante du compteur NV, et si la clé privée du fichier dérive
+`gateway_public_key`. Le fichier de récupération est déposé par l'opérateur
+hors bande (voir [MAINTENANCE.md](../MAINTENANCE.md)).
 
 ## Signer une release applicative
 
@@ -217,6 +264,6 @@ aucun installateur vérifié n’existe encore sur la machine.
 
 ## Fichier de récupération WireGuard
 
-Sa signature reste volontairement non implémentée. Le lot est bloqué jusqu'au
-choix explicite entre `TpmState.version` sur fichier et un vrai compteur
-monotone NV du TPM. La PCR y sera optionnelle ; le compteur, obligatoire.
+La signature de ce fichier est décrite plus haut, dans « Signer une récupération
+WireGuard ». Sa PCR est optionnelle ; son compteur est obligatoire et vient du
+compteur NV du TPM.

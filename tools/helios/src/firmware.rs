@@ -577,7 +577,7 @@ fn private_key(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
 }
 fn recover(backup: &FirmwareBackup, private_path: &Path) -> Result<Zeroizing<Vec<u8>>> {
     let key = private_key(private_path)?;
-    let recovered = helios_escrow::open_as_operator(&key, &backup.encrypted_secret)?;
+    let recovered = helios_escrow::open_as_operator(&key, &backup.encrypted_secret)?.plaintext;
     firmware_recovery::check_secret(&backup.request, &recovered)?;
     Ok(recovered)
 }
@@ -613,7 +613,7 @@ fn prepare<G: Gateway>(
             backup.request.device_id == device && backup.request.target_version == version,
             "gateway exported another firmware context"
         );
-        let recovered = helios_escrow::open_as_operator(&key, &backup.encrypted_secret)?;
+        let recovered = helios_escrow::open_as_operator(&key, &backup.encrypted_secret)?.plaintext;
         firmware_recovery::check_secret(&backup.request, &recovered)?;
         Some(backup)
     } else {
@@ -690,12 +690,12 @@ fn maintain<G: Gateway>(
         // A counter-first interrupted restore can need a newer authorization;
         // its root, device and version context must remain exactly identical.
         let mut expected = backup.request.clone();
-        expected.version = auth.payload.version;
+        expected.counter = auth.payload.counter;
         anyhow::ensure!(
-            auth.payload == expected && auth.payload.version >= backup.request.version,
+            auth.payload == expected && auth.payload.counter >= backup.request.counter,
             "authorization differs from the prepared backup"
         );
-        backup.request.version = auth.payload.version;
+        backup.request.counter = auth.payload.counter;
         let recovered = recover(
             backup,
             private_path.context("TPM recovery requires --private-key on this workstation")?,
@@ -1032,13 +1032,14 @@ mod tests {
         let public = x25519_dalek::PublicKey::from(&private);
         let backup = FirmwareBackup {
             request: aether::sig::FirmwareRecoveryPayload {
-                version: 1,
+                counter: 1,
                 sealed_blob_anchor: anchor,
                 secret_commitment: firmware_recovery::commitment(&anchor, &secret),
                 device_id: ID.into(),
                 target_version: "2023".into(),
             },
-            encrypted_secret: helios_escrow::seal_to_operator(public.as_bytes(), &secret).unwrap(),
+            encrypted_secret: helios_escrow::seal_secret_to_operator(public.as_bytes(), &secret)
+                .unwrap(),
         };
         (key_path, backup)
     }
@@ -1348,7 +1349,7 @@ mod tests {
         let gateway = FakeGateway::new(sealed);
         let backup = sealed.then(|| FirmwareBackup {
             request: aether::sig::FirmwareRecoveryPayload {
-                version: 1,
+                counter: 1,
                 sealed_blob_anchor: [1; 32],
                 secret_commitment: [2; 32],
                 device_id: ID.into(),
@@ -1467,7 +1468,7 @@ mod tests {
         std::fs::write(&key_path, B64.encode([7u8; 32])).unwrap();
         let backup = FirmwareBackup {
             request: aether::sig::FirmwareRecoveryPayload {
-                version: 1,
+                counter: 1,
                 sealed_blob_anchor: [1; 32],
                 secret_commitment: [2; 32],
                 device_id: "5bc922b7bd1adb5b6f99592611404036bd9f42d1".into(),
@@ -2146,7 +2147,7 @@ esac
 
             let backup = FirmwareBackup {
                 request: aether::sig::FirmwareRecoveryPayload {
-                    version: 1,
+                    counter: 1,
                     sealed_blob_anchor: [1; 32],
                     secret_commitment: [2; 32],
                     device_id: ID.into(),

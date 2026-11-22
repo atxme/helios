@@ -15,6 +15,7 @@ pub(super) async fn handle_external_cmd(
     internal_tx: &mpsc::Sender<OrchestratorCmd>,
     shared_policy: &Arc<RwLock<FirewallPolicy>>,
     boot: &helios_tpm::BootDecision,
+    tpm: &helios_tpm::TpmSettings,
     shared_ipv6: &Arc<RwLock<Ipv6TunnelStatus>>,
 ) -> anyhow::Result<()> {
     match cmd {
@@ -51,6 +52,7 @@ pub(super) async fn handle_external_cmd(
                 &*shared_network.read().await,
                 boot,
                 new_key.expose(),
+                tpm,
             ) {
                 Err(e) => {
                     warn!("WireGuard key rotation refused: {e}");

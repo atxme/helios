@@ -596,8 +596,9 @@ mod sealed_slot_tests {
                 device: path("no-tpm-device").to_string_lossy().into_owned(),
                 sealed_blob_path: path("simulated-root").to_string_lossy().into_owned(),
                 ticket_path: path("ticket").to_string_lossy().into_owned(),
-                state_path: path("state").to_string_lossy().into_owned(),
                 update_window_marker_path: path("window").to_string_lossy().into_owned(),
+                simulated_counter_path: path("simulated-nv-counter").to_string_lossy().into_owned(),
+                counter_status_path: path("anti-rollback.json").to_string_lossy().into_owned(),
                 ..helios_tpm::TpmSettings::default()
             };
             let decision = helios_tpm::BootController::unlock(&settings)

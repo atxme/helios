@@ -29,6 +29,7 @@
 //! protection, and persistence still require target trials — like the
 //! firewall's Netlink effects.
 
+pub mod anti_rollback;
 mod blob_store;
 mod boot_controller;
 #[cfg(test)]
@@ -43,11 +44,13 @@ mod tpm_interface;
 #[cfg(feature = "tpm")]
 mod tpm_real;
 mod update_window;
+pub mod wg_recovery;
 
 pub use boot_controller::{BootController, BootDecision};
 pub use keystore::{
     Context, KeystoreError, SealedKeystore, DOMAIN_GATEWAY_WG_KEY, DOMAIN_KEY_NEGOTIATION_IDENTITY,
 };
+pub use provisioning::prepare_reseal_request;
 pub use secret::SecretKey;
 pub use settings::TpmSettings;
 
@@ -89,8 +92,8 @@ pub enum TpmError {
     #[error("invalid reseal ticket signature")]
     TicketInvalidSignature,
 
-    #[error("reseal ticket rejected (anti-replay): version {ticket} <= current {current}")]
-    TicketRollback { ticket: u64, current: u64 },
+    #[error("reseal ticket issued for another sealed blob — refused")]
+    TicketAnchorMismatch,
 
     #[error("reseal ticket bound to a PCR state different from the current one")]
     TicketPcrMismatch,
@@ -112,6 +115,15 @@ pub enum TpmError {
 
     #[error("update-window state is uncertain and could not be safely cleaned up: {0}")]
     UpdateWindowCleanupFailed(String),
+
+    #[error("TPM counter unavailable: {0}")]
+    CounterUnavailable(String),
+
+    #[error("artifact counter {artifact} does not match the TPM counter {current}")]
+    CounterMismatch { artifact: u64, current: u64 },
+
+    #[error("WireGuard recovery refused: {0}")]
+    RecoveryRefused(String),
 
     #[error(transparent)]
     Keystore(#[from] keystore::KeystoreError),

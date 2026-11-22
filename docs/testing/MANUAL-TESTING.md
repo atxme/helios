@@ -186,8 +186,10 @@ Exercer le cycle dans un répertoire jetable, jamais avec une clé de production
 ```sh
 tmp_keys=$(mktemp -d)
 cargo run -p helios-publisher -- keygen --key-epoch 99 --output-dir "$tmp_keys/keys"
+printf '{"counter":1,"sealed_blob_anchor":"%064d"}\n' 0 > "$tmp_keys/request.json"
 cargo run -p helios-publisher -- reseal-ticket \
-  --key-epoch 99 --version 1 \
+  --request "$tmp_keys/request.json" \
+  --key-epoch 99 \
   --ed25519-private-key "$tmp_keys/keys/ed25519-private.pk8" \
   --ml-dsa-65-private-key "$tmp_keys/keys/ml-dsa-65-private.bin" \
   --keyring "$tmp_keys/keys/publisher-keyring.json" \
@@ -197,6 +199,40 @@ cargo run -p helios-publisher -- reseal-ticket \
 Le billet doit contenir exactement une signature `ed25519` et une
 `ml-dsa-65`. Une deuxième commande vers le même `--output` doit échouer. Le
 guide de production est [PUBLISHER-SIGNING.md](../security/PUBLISHER-SIGNING.md).
+
+## Q. F5 : compteur NV et récupération signée
+
+Recette sur TPM réel, à faire sur une machine **jetable** : elle supprime et
+recrée l'index du compteur de production `0x01804847`. Les tests automatisés
+ne la remplacent pas (voir [TESTING.md](TESTING.md)). Chaque étape indique le
+résultat attendu. La gateway doit rester joignable, par Tailscale ou par la
+console, tout au long de la recette.
+
+1. **Création.** Après provisionnement, `sudo heliosd tpm counter-status`
+   affiche une valeur `C`, et `/var/lib/helios/anti-rollback.json` porte la même
+   valeur, sans erreur.
+2. **Persistance.** Redémarrer la machine. `counter-status` affiche encore `C`,
+   ou la valeur attendue si un démarrage a consommé un artefact.
+3. **Pas de recul.** Relever `C`, puis supprimer l'index avec
+   `tpm2_nvundefine 0x01804847`. Redémarrer : `heliosd` recrée le compteur, et
+   la valeur lue doit être **supérieure ou égale** à `C`. Cette propriété n'est
+   pas encore établie sur TPM réel ; c'est ce que l'essai doit confirmer.
+4. **Mise à jour qui déplace les PCR**, sans fenêtre armée :
+   - `sudo heliosd tpm prepare-reseal > reseal-request.json`, puis
+     `helios-publisher reseal-ticket` pour cette requête : le billet vise `C` ;
+   - installer la mise à jour et redémarrer : le descellement échoue, le billet
+     est consommé, et le compteur passe de `C` à `C+1` ;
+   - si le coffre reste indéchiffrable, `helios escrow prepare-recovery` (son
+     `--counter` vaut `C+1` par défaut, d'après le séquestre), puis
+     `helios-publisher wg-recovery`, puis `helios escrow assemble-recovery`. Déposer
+     `wg-key.recovery` : au démarrage suivant, la gateway le consomme et le
+     compteur passe à `C+2`.
+   - Rejouer ensuite le même fichier doit être refusé, sans modifier le
+     compteur.
+
+Un artefact signé pour une autre valeur, ou déjà consommé, est refusé sans
+modifier le compteur. La procédure opérateur est dans
+[MAINTENANCE.md](../MAINTENANCE.md).
 
 ## Orion et son IHM Tauri
 

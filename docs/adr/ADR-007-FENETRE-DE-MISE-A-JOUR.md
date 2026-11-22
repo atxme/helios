@@ -101,8 +101,9 @@ entre-temps. Une erreur d'écrasement après rescellement est fatale et ne retom
 jamais sur le billet : ce dernier fabriquerait un nouveau secret alors que le bon
 blob est déjà en place.
 
-`TpmState.version`, le compteur anti-rejeu des billets, n'est pas touché : la
-fenêtre ne consomme aucune version et n'interfère pas avec l'anti-rollback.
+Le compteur anti-rejeu des billets et de la restauration (compteur NV du TPM,
+ADR-002 amendement 2, index `0x01804847`) n'est pas touché : la fenêtre ne
+consomme aucune valeur de compteur et n'interfère pas avec l'anti-rollback.
 
 ### 3. Ce que la fenêtre ne couvre pas
 
@@ -150,7 +151,7 @@ séquestre et d'éditeur restent hors gateway. Cela conserve tous les coffres,
 contrairement au séquestre WireGuard seul. HESC v1 reste une confidentialité
 classique X25519/AES-256-GCM, explicitement distincte des signatures PQ.
 
-Une autorisation `helios-firmware-recovery-v1`, signée Ed25519 **et** ML-DSA-65,
+Une autorisation `helios-firmware-recovery-v2`, signée Ed25519 **et** ML-DSA-65,
 lie compteur, ancre SHA-256 du blob nominal, engagement séparé par domaine du
 secret, périphérique et version firmware. Un billet de rescellement générique
 ne peut pas autoriser ce chemin. Après reboot, le daemon offline vérifie cette
@@ -163,10 +164,10 @@ Une fenêtre OS ou un billet en attente est refusé avant préparation. La
 restauration révoque l'index NV par Owner sans le lire : sa politique PCR 0/7
 ancienne peut empêcher même la lecture d'un index vidé. Une erreur TPM ou
 révocation NV est fatale avant modification du compteur/blob, sans création
-d'un nouveau secret. Le compteur fichier partagé avec les billets est avancé
-avant le blob ; une coupure entre écritures impose une nouvelle autorisation
-de version supérieure. L'hypothèse de confiance de ce compteur est désormais
-explicite dans l'[amendement 5 de l'ADR-002](ADR-002-SIGNATURES-PQ.md).
+d'un nouveau secret. Le compteur NV partagé avec les billets est avancé avant le
+blob ; une coupure entre écritures impose une nouvelle autorisation pour la
+valeur suivante. Son hypothèse de confiance est fixée par l'[amendement 5 de
+l'ADR-002](ADR-002-SIGNATURES-PQ.md).
 
 Le journal est non secret, sauf sa sauvegarde chiffrée ; il vit hors gateway.
 L'installation n'est jamais rejouée automatiquement après une interruption.

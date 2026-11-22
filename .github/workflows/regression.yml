@@ -156,6 +156,8 @@ jobs:
       - name: Contrat aether sans feature de signature
         if: needs.changes.outputs.aether == 'true'
         run: cargo test --locked -p aether --lib
+      - name: Tests heliosd sans la feature tpm (TPM simulé)
+        run: cargo test --locked -p heliosd
 
   orion-windows:
     name: Orion et Astra — sécurité Windows

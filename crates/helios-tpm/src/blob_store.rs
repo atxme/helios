@@ -1,22 +1,12 @@
 use std::{io::Write as _, path::Path};
 
-use crate::settings::TpmSettings;
-use serde::{Deserialize, Serialize};
+use crate::{
+    reseal_ticket::ResealTicket, settings::TpmSettings, tpm_interface::SealedBlob, Result, TpmError,
+};
 
-use crate::{reseal_ticket::ResealTicket, tpm_interface::SealedBlob, Result, TpmError};
-
-/// Minimal persistent state: anti-replay version counter for tickets.
+/// Access to the configuration partition: sealed blob, ticket, window marker.
 ///
-/// On the hardened target, this counter should live in a locked NVRAM area
-/// of the TPM; here it is stored next to the blob (sufficient for the
-/// WSL2/dev model).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub(crate) struct TpmState {
-    #[serde(default)]
-    pub version: u64,
-}
-
-/// Access to the configuration partition: sealed blob, ticket, state.
+/// The anti-rollback counter is not stored here: it lives in the TPM.
 pub(crate) struct BlobStore<'a> {
     cfg: &'a TpmSettings,
 }
@@ -24,6 +14,12 @@ pub(crate) struct BlobStore<'a> {
 impl<'a> BlobStore<'a> {
     pub(crate) fn new(cfg: &'a TpmSettings) -> Self {
         Self { cfg }
+    }
+
+    /// The settings this store was opened with, for the TPM operations that
+    /// need them alongside it.
+    pub(crate) fn settings(&self) -> &'a TpmSettings {
+        self.cfg
     }
 
     // ── Sealed blob ──────────────────────────────────────────────────────────
@@ -85,21 +81,6 @@ impl<'a> BlobStore<'a> {
             Err(e) => Err(io_err(&self.cfg.ticket_path, e)),
         }
     }
-
-    // ── State (version counter) ─────────────────────────────────────────────
-
-    pub(crate) fn load_state(&self) -> Result<TpmState> {
-        match std::fs::read(&self.cfg.state_path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| TpmError::Serde(e.to_string())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TpmState::default()),
-            Err(e) => Err(io_err(&self.cfg.state_path, e)),
-        }
-    }
-
-    pub(crate) fn store_state(&self, state: &TpmState) -> Result<()> {
-        let json = serde_json::to_vec_pretty(state).map_err(|e| TpmError::Serde(e.to_string()))?;
-        atomic_write(&self.cfg.state_path, &json)
-    }
 }
 
 fn io_err(path: &str, e: std::io::Error) -> TpmError {
@@ -111,7 +92,7 @@ fn io_err(path: &str, e: std::io::Error) -> TpmError {
 
 /// Atomic write: temp file + rename, so a power cut never leaves a
 /// truncated blob/state (the next boot depends on it).
-fn atomic_write(path: &str, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(path: &str, bytes: &[u8]) -> Result<()> {
     let p = Path::new(path);
     if let Some(parent) = p.parent() {
         if !parent.as_os_str().is_empty() {

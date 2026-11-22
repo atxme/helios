@@ -9,14 +9,21 @@ use super::*;
 const ED_SEED: [u8; 32] = *b"helios-sign-ed25519-test-seed001";
 const ML_SEED: [u8; 32] = *b"helios-sign-mldsa65-test-seed001";
 
-fn signed(payload: ResealPayload, key_epoch: u32) -> (SignedResealTicket, PublisherPublicKeys) {
+/// Public keys of the test keyring, for the given epoch.
+fn test_keys(key_epoch: u32) -> PublisherPublicKeys {
     let ed = Ed25519KeyPair::from_seed_unchecked(&ED_SEED).unwrap();
-    let (ml_public, ml_private) = KG::keygen_from_seed(&ML_SEED);
-    let keys = PublisherPublicKeys {
+    let (ml_public, _) = KG::keygen_from_seed(&ML_SEED);
+    PublisherPublicKeys {
         key_epoch,
         ed25519: ed.public_key().as_ref().try_into().unwrap(),
         ml_dsa_65: ml_public.into_bytes(),
-    };
+    }
+}
+
+fn signed(payload: ResealPayload, key_epoch: u32) -> (SignedResealTicket, PublisherPublicKeys) {
+    let ed = Ed25519KeyPair::from_seed_unchecked(&ED_SEED).unwrap();
+    let (_, ml_private) = KG::keygen_from_seed(&ML_SEED);
+    let keys = test_keys(key_epoch);
     let message = signing_bytes(&payload, key_epoch);
     let ed_signature = ed.sign(&message);
     let ml_signature = ml_private
@@ -147,7 +154,8 @@ fn any_content_alteration_changes_the_signed_bytes() {
 fn both_valid_signatures_are_required() {
     let (envelope, keys) = signed(
         ResealPayload {
-            version: 3,
+            counter: 3,
+            sealed_blob_anchor: [0; 32],
             expected_pcr_digest: None,
         },
         1,
@@ -170,7 +178,8 @@ fn both_valid_signatures_are_required() {
 fn a_known_but_invalid_signature_is_a_rejection() {
     let (envelope, keys) = signed(
         ResealPayload {
-            version: 3,
+            counter: 3,
+            sealed_blob_anchor: [0; 32],
             expected_pcr_digest: None,
         },
         1,
@@ -196,7 +205,8 @@ fn a_known_but_invalid_signature_is_a_rejection() {
 fn unknown_algorithm_ignored_but_known_duplicate_rejected() {
     let (mut envelope, keys) = signed(
         ResealPayload {
-            version: 1,
+            counter: 1,
+            sealed_blob_anchor: [0; 32],
             expected_pcr_digest: None,
         },
         1,
@@ -244,7 +254,8 @@ fn binary_manifest_has_a_strict_canonical_encoding() {
 fn unknown_epoch_and_epoch_rewriting_are_rejected() {
     let (mut envelope, keys) = signed(
         ResealPayload {
-            version: 1,
+            counter: 1,
+            sealed_blob_anchor: [0; 32],
             expected_pcr_digest: None,
         },
         1,
@@ -269,12 +280,13 @@ fn unknown_epoch_and_epoch_rewriting_are_rejected() {
 fn payload_mutation_is_rejected() {
     let (mut envelope, keys) = signed(
         ResealPayload {
-            version: 1,
+            counter: 1,
+            sealed_blob_anchor: [0; 32],
             expected_pcr_digest: Some([4u8; 32]),
         },
         1,
     );
-    envelope.payload.version = 2;
+    envelope.payload.counter = 2;
     assert!(matches!(
         envelope.verify(&[keys]),
         Err(SignatureError::InvalidSignature(_))
@@ -287,7 +299,7 @@ fn domain_and_format_version_are_part_of_the_signature() {
     struct OtherArtifact(ResealPayload);
 
     impl ArtifactPayload for OtherArtifact {
-        const DOMAIN: &'static [u8] = b"helios-wg-recovery-v1";
+        const DOMAIN: &'static [u8] = b"helios-test-other-v1";
         const FORMAT_VERSION: u32 = 1;
 
         fn encode_canonical(&self, output: &mut Vec<u8>) {
@@ -297,7 +309,8 @@ fn domain_and_format_version_are_part_of_the_signature() {
 
     let (ticket, keys) = signed(
         ResealPayload {
-            version: 1,
+            counter: 1,
+            sealed_blob_anchor: [0; 32],
             expected_pcr_digest: None,
         },
         1,
@@ -348,11 +361,11 @@ fn ed25519_rejects_non_canonical_encodings_and_weak_points() {
 #[test]
 fn reordered_json_does_not_change_the_canonical_bytes() {
     let first: SignedResealTicket = serde_json::from_str(
-        r#"{"payload":{"version":9,"expected_pcr_digest":null},"key_epoch":1,"signatures":[]}"#,
+        r#"{"payload":{"counter":9,"sealed_blob_anchor":"0000000000000000000000000000000000000000000000000000000000000000","expected_pcr_digest":null},"key_epoch":1,"signatures":[]}"#,
     )
     .unwrap();
     let second: SignedResealTicket = serde_json::from_str(
-        r#"{"signatures":[],"key_epoch":1,"payload":{"expected_pcr_digest":null,"version":9}}"#,
+        r#"{"signatures":[],"key_epoch":1,"payload":{"expected_pcr_digest":null,"counter":9,"sealed_blob_anchor":"0000000000000000000000000000000000000000000000000000000000000000"}}"#,
     )
     .unwrap();
     assert_eq!(
@@ -365,7 +378,8 @@ fn reordered_json_does_not_change_the_canonical_bytes() {
 fn invalid_base64_encoding_and_empty_signature_are_fail_closed() {
     let (envelope, keys) = signed(
         ResealPayload {
-            version: 5,
+            counter: 5,
+            sealed_blob_anchor: [0; 32],
             expected_pcr_digest: None,
         },
         1,
@@ -389,9 +403,9 @@ fn invalid_base64_encoding_and_empty_signature_are_fail_closed() {
 #[test]
 fn json_rejects_any_unauthenticated_field() {
     for json in [
-        r#"{"payload":{"version":9,"expected_pcr_digest":null},"key_epoch":1,"signatures":[],"selector":"attaquant"}"#,
-        r#"{"payload":{"version":9,"expected_pcr_digest":null,"ignored":true},"key_epoch":1,"signatures":[]}"#,
-        r#"{"payload":{"version":9,"expected_pcr_digest":null},"key_epoch":1,"signatures":[{"alg":"ed25519","sig":"AA==","extra":1}]}"#,
+        r#"{"payload":{"counter":9,"sealed_blob_anchor":"0000000000000000000000000000000000000000000000000000000000000000","expected_pcr_digest":null},"key_epoch":1,"signatures":[],"selector":"attaquant"}"#,
+        r#"{"payload":{"counter":9,"sealed_blob_anchor":"0000000000000000000000000000000000000000000000000000000000000000","expected_pcr_digest":null,"ignored":true},"key_epoch":1,"signatures":[]}"#,
+        r#"{"payload":{"counter":9,"sealed_blob_anchor":"0000000000000000000000000000000000000000000000000000000000000000","expected_pcr_digest":null},"key_epoch":1,"signatures":[{"alg":"ed25519","sig":"AA==","extra":1}]}"#,
     ] {
         assert!(serde_json::from_str::<SignedResealTicket>(json).is_err());
     }
@@ -401,7 +415,8 @@ fn json_rejects_any_unauthenticated_field() {
 fn fingerprint_identifies_both_halves_of_the_keyring() {
     let (_, keys) = signed(
         ResealPayload {
-            version: 1,
+            counter: 1,
+            sealed_blob_anchor: [0; 32],
             expected_pcr_digest: None,
         },
         7,
@@ -421,7 +436,7 @@ fn fingerprint_identifies_both_halves_of_the_keyring() {
 #[test]
 fn firmware_authorization_is_bound_to_every_context_field_and_its_own_domain() {
     let payload = FirmwareRecoveryPayload {
-        version: 3,
+        counter: 3,
         sealed_blob_anchor: [1; 32],
         secret_commitment: [2; 32],
         device_id: "5bc922b7bd1adb5b6f99592611404036bd9f42d0".into(),
@@ -429,7 +444,7 @@ fn firmware_authorization_is_bound_to_every_context_field_and_its_own_domain() {
     };
     let message = signing_bytes(&payload, 1);
     let mut changed = payload.clone();
-    changed.version += 1;
+    changed.counter += 1;
     assert_ne!(message, signing_bytes(&changed, 1));
     changed = payload.clone();
     changed.sealed_blob_anchor[0] ^= 1;
@@ -450,7 +465,144 @@ fn firmware_authorization_is_bound_to_every_context_field_and_its_own_domain() {
     assert!(serde_json::from_value::<FirmwareRecoveryPayload>(json).is_err());
     changed.target_version = "--force".into();
     assert!(changed.validate().is_err());
-    changed = payload;
-    changed.version = 0;
-    assert!(changed.validate().is_err());
+}
+
+#[test]
+fn firmware_recovery_v2_domain_and_counter_zero_validate() {
+    assert_eq!(
+        FirmwareRecoveryPayload::DOMAIN,
+        b"helios-firmware-recovery-v2"
+    );
+    assert_eq!(FirmwareRecoveryPayload::FORMAT_VERSION, 2);
+    let payload = FirmwareRecoveryPayload {
+        counter: 0,
+        sealed_blob_anchor: [1; 32],
+        secret_commitment: [2; 32],
+        device_id: "5bc922b7bd1adb5b6f99592611404036bd9f42d0".into(),
+        target_version: "2023".into(),
+    };
+    assert_eq!(payload.validate(), Ok(()));
+}
+
+#[test]
+fn reseal_v3_canonical_bytes_are_fixed() {
+    let payload = ResealPayload {
+        counter: 7,
+        sealed_blob_anchor: [0xAB; 32],
+        expected_pcr_digest: None,
+    };
+    assert_eq!(ResealPayload::DOMAIN, b"helios-tpm-reseal-v3");
+    assert_eq!(ResealPayload::FORMAT_VERSION, 3);
+
+    let bytes = signing_bytes(&payload, 1);
+    assert!(bytes.starts_with(b"helios-tpm-reseal-v3"));
+    let body = &bytes[ResealPayload::DOMAIN.len() + 8..];
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&7u64.to_be_bytes());
+    expected.extend_from_slice(&[0xAB; 32]);
+    expected.push(0u8);
+    assert_eq!(body, expected.as_slice());
+}
+
+/// Signs arbitrary message bytes with the test keyring of `ED_SEED`/`ML_SEED`.
+fn signatures_over(message: &[u8]) -> Vec<ArtifactSignature> {
+    let ed = Ed25519KeyPair::from_seed_unchecked(&ED_SEED).unwrap();
+    let (_, ml_private) = KG::keygen_from_seed(&ML_SEED);
+    let ed_signature = ed.sign(message);
+    let ml_signature = ml_private
+        .try_sign_with_seed(&[7u8; 32], message, &[])
+        .unwrap();
+    vec![
+        ArtifactSignature {
+            alg: "ed25519".into(),
+            sig: STANDARD.encode(ed_signature.as_ref()),
+        },
+        ArtifactSignature {
+            alg: "ml-dsa-65".into(),
+            sig: STANDARD.encode(ml_signature),
+        },
+    ]
+}
+
+#[test]
+fn a_v2_reseal_signature_does_not_verify_as_v3() {
+    let payload = ResealPayload {
+        counter: 7,
+        sealed_blob_anchor: [0xAB; 32],
+        expected_pcr_digest: None,
+    };
+    let keys = test_keys(1);
+    // Canonical body identical to v3, but the v2 domain and format version.
+    let mut v2_message = Vec::new();
+    v2_message.extend_from_slice(b"helios-tpm-reseal-v2");
+    v2_message.extend_from_slice(&2u32.to_be_bytes());
+    v2_message.extend_from_slice(&1u32.to_be_bytes());
+    v2_message.extend_from_slice(&7u64.to_be_bytes());
+    v2_message.extend_from_slice(&[0xAB; 32]);
+    v2_message.push(0u8);
+    let forged = SignedEnvelope {
+        payload,
+        key_epoch: 1,
+        signatures: signatures_over(&v2_message),
+    };
+    assert_eq!(
+        forged.verify(&[keys]),
+        Err(SignatureError::InvalidSignature(AlgId::Ed25519))
+    );
+}
+
+fn wireguard_recovery_fixture() -> (SignedWireGuardRecovery, PublisherPublicKeys, [u8; 32]) {
+    let private_key = [0x42u8; 32];
+    let public = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private_key));
+    let payload = WireGuardRecoveryPayload {
+        counter: 4,
+        gateway_public_key: *public.as_bytes(),
+        expected_pcr_digest: Some([9u8; 32]),
+    };
+    let message = signing_bytes(&payload, 1);
+    let envelope = SignedEnvelope {
+        payload,
+        key_epoch: 1,
+        signatures: signatures_over(&message),
+    };
+    (envelope, test_keys(1), private_key)
+}
+
+#[test]
+fn wireguard_recovery_round_trips_and_binds_the_key() {
+    let (envelope, keys, private_key) = wireguard_recovery_fixture();
+    assert_eq!(
+        verify_wireguard_recovery(&envelope, &[keys], &private_key),
+        Ok(())
+    );
+
+    let other_key = [0x43u8; 32];
+    assert!(matches!(
+        verify_wireguard_recovery(&envelope, &[keys], &other_key),
+        Err(WireGuardRecoveryError::ForeignKey)
+    ));
+
+    for algorithm in REQUIRED_ALGS {
+        let mut missing = envelope.clone();
+        missing
+            .signatures
+            .retain(|entry| entry.alg != algorithm.as_str());
+        assert!(matches!(
+            verify_wireguard_recovery(&missing, &[keys], &private_key),
+            Err(WireGuardRecoveryError::Signature(_))
+        ));
+    }
+}
+
+#[test]
+fn wireguard_recovery_json_refuses_unknown_fields() {
+    let (envelope, _, _) = wireguard_recovery_fixture();
+    let json = serde_json::to_string(&envelope).unwrap();
+    assert!(json.contains("gateway_public_key"));
+    let decoded: SignedWireGuardRecovery = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, envelope);
+
+    let mut value = serde_json::to_value(&envelope.payload).unwrap();
+    value["champ_inconnu"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<WireGuardRecoveryPayload>(value).is_err());
 }
