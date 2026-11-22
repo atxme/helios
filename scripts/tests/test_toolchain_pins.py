@@ -16,15 +16,25 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 def write_tree(root, *, dockerfile=True, docker_rust="1.100.0", docker_node="26.13.1",
                cargo_rust="1.100", setup_min="1.100", workflow_rust="1.100.0",
                workflow_node="26", workflow_extra=""):
+    """Writes a repository where a None pin means the source exists but states no version."""
     if dockerfile:
         build_env = root / "tools" / "build-env"
         build_env.mkdir(parents=True)
-        (build_env / "Dockerfile").write_text(
-            f"ARG RUST_VERSION={docker_rust}\nARG NODE_VERSION={docker_node}\nFROM debian\n"
-        )
-    (root / "Cargo.toml").write_text(f'[package]\nrust-version = "{cargo_rust}"\n')
+        arguments = ""
+        if docker_rust is not None:
+            arguments += f"ARG RUST_VERSION={docker_rust}\n"
+        if docker_node is not None:
+            arguments += f"ARG NODE_VERSION={docker_node}\n"
+        (build_env / "Dockerfile").write_text(arguments + "FROM debian\n")
+    if cargo_rust is None:
+        (root / "Cargo.toml").write_text('[package]\nname = "helios"\n')
+    else:
+        (root / "Cargo.toml").write_text(f'[package]\nrust-version = "{cargo_rust}"\n')
     (root / "scripts").mkdir()
-    (root / "scripts" / "setup-dev.sh").write_text(f'RUST_MIN="{setup_min}"\n')
+    if setup_min is None:
+        (root / "scripts" / "setup-dev.sh").write_text("# no minimum\n")
+    else:
+        (root / "scripts" / "setup-dev.sh").write_text(f'RUST_MIN="{setup_min}"\n')
     workflows = root / ".github" / "workflows"
     workflows.mkdir(parents=True)
     (workflows / "regression.yml").write_text(
@@ -67,6 +77,55 @@ class ToolchainPinsTest(unittest.TestCase):
 
     def test_missing_dockerfile_still_compares_the_other_pins(self):
         problems = self.check(dockerfile=False, setup_min="1.95")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("setup-dev.sh", problems[0])
+
+    def test_a_pin_source_without_a_rust_pin_is_a_mismatch(self):
+        problems = self.check(cargo_rust=None)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("Cargo.toml", problems[0])
+        self.assertIn("aucune version", problems[0])
+
+    def test_a_setup_script_without_a_minimum_is_a_mismatch(self):
+        problems = self.check(setup_min=None)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("setup-dev.sh", problems[0])
+
+    def test_a_dockerfile_without_either_arg_is_a_mismatch(self):
+        problems = self.check(docker_rust=None, docker_node=None)
+        self.assertEqual(len(problems), 2)
+        self.assertTrue(all("Dockerfile" in problem for problem in problems))
+        self.assertTrue(any(problem.startswith("rust:") for problem in problems))
+        self.assertTrue(any(problem.startswith("node:") for problem in problems))
+
+    def test_a_dockerfile_without_a_node_arg_is_a_mismatch(self):
+        problems = self.check(docker_node=None)
+        self.assertEqual(len(problems), 1)
+        self.assertTrue(problems[0].startswith("node:"))
+        self.assertIn("Dockerfile", problems[0])
+
+    def test_yaml_workflows_are_scanned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = write_tree(Path(directory))
+            (root / ".github" / "workflows" / "release.yaml").write_text(
+                "steps:\n  - uses: dtolnay/rust-toolchain@1.95.0\n"
+            )
+            problems = toolchain_pins.mismatches(toolchain_pins.collect_pins(root))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("release.yaml", problems[0])
+
+    def test_the_dockerfile_is_the_reference_even_in_a_minority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = write_tree(Path(directory), docker_rust="1.95.0", cargo_rust="1.100",
+                              setup_min="1.100", workflow_rust="1.100.0")
+            problems = toolchain_pins.mismatches(toolchain_pins.collect_pins(root))
+        self.assertEqual(len(problems), 3)
+        self.assertTrue(all("référence : tools/build-env/Dockerfile" in p for p in problems))
+
+    def test_without_a_dockerfile_the_most_frequent_pin_is_the_reference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = write_tree(Path(directory), dockerfile=False, setup_min="1.95")
+            problems = toolchain_pins.mismatches(toolchain_pins.collect_pins(root))
         self.assertEqual(len(problems), 1)
         self.assertIn("setup-dev.sh", problems[0])
 

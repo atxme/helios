@@ -2,8 +2,10 @@
 """Verifies that the working toolchain pins of the repository agree.
 
 Rust pins are compared at the major.minor level, Node pins at the major level.
-The first pin of a tool, or the most frequent one on a tie, is the reference.
-Exit status 1 lists every pin that disagrees with it.
+The Dockerfile's pin is the reference when it has one; otherwise the most
+frequent pin wins, the first one on a tie. A pin source file that exists but
+yields no pin is itself a disagreement. Exit status 1 lists every pin that
+disagrees with the reference.
 """
 
 from collections import Counter
@@ -17,7 +19,7 @@ NODE = "node"
 DOCKERFILE = "tools/build-env/Dockerfile"
 CARGO_MANIFEST = "Cargo.toml"
 SETUP_SCRIPT = "scripts/setup-dev.sh"
-WORKFLOW_GLOB = ".github/workflows/*.yml"
+WORKFLOW_GLOBS = (".github/workflows/*.yml", ".github/workflows/*.yaml")
 
 DOCKER_RUST = re.compile(r"^ARG RUST_VERSION=(\S+)$", re.MULTILINE)
 DOCKER_NODE = re.compile(r"^ARG NODE_VERSION=(\S+)$", re.MULTILINE)
@@ -37,7 +39,11 @@ def _first(pattern, text):
 
 
 def collect_pins(root):
-    """Return {tool: [(relative file, version as written)]} for the repository at root."""
+    """Return {tool: [(relative file, version as written or None)]} for the repository at root.
+
+    A pin source file that exists but states no version contributes a None entry,
+    so that the omission is reported rather than silently ignored.
+    """
     root = Path(root)
     pins = {RUST: [], NODE: []}
 
@@ -55,7 +61,8 @@ def collect_pins(root):
     if setup.is_file():
         pins[RUST].append((SETUP_SCRIPT, _first(SETUP_RUST, _read(setup))))
 
-    for workflow in sorted(root.glob(WORKFLOW_GLOB)):
+    workflows = sorted({path for glob in WORKFLOW_GLOBS for path in root.glob(glob)})
+    for workflow in workflows:
         name = workflow.relative_to(root).as_posix()
         text = _read(workflow)
         for version in WORKFLOW_RUST.findall(text):
@@ -63,7 +70,7 @@ def collect_pins(root):
         for version in WORKFLOW_NODE.findall(text):
             pins[NODE].append((name, version))
 
-    return {tool: [(name, version) for name, version in entries if version] for tool, entries in pins.items()}
+    return pins
 
 
 def _key(tool, version):
@@ -73,17 +80,30 @@ def _key(tool, version):
     return parts[0]
 
 
+def _reference_key(tool, known):
+    """Key of the reference pin among (name, version, key) triples: Dockerfile first."""
+    for name, _, key in known:
+        if name == DOCKERFILE:
+            return key
+    counts = Counter(key for _, _, key in known)
+    return counts.most_common(1)[0][0]
+
+
 def mismatches(pins):
     """Return one readable message per pin that disagrees with its tool's reference."""
     problems = []
     for tool, entries in pins.items():
         if not entries:
             continue
-        keys = [(name, version, _key(tool, version)) for name, version in entries]
-        counts = Counter(key for _, _, key in keys)
-        reference_key = counts.most_common(1)[0][0]
-        reference_file = next(name for name, _, key in keys if key == reference_key)
-        for name, version, key in keys:
+        for name, version in entries:
+            if version is None:
+                problems.append(f"{tool}: {name} n'épingle aucune version reconnue")
+        known = [(name, version, _key(tool, version)) for name, version in entries if version]
+        if not known:
+            continue
+        reference_key = _reference_key(tool, known)
+        reference_file = next(name for name, _, key in known if key == reference_key)
+        for name, version, key in known:
             if key != reference_key:
                 problems.append(
                     f"{tool}: {name} épingle {version} ; {reference_key} attendu "
