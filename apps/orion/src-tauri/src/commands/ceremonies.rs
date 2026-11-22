@@ -1054,37 +1054,45 @@ fn check_tunnel_leaf(
 pub(crate) async fn operator_invitations(
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::operator::invitations::InvitationView>, String> {
-    use orion_core::gateway_admin as admin;
-
     let registry = astra_operator::enrollment::InvitationRegistry::default_location()
         .map_err(|error| format!("{error:#}"))?;
-    let admitted = match connected_gateway(&state).await {
-        Ok(base) => match admin::orion_client() {
+    operator_invitations_from(&state.client, &registry).await
+}
+
+async fn operator_invitations_from(
+    engine: &EngineClient,
+    registry: &astra_operator::enrollment::InvitationRegistry,
+) -> Result<Vec<crate::operator::invitations::InvitationView>, String> {
+    use orion_core::gateway_admin as admin;
+
+    let admitted = match connected_profile(engine).await {
+        Ok((base, _, _)) => match admin::orion_client() {
             Ok(client) => admin::admitted_keys(&client, &base).await.ok(),
             Err(_) => None,
         },
         Err(_) => None,
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    crate::operator::invitations::list(&registry, now, admitted.as_deref())
+    crate::operator::invitations::list(registry, crate::operator::now_unix(), admitted.as_deref())
 }
 
 /// Revokes an invitation still issued. No key: the registry refuses anything
 /// that is not issued, and the revocation destroys its proof key.
 #[tauri::command]
 pub(crate) async fn revoke_invitation(invitation_id: String) -> Result<(), String> {
+    revoke_invitation_with_registry(
+        &invitation_id,
+        astra_operator::enrollment::InvitationRegistry::default_location,
+    )
+}
+
+fn revoke_invitation_with_registry(
+    invitation_id: &str,
+    registry: impl FnOnce() -> anyhow::Result<astra_operator::enrollment::InvitationRegistry>,
+) -> Result<(), String> {
     let id = aether::certificates::encoding::Id16::parse_hex(invitation_id.trim())
         .map_err(|error| error.to_string())?;
-    let registry = astra_operator::enrollment::InvitationRegistry::default_location()
-        .map_err(|error| format!("{error:#}"))?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    crate::operator::invitations::revoke(&registry, &id, now)
+    let registry = registry().map_err(|error| format!("{error:#}"))?;
+    crate::operator::invitations::revoke(&registry, &id, crate::operator::now_unix())
 }
 
 const NO_CONNECTED_GATEWAY: &str = "Connectez d'abord le profil de la gateway, avec un pair \
@@ -1196,3 +1204,7 @@ mod gateway_command_tests;
 #[cfg(all(test, not(windows)))]
 #[path = "ceremonies/operator_campaign_tests.rs"]
 mod operator_campaign_tests;
+
+#[cfg(test)]
+#[path = "ceremonies/invitation_tests.rs"]
+mod invitation_tests;
