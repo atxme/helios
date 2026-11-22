@@ -97,8 +97,9 @@ Anti-objectifs, échecs même si « ça marche » :
 
 - Un index NV de type **compteur** (`TPM_NT_COUNTER`) dans la plage
   propriétaire, à une adresse fixe dans `TpmSettings`
-  (`anti_rollback_nv_index`, défaut `0x0180_4846`, voisin de
-  `update_window_nv_index = 0x0180_4845`).
+  (`anti_rollback_nv_index`, défaut `0x0180_4847` : `0x0180_4845` est la
+  fenêtre de mise à jour et `0x0180_4846` l'index jetable de son essai
+  matériel, `crates/helios-tpm/tests/materiel.rs`).
 - Attributs : écriture et lecture sous l'autorisation propriétaire (même
   session à autorisation nulle que l'index de la fenêtre,
   `tpm_real.rs`), `no_da`. Le choix exact des attributs (ex. `OWNERWRITE`,
