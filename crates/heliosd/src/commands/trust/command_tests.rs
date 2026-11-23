@@ -598,6 +598,154 @@ fn a_signed_abort_consumes_the_epoch_and_removes_only_its_local_candidate() {
 }
 
 #[test]
+fn client_tls_rotation_rejects_wrong_domain_epoch_and_sequence_without_mutation() {
+    isolated(
+        "client_tls_rotation_rejects_wrong_domain_epoch_and_sequence_without_mutation",
+        |root| {
+            let fixture = Fixture::new(root);
+            fixture.persist();
+            let valid = fixture.tls_rotation();
+            let mut wrong_domain = valid.clone();
+            wrong_domain.trust_domain_id =
+                aether::certificates::encoding::TrustDomainId::new([0x44; 16])
+                    .expect("different domain");
+            wrong_domain = wrong_domain
+                .sign(&fixture.ca_private)
+                .expect("signed transition for another domain");
+
+            let mut wrong_ca_epoch = valid.clone();
+            wrong_ca_epoch.ca_epoch = 2;
+            wrong_ca_epoch = wrong_ca_epoch
+                .sign(&fixture.ca_private)
+                .expect("signed transition for another PQ epoch");
+
+            let mut skipped_tls_epoch = valid.clone();
+            skipped_tls_epoch.next_ca_tls_epoch = 3;
+            skipped_tls_epoch = skipped_tls_epoch
+                .sign(&fixture.ca_private)
+                .expect("signed transition with skipped TLS epoch");
+
+            let initial = registry_bytes();
+            for (label, transition, cause) in [
+                (
+                    "wrong trust domain",
+                    wrong_domain,
+                    "object belongs to another trust domain",
+                ),
+                (
+                    "wrong CA epoch",
+                    wrong_ca_epoch,
+                    "issuer is not authorized for this operation",
+                ),
+                (
+                    "skipped TLS epoch",
+                    skipped_tls_epoch,
+                    "generation 3 skips 2",
+                ),
+            ] {
+                let error = install_client_tls_ca(&fixture.input(&transition))
+                    .expect_err(&format!("{label} is rejected"));
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("installing the client TLS CA rotation"),
+                    "{message}"
+                );
+                assert!(message.contains(cause), "{label}: {message}");
+                assert_eq!(registry_bytes(), initial, "{label} leaves state untouched");
+            }
+        },
+    );
+}
+
+#[test]
+fn issuer_install_rejects_wrong_domain_gateway_and_epoch_atomically() {
+    isolated(
+        "issuer_install_rejects_wrong_domain_gateway_and_epoch_atomically",
+        |root| {
+            let fixture = Fixture::new(root);
+            fixture.persist();
+            let valid = fixture.issuer(*fixture.state.astra.astra_policy_fingerprint.fingerprint());
+
+            let mut wrong_domain = valid.clone();
+            wrong_domain.trust_domain_id =
+                aether::certificates::encoding::TrustDomainId::new([0x55; 16])
+                    .expect("different domain");
+            wrong_domain = wrong_domain
+                .sign(&fixture.ca_private)
+                .expect("signed authorization for another domain");
+
+            let mut wrong_gateway = valid.clone();
+            wrong_gateway.gateway_wg_public_key = key(7);
+            wrong_gateway = wrong_gateway
+                .sign(&fixture.ca_private)
+                .expect("signed authorization for another gateway");
+
+            let initial = registry_bytes();
+            for (label, authorization, cause) in [
+                (
+                    "wrong trust domain",
+                    wrong_domain,
+                    "object belongs to another trust domain",
+                ),
+                (
+                    "wrong gateway",
+                    wrong_gateway,
+                    "object names another gateway identity",
+                ),
+            ] {
+                let error = install_astra_issuer(&fixture.input(&authorization))
+                    .expect_err("issuer authorization must match the pinned gateway state");
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("adopting the current Astra issuance policy"),
+                    "{message}"
+                );
+                assert!(message.contains(cause), "{label}: {message}");
+                assert_eq!(registry_bytes(), initial, "{label} leaves state untouched");
+            }
+
+            let mut epoch_two = valid.clone();
+            epoch_two.issuer_epoch = 2;
+            epoch_two = epoch_two
+                .sign(&fixture.ca_private)
+                .expect("sign the first installed issuer epoch");
+            install_astra_issuer(&fixture.input(&epoch_two))
+                .expect("first installed delegation may use epoch two");
+            let installed = registry_bytes();
+            let registry = fixture.reload();
+            assert_eq!(
+                registry
+                    .state()
+                    .issuer
+                    .as_ref()
+                    .map(|issuer| issuer.issuer_epoch),
+                Some(2)
+            );
+            assert_eq!(
+                registry.state().astra.astra_policy_fingerprint,
+                fixture.state.astra.astra_policy_fingerprint,
+                "adopting a delegation that names the current pin keeps it unchanged"
+            );
+
+            let error = install_astra_issuer(&fixture.input(&valid))
+                .expect_err("a previously spent issuer epoch cannot be restored");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(
+                    "delegation at issuer epoch 1 does not advance past the installed epoch 2"
+                ),
+                "{message}"
+            );
+            assert_eq!(
+                registry_bytes(),
+                installed,
+                "rollback leaves the installed issuer intact"
+            );
+        },
+    );
+}
+
+#[test]
 fn offline_install_refuses_missing_registry_and_reports_malformed_input() {
     isolated(
         "offline_install_refuses_missing_registry_and_reports_malformed_input",

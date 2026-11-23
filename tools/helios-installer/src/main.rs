@@ -419,6 +419,22 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn readiness_poll_times_out_on_a_matching_version_in_simulated_mode() {
+        let directory = test_directory("simulated-readiness");
+        fs::create_dir(&directory).unwrap();
+        let marker = directory.join("ready");
+        fs::write(&marker, "version=2.0.0\nmode_reel=false\n").unwrap();
+
+        let error =
+            wait_ready(&marker, Duration::from_millis(50), Some("2.0.0"), true).unwrap_err();
+        assert!(error.to_string().contains("did not publish"));
+        assert!(error.to_string().contains(marker.to_str().unwrap()));
+        assert!(marker.is_file());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn activation_request(name: &str) -> (PathBuf, PathBuf) {
         let root = test_directory(name);
         fs::create_dir(&root).unwrap();

@@ -781,6 +781,81 @@ fn proc_net_dev_requires_the_exact_interface_and_complete_counters() {
 }
 
 #[test]
+fn proc_net_dev_refuses_invalid_values_in_each_consumed_counter_column() {
+    for index in [0, 1, 8, 9] {
+        let mut counters = ["0"; 16];
+        counters[index] = "18446744073709551616";
+        let content = format!("helios0: {}", counters.join(" "));
+        assert_eq!(parse_proc_net_dev(&content, "helios0"), None);
+    }
+}
+
+#[tokio::test]
+async fn mtu_probe_stays_silent_until_the_tunnel_is_up() {
+    let (event_tx, mut events) = broadcast::channel(2);
+    let (internal_tx, mut commands) = mpsc::channel(2);
+    let state = Arc::new(RwLock::new(TunnelState::Down));
+
+    for inactive in [
+        TunnelState::Down,
+        TunnelState::Connecting,
+        TunnelState::Failed,
+        TunnelState::CaptivePortal,
+    ] {
+        *state.write().await = inactive;
+        spawn_mtu_probe_if_up("unused", true, &state, &event_tx, &internal_tx).await;
+    }
+    drop(event_tx);
+    drop(internal_tx);
+    assert!(matches!(
+        events.recv().await,
+        Err(broadcast::error::RecvError::Closed)
+    ));
+    assert!(commands.recv().await.is_none());
+}
+
+async fn assert_probe_reports_fallback_mtu(iface: &str, dry_run: bool) {
+    let (event_tx, mut events) = broadcast::channel(2);
+    let (internal_tx, mut commands) = mpsc::channel(2);
+    let state = Arc::new(RwLock::new(TunnelState::Up));
+
+    spawn_mtu_probe_if_up(iface, dry_run, &state, &event_tx, &internal_tx).await;
+    drop(event_tx);
+    drop(internal_tx);
+    time::timeout(Duration::from_secs(2), async {
+        assert!(matches!(
+            events.recv().await,
+            Ok(HeliosEvent::MtuDiscovered {
+                mtu: 1420,
+                mss: 1380,
+            })
+        ));
+        assert!(matches!(
+            commands.recv().await,
+            Some(OrchestratorCmd::SetMssClamp(1380))
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
+        assert!(commands.recv().await.is_none());
+    })
+    .await
+    .expect("the MTU probe reports once to both channels and exits");
+}
+
+#[tokio::test]
+async fn dry_run_mtu_probe_uses_the_default_transport_and_requests_the_matching_clamp() {
+    assert_probe_reports_fallback_mtu("unused", true).await;
+}
+
+#[tokio::test]
+async fn missing_wan_mtu_uses_the_default_transport_and_requests_the_matching_clamp() {
+    // Linux interface names have at most 15 bytes.
+    assert_probe_reports_fallback_mtu("helios-cannot-be-a-kernel-interface", false).await;
+}
+
+#[test]
 fn handshake_freshness_covers_absent_recent_stale_and_future_timestamps() {
     let mut peer = connected_peer("192.0.2.1:51820");
     peer.last_handshake = None;
