@@ -289,6 +289,16 @@ pub fn discard(out: &Path) -> Result<()> {
     std::fs::remove_dir_all(scratch).with_context(|| format!("removing {}", scratch.display()))
 }
 
+/// The command that runs `cargo xtask` with `arguments`, locked, inside the
+/// build container.
+pub fn xtask_command(arguments: &[String]) -> Vec<String> {
+    let mut command: Vec<String> = ["cargo", "run", "--locked", "--package", "xtask", "--"]
+        .map(String::from)
+        .into();
+    command.extend(arguments.iter().cloned());
+    command
+}
+
 /// Runs `command` in the build image and returns the host directory mounted on
 /// `/helios/out`, which the caller copies out and then [`discard`]s.
 ///

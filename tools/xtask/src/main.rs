@@ -26,7 +26,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use xtask::{archive, container, orion_deps};
+use xtask::{archive, container, orion_deps, verify};
 
 /// Features of the shipped gateway. A production bundle carries all of them:
 /// a `heliosd` without `netlink` or `wireguard` would refuse to start on a
@@ -127,6 +127,19 @@ enum Cmd {
         #[arg(long)]
         skip_npm_ci: bool,
     },
+    /// Checks a signed bundle against the commit its manifest names.
+    ///
+    /// The signature must verify under `--keyring`. The commit is then rebuilt
+    /// in the build container, and every file compared: the command fails
+    /// unless the bundle and the rebuilt commit agree file for file.
+    Verify {
+        /// Bundle directory, or the `.tar.gz` archive made by `pack`.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Public keyring the signature must verify under.
+        #[arg(long)]
+        keyring: PathBuf,
+    },
     /// Archives a **signed** bundle.
     Pack {
         /// Directory produced by `bundle`, containing `manifest.json`.
@@ -157,6 +170,7 @@ fn main() -> Result<()> {
             with_nsis,
             skip_npm_ci,
         } => orion_msi(unsigned, with_nsis, skip_npm_ci),
+        Cmd::Verify { bundle, keyring } => verify::run(&workspace_root()?, &bundle, &keyring),
         Cmd::Pack { dir, output } => pack(&dir, output),
     }
 }
@@ -493,21 +507,15 @@ fn assemble_in_container(
     if skip_frontend {
         arguments.push("--skip-frontend".into());
     }
-    let out =
-        container::build_in_container(root, &publisher_keyring()?, container_xtask(&arguments))?;
+    let out = container::build_in_container(
+        root,
+        &publisher_keyring()?,
+        container::xtask_command(&arguments),
+    )?;
     let copied = container::copy_out(&out.join(&name), staging);
     let discarded = container::discard(&out);
     copied?;
     discarded
-}
-
-/// The command that runs this tool, locked, inside the build container.
-fn container_xtask(arguments: &[String]) -> Vec<String> {
-    let mut command: Vec<String> = ["cargo", "run", "--locked", "--package", "xtask", "--"]
-        .map(String::from)
-        .into();
-    command.extend(arguments.iter().cloned());
-    command
 }
 
 /// Builds the exact daemon shape shipped to a real gateway.
