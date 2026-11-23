@@ -38,7 +38,9 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     for volume in helios-build-cargo helios-build-target; do
         if docker volume inspect "$volume" >/dev/null 2>&1; then
             echo "Suppression du volume Docker : $volume"
-            docker volume rm "$volume" >/dev/null
+            if ! docker volume rm "$volume" >/dev/null; then
+                echo "Avertissement : volume Docker $volume non supprimé (en usage ?)." >&2
+            fi
         fi
     done
 else

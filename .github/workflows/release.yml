@@ -158,9 +158,9 @@ jobs:
       - uses: actions/checkout@v7
 
       # L'hôte ne fait qu'orchestrer : `cargo xtask bundle` compile dans le
-      # conteneur épinglé (Rust 1.100.0, Node 26, dépendances système). Le Rust
-      # préinstallé du runner suffit donc à compiler xtask ; aucune toolchain ni
-      # paquet n'est installé ici.
+      # conteneur épinglé (Rust 1.100.0, Node 26, dépendances système). Seul
+      # xtask se compile ici, avec la toolchain épinglée du workspace.
+      - uses: dtolnay/rust-toolchain@1.100.0
 
       # Le trousseau **public** de l'éditeur n'est pas un secret : c'est l'ancre
       # de confiance compilée dans le binaire. Il est fourni en variable de

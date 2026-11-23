@@ -28,6 +28,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - uses: dtolnay/rust-toolchain@1.100.0
+
       # Le trousseau **public** de l'éditeur, comme dans `release.yml` : c'est
       # l'ancre de confiance compilée dans le bundle, et il n'est pas secret.
       - name: Ancre de confiance éditeur
@@ -61,16 +63,21 @@ jobs:
       # Volumes de cache vidés : la seconde construction repart de zéro, sans
       # rien hérité de la première.
       - name: Vidage des volumes de cache
-        run: docker volume rm helios-build-cargo helios-build-target
+        run: |
+          for volume in helios-build-cargo helios-build-target; do
+            if docker volume inspect "$volume" >/dev/null 2>&1; then
+              docker volume rm "$volume"
+            fi
+          done
 
       # Second checkout du même commit, hors de l'espace de travail, pour que
       # les chemins absolus de la première construction ne se retrouvent pas
-      # identiques dans la seconde.
+      # identiques dans la seconde. `actions/checkout` refuse un chemin hors de
+      # l'espace de travail : on clone localement puis on se place sur le commit.
       - name: Second checkout
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.sha }}
-          path: ${{ runner.temp }}/b
+        run: |
+          git clone --no-checkout "$GITHUB_WORKSPACE" "$RUNNER_TEMP/b"
+          git -C "$RUNNER_TEMP/b" checkout --detach "$GITHUB_SHA"
 
       - name: Construction B (second checkout, fuseau et umask différents)
         working-directory: ${{ runner.temp }}/b
