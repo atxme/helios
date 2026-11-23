@@ -31,3 +31,16 @@ fi
 # genuinely fresh single-target build. It is recreated on demand.
 remove_target "$canonical_target"
 echo "Cibles Helios nettoyées. La prochaine compilation utilisera uniquement : $canonical_target"
+
+# Volumes Docker du build conteneurisé (cache Cargo et cible). Absents ou démon
+# arrêté : rien à faire, sans échec du nettoyage.
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    for volume in helios-build-cargo helios-build-target; do
+        if docker volume inspect "$volume" >/dev/null 2>&1; then
+            echo "Suppression du volume Docker : $volume"
+            docker volume rm "$volume" >/dev/null
+        fi
+    done
+else
+    echo "Docker indisponible : volumes de build non supprimés."
+fi

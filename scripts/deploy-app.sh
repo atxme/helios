@@ -16,6 +16,7 @@ CHANNEL="${HELIOS_DEPLOY_CHANNEL:-production}"
 SEQUENCE=""
 SKIP_FRONTEND=0
 STAGE_ONLY=0
+BUILD_NATIVE=0
 
 usage() {
     cat >&2 <<'EOF'
@@ -26,6 +27,8 @@ Usage: ./scripts/deploy-app.sh [options]
   --channel C        testing or production (default: production)
   --skip-frontend    Reuse web/dist for a faster Rust-only iteration
   --stage-only       Upload and verify without activating
+  --build-natif      Build on this host (cargo xtask app --native) instead of
+                     the pinned build container (default)
 
 Variables: HELIOS_URL, HELIOS_DEPLOY_CHANNEL.
 EOF
@@ -39,6 +42,7 @@ while [ $# -gt 0 ]; do
         --channel) CHANNEL="${2:-}"; shift 2 ;;
         --skip-frontend) SKIP_FRONTEND=1; shift ;;
         --stage-only) STAGE_ONLY=1; shift ;;
+        --build-natif) BUILD_NATIVE=1; shift ;;
         -h|--help) usage 0 ;;
         *) echo "unknown option: $1" >&2; usage ;;
     esac
@@ -89,6 +93,9 @@ echo "==> Build heliosd $VERSION ($TARGET)"
 BUILD_ARGS=(app --target "$TARGET")
 if [ "$SKIP_FRONTEND" = "1" ]; then
     BUILD_ARGS+=(--skip-frontend)
+fi
+if [ "$BUILD_NATIVE" = "1" ]; then
+    BUILD_ARGS+=(--native)
 fi
 HELIOS_PUBLISHER_KEYRING_PATH="$EPOCH_DIR/publisher-keyring.json" \
     cargo xtask "${BUILD_ARGS[@]}"

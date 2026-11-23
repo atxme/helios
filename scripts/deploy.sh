@@ -42,6 +42,7 @@ INSTALLER=1
 ASTRA=1
 ASTRA_ONLY=0
 FIREWALL_MODE=preserve
+BUILD_NATIF=0
 SEQUENCE=""
 # Relais public créé dans Orion (Astra › Coffre et clés) : domaine, RP ID, ancre CA-PQ.
 # Rien de secret — le coffre, lui, ne quitte jamais le poste opérateur.
@@ -78,6 +79,8 @@ usage() {
 Usage : ./scripts/deploy.sh [hôte-ssh] [options]
 
   --sequence N     Force la séquence de release (défaut : horodatage Unix)
+  --build-natif    Construit sur ce poste (`cargo xtask bundle --native`) au lieu
+                   du conteneur de build épinglé (défaut)
   --copie-seule    Copie l'archive sans lancer l'installation privilégiée
   --canal C        testing ou production (défaut : production)
   --sans-astra     Saute le conteneur d'autorité, même si un relais existe
@@ -105,6 +108,7 @@ CIBLE=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --sequence) SEQUENCE="${2:-}"; shift 2 ;;
+        --build-natif) BUILD_NATIF=1; shift ;;
         --copie-seule) INSTALLER=0; shift ;;
         --sans-astra) ASTRA=0; shift ;;
         --astra) ASTRA_ONLY=1; shift ;;
@@ -199,8 +203,12 @@ if [ "$ASTRA_ONLY" = "0" ]; then
 echo "==> 1/7  Construction"
 # `xtask bundle` rappelle les deux commandes suivantes à taper : elles sont
 # redondantes ici, ce script les enchaîne. On coupe à partir de ce rappel.
+BUNDLE_ARGS=(bundle --target "$CIBLE_TRIPLE")
+if [ "$BUILD_NATIF" = "1" ]; then
+    BUNDLE_ARGS+=(--native)
+fi
 HELIOS_PUBLISHER_KEYRING_PATH="$EPOQUE/publisher-keyring.json" \
-    cargo xtask bundle --target "$CIBLE_TRIPLE" \
+    cargo xtask "${BUNDLE_ARGS[@]}" \
     | sed '/^Signer sur le poste éditeur/,$d'
 
 echo "==> 2/7  Signature hors ligne (époque $EPOQUE_N)"
@@ -389,9 +397,9 @@ deployer_astra() {
     local canal_present cert_astra cert_gateway demande_gateway certificat_distant
     local ca_tls_der empreinte_ca_tls ca_tls_distant arg_ca_tls
 
-    # `docker` n'est utilisable sans privilège ni ici ni sur la gateway :
-    # l'utilisateur n'est dans le groupe `docker` d'aucune des deux. Tout ce
-    # qui touche au conteneur passe donc par le même sudo distant que le reste
+    # Sur la gateway, `docker` n'est utilisable qu'avec sudo : l'utilisateur
+    # est dans le groupe `docker` du poste, pas sur la gateway. Tout ce qui
+    # touche au conteneur passe donc par le même sudo distant que le reste
     # du déploiement — et l'image se construit **sur la cible**, ce qui évite
     # d'exiger un docker local et de transférer plusieurs centaines de Mio.
     compose="$(helios_ssh_sudo_capture "$CIBLE" 'if docker compose version >/dev/null 2>&1; then

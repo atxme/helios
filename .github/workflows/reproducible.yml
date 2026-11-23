@@ -1,0 +1,112 @@
+name: Reproductibilité du bundle
+
+# Construit deux fois le bundle gateway, depuis deux emplacements, avec deux
+# fuseaux horaires et deux umask, sans cache Docker partagé, puis compare les
+# empreintes de chaque fichier. Une différence signale une entrée qui n'est pas
+# figée par le commit : horodatage, chemin, ordre de lecture, environnement.
+#
+# Déclenché sur tag, à la main, et chaque lundi à 04:00 UTC. Ne publie rien et
+# ne signe rien : seule la comparaison compte.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  double-construction:
+    name: Double construction du bundle gateway
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v7
+
+      # Le trousseau **public** de l'éditeur, comme dans `release.yml` : c'est
+      # l'ancre de confiance compilée dans le bundle, et il n'est pas secret.
+      - name: Ancre de confiance éditeur
+        env:
+          KEYRING: ${{ vars.HELIOS_PUBLISHER_KEYRING }}
+        run: |
+          if [ -z "$KEYRING" ]; then
+            echo "::error::La variable de dépôt HELIOS_PUBLISHER_KEYRING est absente." \
+                 "Y placer le contenu du trousseau PUBLIC de production" \
+                 "(publisher-keyring.json). Aucune clé privée ne doit y figurer."
+            exit 1
+          fi
+          printf '%s' "$KEYRING" > "$RUNNER_TEMP/publisher-keyring.json"
+          if grep -qi 'private' "$RUNNER_TEMP/publisher-keyring.json"; then
+            echo "::error::Le trousseau fourni semble contenir une clé privée. Abandon."
+            exit 1
+          fi
+
+      - name: Construction A (espace de travail)
+        env:
+          HELIOS_PUBLISHER_KEYRING_PATH: ${{ runner.temp }}/publisher-keyring.json
+        run: cargo xtask bundle
+
+      - name: Empreintes A
+        run: |
+          mkdir -p "$RUNNER_TEMP/repro"
+          (cd target/bundle && find . -type f -print0 | sort -z | xargs -0 sha256sum) \
+            > "$RUNNER_TEMP/repro/a.sha256"
+          cat "$RUNNER_TEMP/repro/a.sha256"
+
+      # Volumes de cache vidés : la seconde construction repart de zéro, sans
+      # rien hérité de la première.
+      - name: Vidage des volumes de cache
+        run: docker volume rm helios-build-cargo helios-build-target
+
+      # Second checkout du même commit, hors de l'espace de travail, pour que
+      # les chemins absolus de la première construction ne se retrouvent pas
+      # identiques dans la seconde.
+      - name: Second checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: ${{ runner.temp }}/b
+
+      - name: Construction B (second checkout, fuseau et umask différents)
+        working-directory: ${{ runner.temp }}/b
+        env:
+          HELIOS_PUBLISHER_KEYRING_PATH: ${{ runner.temp }}/publisher-keyring.json
+          TZ: Pacific/Auckland
+        run: |
+          umask 077
+          cargo xtask bundle
+
+      - name: Empreintes B
+        run: |
+          mkdir -p "$RUNNER_TEMP/repro"
+          (cd "$RUNNER_TEMP/b/target/bundle" && find . -type f -print0 | sort -z | xargs -0 sha256sum) \
+            > "$RUNNER_TEMP/repro/b.sha256"
+          cat "$RUNNER_TEMP/repro/b.sha256"
+
+      - name: Listes d'empreintes en artefact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: empreintes-reproductibilite
+          path: ${{ runner.temp }}/repro/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Comparaison des deux constructions
+        run: |
+          a="$RUNNER_TEMP/repro/a.sha256"
+          b="$RUNNER_TEMP/repro/b.sha256"
+          if [ ! -s "$a" ] || [ ! -s "$b" ]; then
+            echo "::error::Une des deux listes d'empreintes est vide."
+            exit 1
+          fi
+          if ! diff -u "$a" "$b"; then
+            echo "::error::Le bundle gateway n'est pas reproductible : les deux constructions diffèrent (différence ci-dessus)."
+            exit 1
+          fi
+          echo "Constructions identiques : $(wc -l < "$a") fichiers."
