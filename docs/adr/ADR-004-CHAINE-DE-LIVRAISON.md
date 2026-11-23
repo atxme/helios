@@ -265,6 +265,9 @@ dépôt. La commande de signature Tauri impose un horodatage RFC 3161 avec
   ces deux entrées (spec F15 §5.1). Un tiers peut le vérifier : `cargo xtask
   verify` reconstruit le commit nommé dans le conteneur de build figé et compare
   fichier à fichier. Le bundle gateway est donc reconstructible par un tiers.
+  Le trousseau public donné à `verify` doit être celui compilé dans le bundle
+  publié (à archiver à chaque époque) : un autre ne donne des différences que
+  sur les binaires.
   Ce qui n’est **pas** promis :
   * l’archive `.tar.gz` signée d’une publication à l’autre : la comparaison
     porte sur les fichiers du bundle, hors `manifest.json`, dont la signature et

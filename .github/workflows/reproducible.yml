@@ -15,6 +15,14 @@ on:
   push:
     tags:
       - "v*"
+  # GitHub ne distribue un workflow que depuis la branche par défaut : sans ce
+  # déclencheur, il ne pourrait pas passer avant la fusion.
+  pull_request:
+    paths:
+      - "tools/build-env/**"
+      - "tools/xtask/**"
+      - "Cargo.lock"
+      - ".github/workflows/reproducible.yml"
   workflow_dispatch:
   schedule:
     - cron: "0 4 * * 1"
@@ -62,7 +70,9 @@ jobs:
           mkdir -p "$RUNNER_TEMP/repro"
           (cd target/bundle && find . -type f -print0 | sort -z | xargs -0 sha256sum) \
             > "$RUNNER_TEMP/repro/a.sha256"
-          cat "$RUNNER_TEMP/repro/a.sha256"
+          (cd target/bundle && find . -type f -printf '%m %s %P\n' | sort) \
+            > "$RUNNER_TEMP/repro/a.meta"
+          cat "$RUNNER_TEMP/repro/a.sha256" "$RUNNER_TEMP/repro/a.meta"
 
       # Volumes de cache vidés : la seconde construction repart de zéro, sans
       # rien hérité de la première.
@@ -97,7 +107,9 @@ jobs:
           mkdir -p "$RUNNER_TEMP/repro"
           (cd "$RUNNER_TEMP/b/target/bundle" && find . -type f -print0 | sort -z | xargs -0 sha256sum) \
             > "$RUNNER_TEMP/repro/b.sha256"
-          cat "$RUNNER_TEMP/repro/b.sha256"
+          (cd "$RUNNER_TEMP/b/target/bundle" && find . -type f -printf '%m %s %P\n' | sort) \
+            > "$RUNNER_TEMP/repro/b.meta"
+          cat "$RUNNER_TEMP/repro/b.sha256" "$RUNNER_TEMP/repro/b.meta"
 
       - name: Listes d'empreintes en artefact
         if: always()
@@ -116,7 +128,9 @@ jobs:
             echo "::error::Une des deux listes d'empreintes est vide."
             exit 1
           fi
-          if ! diff -u "$a" "$b"; then
+          # Mode (bit exécutable compris) et taille, en plus des empreintes : ce
+          # sont les attributs que `collect` compare.
+          if ! diff -u "$a" "$b" || ! diff -u "${a%.sha256}.meta" "${b%.sha256}.meta"; then
             echo "::error::Le bundle gateway n'est pas reproductible : les deux constructions diffèrent (différence ci-dessus)."
             exit 1
           fi

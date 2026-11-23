@@ -151,7 +151,7 @@ jobs:
   bundle:
     name: Assemblage du bundle gateway
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       CARGO_BUILD_JOBS: 2
     steps:

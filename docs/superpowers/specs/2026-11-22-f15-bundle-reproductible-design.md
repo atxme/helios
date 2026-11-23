@@ -397,7 +397,7 @@ oubliées.
   commit depuis deux chemins de checkout différents donnent la même liste
   `collect`. C'est la preuve d'acceptation du lot, consignée dans le rapport
   final.
-- **CI :** `reproducible.yml` vert sur la branche avant la fusion
+- **CI :** `reproducible.yml` vert avant la fusion, sur une pull request qui touche `tools/build-env/`, `tools/xtask/`, `Cargo.lock` ou le workflow lui-même (GitHub ne distribue un workflow que depuis la branche par défaut : un déclencheur `pull_request` a été ajouté ; à défaut, premier passage après la fusion)
   (`workflow_dispatch`).
 - **Installateur :** `helios-installer bootstrap` installe une archive produite
   par le nouveau `pack` (test existant d'extraction adapté si besoin).

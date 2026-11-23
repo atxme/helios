@@ -357,12 +357,18 @@ cargo xtask verify --bundle <répertoire signé ou archive .tar.gz> --keyring <t
 * `--bundle` accepte le répertoire produit par `cargo xtask bundle` et signé,
   ou l'archive `.tar.gz` produite par `cargo xtask pack`.
 * `--keyring` est le trousseau **public** de l'éditeur. Un trousseau qui
-  contiendrait une clé privée ne doit pas servir.
+  contiendrait une clé privée ne doit pas servir. C'est aussi une entrée du
+  build : il doit être le trousseau public compilé dans le bundle publié
+  (archiver le trousseau public de chaque époque à la publication). Un autre
+  trousseau, même s'il vérifie encore la signature, ne change que les
+  binaires.
 * La signature du manifeste est vérifiée en premier. Un manifeste non signé ou
   mal signé est refusé avant tout build.
 * La comparaison porte sur les fichiers du bundle, `manifest.json` exclu.
   L'archive `.tar.gz` n'y figure pas : elle change d'une publication à l'autre.
-* `verify` ne touche ni à `target/bundle/` ni au répertoire de travail.
+* `verify` ne touche ni à `target/bundle/` ni aux fichiers suivis ; un worktree
+  git temporaire est créé puis retiré (`git worktree prune` s'il reste après une
+  interruption). Il se lance depuis un clone qui contient le commit nommé.
 
 Le succès affiche `==> The bundle matches the commit it names, file for file`
 et sort avec le code 0. Tout autre résultat sort avec le code 1 :
@@ -373,8 +379,11 @@ et sort avec le code 0. Tout autre résultat sort avec le code 1 :
   car le commit ne peut pas être reconstruit à l'identique.
 * **Signature invalide** ou trousseau illisible : refus avant la reconstruction.
 * **Différences** : chaque fichier manquant, en trop ou différent est affiché,
-  avec les deux empreintes, puis la commande échoue. Le bundle n'est alors pas
-  celui que produit le commit qu'il nomme.
+  avec les deux empreintes et la liste (manifeste signé ou fichiers sur disque)
+  où elle a été trouvée, puis la commande échoue. Si seuls des exécutables
+  (`heliosd`, `helios`, `helios-installer`) diffèrent, écarter d'abord un
+  `--keyring` différent de celui compilé dans le bundle ; sinon le bundle n'est
+  pas celui que produit le commit qu'il nomme.
 * **Docker indisponible** : la reconstruction ne peut pas démarrer.
 
 ### Prérequis Docker

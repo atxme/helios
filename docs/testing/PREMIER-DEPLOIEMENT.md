@@ -199,6 +199,9 @@ les unités systemd.
 
 ## Étape 2 — Fabriquer le bundle
 
+Prérequis : Docker (la construction se fait dans le conteneur de build), ou
+`--native` pour construire sur ce poste, sans garantie de reproductibilité.
+
 ```sh
 export HELIOS_PUBLISHER_KEYRING_PATH=/chemin/hors-ligne/helios-epoch-1/publisher-keyring.json
 cargo xtask bundle

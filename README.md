@@ -147,7 +147,7 @@ l'[ADR-005](docs/adr/ADR-005-NEGOCIATION-DE-CLE.md) et la
 
 Le dépôt contient un workspace Rust et deux interfaces React : la console web
 Helios et l'application Orion. Il nécessite Rust 1.100 ou supérieur et Node.js
-`^22.22.2 || ^24.15.0 || >=26.0.0`. Sous Linux, la compilation du shell Tauri
+`>=26.0.0`. Sous Linux, la compilation du shell Tauri
 nécessite WebKitGTK 4.1 et GTK3 ; `scripts/setup-dev.sh` installe les
 dépendances de développement sur Debian et Ubuntu.
 
