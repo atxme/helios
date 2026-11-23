@@ -234,6 +234,84 @@ fn an_absent_request_is_not_an_error() {
 }
 
 #[test]
+fn preparation_resumes_persisted_material_and_preserves_it_on_refusal() {
+    const CHILD: &str = "HELIOS_TEST_GATEWAY_PREPARATION";
+    const TEST_NAME: &str =
+        "gateway_rotation::tests::preparation_resumes_persisted_material_and_preserves_it_on_refusal";
+
+    let Some(directory) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path();
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD, root)
+            .env("HELIOS_GATEWAY_REQUEST", root.join("request.json"))
+            .env("HELIOS_KEY_NEGO_NEXT_CERT", root.join("candidate.der"))
+            .env("HELIOS_KEY_NEGO_NEXT_KEY", root.join("candidate.vault"))
+            .output()
+            .expect("start isolated test");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    };
+
+    let request_path = directory.join("request.json");
+    let tls_path = directory.join("candidate.der");
+    let registry = registry_in(&directory, gateway());
+    let prepare = || prepare_request(&registry, None, false, false, false, false, NOW);
+
+    let error = prepare()
+        .err()
+        .expect("a first candidate needs the sealed secret");
+    assert!(
+        error.to_string().contains("TPM secret unavailable"),
+        "{error:#}"
+    );
+    assert!(!request_path.exists());
+    assert!(!tls_path.exists());
+
+    let held = request(4, NOW + 3_600);
+    write_pending(&request_path, &held).expect("persist ceremony request");
+    let request_before = std::fs::read(&request_path).expect("saved request");
+
+    let prepared = prepare().expect("reuse a valid request without a TLS candidate");
+    assert!(prepared.reused);
+    assert_eq!(prepared.request, held);
+    assert_eq!(prepared.path, request_path);
+    assert!(prepared.tls_certificate.is_none());
+
+    let tls = DerCertificate::new(vec![8; 64]).expect("bounded TLS certificate bytes");
+    std::fs::write(&tls_path, tls.as_bytes()).expect("persist public TLS leaf");
+    let prepared = prepare().expect("reuse while exporting the TLS candidate");
+    assert_eq!(prepared.tls_certificate, Some(tls));
+    assert_eq!(std::fs::read(&request_path).unwrap(), request_before);
+
+    std::fs::write(&tls_path, []).expect("write an empty candidate");
+    let error = prepare()
+        .err()
+        .expect("an empty TLS candidate must not be treated as absent");
+    assert!(format!("{error:#}").contains("candidate.der"));
+    assert_eq!(std::fs::read(&request_path).unwrap(), request_before);
+
+    std::fs::remove_file(&tls_path).expect("clear the invalid fixture candidate");
+    let expired = request(4, NOW - 1);
+    write_pending(&request_path, &expired).expect("persist expired request");
+    let error = prepare()
+        .err()
+        .expect("re-signing requires the sealed candidate secret");
+    assert!(
+        error.to_string().contains("TPM secret unavailable"),
+        "{error:#}"
+    );
+    assert_eq!(read_pending(&request_path).unwrap(), Some(expired));
+}
+
+#[test]
 fn a_malformed_pending_request_is_not_treated_as_absent() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let path = directory.path().join("gateway-certificate-request.json");

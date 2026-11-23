@@ -739,7 +739,10 @@ mod tests {
         AstraCredentialBinding, CredentialRegistry, CredentialState, MAX_CREDENTIAL_BINDINGS,
     };
     use aether::certificates::encoding::{
-        generate_ml_dsa_87_keypair, MlDsa87Signature, TrustDomainId, WireGuardKey,
+        generate_ml_dsa_87_keypair, Id16, MlDsa87Signature, TrustDomainId, WireGuardKey,
+    };
+    use aether::certificates::status::{
+        AstraRotationCampaign, AstraSignerRequest, CampaignScope, CampaignTarget, CertificateKind,
     };
     use aether::certificates::CERTIFICATE_FORMAT_VERSION;
     use astra_channel::{OperatorIdentity, MAX_OPERATOR_STATUS_BYTES};
@@ -809,6 +812,359 @@ mod tests {
             .await
             .expect("the answer stays within the operator bound")
             .to_vec()
+    }
+
+    fn signing_operation(
+        campaign_seed: u8,
+        operation_seed: u8,
+        created_at: u64,
+        expires_at: u64,
+        scope: CampaignScope,
+        reason: String,
+    ) -> crate::signing::SigningOperation {
+        let campaign =
+            Box::new(AstraRotationCampaign {
+                format_version: CERTIFICATE_FORMAT_VERSION,
+                campaign_id: Id16::new([campaign_seed; 16]).expect("campaign ID"),
+                trust_domain_id: TrustDomainId::new(DOMAIN).expect("domain"),
+                gateway_wg_public_key: WireGuardKey::from_bytes(GATEWAY),
+                server_name: "gateway.example".into(),
+                created_at,
+                expires_at,
+                scope,
+                targets: vec![CampaignTarget {
+                    certificate_kind: CertificateKind::ClientPq,
+                    identity_key: WireGuardKey::from_bytes([3; 32]),
+                    epoch: 1,
+                    generation: 4,
+                    active_tls_certificate_fingerprint:
+                        aether::certificates::encoding::Fingerprint::of(b"active TLS"),
+                    active_pq_certificate_fingerprint:
+                        aether::certificates::encoding::Fingerprint::of(b"active PQ"),
+                }],
+                reason,
+                requested_by: "operator workstation".into(),
+                policy_fingerprint: aether::certificates::encoding::Fingerprint::of(b"policy"),
+                required_credentials: scope.required_credentials(),
+            });
+        let request = Box::new(AstraSignerRequest {
+            format_version: CERTIFICATE_FORMAT_VERSION,
+            operation_id: Id16::new([operation_seed; 16]).expect("operation ID"),
+            campaign_fingerprint: campaign.fingerprint(),
+            authority_url: "https://astra.example".into(),
+            encrypted_vault_fingerprint: aether::certificates::encoding::Fingerprint::of(b"vault"),
+            required_credentials: campaign.required_credentials,
+            created_at,
+            expires_at,
+            astra_service_key_epoch: 1,
+            astra_signature: MlDsa87Signature::placeholder(),
+        });
+        crate::signing::SigningOperation::new(campaign, request, created_at)
+            .expect("valid operator operation")
+    }
+
+    async fn pending_answer(service: &Arc<AstraService>) -> Vec<u8> {
+        let response = pending(
+            State(Arc::clone(service)),
+            Json(RelayedOperatorCampaign {
+                operator: OperatorIdentity::DevLoopback,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), MAX_OPERATOR_STATUS_BYTES)
+            .await
+            .expect("pending list stays bounded")
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn pending_lists_only_live_unapproved_campaigns_in_deadline_order() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let service = fixture(directory.path());
+        serve(
+            &service,
+            Box::new(CredentialRegistry {
+                trust_domain_id: TrustDomainId::new(DOMAIN).expect("domain"),
+                gateway_wg_public_key: WireGuardKey::from_bytes(GATEWAY),
+                ca_epoch: 1,
+                credential_registry_epoch: 1,
+                bindings: Vec::new(),
+            }),
+        );
+        let now = now_unix();
+        let later = signing_operation(
+            11,
+            21,
+            now,
+            now + 240,
+            CampaignScope::FleetLeafs,
+            "later deadline".into(),
+        );
+        let later_id = later.operation_id;
+        let sooner = signing_operation(
+            12,
+            22,
+            now,
+            now + 120,
+            CampaignScope::FleetLeafs,
+            "sooner deadline".into(),
+        );
+        let sooner_id = sooner.operation_id;
+        let mut approved = signing_operation(
+            13,
+            23,
+            now,
+            now + 180,
+            CampaignScope::FleetLeafs,
+            "already approved".into(),
+        );
+        approved.approve_without_ceremony();
+        let expired = signing_operation(
+            14,
+            24,
+            now.saturating_sub(400),
+            now.saturating_sub(100),
+            CampaignScope::FleetLeafs,
+            "expired".into(),
+        );
+        {
+            let mut store = service.signing.lock().await;
+            store.open(later, now).expect("later operation");
+            store.open(sooner, now).expect("sooner operation");
+            store.open(approved, now).expect("approved operation");
+            store
+                .open(expired, now.saturating_sub(400))
+                .expect("expired operation");
+        }
+
+        let body = pending_answer(&service).await;
+        let list: aether::certificates::transport::OperatorPendingList =
+            serde_json::from_slice(&body).expect("pending list");
+
+        assert_eq!(list.operations.len(), 2);
+        assert_eq!(list.operations[0].operation_id, sooner_id);
+        assert_eq!(list.operations[0].reason, "sooner deadline");
+        assert_eq!(list.operations[0].target_count, 1);
+        assert_eq!(list.operations[0].required_credentials, 1);
+        assert_eq!(list.operations[1].operation_id, later_id);
+        assert!(!body
+            .windows(b"capability".len())
+            .any(|part| part == b"capability"));
+
+        let relayed = || {
+            Json(RelayedOperatorCampaign {
+                operator: OperatorIdentity::DevLoopback,
+            })
+        };
+        let operation_response = operation(
+            State(Arc::clone(&service)),
+            Path(sooner_id.to_string()),
+            relayed(),
+        )
+        .await;
+        assert_eq!(operation_response.status(), axum::http::StatusCode::OK);
+        let operation_view: crate::signing::SigningOperationView = serde_json::from_slice(
+            &axum::body::to_bytes(operation_response.into_body(), MAX_OPERATOR_STATUS_BYTES)
+                .await
+                .expect("operation view stays bounded"),
+        )
+        .expect("operation view");
+        assert_eq!(operation_view.operation_id, sooner_id);
+        assert_eq!(
+            operation_view.state,
+            crate::signing::SigningOperationState::AwaitingOperator
+        );
+        assert!(operation_view.signer_request_token.is_some());
+        assert!(operation_view.vault_token.is_none());
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!(
+                "Bearer {}",
+                operation_view
+                    .signer_request_token
+                    .as_deref()
+                    .expect("token")
+            )
+            .parse()
+            .expect("authorization header"),
+        );
+        let signer_response = signer_request(
+            State(Arc::clone(&service)),
+            Path(sooner_id.to_string()),
+            headers,
+            relayed(),
+        )
+        .await;
+        assert_eq!(signer_response.status(), axum::http::StatusCode::OK);
+        let signer: crate::service::SignerRequestResponse = serde_json::from_slice(
+            &axum::body::to_bytes(signer_response.into_body(), MAX_OPERATOR_STATUS_BYTES)
+                .await
+                .expect("signer request stays bounded"),
+        )
+        .expect("signer request");
+        assert_eq!(signer.signer_request.operation_id, sooner_id);
+        assert_eq!(signer.campaign.reason, "sooner deadline");
+
+        let unknown = operation(
+            State(Arc::clone(&service)),
+            Path("01010101010101010101010101010101".into()),
+            relayed(),
+        )
+        .await;
+        let malformed = operation(
+            State(Arc::clone(&service)),
+            Path("not-hex".into()),
+            relayed(),
+        )
+        .await;
+        assert_eq!(unknown.status(), axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(malformed.status(), unknown.status());
+        let unknown_body = axum::body::to_bytes(unknown.into_body(), 1024)
+            .await
+            .expect("refusal body");
+        let malformed_body = axum::body::to_bytes(malformed.into_body(), 1024)
+            .await
+            .expect("refusal body");
+        assert_eq!(unknown_body, malformed_body);
+
+        let mut invalid_headers = axum::http::HeaderMap::new();
+        invalid_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer invalid".parse().expect("authorization header"),
+        );
+        let refused_signer = signer_request(
+            State(Arc::clone(&service)),
+            Path(sooner_id.to_string()),
+            invalid_headers,
+            relayed(),
+        )
+        .await;
+        assert_eq!(refused_signer.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn pending_is_empty_when_only_an_expired_campaign_remains() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let service = fixture(directory.path());
+        let now = now_unix();
+        let expired = signing_operation(
+            31,
+            41,
+            now.saturating_sub(400),
+            now.saturating_sub(100),
+            CampaignScope::FleetLeafs,
+            "expired campaign".into(),
+        );
+        service
+            .signing
+            .lock()
+            .await
+            .open(expired, now.saturating_sub(400))
+            .expect("expired operation can be retained until listing");
+
+        let list: aether::certificates::transport::OperatorPendingList =
+            serde_json::from_slice(&pending_answer(&service).await).expect("pending list");
+
+        assert!(list.operations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn operation_view_capability_reads_only_the_named_encrypted_vault() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let service = fixture(directory.path());
+        let now = now_unix();
+        let held_vault = b"vault".to_vec();
+        let fingerprint = Fingerprint::of(&held_vault);
+        *service.encrypted_vault.write().expect("vault lock") = Some(Arc::new(held_vault.clone()));
+        let stored_operation = signing_operation(
+            51,
+            61,
+            now,
+            now + 300,
+            CampaignScope::IssuerDelegation,
+            "renew delegated issuer".into(),
+        );
+        let operation_id = stored_operation.operation_id;
+        service
+            .signing
+            .lock()
+            .await
+            .open(stored_operation, now)
+            .expect("open operator operation");
+
+        let relayed = || {
+            Json(RelayedOperatorCampaign {
+                operator: OperatorIdentity::DevLoopback,
+            })
+        };
+        let operation_response = operation(
+            State(Arc::clone(&service)),
+            Path(operation_id.to_string()),
+            relayed(),
+        )
+        .await;
+        assert_eq!(operation_response.status(), axum::http::StatusCode::OK);
+        let view: crate::signing::SigningOperationView = serde_json::from_slice(
+            &axum::body::to_bytes(operation_response.into_body(), MAX_OPERATOR_STATUS_BYTES)
+                .await
+                .expect("operation view"),
+        )
+        .expect("view");
+        let token = view.vault_token.expect("issuer scope opens the vault");
+        assert!(view.signer_request_token.is_some());
+
+        let mut authorized = axum::http::HeaderMap::new();
+        authorized.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}")
+                .parse()
+                .expect("authorization header"),
+        );
+        let copied = vault(
+            State(Arc::clone(&service)),
+            Path(fingerprint.to_string()),
+            authorized.clone(),
+            relayed(),
+        )
+        .await;
+        assert_eq!(copied.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(copied.into_body(), MAX_OPERATOR_STATUS_BYTES)
+                .await
+                .expect("vault response"),
+            held_vault
+        );
+
+        let wrong_fingerprint = vault(
+            State(Arc::clone(&service)),
+            Path(Fingerprint::of(b"another vault").to_string()),
+            authorized.clone(),
+            relayed(),
+        )
+        .await;
+        assert_eq!(
+            wrong_fingerprint.status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+        let missing_token = vault(
+            State(Arc::clone(&service)),
+            Path(fingerprint.to_string()),
+            axum::http::HeaderMap::new(),
+            relayed(),
+        )
+        .await;
+        assert_eq!(missing_token.status(), axum::http::StatusCode::BAD_REQUEST);
+        let malformed_path = vault(
+            State(Arc::clone(&service)),
+            Path("not-a-fingerprint".into()),
+            authorized,
+            relayed(),
+        )
+        .await;
+        assert_eq!(malformed_path.status(), axum::http::StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

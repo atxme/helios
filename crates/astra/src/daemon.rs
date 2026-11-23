@@ -968,6 +968,72 @@ mod tests {
         assert_eq!(service.approval_credentials().epoch, 5);
     }
 
+    #[test]
+    fn a_missing_credential_document_starts_with_an_empty_allow_list() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (_, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let registry = registry_of(service(directory.path(), ca_public, 4, None, None));
+
+        let credentials = load_approval_credentials(directory.path(), &registry)
+            .expect("missing credentials are a supported install state");
+
+        assert!(credentials.ids.is_empty());
+        assert!(credentials.registry.is_none());
+        assert_eq!(
+            credentials.epoch,
+            registry.state().credential_registry_epoch
+        );
+    }
+
+    #[test]
+    fn an_oversized_credential_document_is_rejected_before_reading() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (_, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let registry = registry_of(service(directory.path(), ca_public, 2, None, None));
+        let path = directory.path().join(CREDENTIALS_FILE);
+        let file = std::fs::File::create(path).expect("credential file");
+        file.set_len(MAX_CREDENTIALS_BYTES + 1)
+            .expect("oversized sparse file");
+
+        let error = load_approval_credentials(directory.path(), &registry)
+            .err()
+            .expect("oversized credentials must fail closed");
+
+        assert!(error.to_string().contains("not a credential document"));
+    }
+
+    #[test]
+    fn a_valid_signed_credential_document_is_loaded_from_the_state_volume() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let registry = registry_of(service(directory.path(), ca_public, 2, None, None));
+        let document = document(&ca_private, 2, 1);
+        write_credentials_file(directory.path(), &document).expect("write signed document");
+
+        let credentials = load_approval_credentials(directory.path(), &registry)
+            .expect("the pinned CA signed this document");
+
+        assert_eq!(credentials.epoch, 1);
+        assert_eq!(credentials.ids, vec![vec![7; 16]]);
+        assert_eq!(credentials.registry.as_deref(), Some(document.as_ref()));
+    }
+
+    #[test]
+    fn an_unparseable_or_wrongly_signed_credential_document_is_rejected() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (_, ca_public) = generate_ml_dsa_87_keypair().expect("keygen");
+        let registry = registry_of(service(directory.path(), ca_public, 2, None, None));
+        let path = directory.path().join(CREDENTIALS_FILE);
+
+        std::fs::write(&path, b"not-json").expect("malformed document");
+        assert!(load_approval_credentials(directory.path(), &registry).is_err());
+
+        let (other_private, _) = generate_ml_dsa_87_keypair().expect("other keygen");
+        let foreign = document(&other_private, 2, 1);
+        write_credentials_file(directory.path(), &foreign).expect("write foreign document");
+        assert!(load_approval_credentials(directory.path(), &registry).is_err());
+    }
+
     const NOW: u64 = 1_000_000;
 
     /// The gateway's peers and revocations, as its private channel serves

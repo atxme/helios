@@ -337,7 +337,7 @@ impl ::astra_channel::TrustUpdatePreparer for StubAuthority {
 /// `admit_peer` never reaches the signer — it records a generation the
 /// operator issued — so a stub that refuses is enough, and it makes the
 /// test say out loud that admission borrows no gateway key.
-struct RefusingSigner;
+struct RefusingSigner(PqCertificate);
 
 impl StageReceiptSigner for RefusingSigner {
     fn sign_stage_receipt(
@@ -348,7 +348,7 @@ impl StageReceiptSigner for RefusingSigner {
     }
 
     fn served_pq_certificate(&self) -> PqCertificate {
-        gateway_leaf()
+        self.0.clone()
     }
 }
 
@@ -358,7 +358,10 @@ fn service(state: RegistryState) -> (CertificateService, tempfile::TempDir) {
         CertificateRegistry::bootstrap(directory.path().join("certificates.json"), state)
             .expect("registry");
     (
-        CertificateService::new(Arc::new(Mutex::new(registry)), Arc::new(RefusingSigner)),
+        CertificateService::new(
+            Arc::new(Mutex::new(registry)),
+            Arc::new(RefusingSigner(gateway_leaf())),
+        ),
         directory,
     )
 }
@@ -1315,6 +1318,139 @@ async fn gateway_revocation_is_authenticated_scoped_and_terminal() {
     assert!(registry.state().gateway.revoked);
     assert_eq!(registry.state().gateway.revocation_epoch, 1);
     assert!(registry.state().gateway.awaited_replacement.is_none());
+}
+
+#[tokio::test]
+async fn astra_reads_peer_records_and_the_identity_the_gateway_serves() {
+    use ::astra_channel::AstraChannelHandler;
+
+    let peer_key = key(2);
+    let mut registry_state = state();
+    registry_state.peers.insert(peer_key.to_base64(), peer());
+    let material = aether::certificates::test_x509::client_material("gateway");
+    registry_state.gateway.active_gateway_tls_certificate = material.leaf.clone();
+    let expected_tls_expiry = aether::certificates::x509::inspect(&material.leaf)
+        .expect("the served TLS leaf is valid")
+        .not_after;
+    let (service, _directory) = service(registry_state);
+
+    let peer_view = service.peer_state(&peer_key).await.expect("peer snapshot");
+    assert_eq!(peer_view.name, "workstation");
+    assert_eq!(peer_view.state.active.generation, 4);
+    assert_eq!(
+        service.peer_keys().await.expect("peer listing"),
+        vec![peer_key]
+    );
+
+    let served_pq = service.signer.served_pq_certificate();
+    let expected_pq_fingerprint =
+        aether::certificates::gateway::pq_certificate_fingerprint(&served_pq)
+            .expect("served certificate fingerprint");
+    let gateway = service.gateway_identity().await.expect("served identity");
+    assert_eq!(gateway.pq_certificate, served_pq);
+    assert_eq!(gateway.pq_certificate_fingerprint, expected_pq_fingerprint);
+    assert_eq!(
+        gateway.tls_certificate_fingerprint,
+        material.leaf.fingerprint()
+    );
+    assert_eq!(gateway.tls_certificate_not_after, expected_tls_expiry);
+    assert_eq!(gateway.active_gateway_identity_epoch, 3);
+    assert_eq!(gateway.gateway_decision_epoch, 3);
+}
+
+fn live_distribution() -> ::astra_channel::TrustDistribution {
+    let mut pending = distribution(0, 1);
+    let now = now_unix();
+    pending.manifest.created_at = now;
+    pending.manifest.expires_at = now + 3_600;
+    pending.manifest.minimum_activation_at = now + 60;
+    let fingerprint = pending.manifest.fingerprint();
+    for chunk in &mut pending.chunks {
+        chunk.manifest_fingerprint = fingerprint;
+    }
+    ::astra_channel::TrustDistribution {
+        manifest: pending.manifest,
+        chunks: pending.chunks,
+    }
+}
+
+#[tokio::test]
+async fn astra_distribution_is_persisted_as_one_complete_peer_transaction() {
+    use ::astra_channel::AstraChannelHandler;
+
+    let peer_key = key(2);
+    let mut registry_state = state();
+    registry_state.peers.insert(peer_key.to_base64(), peer());
+    let (service, directory) = service(registry_state);
+    let distribution = live_distribution();
+    let expected_fingerprint = distribution.manifest.fingerprint();
+    let expected_chunk_count = distribution.chunks.len();
+
+    service
+        .distribute(Box::new(distribution))
+        .await
+        .expect("stage the authority's complete transaction");
+
+    let registry_path = directory.path().join("certificates.json");
+    let persisted = CertificateRegistry::load(&registry_path)
+        .expect("reload registry")
+        .expect("registry persisted");
+    let queued = persisted
+        .peer(&peer_key)
+        .and_then(|peer| peer.distribution.as_ref())
+        .expect("transaction is queued for its named peer");
+    assert_eq!(queued.manifest.fingerprint(), expected_fingerprint);
+    assert_eq!(queued.chunks.len(), expected_chunk_count);
+    assert_eq!(queued.cursor, 0);
+}
+
+#[tokio::test]
+async fn astra_applies_a_signed_client_revocation_to_only_the_named_peer() {
+    use ::astra_channel::AstraChannelHandler;
+
+    let peer_key = key(2);
+    let (ca_private, ca_public) = generate_ml_dsa_87_keypair().expect("CA keypair");
+    let mut registry_state = state();
+    registry_state.gateway.current_ca_public_key = ca_public;
+    registry_state.peers.insert(peer_key.to_base64(), peer());
+    let active = registry_state
+        .peers
+        .get(&peer_key.to_base64())
+        .expect("peer");
+    let revocation = EmergencyCertificateRevocation {
+        format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+        trust_domain_id: registry_state.trust_domain_id,
+        ca_epoch: registry_state.gateway.ca_epoch,
+        scope: RevocationScope::Client,
+        identity_key: peer_key,
+        server_name: None,
+        revocation_epoch: 1,
+        revoked_tls_fingerprint: Some(active.state.active.tls_certificate_fingerprint),
+        revoked_tls_not_after: Some(active.state.active.not_after),
+        revoked_pq_fingerprint: Some(active.state.active.pq_certificate_fingerprint),
+        revoked_pq_not_after: Some(active.active_pq_certificate.not_after_unix),
+        effective_at: 0,
+        reason: RevocationReason::KeyCompromise,
+        replacement_transition_fingerprint: None,
+        ca_signature: MlDsa87Signature::placeholder(),
+    }
+    .sign(&ca_private)
+    .expect("authority signs revocation");
+    let (service, _directory) = service(registry_state);
+
+    service
+        .revoke(Box::new(revocation))
+        .await
+        .expect("authenticated client revocation");
+
+    let registry = service.registry.lock().await;
+    let revoked = registry
+        .peer(&peer_key)
+        .expect("revoked peer remains recorded");
+    assert_eq!(revoked.state.revocation_epoch, 1);
+    assert!(revoked.state.revoked);
+    assert!(revoked.state.pending.is_none());
+    assert!(!registry.state().gateway.revoked);
 }
 
 #[tokio::test]
