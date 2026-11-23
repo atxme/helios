@@ -586,40 +586,39 @@ Répéter pour chaque classe de paquet : noyau, `grub-efi` / `shim-signed`,
 - armer, puis mettre à jour un firmware (PCR 0) : la fenêtre ne s'ouvre pas, on
   retombe sur billet et séquestre.
 
-Le cycle NV — armement, état, révocation — est partiellement couvert par
-`cargo test -p helios-tpm --features tpm --test materiel` avec
-`HELIOS_TPM_MATERIEL=1`. Ce test **écrit** un index NV disposable
-(`0x01804846`), contrairement aux autres du fichier ; le retirer ensuite avec
-`tpm2_nvundefine 0x01804846` si la machine n'est pas jetable. La consommation
-elle-même reste manuelle : elle suppose un déplacement réel de PCR 4, donc un
-redémarrage.
+Avec la feature `tpm`, la suite `materiel` démarre automatiquement un
+`swtpm` local par essai si l’exécutable et la boucle locale sont disponibles.
+Chaque instance écoute sur `127.0.0.1` et conserve son état dans un dossier
+temporaire supprimé à la fin du test. Les essais s’exécutent en parallèle
+sur des instances séparées. L’environnement de mesure doit disposer de
+`swtpm` pour couvrir les appels ESAPI de scellement, de descellement et
+d’accès aux index NV. Les tests d’identité gateway réutilisent ce simulateur
+pour préparer et relire les matériels scellés avec la feature `tpm`.
 
-Le même test accepte `HELIOS_TPM_TCTI=swtpm:host=127.0.0.1,port=2321`. Il
-valide alors le vrai chemin ESAPI — politique de lecture NV sans `OWNERREAD`,
-écrasement et impossibilité de ressusciter le secret avec le seul
-marqueur disque — sans prétendre mesurer Secure Boot ni les PCR d'une cible.
+Le scénario de mise à jour sur simulateur vérifie que le changement de PCR 4
+consomme la fenêtre et rescelle le même secret, et qu’un changement de PCR 7
+laisse le secret inaccessible. Il modifie exclusivement les PCR de son
+instance jetable. La vérification de Secure Boot, du changement réel de PCR
+au redémarrage et des garanties matérielles reste une recette sur cible.
 
-L'essai du **compteur anti-rejeu** (F5) fait partie du même fichier. Il définit
-l'index jetable `0x01804848` (le compteur de production est `0x01804847`) et
-vérifie que le compteur ne recule pas d'une connexion à l'autre. Il laisse
-l'index en place ; le retirer avec `tpm2_nvundefine 0x01804848` si la machine
-n'est pas jetable. Il ne prouve pas qu'une suppression puis une recréation de
-l'index ne fait pas reculer le compteur : cette propriété, attendue de la
-spécification TPM 2.0, reste à confirmer sur TPM réel (recette « Q. F5 » de [MANUAL-TESTING.md](MANUAL-TESTING.md)).
+L’activation explicite `HELIOS_TPM_MATERIEL=1` fait tourner les essais
+matériels sur `/dev/tpmrm0` par défaut. Ces essais s’exécutent en série et
+utilisent les index NV jetables `0x01804846` pour la fenêtre et `0x01804848`
+pour le compteur. Ils ne modifient aucun PCR. Les essais qui changent les
+PCR continuent à utiliser leur propre simulateur.
 
-Les essais matériels **s'exécutent en série**, sur un seul TPM ou un seul
-swtpm, avec `--test-threads=1`. En parallèle, les essais se disputent les
-contextes d'objets du TPM et échouent avec « out of memory for object
-contexts » :
+La même activation accepte un TCTI explicitement pointé sur un simulateur
+déjà démarré.
 
 ```sh
 HELIOS_TPM_MATERIEL=1 \
 HELIOS_TPM_TCTI=swtpm:host=127.0.0.1,port=2321 \
-  cargo test -p helios-tpm --features tpm --test materiel -- --test-threads=1
+  scripts/wsl-cargo test -p helios-tpm --features tpm --test materiel -- --test-threads=1
 ```
 
-Sur une cible réelle, omettre `HELIOS_TPM_TCTI` : le test utilise alors
-`/dev/tpmrm0`.
+Le compteur est vérifié d’une connexion à l’autre. Sa résistance à une
+suppression puis recréation de l’index reste à confirmer sur matériel,
+dans la recette « Q. F5 » de [MANUAL-TESTING](MANUAL-TESTING.md).
 
 ### Renouvellement du PSK à chaud (V1)
 

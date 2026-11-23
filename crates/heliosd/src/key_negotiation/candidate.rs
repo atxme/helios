@@ -564,7 +564,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, not(feature = "tpm")))]
+#[cfg(test)]
 mod sealed_slot_tests {
     use super::*;
     use aether::certificates::{
@@ -587,29 +587,17 @@ mod sealed_slot_tests {
     }
 
     impl Slot {
-        fn new() -> Self {
+        fn new() -> Option<Self> {
             let directory = tempfile::tempdir().expect("temporary candidate directory");
             let path = |name| directory.path().join(name);
-            let settings = helios_tpm::TpmSettings {
-                enabled: true,
-                allow_provisioning: true,
-                device: path("no-tpm-device").to_string_lossy().into_owned(),
-                sealed_blob_path: path("simulated-root").to_string_lossy().into_owned(),
-                ticket_path: path("ticket").to_string_lossy().into_owned(),
-                update_window_marker_path: path("window").to_string_lossy().into_owned(),
-                simulated_counter_path: path("simulated-nv-counter").to_string_lossy().into_owned(),
-                counter_status_path: path("anti-rollback.json").to_string_lossy().into_owned(),
-                ..helios_tpm::TpmSettings::default()
-            };
-            let decision = helios_tpm::BootController::unlock(&settings)
-                .expect("provision secret with the simulated TPM");
-            Self {
-                secret: decision.secret().expect("simulated secret").clone(),
+            let decision = crate::key_negotiation::tests::isolated_boot(directory.path())?;
+            Some(Self {
+                secret: decision.secret().expect("fixture TPM secret").clone(),
                 gateway_key: WireGuardKey::from_bytes([9; 32]),
                 keystore: path("candidate.sealed"),
                 certificate: path("candidate.der"),
                 _directory: directory,
-            }
+            })
         }
 
         fn seal(&self, rotate_tls: bool) -> Result<SealedCandidate> {
@@ -653,7 +641,9 @@ mod sealed_slot_tests {
 
     #[test]
     fn sealing_tls_writes_a_leaf_matching_the_private_key_then_pq_only_replaces_the_candidate() {
-        let slot = Slot::new();
+        let Some(slot) = Slot::new() else {
+            return;
+        };
         let sealed = slot.seal(true).expect("seal TLS and PQ keys");
         let leaf = sealed.tls_certificate.expect("candidate TLS certificate");
         assert_eq!(
@@ -676,7 +666,9 @@ mod sealed_slot_tests {
 
     #[test]
     fn sealing_failure_cannot_replace_the_public_leaf() {
-        let slot = Slot::new();
+        let Some(slot) = Slot::new() else {
+            return;
+        };
         let leaf = slot.seal(true).expect("first preparation").tls_certificate;
         std::fs::remove_file(&slot.keystore).expect("remove test vault");
         std::fs::create_dir(&slot.keystore).expect("block writes at the vault path");
@@ -694,7 +686,9 @@ mod sealed_slot_tests {
 
     #[test]
     fn a_failed_public_install_leaves_the_private_candidate_sealed() {
-        let slot = Slot::new();
+        let Some(slot) = Slot::new() else {
+            return;
+        };
         std::fs::create_dir(&slot.certificate).expect("block publication");
 
         let Err(error) = slot.seal(true) else {
@@ -710,7 +704,9 @@ mod sealed_slot_tests {
 
     #[test]
     fn recovery_proves_possession_without_faking_active_key_continuity() {
-        let slot = Slot::new();
+        let Some(slot) = Slot::new() else {
+            return;
+        };
         let sealed = slot.seal(false).expect("seal PQ key");
         let request = slot.request(sealed.pq_public_key);
         let signed = sign_certificate_request_at(
@@ -739,7 +735,9 @@ mod sealed_slot_tests {
 
     #[test]
     fn signing_refuses_to_open_the_slot_for_another_gateway_or_epoch() {
-        let slot = Slot::new();
+        let Some(slot) = Slot::new() else {
+            return;
+        };
         let sealed = slot.seal(false).expect("seal PQ key");
         let request = slot.request(sealed.pq_public_key);
 
@@ -766,7 +764,9 @@ mod sealed_slot_tests {
 
     #[test]
     fn signing_distinguishes_malformed_candidate_records_from_missing_unlock_secret() {
-        let slot = Slot::new();
+        let Some(slot) = Slot::new() else {
+            return;
+        };
         let sealed = slot.seal(false).expect("seal PQ key");
         let request = slot.request(sealed.pq_public_key);
         let gateway_key = slot.gateway_key.to_base64();

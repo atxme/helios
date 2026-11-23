@@ -447,6 +447,212 @@ fn development_private_identity_requires_owner_only_permissions() {
     assert!(format!("{error:#}").contains("expected 0600 or stricter"));
 }
 
+struct BootstrapPaths {
+    directory: tempfile::TempDir,
+}
+
+impl BootstrapPaths {
+    fn new() -> Self {
+        Self {
+            directory: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    fn files(&self) -> ActiveIdentityFiles {
+        let dir = self.directory.path();
+        ActiveIdentityFiles {
+            tls_certificate: dir.join("tls.der"),
+            client_tls_ca: dir.join("client-ca.der"),
+            pq_certificate: dir.join("pq.json"),
+            bootstrap_request: dir.join("request.json"),
+            client_pq_ca: dir.join("ca-pq.bin"),
+            private_keystore: dir.join("private.sealed"),
+        }
+    }
+
+    fn input_anchors(&self) -> (std::path::PathBuf, std::path::PathBuf) {
+        let path = self.directory.path();
+        let tls = path.join("input-tls.der");
+        let pq = path.join("input-pq.bin");
+        std::fs::write(
+            &tls,
+            aether::certificates::test_x509::certificate_authority("client CA").as_bytes(),
+        )
+        .unwrap();
+        let (_, ca_key) = generate_ml_dsa_87_keypair().unwrap();
+        std::fs::write(&pq, ca_key).unwrap();
+        (tls, pq)
+    }
+}
+
+#[test]
+fn gateway_initialization_seals_the_keys_and_installs_only_a_matching_ca_issued_leaf() {
+    let fixture = BootstrapPaths::new();
+    let files = fixture.files();
+    let (tls_ca, pq_ca) = fixture.input_anchors();
+    let Some(boot) = super::isolated_boot(fixture.directory.path()) else {
+        return;
+    };
+    let initialize = |rotate| {
+        initialize_at(
+            "gateway.example",
+            GATEWAY_KEY,
+            &tls_ca,
+            &pq_ca,
+            &boot,
+            rotate,
+            &files,
+        )
+    };
+
+    let initialized = initialize(false).expect("initialize gateway identity");
+    assert_eq!(initialized.certificate_path, files.tls_certificate);
+    assert_eq!(initialized.bootstrap_request_path, files.bootstrap_request);
+    assert_eq!(
+        initialized.certificate_sha256,
+        aether_key_negotiation::certificate_fingerprint_der(
+            &std::fs::read(&files.tls_certificate).unwrap()
+        )
+    );
+    assert_eq!(
+        std::fs::read(&files.client_tls_ca).unwrap(),
+        std::fs::read(&tls_ca).unwrap()
+    );
+    assert_eq!(
+        std::fs::read(&files.client_pq_ca).unwrap(),
+        std::fs::read(&pq_ca).unwrap()
+    );
+    assert!(!files.pq_certificate.exists());
+
+    let request = read_gateway_bootstrap_request(&files.bootstrap_request)
+        .unwrap()
+        .unwrap();
+    request
+        .verify()
+        .expect("gateway proves possession of the new PQ key");
+    assert_eq!(request.server_name, "gateway.example");
+    assert_eq!(request.gateway_wg_public_key.to_base64(), GATEWAY_KEY);
+    assert_eq!(
+        request.fingerprint().to_hex(),
+        initialized.bootstrap_request_fingerprint
+    );
+    let keystore = SealedKeystore::new(
+        &files.private_keystore,
+        helios_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
+    );
+    let secret = boot.secret().unwrap();
+    let sealed = keystore
+        .load(secret, &negotiation_identity_context(GATEWAY_KEY))
+        .unwrap();
+    let private: StoredPrivateIdentity = serde_json::from_slice(&sealed).unwrap();
+    assert!(keystore
+        .load(secret, &negotiation_identity_context("another gateway"))
+        .is_err());
+    assert!(!private.pq_private_key.is_empty());
+    assert!(!private.tls_private_key.is_empty());
+    let persisted_request = std::fs::read_to_string(&files.bootstrap_request).unwrap();
+    assert!(!persisted_request.contains(&private.pq_private_key));
+    assert!(!persisted_request.contains(&private.tls_private_key));
+
+    let (_, _, ca_public, ca_private, now) = bootstrap_fixture();
+    let issued = fixture.directory.path().join("issued.json");
+    let leaf = bootstrap_leaf(
+        &request,
+        request.ml_dsa_87_public_key.as_bytes(),
+        &ca_private,
+        now - 1,
+        now + 3_600,
+    );
+    std::fs::write(&issued, serde_json::to_vec(&leaf).unwrap()).unwrap();
+    install_gateway_bootstrap_certificate_at(
+        &files.bootstrap_request,
+        &issued,
+        &files.pq_certificate,
+        &ca_public,
+        now,
+    )
+    .unwrap();
+    let served = read_served_identity(
+        &files.tls_certificate,
+        &files.pq_certificate,
+        &files.client_tls_ca,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(served.pq_certificate, leaf);
+
+    let Err(error) = initialize(false) else {
+        panic!("re-initialization needs explicit rotation");
+    };
+    assert!(error.to_string().contains("use --rotate"));
+    assert_eq!(
+        std::fs::read_to_string(&files.bootstrap_request).unwrap(),
+        persisted_request
+    );
+
+    let replacement = initialize(true).expect("replace after explicit rotation");
+    assert_ne!(
+        replacement.bootstrap_request_fingerprint,
+        initialized.bootstrap_request_fingerprint
+    );
+    assert!(!files.pq_certificate.exists());
+    assert!(read_served_identity(
+        &files.tls_certificate,
+        &files.pq_certificate,
+        &files.client_tls_ca
+    )
+    .unwrap()
+    .is_none());
+}
+
+#[test]
+fn gateway_initialization_refuses_missing_secret_and_invalid_anchors_before_persisting() {
+    let fixture = BootstrapPaths::new();
+    let files = fixture.files();
+    let (tls_ca, pq_ca) = fixture.input_anchors();
+    let run = |boot: &BootDecision| {
+        initialize_at(
+            "gateway.example",
+            GATEWAY_KEY,
+            &tls_ca,
+            &pq_ca,
+            boot,
+            false,
+            &files,
+        )
+        .err()
+        .expect("preflight refusal")
+    };
+
+    assert!(run(&BootDecision::Disabled)
+        .to_string()
+        .contains("TPM secret unavailable"));
+    let Some(boot) = super::isolated_boot(fixture.directory.path()) else {
+        return;
+    };
+    let ca_pq = std::fs::read(&pq_ca).unwrap();
+    std::fs::write(&pq_ca, b"wrong length").unwrap();
+    assert!(run(&boot)
+        .to_string()
+        .contains("client PQ CA public key is"));
+    std::fs::write(&pq_ca, ca_pq).unwrap();
+    std::fs::write(&tls_ca, b"invalid certificate").unwrap();
+    assert!(run(&boot)
+        .to_string()
+        .contains("client CA is not a valid DER certificate"));
+
+    for path in [
+        files.private_keystore,
+        files.tls_certificate,
+        files.client_tls_ca,
+        files.pq_certificate,
+        files.bootstrap_request,
+        files.client_pq_ca,
+    ] {
+        assert!(!path.exists(), "preflight created {:?}", path);
+    }
+}
+
 #[test]
 fn bootstrap_certificate_is_installed_and_read_with_the_public_tls_material() {
     let directory = tempfile::tempdir().unwrap();

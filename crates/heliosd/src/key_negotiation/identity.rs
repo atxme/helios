@@ -579,22 +579,55 @@ pub fn initialize(
     boot: &BootDecision,
     rotate: bool,
 ) -> Result<InitializedIdentity> {
+    initialize_at(
+        server_name,
+        gateway_wg_public_key,
+        client_ca_path,
+        client_pq_ca_path,
+        boot,
+        rotate,
+        &ActiveIdentityFiles {
+            tls_certificate: CERTIFICATE_PATH.into(),
+            client_tls_ca: CLIENT_CA_PATH.into(),
+            pq_certificate: PQ_CERTIFICATE_PATH.into(),
+            bootstrap_request: GATEWAY_BOOTSTRAP_REQUEST_PATH.into(),
+            client_pq_ca: CLIENT_PQ_CA_PATH.into(),
+            private_keystore: PRIVATE_KEYSTORE_PATH.into(),
+        },
+    )
+}
+
+/// The destinations that together hold the gateway identity and its anchors.
+pub(super) struct ActiveIdentityFiles {
+    pub(super) tls_certificate: std::path::PathBuf,
+    pub(super) client_tls_ca: std::path::PathBuf,
+    pub(super) pq_certificate: std::path::PathBuf,
+    pub(super) bootstrap_request: std::path::PathBuf,
+    pub(super) client_pq_ca: std::path::PathBuf,
+    pub(super) private_keystore: std::path::PathBuf,
+}
+
+pub(super) fn initialize_at(
+    server_name: &str,
+    gateway_wg_public_key: &str,
+    client_ca_path: &Path,
+    client_pq_ca_path: &Path,
+    boot: &BootDecision,
+    rotate: bool,
+    files: &ActiveIdentityFiles,
+) -> Result<InitializedIdentity> {
     use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
 
-    let certificate_path = std::path::PathBuf::from(CERTIFICATE_PATH);
-    let client_ca_destination = std::path::PathBuf::from(CLIENT_CA_PATH);
-    let bootstrap_request_path = std::path::PathBuf::from(GATEWAY_BOOTSTRAP_REQUEST_PATH);
-    let client_pq_ca_destination = std::path::PathBuf::from(CLIENT_PQ_CA_PATH);
     let keystore = SealedKeystore::new(
-        PRIVATE_KEYSTORE_PATH,
+        &files.private_keystore,
         helios_tpm::DOMAIN_KEY_NEGOTIATION_IDENTITY,
     );
     let already_initialized = keystore.exists()
-        || certificate_path.exists()
-        || client_ca_destination.exists()
-        || std::path::Path::new(PQ_CERTIFICATE_PATH).exists()
-        || bootstrap_request_path.exists()
-        || client_pq_ca_destination.exists();
+        || files.tls_certificate.exists()
+        || files.client_tls_ca.exists()
+        || files.pq_certificate.exists()
+        || files.bootstrap_request.exists()
+        || files.client_pq_ca.exists();
     anyhow::ensure!(
         rotate || !already_initialized,
         "a key-negotiation identity already exists; use --rotate to replace it explicitly"
@@ -665,12 +698,12 @@ pub fn initialize(
         )
         .context("sealing the gateway TLS and PQ keys")?;
 
-    write_public_atomic(&certificate_path, certificate.der().as_ref())
+    write_public_atomic(&files.tls_certificate, certificate.der().as_ref())
         .context("installing the gateway TLS certificate")?;
-    write_public_atomic(&client_ca_destination, &client_ca)
+    write_public_atomic(&files.client_tls_ca, &client_ca)
         .context("installing the Orion client CA")?;
     write_public_atomic(
-        &bootstrap_request_path,
+        &files.bootstrap_request,
         &serde_json::to_vec_pretty(&bootstrap_request)
             .context("encoding the gateway bootstrap request")?,
     )
@@ -679,9 +712,9 @@ pub fn initialize(
     // the answer to this new request. Without a registry the loader still
     // requires self-signature, so absence fails closed until CA-PQ answers;
     // with a registry, the persisted active leaf remains authoritative.
-    remove_if_present(Path::new(PQ_CERTIFICATE_PATH))
+    remove_if_present(&files.pq_certificate)
         .context("retiring the previous gateway PQ certificate")?;
-    write_public_atomic(&client_pq_ca_destination, &client_pq_ca)
+    write_public_atomic(&files.client_pq_ca, &client_pq_ca)
         .context("installing the Orion client PQ CA")?;
 
     if rotate {
@@ -693,8 +726,8 @@ pub fn initialize(
         certificate_sha256: aether_key_negotiation::certificate_fingerprint_der(
             certificate.der().as_ref(),
         ),
-        certificate_path,
+        certificate_path: files.tls_certificate.clone(),
         bootstrap_request_fingerprint: bootstrap_request.fingerprint().to_hex(),
-        bootstrap_request_path,
+        bootstrap_request_path: files.bootstrap_request.clone(),
     })
 }
