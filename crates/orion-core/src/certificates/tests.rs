@@ -81,6 +81,63 @@ fn a_renewal_is_due_only_from_its_own_instant() {
     assert!(renewal_is_due(&generation, &key(1), instant).expect("due"));
 }
 
+#[test]
+fn renewal_due_is_inclusive_at_the_threshold_and_refuses_invalid_windows() {
+    let active = generation(4);
+    let threshold = renewal_instant(&active, &key(7)).expect("threshold");
+    assert!(!renewal_is_due(&active, &key(7), threshold - 1).expect("not due"));
+    assert!(renewal_is_due(&active, &key(7), threshold).expect("due at threshold"));
+    assert!(renewal_is_due(&active, &key(7), active.not_after).expect("due at expiry"));
+
+    let mut invalid = active;
+    invalid.not_after = invalid.not_before;
+    assert!(matches!(
+        renewal_is_due(&invalid, &key(7), threshold),
+        Err(CertificateError::InvalidValidityPeriod)
+    ));
+}
+
+#[cfg(feature = "certificate-signing")]
+#[test]
+fn trust_store_save_failure_keeps_the_live_state_and_load_rejects_bad_files() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (_, anchor) = aether::certificates::encoding::generate_ml_dsa_87_keypair().expect("anchor");
+    let (_, service) =
+        aether::certificates::encoding::generate_ml_dsa_87_keypair().expect("service");
+    let state = store(
+        directory.path().join("missing-parent/trust.json"),
+        anchor,
+        service,
+    )
+    .state()
+    .clone();
+    let trust = TrustStore::new(
+        directory.path().join("missing-parent/trust.json"),
+        state.clone(),
+    );
+
+    assert!(matches!(trust.save(), Err(TrustError::Io(_))));
+    assert_eq!(trust.state(), &state);
+    assert!(TrustStore::load(&trust.path)
+        .expect("missing file is not corrupt")
+        .is_none());
+
+    let corrupt_path = directory.path().join("corrupt.json");
+    std::fs::write(&corrupt_path, b"{").expect("write corrupt fixture");
+    assert!(matches!(
+        TrustStore::load(&corrupt_path),
+        Err(TrustError::Corrupt(_))
+    ));
+
+    let oversized_path = directory.path().join("oversized.json");
+    let file = std::fs::File::create(&oversized_path).expect("create oversized fixture");
+    file.set_len(MAX_TRUST_STORE_BYTES + 1)
+        .expect("size fixture");
+    assert!(
+        matches!(TrustStore::load(&oversized_path), Err(TrustError::Corrupt(reason)) if reason.contains("size bound"))
+    );
+}
+
 /// Astra sends a suggested window with every status. It may bring a
 /// renewal **forward** — an incident campaign — and can never push one
 /// back: a gateway able to delay renewals could manufacture the very
@@ -944,6 +1001,125 @@ fn a_status_about_something_this_store_does_not_hold_is_refused() {
             1_000,
         )
         .expect("counters are per target");
+}
+
+/// Status matching spans both client generations and each active/next trust
+/// slot. Exercise the optional slots together so a future addition to this
+/// target inventory cannot silently skip status ordering for a staged object.
+#[cfg(feature = "certificate-signing")]
+#[test]
+fn signed_statuses_bind_to_every_next_generation_and_authority_slot() {
+    use aether::certificates::encoding::{generate_ml_dsa_87_keypair, MlDsa87Signature};
+    use aether::certificates::status::{
+        AstraCertificateStatus, CertificateKind, CertificateStatus,
+    };
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let (_, anchor) = generate_ml_dsa_87_keypair().expect("anchor");
+    let (service_private, service_public) = generate_ml_dsa_87_keypair().expect("service");
+    let mut state = store(directory.path().join("trust.json"), anchor, service_public)
+        .state()
+        .clone();
+
+    let client_next = generation(5);
+    state.certificates.next = Some(client_next.clone());
+
+    let (_, next_ca) = generate_ml_dsa_87_keypair().expect("next CA");
+    state.gateway.next_ca_public_key = Some(next_ca.clone());
+    state.client_tls_ca.next_client_tls_ca_certificate =
+        Some(DerCertificate::new(vec![3; 64]).expect("next TLS CA"));
+    let (_, next_service) = generate_ml_dsa_87_keypair().expect("next service key");
+    state.astra.next_astra_service_public_key = Some(next_service.clone());
+
+    state.gateway.next_gateway_identity_epoch = Some(2);
+    state.gateway.next_gateway_tls_certificate =
+        Some(DerCertificate::new(vec![4; 64]).expect("next gateway TLS"));
+    state.gateway.next_gateway_certificate = Some(gateway_leaf());
+
+    let mut store = TrustStore::new(directory.path().join("trust.json"), state.clone());
+    let status = |certificate_fingerprint, certificate_kind, generation| {
+        AstraCertificateStatus {
+            format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+            trust_domain_id: state.trust_domain_id,
+            certificate_fingerprint,
+            certificate_kind,
+            generation,
+            status: CertificateStatus::Active,
+            suggested_window_start: 800_000,
+            suggested_window_end: 1_000_000,
+            produced_at: 1_000,
+            next_update: 4_600,
+            status_epoch: 1,
+            astra_service_key_epoch: 1,
+            astra_signature: MlDsa87Signature::placeholder(),
+        }
+        .sign(&service_private)
+        .expect("status signature")
+    };
+
+    let gateway_next_pq = aether::certificates::gateway::pq_certificate_fingerprint(
+        state
+            .gateway
+            .next_gateway_certificate
+            .as_ref()
+            .expect("next gateway PQ"),
+    )
+    .expect("gateway PQ fingerprint");
+    let statuses = [
+        status(
+            client_next.tls_certificate_fingerprint,
+            CertificateKind::ClientTls,
+            client_next.generation,
+        ),
+        status(
+            client_next.pq_certificate_fingerprint,
+            CertificateKind::ClientPq,
+            client_next.generation,
+        ),
+        status(
+            state
+                .gateway
+                .next_gateway_tls_certificate
+                .as_ref()
+                .expect("next gateway TLS")
+                .fingerprint(),
+            CertificateKind::GatewayTls,
+            2,
+        ),
+        status(gateway_next_pq, CertificateKind::GatewayPq, 2),
+        status(next_ca.authority_fingerprint(), CertificateKind::CaPq, 2),
+        status(
+            state
+                .client_tls_ca
+                .next_client_tls_ca_certificate
+                .as_ref()
+                .expect("next TLS CA")
+                .fingerprint(),
+            CertificateKind::CaTls,
+            2,
+        ),
+        status(
+            next_service.authority_fingerprint(),
+            CertificateKind::AstraServiceKey,
+            2,
+        ),
+    ];
+    let objects: Vec<_> = statuses
+        .iter()
+        .cloned()
+        .map(|status| TrustUpdateObject::CertificateStatus(Box::new(status)))
+        .collect();
+
+    assert_eq!(store.apply(&objects, 1_000).expect("all held targets"), 7);
+    for status in statuses {
+        assert_eq!(
+            store
+                .state()
+                .ledger
+                .last_status_for(&status.certificate_fingerprint),
+            Some((1, 1))
+        );
+    }
 }
 
 /// A transaction that fails anywhere leaves the live state untouched —

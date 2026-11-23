@@ -477,6 +477,122 @@ mod tests {
         assert!(found.faults.is_empty());
     }
 
+    #[cfg(feature = "certificate-signing")]
+    #[test]
+    fn operator_inventory_distinguishes_epoch_only_from_verified_rows() {
+        use aether::certificates::approval::{
+            AstraCredentialBinding, CredentialRegistry, CredentialState,
+        };
+        use aether::certificates::encoding::{Fingerprint, MlDsa87Signature};
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let domain = domain();
+        let mut state = crate::test_domain::store(directory.path(), &domain)
+            .state()
+            .clone();
+        let mut cose_key = vec![0xA5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20];
+        cose_key.extend_from_slice(&[3; 32]);
+        cose_key.extend_from_slice(&[0x22, 0x58, 0x20]);
+        cose_key.extend_from_slice(&[5; 32]);
+
+        let epoch_only = operator_inventory(&state).expect("epoch without rows");
+        assert_eq!(
+            epoch_only.registry_epoch,
+            state.astra.credential_registry_epoch
+        );
+        assert_eq!(epoch_only.detail, OperatorCredentialDetail::EpochOnly);
+        assert!(epoch_only.credentials.is_empty());
+
+        let mut bindings = Vec::new();
+        for (credential_id, state_value, epoch) in [
+            (vec![0xB0], CredentialState::Revoked, 2),
+            (vec![0xA0], CredentialState::Active, 1),
+        ] {
+            bindings.push(
+                AstraCredentialBinding {
+                    format_version: aether::certificates::CERTIFICATE_FORMAT_VERSION,
+                    credential_id: credential_id.clone(),
+                    credential_public_key: cose_key.clone(),
+                    aaguid: [0; 16],
+                    trust_domain_id: state.trust_domain_id,
+                    gateway_wg_public_key: state.gateway.gateway_wg_public_key,
+                    state: state_value,
+                    credential_epoch: epoch,
+                    credential_registry_epoch: 1,
+                    ca_epoch: state.gateway.ca_epoch,
+                    created_at: 100 + u64::from(credential_id[0]),
+                    ca_pq_signature: MlDsa87Signature::placeholder(),
+                }
+                .sign(&domain.ca_pq_private)
+                .expect("CA-PQ signed binding"),
+            );
+        }
+        for binding in &bindings {
+            state.astra.credential_bindings.insert(
+                Fingerprint::of(&binding.credential_id).to_hex(),
+                binding.clone(),
+            );
+        }
+        state.credential_registry = Some(CredentialRegistry {
+            trust_domain_id: state.trust_domain_id,
+            gateway_wg_public_key: state.gateway.gateway_wg_public_key,
+            ca_epoch: state.gateway.ca_epoch,
+            credential_registry_epoch: state.astra.credential_registry_epoch,
+            bindings,
+        });
+
+        let verified = operator_inventory(&state).expect("verified registry");
+        assert_eq!(verified.detail, OperatorCredentialDetail::Verified);
+        assert_eq!(
+            verified.registry_epoch,
+            state.astra.credential_registry_epoch
+        );
+        assert_eq!(verified.credentials.len(), 2);
+        assert_eq!(
+            verified.credentials[0].fingerprint,
+            Fingerprint::of(&[0xA0]).to_hex(),
+            "public inventory is sorted by fingerprint"
+        );
+        assert_eq!(verified.credentials[0].state, CredentialState::Active);
+        assert_eq!(verified.credentials[1].state, CredentialState::Revoked);
+        assert!(verified.credentials.iter().all(|row| row.created_at > 0));
+
+        let mut newer_registry = state.clone();
+        let registry = newer_registry
+            .credential_registry
+            .as_mut()
+            .expect("retained registry");
+        registry.credential_registry_epoch += 1;
+        for binding in &mut registry.bindings {
+            binding.credential_registry_epoch += 1;
+            *binding = binding
+                .clone()
+                .sign(&domain.ca_pq_private)
+                .expect("re-signed registry row");
+        }
+        assert!(operator_inventory(&newer_registry).is_err());
+
+        let mut truncated = state.clone();
+        truncated
+            .credential_registry
+            .as_mut()
+            .expect("retained registry")
+            .bindings
+            .pop();
+        assert!(operator_inventory(&truncated).is_err());
+
+        let mut changed_row = state;
+        let rows = &changed_row
+            .credential_registry
+            .as_ref()
+            .expect("retained registry")
+            .bindings;
+        let key = Fingerprint::of(&rows[0].credential_id).to_hex();
+        let unrelated = rows[1].clone();
+        changed_row.astra.credential_bindings.insert(key, unrelated);
+        assert!(operator_inventory(&changed_row).is_err());
+    }
+
     /// Orion must not turn a pinned epoch into an invented list. Until it
     /// persists a CA-PQ-verified registry, the inventory says exactly what the
     /// profile holds and distinguishes that from an empty registry.

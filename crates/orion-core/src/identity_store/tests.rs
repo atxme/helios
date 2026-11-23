@@ -282,6 +282,157 @@ fn a_second_previous_slot_is_refused_while_the_first_is_live() {
 }
 
 #[test]
+fn protected_record_validation_rejects_inconsistent_envelopes() {
+    let mut record = ProtectedIdentityRecord::new(bundle());
+    assert!(record.validate("orion-portable").is_ok());
+
+    let mut unsupported = ProtectedIdentityRecord::new(bundle());
+    unsupported.format_version += 1;
+    assert!(unsupported.validate("orion-portable").is_err());
+
+    let mut wrong_current = ProtectedIdentityRecord::new(bundle());
+    wrong_current.current.identity = "another-identity".into();
+    assert!(wrong_current.validate("orion-portable").is_err());
+
+    record.serve_previous = true;
+    assert!(record.validate("orion-portable").is_err());
+
+    let mut wrong_previous = ProtectedIdentityRecord::new(bundle());
+    let mut previous = bundle().duplicate();
+    previous.identity = "another-identity".into();
+    wrong_previous.previous = Some(PreviousIdentitySlot {
+        bundle: previous,
+        available_from: 2_000,
+        available_until: 3_000,
+    });
+    assert!(wrong_previous.validate("orion-portable").is_err());
+
+    let mut empty_window = ProtectedIdentityRecord::new(bundle());
+    empty_window.previous = Some(PreviousIdentitySlot {
+        bundle: bundle(),
+        available_from: 3_000,
+        available_until: 3_000,
+    });
+    assert!(empty_window.validate("orion-portable").is_err());
+
+    let mut conflicting_tombstone = ProtectedIdentityRecord::new(bundle());
+    conflicting_tombstone.previous = Some(PreviousIdentitySlot {
+        bundle: bundle(),
+        available_from: 2_000,
+        available_until: 3_000,
+    });
+    conflicting_tombstone.retired_previous = Some(RetiredIdentityWindow {
+        available_from: 1_000,
+        available_until: 1_500,
+    });
+    assert!(conflicting_tombstone.validate("orion-portable").is_err());
+
+    let mut invalid_tombstone = ProtectedIdentityRecord::new(bundle());
+    invalid_tombstone.retired_previous = Some(RetiredIdentityWindow {
+        available_from: 1_500,
+        available_until: 1_000,
+    });
+    assert!(invalid_tombstone.validate("orion-portable").is_err());
+}
+
+#[test]
+fn previous_slot_status_is_exact_at_each_window_boundary() {
+    let mut record = ProtectedIdentityRecord::new(bundle());
+    assert!(record.previous_status(1_999).is_none());
+    let mut incoming = bundle().duplicate();
+    incoming.pq_private_key = base64::engine::general_purpose::STANDARD
+        .encode([9u8; 64])
+        .into();
+    record.promote(incoming, 2_000, 3_000).expect("promoted");
+
+    assert_eq!(
+        record.previous_status(1_999).unwrap().phase,
+        PreviousIdentityPhase::NotYetAvailable
+    );
+    assert!(!record.previous_status(1_999).unwrap().selected);
+    assert_eq!(
+        record.previous_status(2_000).unwrap().phase,
+        PreviousIdentityPhase::Available
+    );
+    assert_eq!(
+        record.previous_status(3_000).unwrap().phase,
+        PreviousIdentityPhase::Expired
+    );
+    assert_eq!(record.served_at(1_999), &record.current);
+    assert_eq!(record.served_at(3_000), &record.current);
+
+    record.retire_previous(3_000);
+    assert_eq!(
+        record.previous_status(2_500).unwrap().phase,
+        PreviousIdentityPhase::Expired,
+        "a retired tombstone remains an expired historical window"
+    );
+    assert!(!record.retire_previous(3_001), "retiring is idempotent");
+}
+
+#[test]
+fn named_record_listing_and_removal_are_bounded_to_matching_files() {
+    let directory = test_directory("named-records");
+    std::fs::create_dir_all(&directory).unwrap();
+    let store = ProtectedIdentityStore::at(directory.clone());
+
+    assert!(store.names_with_prefix("pending-").unwrap().is_empty());
+    for name in ["pending-z", "pending-a", "other"] {
+        std::fs::write(store.path_of(name).unwrap(), b"sealed fixture").unwrap();
+    }
+    std::fs::write(directory.join("pending-not-sealed.tmp"), b"ignore").unwrap();
+    std::fs::create_dir(directory.join(format!("pending-directory{SEALED_SUFFIX}"))).unwrap();
+
+    assert_eq!(
+        store.names_with_prefix("pending-").unwrap(),
+        vec!["pending-a".to_string(), "pending-z".to_string()]
+    );
+    assert!(store.remove_named("pending-a").is_ok());
+    assert!(
+        store.remove_named("pending-a").is_ok(),
+        "absent removal is safe"
+    );
+    assert!(store.remove_named("pending-directory").is_err());
+    assert_eq!(
+        store.names_with_prefix("pending-").unwrap(),
+        vec!["pending-z".to_string()]
+    );
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn named_record_reads_keep_invalid_names_and_oversized_files_distinct() {
+    let directory = test_directory("named-read-bounds");
+    std::fs::create_dir_all(&directory).unwrap();
+    let store = ProtectedIdentityStore::at(directory.clone());
+
+    assert!(
+        store.open_named("...").is_err(),
+        "invalid names are refused"
+    );
+    let oversized = store.path_of("pending-large").unwrap();
+    std::fs::File::create(&oversized)
+        .unwrap()
+        .set_len((MAX_SEALED_BYTES + 1) as u64)
+        .unwrap();
+    let error = store
+        .open_named("pending-large")
+        .expect_err("oversized records are refused before unsealing");
+    assert!(!matches!(
+        error.downcast_ref::<IdentityStoreError>(),
+        Some(IdentityStoreError::NotFound(_))
+    ));
+
+    let not_directory = directory.join("file-not-directory");
+    std::fs::write(&not_directory, b"fixture").unwrap();
+    let invalid_store = ProtectedIdentityStore::at(not_directory);
+    assert!(invalid_store.names_with_prefix("pending-").is_err());
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn loading_an_absent_identity_reports_its_name() {
     let store = ProtectedIdentityStore::at(test_directory("missing"));
     let error = store.load("workstation").expect_err("identity is absent");

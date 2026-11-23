@@ -561,6 +561,74 @@ mod lifecycle {
     }
 
     #[tokio::test]
+    async fn certificate_commands_return_inventory_and_action_states_through_the_engine_reply() {
+        use crate::command::{EngineCommand, EngineReply};
+
+        let scratch = Scratch::new("certificate-command-replies");
+        let service = service(&scratch);
+        let (events, _receiver) = crate::events::EventQueue::new();
+
+        let inventory = crate::serve::Engine::handle(
+            service.as_ref(),
+            EngineCommand::CertificateInventory {
+                key_negotiation: None,
+            },
+            &events,
+        )
+        .await
+        .expect("inventory command succeeds");
+        let EngineReply::CertificateInventory(inventory) = inventory else {
+            panic!("inventory command returns its typed reply");
+        };
+        assert_eq!(inventory, orion_core::CertificateInventory::default());
+
+        let actions = crate::serve::Engine::handle(
+            service.as_ref(),
+            EngineCommand::CertificateActions {
+                key_negotiation: None,
+            },
+            &events,
+        )
+        .await
+        .expect("action-state command succeeds");
+        let EngineReply::CertificateActions(actions) = actions else {
+            panic!("action-state command returns its typed reply");
+        };
+        assert_eq!(actions.len(), 4);
+        assert!(actions.iter().all(|state| {
+            state.blocked_by == Some(orion_core::CertificateActionBlock::NoNegotiation)
+                && state.message.is_some()
+        }));
+    }
+
+    #[tokio::test]
+    async fn renewal_and_recovery_drivers_refuse_missing_inputs_before_network_work() {
+        let scratch = Scratch::new("certificate-driver-inputs");
+        let service = service(&scratch);
+
+        assert_eq!(
+            service
+                .drive_renewal("bureau", None, None)
+                .await
+                .unwrap_err(),
+            "ce profil ne négocie pas de clé"
+        );
+        let missing_url = service
+            .drive_renewal("bureau", Some(key_negotiation("identity")), None)
+            .await
+            .unwrap_err();
+        assert!(missing_url.contains("ne porte pas l'adresse de l'API"));
+
+        let missing_identity = service
+            .drive_recovery("bureau", Some(key_negotiation(" ")))
+            .await
+            .unwrap_err();
+        assert!(missing_identity.contains("aucune identité protégée"));
+        assert!(service.renewals.lock().await.is_empty());
+        assert!(service.recoveries.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn rejected_single_profile_action_is_recorded_for_the_overview() {
         let scratch = Scratch::new("action-refusal-overview");
         let service = service(&scratch);

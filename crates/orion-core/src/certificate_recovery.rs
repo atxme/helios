@@ -1536,6 +1536,30 @@ mod tests {
             Err(RecoveryError::NoHistoricalProof)
         ));
     }
+
+    #[test]
+    fn malformed_historical_leaf_and_secret_are_named_without_leaking_bytes() {
+        let mut bundle = crate::test_domain::bundle(&domain());
+        bundle.certificate_chain[0] = "not base64!".into();
+        assert!(matches!(
+            leaf_of(&bundle),
+            Err(RecoveryError::NoHistoricalProof)
+        ));
+
+        bundle.certificate_chain[0] = base64::engine::general_purpose::STANDARD.encode([]);
+        assert!(matches!(
+            leaf_of(&bundle),
+            Err(RecoveryError::Certificate(_))
+        ));
+        assert!(matches!(
+            decode_secret("!private-material!", "expired key"),
+            Err(RecoveryError::Identity(message)) if message.contains("base64 illisible")
+        ));
+        assert_eq!(
+            decode_secret("AQID", "expired key").unwrap().as_slice(),
+            &[1, 2, 3]
+        );
+    }
 }
 
 #[cfg(test)]
