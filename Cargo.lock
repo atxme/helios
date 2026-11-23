@@ -2376,9 +2376,11 @@ dependencies = [
 name = "helios-installer"
 version = "1.5.3"
 dependencies = [
+ "aether",
  "anyhow",
  "clap",
  "helios-update",
+ "serde_json",
 ]
 
 [[package]]
