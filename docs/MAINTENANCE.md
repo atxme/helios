@@ -343,3 +343,71 @@ SSH à chaque étape, reboot, restauration, ouverture des coffres et connexion
 Orion sans ré-enrôlement, puis vérifier l'absence d'une fenêtre NV résiduelle.
 Voir [TESTING.md](testing/TESTING.md). Ne pas commencer cette recette sur la
 gateway principale de production.
+
+## Vérifier un bundle
+
+Un bundle gateway signé se vérifie contre le commit qu'il nomme. La commande
+reconstruit ce commit dans le conteneur de build, puis compare chaque fichier
+(chemin, taille, mode et SHA-256) :
+
+```sh
+cargo xtask verify --bundle <répertoire signé ou archive .tar.gz> --keyring <trousseau public>
+```
+
+* `--bundle` accepte le répertoire produit par `cargo xtask bundle` et signé,
+  ou l'archive `.tar.gz` produite par `cargo xtask pack`.
+* `--keyring` est le trousseau **public** de l'éditeur. Un trousseau qui
+  contiendrait une clé privée ne doit pas servir.
+* La signature du manifeste est vérifiée en premier. Un manifeste non signé ou
+  mal signé est refusé avant tout build.
+* La comparaison porte sur les fichiers du bundle, `manifest.json` exclu.
+  L'archive `.tar.gz` n'y figure pas : elle change d'une publication à l'autre.
+* `verify` ne touche ni à `target/bundle/` ni au répertoire de travail.
+
+Le succès affiche `==> The bundle matches the commit it names, file for file`
+et sort avec le code 0. Tout autre résultat sort avec le code 1 :
+
+* **Commit absent** du dépôt local : le message demande de lancer `git fetch`,
+  puis de relancer la vérification.
+* **Commit `-dirty`** ou cible autre que `x86_64-unknown-linux-gnu` : refusé,
+  car le commit ne peut pas être reconstruit à l'identique.
+* **Signature invalide** ou trousseau illisible : refus avant la reconstruction.
+* **Différences** : chaque fichier manquant, en trop ou différent est affiché,
+  avec les deux empreintes, puis la commande échoue. Le bundle n'est alors pas
+  celui que produit le commit qu'il nomme.
+* **Docker indisponible** : la reconstruction ne peut pas démarrer.
+
+### Prérequis Docker
+
+La livraison (`cargo xtask bundle`, `cargo xtask app` et `verify`) compile dans
+un conteneur. Il faut un démon Docker local, en mode *rootful*, et l'utilisateur
+dans le groupe `docker` ; Docker sans démon root et podman ne sont pas pris en
+charge. L'image `helios-build:<12 premiers hex du SHA-256 de tools/build-env/Dockerfile>`
+est construite au premier usage, puis réutilisée tant que le Dockerfile ne
+change pas. Le cache Cargo et la cible de build vivent dans les volumes Docker
+`helios-build-cargo` et `helios-build-target`. `scripts/clean-wsl-targets` les
+supprime avec les cibles locales.
+
+### `--build-natif`
+
+`scripts/deploy.sh --build-natif` et `scripts/deploy-app.sh --build-natif`
+lancent `cargo xtask bundle --native` et `cargo xtask app --native` sur ce poste,
+sans conteneur. Le build utilise alors la toolchain et les bibliothèques de
+l'hôte. Il n'offre **aucune garantie de reproductibilité** : un bundle ainsi
+produit peut ne pas passer `cargo xtask verify`. À réserver au développement ;
+pour une livraison, garder le build conteneur par défaut.
+
+### Monter de toolchain
+
+1. Changer les `ARG` de `tools/build-env/Dockerfile` : `RUST_VERSION`,
+   `NODE_VERSION` et `NODE_SHA256`, et si besoin `DEBIAN_DIGEST`, `SNAPSHOT`,
+   `RUSTUP_VERSION` et `RUSTUP_INIT_SHA256`. Le Dockerfile indique où trouver
+   chaque valeur.
+2. Lancer `python3 scripts/toolchain_pins.py`. Il liste chaque épingle qui ne
+   concorde pas avec le Dockerfile, et sort avec le code 1 tant qu'il en reste.
+   Les épingles qu'il contrôle sont `rust-version` dans `Cargo.toml`, `RUST_MIN`
+   dans `scripts/setup-dev.sh`, `dtolnay/rust-toolchain@` et `node-version` dans
+   les workflows. Les modifier jusqu'au message « Versions de toolchain
+   concordantes ».
+3. Le changement de Dockerfile donne une nouvelle étiquette d'image : la
+   prochaine construction reconstruit l'image.

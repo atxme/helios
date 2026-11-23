@@ -259,11 +259,20 @@ dépôt. La commande de signature Tauri impose un horodatage RFC 3161 avec
   celle publiée. Les installations suivantes sont vérifiées par un installateur
   déjà installé. Ce qui débloquerait : un paquet système signé par une
   distribution, hors périmètre ici.
-* **Le bundle n’est pas reproductible bit à bit.** Deux builds du même commit
-  produisent des binaires différents (chemins, horodatages du compilateur), donc
-  des empreintes différentes. La signature reste vérifiable, mais un tiers ne
-  peut pas reconstruire l’artefact pour le confronter. Ce qui débloquerait :
-  `--remap-path-prefix`, `SOURCE_DATE_EPOCH` et un conteneur de build figé.
+* **Reproductibilité : levée pour le bundle gateway (F15), reste pour Orion.**
+  Pour un commit propre et un trousseau public donnés, `cargo xtask bundle`
+  produit des fichiers (chemin, taille, mode, SHA-256) qui ne dépendent que de
+  ces deux entrées (spec F15 §5.1). Un tiers peut le vérifier : `cargo xtask
+  verify` reconstruit le commit nommé dans le conteneur de build figé et compare
+  fichier à fichier. Le bundle gateway est donc reconstructible par un tiers.
+  Ce qui n’est **pas** promis :
+  * l’archive `.tar.gz` signée d’une publication à l’autre : la comparaison
+    porte sur les fichiers du bundle, hors `manifest.json`, dont la signature et
+    l’époque changent à chaque publication ;
+  * le build `--native` (`--build-natif` dans les scripts de déploiement), qui
+    utilise la toolchain et les bibliothèques de l’hôte et n’offre aucune
+    garantie de reproductibilité ;
+  * le bundle d’Orion, qui relève d’un lot séparé.
 * **Frontière moteur / IHM d'Orion sous Windows (F11).** Orion n'est plus
   entièrement administrateur : seul le moteur (`orion.exe --engine`) est élevé et
   porte WireGuardNT, le coffre et les identités ; l'IHM, sa WebView et les

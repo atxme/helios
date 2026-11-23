@@ -1,9 +1,13 @@
 name: Reproductibilité du bundle
 
-# Construit deux fois le bundle gateway, depuis deux emplacements, avec deux
-# fuseaux horaires et deux umask, sans cache Docker partagé, puis compare les
-# empreintes de chaque fichier. Une différence signale une entrée qui n'est pas
-# figée par le commit : horodatage, chemin, ordre de lecture, environnement.
+# Construit deux fois le bundle gateway, depuis deux emplacements (l'espace de
+# travail puis un second clone), en vidant les volumes de cache Docker entre les
+# deux constructions, puis compare les empreintes de chaque fichier. Le fuseau
+# horaire et l'umask ne varient que dans l'environnement de l'hôte qui lance
+# `cargo xtask bundle` : le conteneur de build force TZ=UTC et umask 022, donc
+# ces réglages n'atteignent pas le bundle. Une différence signale une entrée qui
+# n'est pas figée par le commit : chemin, horodatage, ordre de lecture,
+# environnement du conteneur.
 #
 # Déclenché sur tag, à la main, et chaque lundi à 04:00 UTC. Ne publie rien et
 # ne signe rien : seule la comparaison compte.

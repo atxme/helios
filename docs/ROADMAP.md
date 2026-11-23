@@ -169,7 +169,7 @@ dans `RENOUVELLEMENT-CERTIFICATS.md`, §7.1 et §8).
 
 | # | Fonctionnalité | Source | Faisable ici ? |
 | --- | --- | --- | --- |
-| F15 | **Bundle reproductible** : chemins remappés, `SOURCE_DATE_EPOCH`, conteneur de build figé | ADR-004 « Limites connues » | **Oui** |
+| F15 | **Bundle reproductible** : chemins remappés, `SOURCE_DATE_EPOCH`, conteneur de build figé | ADR-004 « Limites connues » | Code : **oui**, implémenté sur `feat/f15-reproducible-bundle` (23 novembre 2026) ; validation : **non**, reste le premier passage de `reproducible.yml` après le premier push |
 
 La veille n'a pas permis d'établir si `trim-paths` est stabilisé dans Cargo à la
 version locale (`rustc 1.99.0`) : à vérifier avant de choisir entre `trim-paths`
@@ -210,7 +210,7 @@ Faisable maintenant (sans matériel)
   outillage headless Orion · T2 · T4 compilation · T5 · T6 mesure
   D1, D6 à D8 arbitrages (D5 tranché le 21 novembre 2026)
   F14 Orion seul binaire client (enrôlement v5 d'abord), après F11
-  F15 reproductible
+  F15 reproductible : implémenté sur `feat/f15-reproducible-bundle`, reste le premier passage de `reproducible.yml` après le push
 
 Faisable en code, validation sur cible à planifier
   F5 (fusionné, recette TPM « Q. F5 ») · F7 (fusionné, recette Windows « P. F7 ») · F12 libsecret · F13 NSIS

@@ -32,6 +32,22 @@ identiques entre A, B et C.
 Aucun : les normalisations de la spec §5.4 suffisent, aucune source d'écart
 nouvelle n'a été trouvée.
 
+## Précisions
+
+- **Nombre de jobs.** `xtask` transmet au conteneur la valeur de
+  `CARGO_BUILD_JOBS` telle que l'hôte la définit. Les trois builds ont tourné
+  avec 1 ou 2 jobs : `scripts/wsl-cargo` a ramené la valeur à 1 faute de
+  mémoire disponible sous WSL. Le rapport de la tâche 4 ne précise pas la
+  valeur de chaque build. Des empreintes identiques malgré ces valeurs sont une
+  observation, pas une preuve que le résultat ne dépend pas du nombre de jobs.
+- **Hors comparaison : l'archive.** Les trois builds n'ont produit que le
+  répertoire de bundle (`cargo xtask bundle`, non signé, sans `pack`). La
+  comparaison porte donc sur les fichiers du bundle. L'archive `.tar.gz` n'y
+  figure pas, et le manifeste signé non plus.
+- **Commit et chemins de B.** Le build B a été fait depuis un second clone, à un
+  chemin distinct du worktree, sur le commit `6ad5b278`, comme A et C. Ce clone
+  sert à vérifier que le chemin absolu du dépôt n'entre pas dans le bundle.
+
 ## Limite
 
 Mesure sur une seule machine (même noyau, même démon Docker). Le build B
