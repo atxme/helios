@@ -17,12 +17,14 @@ RUST = "rust"
 NODE = "node"
 
 DOCKERFILE = "tools/build-env/Dockerfile"
+ASTRA_DOCKERFILE = "deploy/astra/Dockerfile"
 CARGO_MANIFEST = "Cargo.toml"
 SETUP_SCRIPT = "scripts/setup-dev.sh"
 WORKFLOW_GLOBS = (".github/workflows/*.yml", ".github/workflows/*.yaml")
 
 DOCKER_RUST = re.compile(r"^ARG RUST_VERSION=(\S+)$", re.MULTILINE)
 DOCKER_NODE = re.compile(r"^ARG NODE_VERSION=(\S+)$", re.MULTILINE)
+ASTRA_RUST = re.compile(r"^FROM rust:(\d+\.\d+(?:\.\d+)?)-", re.MULTILINE)
 CARGO_RUST = re.compile(r'^rust-version\s*=\s*"([^"]+)"', re.MULTILINE)
 SETUP_RUST = re.compile(r'^RUST_MIN="([^"]+)"', re.MULTILINE)
 WORKFLOW_RUST = re.compile(r"dtolnay/rust-toolchain@(\d+\.\d+\.\d+)\b")
@@ -52,6 +54,10 @@ def collect_pins(root):
         text = _read(dockerfile)
         pins[RUST].append((DOCKERFILE, _first(DOCKER_RUST, text)))
         pins[NODE].append((DOCKERFILE, _first(DOCKER_NODE, text)))
+
+    astra = root / ASTRA_DOCKERFILE
+    if astra.is_file():
+        pins[RUST].append((ASTRA_DOCKERFILE, _first(ASTRA_RUST, _read(astra))))
 
     cargo = root / CARGO_MANIFEST
     if cargo.is_file():

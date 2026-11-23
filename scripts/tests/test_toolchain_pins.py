@@ -15,7 +15,7 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 
 def write_tree(root, *, dockerfile=True, docker_rust="1.100.0", docker_node="26.13.1",
                cargo_rust="1.100", setup_min="1.100", workflow_rust="1.100.0",
-               workflow_node="26", workflow_extra=""):
+               workflow_node="26", workflow_extra="", astra_rust=None):
     """Writes a repository where a None pin means the source exists but states no version."""
     if dockerfile:
         build_env = root / "tools" / "build-env"
@@ -26,6 +26,10 @@ def write_tree(root, *, dockerfile=True, docker_rust="1.100.0", docker_node="26.
         if docker_node is not None:
             arguments += f"ARG NODE_VERSION={docker_node}\n"
         (build_env / "Dockerfile").write_text(arguments + "FROM debian\n")
+    if astra_rust is not None:
+        astra = root / "deploy" / "astra"
+        astra.mkdir(parents=True)
+        (astra / "Dockerfile").write_text(f"FROM rust:{astra_rust}-trixie AS build\n")
     if cargo_rust is None:
         (root / "Cargo.toml").write_text('[package]\nname = "helios"\n')
     else:
@@ -60,6 +64,13 @@ class ToolchainPinsTest(unittest.TestCase):
         problems = self.check(workflow_rust="1.95.0")
         self.assertEqual(len(problems), 1)
         self.assertIn("regression.yml", problems[0])
+        self.assertIn("1.95", problems[0])
+
+    def test_the_astra_image_pin_is_checked(self):
+        self.assertEqual(self.check(astra_rust="1.100"), [])
+        problems = self.check(astra_rust="1.95")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("deploy/astra/Dockerfile", problems[0])
         self.assertIn("1.95", problems[0])
 
     def test_nightly_is_ignored(self):

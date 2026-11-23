@@ -19,6 +19,7 @@ fn app_and_bundle_require_a_publisher_keyring_before_building() {
             "--target",
             "x86_64-unknown-linux-gnu",
             "--skip-frontend",
+            "--native",
         ]);
         assert!(
             !output.status.success(),

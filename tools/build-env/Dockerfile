@@ -93,8 +93,19 @@ RUN curl --proto '=https' --tlsv1.2 -sSfL \
 
 # Répertoires de travail à l'exécution. Un volume nommé neuf hérite du contenu
 # et des modes du point de montage : 1777 permet à l'UID de l'appelant d'écrire.
-ENV CARGO_HOME=/helios/cargo \
-    HOME=/tmp
 RUN mkdir -p /helios/cargo /helios/target \
  && chmod 1777 /helios/cargo /helios/target
+
+# Environnement de build fixe : il fait partie de la recette du commit vérifié,
+# pas de l'xtask qui lance la reconstruction. SOURCE_DATE_EPOCH, CARGO_BUILD_JOBS,
+# les montages et l'utilisateur sont les seules entrées passées à `docker run`.
+ENV RUSTFLAGS="--remap-path-prefix=/helios/src=/helios --remap-path-prefix=/helios/cargo=/cargo" \
+    TZ=UTC \
+    LANG=C.UTF-8 \
+    CARGO_HOME=/helios/cargo \
+    CARGO_TARGET_DIR=/helios/target \
+    HELIOS_PUBLISHER_KEYRING_PATH=/helios/keyring.json \
+    HOME=/tmp
 WORKDIR /helios/src
+# umask 022 explicite : les modes des sorties ne dépendent pas du défaut du démon.
+ENTRYPOINT ["sh", "-c", "umask 022 && exec \"$@\"", "helios-build"]

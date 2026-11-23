@@ -62,6 +62,46 @@ impl fmt::Display for Difference {
     }
 }
 
+/// Which listing of the bundle a difference was found against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// The file list of the signed manifest.
+    Manifest,
+    /// The files actually present in the bundle directory.
+    Disk,
+}
+
+/// A [`Difference`] with the listing it was found against, so that the same
+/// path reported twice (manifest and disk) is not ambiguous.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finding {
+    pub source: Source,
+    pub difference: Difference,
+}
+
+impl fmt::Display for Finding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self.source {
+            Source::Manifest => "signed manifest",
+            Source::Disk => "files on disk",
+        };
+        write!(f, "[{label}] {}", self.difference)
+    }
+}
+
+/// The executables whose bytes depend on the compiled-in publisher keyring.
+const KEYRING_DEPENDENT: [&str; 3] = ["heliosd", "helios", "helios-installer"];
+
+/// True when the differences look like a keyring other than the one compiled
+/// into the bundle: only changed files, only executables.
+pub fn keyring_mismatch_suspected(differences: &[Difference]) -> bool {
+    !differences.is_empty()
+        && differences.iter().all(|difference| {
+            matches!(difference, Difference::Changed { path, .. }
+                if KEYRING_DEPENDENT.contains(&path.as_str()))
+        })
+}
+
 fn digest(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -134,7 +174,7 @@ pub fn verify_bundle(
     keyring: &Path,
     repository: &Path,
     rebuild: impl FnOnce(&Path, &str) -> Result<Vec<BundleEntry>>,
-) -> Result<Vec<Difference>> {
+) -> Result<Vec<Finding>> {
     let scratch = Scratch::new("bundle")?;
     let dir = if bundle_path.is_dir() {
         bundle_path.to_path_buf()
@@ -167,9 +207,19 @@ pub fn verify_bundle(
     let rebuilt = rebuild(repository, &commit)?;
 
     let on_disk = bundle::collect(&dir).context("listing the bundle's files")?;
-    let mut differences = compare(&rebuilt, &payload.files);
-    differences.extend(compare(&rebuilt, &on_disk));
-    Ok(differences)
+    let manifest_differences = compare(&rebuilt, &payload.files)
+        .into_iter()
+        .map(|difference| Finding {
+            source: Source::Manifest,
+            difference,
+        });
+    let disk_differences = compare(&rebuilt, &on_disk)
+        .into_iter()
+        .map(|difference| Finding {
+            source: Source::Disk,
+            difference,
+        });
+    Ok(manifest_differences.chain(disk_differences).collect())
 }
 
 /// Extracts a bundle archive into `scratch` and returns the bundle directory.
@@ -267,8 +317,15 @@ pub fn run(repository: &Path, bundle_path: &Path, keyring: &Path) -> Result<()> 
         println!("==> The bundle matches the commit it names, file for file");
         return Ok(());
     }
-    for difference in &differences {
-        println!("{difference}");
+    for finding in &differences {
+        println!("{finding}");
+    }
+    let plain: Vec<Difference> = differences.iter().map(|f| f.difference.clone()).collect();
+    if keyring_mismatch_suspected(&plain) {
+        println!(
+            "hint: only executables differ. Rule out first that --keyring is the public \
+             keyring compiled into the published bundle (a different one changes the binaries only)."
+        );
     }
     bail!(
         "{} file(s) differ from the rebuilt commit",
@@ -492,6 +549,54 @@ mod tests {
                 Difference::Extra("e".into()),
             ]
         );
+    }
+
+    #[test]
+    fn keyring_mismatch_is_suspected_only_for_changed_executables() {
+        let changed = |path: &str| Difference::Changed {
+            path: path.into(),
+            expected: entry(path, 1, true),
+            actual: entry(path, 2, true),
+        };
+        assert!(keyring_mismatch_suspected(&[
+            changed("heliosd"),
+            changed("helios-installer")
+        ]));
+        assert!(!keyring_mismatch_suspected(&[]));
+        assert!(!keyring_mismatch_suspected(&[changed(
+            "network.toml.example"
+        )]));
+        assert!(!keyring_mismatch_suspected(&[
+            changed("heliosd"),
+            Difference::Missing("helios".into())
+        ]));
+    }
+
+    #[test]
+    fn a_tampered_file_on_disk_is_reported_against_the_disk() {
+        let scratch = Scratch::new("tamper").expect("scratch");
+        let repository = scratch.path().join("repository");
+        fs::create_dir(&repository).expect("repository directory");
+        let commit = repository_with_commit(&repository);
+        let bundle_dir = scratch.path().join("bundle");
+        fs::create_dir(&bundle_dir).expect("bundle directory");
+        let keyring = signed_bundle(&bundle_dir, CONTAINER_TARGET, &commit[..16]);
+        let rebuilt = bundle::collect(&bundle_dir).expect("listing");
+
+        // The manifest stays intact; only the file on disk is altered.
+        fs::write(bundle_dir.join("heliosd"), "the-daemon-tampered").expect("tamper");
+
+        let findings = verify_bundle(&bundle_dir, &keyring, &repository, |_, _| Ok(rebuilt))
+            .expect("verification");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].source, Source::Disk);
+        assert!(
+            matches!(&findings[0].difference, Difference::Changed { path, .. } if path == "heliosd"),
+            "{findings:?}"
+        );
+        assert!(findings[0]
+            .to_string()
+            .starts_with("[files on disk] changed: heliosd"));
     }
 
     #[test]

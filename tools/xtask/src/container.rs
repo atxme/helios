@@ -28,10 +28,16 @@ const OUT_MOUNT: &str = "/helios/out";
 const KEYRING_MOUNT: &str = "/helios/keyring.json";
 const CARGO_HOME_MOUNT: &str = "/helios/cargo";
 const TARGET_MOUNT: &str = "/helios/target";
-/// Runs the command under the umask the outputs depend on (see [`run_args`]).
-const UMASK_WRAPPER: [&str; 4] = ["sh", "-c", "umask 022 && exec \"$@\"", "helios-build"];
-const RUSTFLAGS: &str =
-    "--remap-path-prefix=/helios/src=/helios --remap-path-prefix=/helios/cargo=/cargo";
+
+// Contract between this host-side xtask and the image: the fixed build
+// environment (RUSTFLAGS, TZ, LANG, CARGO_HOME, CARGO_TARGET_DIR, HOME,
+// HELIOS_PUBLISHER_KEYRING_PATH) and the `umask 022` entrypoint live in
+// `tools/build-env/Dockerfile`, so they belong to the verified commit and not
+// to the xtask that happens to run `verify`. The host passes only what varies:
+// mounts, user, SOURCE_DATE_EPOCH and CARGO_BUILD_JOBS. The inner command
+// `cargo run --locked --package xtask -- bundle --native --target <t> --output
+// /helios/out/<name>` (see [`xtask_command`]) is likewise a stable contract
+// between host and image: changing it breaks the verification of older bundles.
 
 /// Everything `docker run` needs for one build.
 pub struct ContainerRun {
@@ -123,7 +129,8 @@ pub fn ensure_image(root: &Path) -> Result<String> {
 
 /// Copies the tracked files of the repository to `dest`, as they are on disk.
 ///
-/// Nothing else is copied: no ignored file, no untracked file, no `.git`.
+/// Nothing else is copied: no ignored file, no untracked file, no `.git`, and
+/// no tracked file that was deleted from the work tree.
 /// Executable bits survive the copy, and uncommitted edits to tracked files
 /// are copied as they are.
 pub fn export_tree(root: &Path, dest: &Path) -> Result<()> {
@@ -146,12 +153,18 @@ pub fn export_tree(root: &Path, dest: &Path) -> Result<()> {
         }
         let relative =
             std::str::from_utf8(raw).context("git ls-files reported a non-UTF-8 path")?;
+        let source = root.join(relative);
+        // A tracked file deleted from the work tree is not part of the tree
+        // "as it is on disk": it is left out, not an error.
+        if std::fs::symlink_metadata(&source).is_err() {
+            continue;
+        }
         let target = dest.join(relative);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        std::fs::copy(root.join(relative), &target)
+        std::fs::copy(&source, &target)
             .with_context(|| format!("copying {relative} to {}", target.display()))?;
     }
     Ok(())
@@ -176,8 +189,9 @@ pub fn source_date_epoch(root: &Path) -> Result<u64> {
 
 /// The `docker run` arguments of one build, ending with the command.
 ///
-/// The command runs under `umask 022` set explicitly, so that the modes of
-/// the outputs do not depend on the Docker daemon's default.
+/// The fixed environment and the `umask 022` entrypoint come from the image
+/// (see the contract note at the top of this file); only variable inputs are
+/// passed here.
 pub fn run_args(run: &ContainerRun) -> Result<Vec<OsString>> {
     let keyring = std::path::absolute(&run.keyring)
         .with_context(|| format!("resolving the keyring path {}", run.keyring.display()))?;
@@ -194,26 +208,15 @@ pub fn run_args(run: &ContainerRun) -> Result<Vec<OsString>> {
     );
     option(&mut args, "-v", format!("{TARGET_VOLUME}:{TARGET_MOUNT}"));
     option(&mut args, "-w", SOURCE_MOUNT);
-    option(&mut args, "-e", format!("RUSTFLAGS={RUSTFLAGS}"));
     option(
         &mut args,
         "-e",
         format!("SOURCE_DATE_EPOCH={}", run.source_date_epoch),
     );
-    option(&mut args, "-e", "TZ=UTC");
-    option(&mut args, "-e", "LANG=C.UTF-8");
-    option(&mut args, "-e", format!("CARGO_HOME={CARGO_HOME_MOUNT}"));
-    option(&mut args, "-e", format!("CARGO_TARGET_DIR={TARGET_MOUNT}"));
-    option(
-        &mut args,
-        "-e",
-        format!("HELIOS_PUBLISHER_KEYRING_PATH={KEYRING_MOUNT}"),
-    );
     if let Some(jobs) = &run.jobs {
         option(&mut args, "-e", format!("CARGO_BUILD_JOBS={jobs}"));
     }
     args.push(run.image.clone().into());
-    args.extend(UMASK_WRAPPER.iter().map(OsString::from));
     args.extend(run.command.iter().map(OsString::from));
     Ok(args)
 }
@@ -492,61 +495,43 @@ mod tests {
     }
 
     #[test]
-    fn run_args_carry_the_fixed_environment() {
+    fn run_args_pass_only_the_variable_inputs() {
         let scratch = Scratch::new("env");
         let keyring = scratch.path().join("keyring.json");
         write(&keyring, "{}");
         let args = strings(&run_args(&sample_run(keyring.clone())).expect("run args"));
 
         let has = |expected: &str| args.iter().any(|arg| arg == expected);
-        let rustflags = args
-            .iter()
-            .find(|arg| arg.starts_with("RUSTFLAGS="))
-            .expect("RUSTFLAGS argument");
-        assert!(rustflags.contains("--remap-path-prefix=/helios/src=/helios"));
-        assert!(rustflags.contains("--remap-path-prefix=/helios/cargo=/cargo"));
         assert!(has("SOURCE_DATE_EPOCH=1700000000"));
-        assert!(has("TZ=UTC"));
-        assert!(has("LANG=C.UTF-8"));
-        assert!(has("CARGO_HOME=/helios/cargo"));
-        assert!(has("CARGO_TARGET_DIR=/helios/target"));
-        assert!(has("HELIOS_PUBLISHER_KEYRING_PATH=/helios/keyring.json"));
         assert!(args.windows(2).any(|pair| pair == ["--user", "1000:1000"]));
+        assert!(args.windows(2).any(|pair| pair == ["-w", "/helios/src"]));
         assert!(has("helios-build-cargo:/helios/cargo"));
         assert!(has("helios-build-target:/helios/target"));
         assert!(has(&format!(
             "{}:/helios/keyring.json:ro",
             keyring.display()
         )));
+        // The fixed environment and the umask belong to the image.
+        for fixed in [
+            "RUSTFLAGS=",
+            "TZ=",
+            "LANG=",
+            "CARGO_HOME=",
+            "CARGO_TARGET_DIR=",
+            "HELIOS_PUBLISHER_KEYRING_PATH=",
+            "HOME=",
+        ] {
+            assert!(
+                !args.iter().any(|arg| arg.starts_with(fixed)),
+                "{fixed} must come from the image"
+            );
+        }
+        assert!(!has("sh") && !has("umask 022 && exec \"$@\""));
         assert!(args.ends_with(&[
             "helios-build:0123456789ab".to_string(),
-            "sh".to_string(),
-            "-c".to_string(),
-            "umask 022 && exec \"$@\"".to_string(),
-            "helios-build".to_string(),
             "cargo".to_string(),
             "--version".to_string(),
         ]));
-    }
-
-    #[test]
-    fn run_args_run_the_command_under_umask_022() {
-        let scratch = Scratch::new("umask");
-        let keyring = scratch.path().join("keyring.json");
-        write(&keyring, "{}");
-        let args = strings(&run_args(&sample_run(keyring)).expect("run args"));
-
-        let image = args
-            .iter()
-            .position(|arg| arg == "helios-build:0123456789ab")
-            .expect("image argument");
-        assert_eq!(&args[image + 1], "sh");
-        assert_eq!(&args[image + 2], "-c");
-        let script = &args[image + 3];
-        assert!(script.starts_with("umask 022 &&"), "{script}");
-        assert!(script.ends_with("exec \"$@\""), "{script}");
-        assert_eq!(&args[image + 4], "helios-build");
-        assert_eq!(&args[image + 5..], ["cargo", "--version"]);
     }
 
     #[test]
@@ -598,6 +583,9 @@ mod tests {
         write(&repo.join("node_modules/x"), "ignored\n");
         write(&repo.join("web/dist/y"), "ignored\n");
         write(&repo.join("src/lib.rs"), "pub fn edited() {}\n");
+        write(&repo.join("gone.txt"), "deleted later\n");
+        git(&repo, &["add", "gone.txt"]);
+        std::fs::remove_file(repo.join("gone.txt")).expect("delete tracked file");
 
         let dest = scratch.path().join("dest");
         export_tree(&repo, &dest).expect("export");

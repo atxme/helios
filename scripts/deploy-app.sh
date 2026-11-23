@@ -53,6 +53,18 @@ case "$CHANNEL" in
     *) echo "invalid channel: $CHANNEL" >&2; exit 1 ;;
 esac
 
+# `web/dist` n'existe pas dans le conteneur : réutiliser le front de ce poste
+# impose la construction native.
+if [ "$SKIP_FRONTEND" = "1" ] && [ "$BUILD_NATIVE" = "0" ]; then
+    echo "--skip-frontend réutilise web/dist de ce poste : construction native (--build-natif) activée" >&2
+    BUILD_NATIVE=1
+fi
+
+if [ "$BUILD_NATIVE" = "0" ] && ! docker info >/dev/null 2>&1; then
+    echo "Docker indisponible : installer Docker, ou relancer avec --build-natif" >&2
+    exit 1
+fi
+
 [ -n "$SEQUENCE" ] || SEQUENCE="$(date +%s)"
 case "$SEQUENCE" in
     ''|*[!0-9]*) echo "invalid release sequence: $SEQUENCE" >&2; exit 1 ;;

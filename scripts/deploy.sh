@@ -139,6 +139,13 @@ if [ "$ASTRA_ONLY" = "1" ] && [ "$FIREWALL_MODE" != "preserve" ]; then
     exit 1
 fi
 
+# La construction se fait dans le conteneur épinglé : sans Docker, on le dit
+# avant toute invite sudo ou tout autre travail.
+if [ "$ASTRA_ONLY" = "0" ] && [ "$BUILD_NATIF" = "0" ] && ! docker info >/dev/null 2>&1; then
+    echo "Docker indisponible : installer Docker, ou relancer avec --build-natif" >&2
+    exit 1
+fi
+
 # Une seule invite pour tout le déploiement, prise **ici** : dans un pipeline,
 # `helios_ssh_sudo` tourne en sous-shell et le mot de passe y serait perdu.
 helios_sudo_init "$CIBLE"
@@ -209,7 +216,7 @@ if [ "$BUILD_NATIF" = "1" ]; then
 fi
 HELIOS_PUBLISHER_KEYRING_PATH="$EPOQUE/publisher-keyring.json" \
     cargo xtask "${BUNDLE_ARGS[@]}" \
-    | sed '/^Signer sur le poste éditeur/,$d'
+    | sed '/^Sign on the publisher workstation/,$d'
 
 echo "==> 2/7  Signature hors ligne (époque $EPOQUE_N)"
 cargo run --quiet -p helios-publisher -- bundle \

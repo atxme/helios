@@ -199,13 +199,9 @@ fn app(target: Option<String>, skip_frontend: bool, native: bool) -> Result<()> 
 /// build would have left it, the path `scripts/deploy-app.sh` reads.
 fn app_in_container(root: &Path, target: &str, skip_frontend: bool) -> Result<PathBuf> {
     container_target(target)?;
-    let skip = if skip_frontend {
-        " --skip-frontend"
-    } else {
-        ""
-    };
+    container_frontend(skip_frontend)?;
     let script = format!(
-        "cargo run --locked --package xtask -- app --native --target {target}{skip} \
+        "cargo run --locked --package xtask -- app --native --target {target} \
          && cp /helios/target/{target}/release/heliosd /helios/out/heliosd"
     );
     let out = container::build_in_container(
@@ -222,6 +218,18 @@ fn app_in_container(root: &Path, target: &str, skip_frontend: bool) -> Result<Pa
     copied?;
     discarded?;
     Ok(binary)
+}
+
+/// Refuses `--skip-frontend` in a container build, before any Docker or build
+/// step: `web/dist` is git-ignored, so the exported tree never carries it.
+fn container_frontend(skip_frontend: bool) -> Result<()> {
+    if skip_frontend {
+        bail!(
+            "--skip-frontend reuses this host's web/dist, which the build container does not \
+             have: it needs `--native`"
+        );
+    }
+    Ok(())
 }
 
 /// Refuses a target the build container cannot produce.
@@ -490,13 +498,14 @@ fn assemble_in_container(
     staging: &Path,
 ) -> Result<()> {
     container_target(target)?;
+    container_frontend(skip_frontend)?;
     let name = staging
         .file_name()
         .context("the bundle output has no directory name")?
         .to_string_lossy()
         .into_owned();
 
-    let mut arguments = vec![
+    let arguments = vec![
         "bundle".to_string(),
         "--native".into(),
         "--target".into(),
@@ -504,9 +513,6 @@ fn assemble_in_container(
         "--output".into(),
         format!("/helios/out/{name}"),
     ];
-    if skip_frontend {
-        arguments.push("--skip-frontend".into());
-    }
     let out = container::build_in_container(
         root,
         &publisher_keyring()?,
@@ -993,6 +999,16 @@ mod tests {
             .expect_err("other targets are refused")
             .to_string();
         assert!(error.contains("--native"), "{error}");
+    }
+
+    #[test]
+    fn container_build_refuses_skip_frontend() {
+        assert!(container_frontend(false).is_ok());
+        let error = container_frontend(true)
+            .expect_err("--skip-frontend needs --native")
+            .to_string();
+        assert!(error.contains("--native"), "{error}");
+        assert!(error.contains("web/dist"), "{error}");
     }
 
     #[test]
