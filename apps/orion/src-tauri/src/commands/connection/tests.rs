@@ -123,6 +123,7 @@ async fn disconnect_sends_the_stop_command_and_returns_backend_failures() {
             Err("interface teardown failed".into()),
             Err("interface teardown failed".into()),
         ),
+        (Ok(EngineReply::Flag(false)), Err(unexpected_engine_reply())),
     ] {
         let (result, ()) = tokio::join!(
             disconnect_from(&client),
@@ -139,16 +140,55 @@ async fn disconnect_sends_the_stop_command_and_returns_backend_failures() {
 async fn renew_psk_acknowledges_start_and_rejects_an_unrelated_reply() {
     let (client, mut engine) = scripted_engine().await;
     for (reply, expected) in [
-        (EngineReply::Unit, Ok(())),
-        (EngineReply::Flag(true), Err(unexpected_engine_reply())),
+        (Ok(EngineReply::Unit), Ok(())),
+        (Ok(EngineReply::Flag(true)), Err(unexpected_engine_reply())),
+        (
+            Err("renewal cannot start".into()),
+            Err("renewal cannot start".into()),
+        ),
     ] {
         let (result, ()) = tokio::join!(
             renew_psk_from(&client),
             engine.reply(|command| {
                 assert!(matches!(command, EngineCommand::RenewPsk));
-                Ok(reply)
+                reply
             }),
         );
         assert_eq!(result, expected);
     }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn connection_command_surfaces_engine_refusals_and_unexpected_replies() {
+    let (client, mut engine) = scripted_engine().await;
+    let app = crate::commands::test_support::command_app(client);
+    for (reply, expected) in [
+        (
+            Err("interface is unavailable".into()),
+            "interface is unavailable".into(),
+        ),
+        (Ok(EngineReply::Flag(true)), unexpected_engine_reply()),
+    ] {
+        let (result, ()) = tokio::join!(
+            connect(app.state(), Some(PROFILE.into())),
+            engine.reply(|command| {
+                assert!(matches!(
+                    command,
+                    EngineCommand::Connect { name: Some(name) } if name == PROFILE
+                ));
+                reply
+            }),
+        );
+        assert_eq!(result, Err(expected));
+    }
+
+    let (result, ()) = tokio::join!(
+        renew_psk(app.state()),
+        engine.reply(|command| {
+            assert!(matches!(command, EngineCommand::RenewPsk));
+            Ok(EngineReply::Unit)
+        }),
+    );
+    assert_eq!(result, Ok(()));
 }

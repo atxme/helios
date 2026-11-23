@@ -400,6 +400,54 @@ fn a_rename_is_refused_while_a_sealed_vault_waits() {
     );
 }
 
+#[test]
+fn finalization_shows_only_the_missing_artifacts_before_requesting_a_key() {
+    for (domain, issues_ca_tls) in [
+        (Domain::new("finalize-new"), true),
+        (Domain::new("finalize-credentials").with_ca_tls(), false),
+    ] {
+        let relay_path = astra_operator::handoff::path_beside(&domain.vault_path);
+        let relay = astra_operator::handoff::load(&relay_path).expect("relay");
+        let initial_relay = std::fs::read(&relay_path).expect("relay before finalization");
+        let (outcome, published, artifacts) = run_vault_gesture(
+            crate::operator::VaultGesture::FinalizeDomain,
+            &domain.vault_path,
+        );
+        outcome.expect("operator may cancel at the key prompt");
+        let offered = published
+            .iter()
+            .find(|status| matches!(status.gesture, GestureState::AwaitingKey { .. }))
+            .expect("opening key is offered");
+        let Some(AstraManifest::DomainFinalization(manifest)) = &offered.manifest else {
+            panic!("the finalization plan must precede the key prompt");
+        };
+        assert_eq!(manifest.server_name, relay.server_name.unwrap());
+        assert_eq!(
+            manifest.gateway_wg_public_key.to_base64(),
+            domain.gateway_key
+        );
+        assert_eq!(manifest.issues_ca_tls, issues_ca_tls);
+        assert!(manifest.issues_credentials);
+        assert_eq!(published.last().unwrap().gesture, GestureState::Cancelled);
+        assert!(artifacts.is_empty());
+        assert_eq!(std::fs::read(relay_path).unwrap(), initial_relay);
+        assert!(!astra_operator::credentials::path_beside(&domain.vault_path).exists());
+    }
+}
+
+#[test]
+fn finalization_requires_a_readable_vault_before_requesting_a_key() {
+    let folder = Folder::new("finalize-missing-vault");
+    let (outcome, published, artifacts) = run_vault_gesture(
+        crate::operator::VaultGesture::FinalizeDomain,
+        &folder.vault_path(),
+    );
+    outcome.expect_err("a missing vault cannot be finalized");
+    refused_before_the_key(&published, Refusal::VaultUnavailable);
+    assert!(artifacts.is_empty());
+    assert!(folder.is_empty());
+}
+
 /// A domain carrying its CA-TLS and a document for every key has nothing
 /// left to issue.
 #[test]
@@ -745,6 +793,59 @@ fn the_second_key_must_be_another_credential() {
     assert_eq!(last.keys[0].label, "quotidienne");
     assert!(artifacts.is_empty());
     assert_eq!(std::fs::read(&relay_path).expect("relay"), relay_before);
+    assert!(!astra_operator::bootstrap::path_beside(&domain.vault_path).exists());
+}
+
+/// Distinct approvals that cannot read the vault's anchors fail after the
+/// signing boundary, while leaving the vault, relay and leaf untouched.
+#[test]
+fn distinct_bootstrap_approvals_must_prove_the_vault_anchors() {
+    let domain = Domain::new("bootstrap-anchor-proof")
+        .full()
+        .without_gateway();
+    let relay_path = astra_operator::handoff::path_beside(&domain.vault_path);
+    let relay_before = std::fs::read(&relay_path).expect("relay");
+    let vault_before = std::fs::read(&domain.vault_path).expect("vault");
+    let (_, plan) = bootstrap_request("gateway.example");
+
+    let (presses, received) = std::sync::mpsc::channel::<Press>();
+    drop(presses);
+    let mut ceremony = Ceremony::new(
+        Id16::new([8; 16]).expect("id"),
+        OperationLocator {
+            kind: OperationKind::IssueGatewayBootstrap,
+            operation_id: None,
+        },
+    );
+    let mut published = Vec::new();
+    let mut artifacts = Vec::new();
+    let mut publish = |status| published.push(status);
+    let mut run = VaultRun {
+        ceremony: &mut ceremony,
+        presses: &received,
+        publish: &mut publish,
+        vault_path: &domain.vault_path,
+    };
+    let first = opening(1);
+    let mut second = opening(2);
+    second.secret = astra_operator::vault::SlotSecret::new(vec![0x42; 32]);
+    let outcome = run.issue_bootstrap(&plan, &first, &second, &mut |artifact| {
+        artifacts.push(artifact)
+    });
+
+    outcome.expect_err("unreadable anchors are refused");
+    assert!(published
+        .iter()
+        .any(|status| status.gesture == GestureState::Signing));
+    let last = published.last().expect("failure status");
+    assert_eq!(last.gesture, GestureState::Failed);
+    assert_eq!(last.refusal, Some(Refusal::Internal));
+    assert!(artifacts.is_empty());
+    assert_eq!(std::fs::read(&relay_path).expect("relay"), relay_before);
+    assert_eq!(
+        std::fs::read(&domain.vault_path).expect("vault"),
+        vault_before
+    );
     assert!(!astra_operator::bootstrap::path_beside(&domain.vault_path).exists());
 }
 

@@ -584,6 +584,54 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_counter_and_pcr_digest_are_preserved_in_the_public_request() {
+        let fx = fixture(None);
+        let digest = [0x42; 32];
+        let decoded = decode_pcr_digest(Some(format!(" {}\n", hex::encode(digest)))).unwrap();
+        let prepared = prepare_with_key(&fx.escrow, &fx.operator_private[..], Some(9), decoded)
+            .expect("prepare with an explicit counter");
+        assert_eq!(prepared.counter, 9);
+        assert_eq!(prepared.counter_source, CounterOrigin::Given);
+        let body: WireGuardRecoveryPayload =
+            serde_json::from_str(&prepared.request.contents).expect("public request");
+        assert_eq!(body.counter, 9);
+        assert_eq!(body.gateway_public_key, wg_public(&fx.wg_private));
+        assert_eq!(body.expected_pcr_digest, Some(digest));
+        assert_eq!(decode_pcr_digest(None).unwrap(), None);
+        assert_eq!(
+            decode_pcr_digest(Some(hex::encode([0; 31]))).unwrap_err(),
+            RecoveryRefusalView::RequestMalformed
+        );
+    }
+
+    #[test]
+    fn assembly_reports_a_write_failure_without_replacing_the_destination() {
+        let fx = fixture(Some(5));
+        let prepared = prepare_with_key(&fx.escrow, &fx.operator_private[..], None, None).unwrap();
+        let authorization = authorization_json(payload(6, wg_public(&fx.wg_private)));
+        let scratch = Scratch::new("write-refused");
+        let target = scratch.0.join(RECOVERY_FILE);
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), b"existing contents").unwrap();
+
+        let refusal = assemble_to(
+            &fx.escrow,
+            &fx.operator_private[..],
+            &prepared.request.contents,
+            &authorization,
+            &target,
+        )
+        .unwrap_err();
+
+        assert_eq!(refusal, RecoveryRefusalView::FrameMalformed);
+        assert_eq!(
+            std::fs::read(target.join("keep")).unwrap(),
+            b"existing contents"
+        );
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
+    }
+
+    #[test]
     fn an_invalid_pcr_digest_is_a_malformed_request() {
         assert_eq!(
             decode_pcr_digest(Some("not hex".to_string())).unwrap_err(),
