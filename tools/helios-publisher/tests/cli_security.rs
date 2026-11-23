@@ -400,3 +400,215 @@ fn wg_recovery_command_signs_the_exact_public_request_and_refuses_overwrite() {
     );
     assert!(!sign().status.success());
 }
+
+struct ReleaseFixture {
+    root: tempfile::TempDir,
+    keys: std::path::PathBuf,
+    bundle: std::path::PathBuf,
+}
+
+impl ReleaseFixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let keys = generate_keys(root.path(), "11");
+        let bundle = root.path().join("bundle");
+        fs::create_dir(&bundle).unwrap();
+        Self { root, keys, bundle }
+    }
+
+    fn write_daemon(&self, machine: u16) {
+        let mut binary = vec![0u8; 64];
+        binary[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        binary[18..20].copy_from_slice(&machine.to_le_bytes());
+        fs::write(self.bundle.join("heliosd"), binary).unwrap();
+    }
+
+    fn release(&self, kind: &str, version: &str, keyring: &Path) -> Command {
+        let mut command = publisher();
+        command
+            .args([
+                kind,
+                "--key-epoch",
+                "11",
+                "--release-sequence",
+                "73",
+                "--channel",
+                "testing",
+                "--version",
+                version,
+                "--git-commit",
+                "0123456789abcdef",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+            ])
+            .arg("--ed25519-private-key")
+            .arg(self.keys.join("ed25519-private.pk8"))
+            .arg("--ml-dsa-65-private-key")
+            .arg(self.keys.join("ml-dsa-65-private.bin"))
+            .arg("--keyring")
+            .arg(keyring);
+        command
+    }
+
+    fn bundle(&self, version: &str, keyring: &Path) -> Command {
+        let mut command = self.release("bundle", version, keyring);
+        command.arg("--dir").arg(&self.bundle);
+        command
+    }
+
+    fn keyring(&self) -> std::path::PathBuf {
+        self.keys.join("publisher-keyring.json")
+    }
+
+    fn assert_refused(mut command: Command, expected: &str) {
+        let output = command.output().unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn bundle_command_signs_the_manifest_of_every_staged_file_and_preserves_it() {
+    use aether::sig::PublisherPublicKeys;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use helios_update::bundle;
+
+    let fixture = ReleaseFixture::new();
+    fixture.write_daemon(62);
+    fs::create_dir(fixture.bundle.join("systemd")).unwrap();
+    fs::write(
+        fixture.bundle.join("systemd/heliosd.service"),
+        b"unit fixture",
+    )
+    .unwrap();
+    let keyring = fixture.keyring();
+    let output = fixture.bundle("1.4.0", &keyring).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("bundle 1.4.0 sequence 73, 2 file(s)"));
+
+    let manifest = bundle::read_manifest(&fixture.bundle).unwrap();
+    let keys: serde_json::Value = serde_json::from_slice(&fs::read(&keyring).unwrap()).unwrap();
+    let keys = &keys[0];
+    manifest
+        .verify(&[PublisherPublicKeys {
+            key_epoch: 11,
+            ed25519: STANDARD
+                .decode(keys["ed25519"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            ml_dsa_65: STANDARD
+                .decode(keys["ml-dsa-65"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        }])
+        .unwrap();
+    bundle::verify_contents(&fixture.bundle, &manifest.payload).unwrap();
+    assert_eq!(manifest.payload.release_sequence, 73);
+    assert_eq!(
+        manifest
+            .payload
+            .files
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        ["heliosd", "systemd/heliosd.service"]
+    );
+    for entry in &manifest.payload.files {
+        assert!(stdout.contains(&format!("{} {}", hex::encode(entry.sha256), entry.path)));
+    }
+    let path = fixture.bundle.join(bundle::BUNDLE_MANIFEST_FILE);
+    let signed = fs::read(&path).unwrap();
+    ReleaseFixture::assert_refused(fixture.bundle("1.4.1", &keyring), "manifest.json");
+    assert_eq!(fs::read(&path).unwrap(), signed);
+}
+
+#[test]
+fn signing_requires_consistent_artifacts_and_complete_metadata() {
+    let fixture = ReleaseFixture::new();
+    let keyring = fixture.keyring();
+    let binary = fixture.bundle.join("heliosd");
+    let manifest = fixture.root.path().join("release.json");
+    let release = |version| {
+        let mut command = fixture.release("binary-release", version, &keyring);
+        command
+            .arg("--binary")
+            .arg(&binary)
+            .arg("--output")
+            .arg(&manifest);
+        command
+    };
+    ReleaseFixture::assert_refused(fixture.bundle("", &keyring), "version, commit, and target");
+    ReleaseFixture::assert_refused(
+        fixture.bundle("1.4.0", &keyring),
+        "always contains the daemon",
+    );
+    ReleaseFixture::assert_refused(release(""), "version, commit, and target");
+    ReleaseFixture::assert_refused(release("1.4.0"), "reading metadata");
+    fs::write(&binary, []).unwrap();
+    ReleaseFixture::assert_refused(release("1.4.0"), "binary size out of bounds");
+    fixture.write_daemon(183);
+    ReleaseFixture::assert_refused(fixture.bundle("1.4.0", &keyring), "ELF architecture 183");
+    ReleaseFixture::assert_refused(release("1.4.0"), "ELF architecture 183");
+    fixture.write_daemon(62);
+    let mut empty_feature = release("1.4.0");
+    empty_feature.args(["--features", " "]);
+    ReleaseFixture::assert_refused(empty_feature, "empty feature is not allowed");
+
+    assert!(!manifest.exists());
+    assert!(!fixture
+        .bundle
+        .join(helios_update::bundle::BUNDLE_MANIFEST_FILE)
+        .exists());
+}
+
+#[test]
+fn bundle_signer_only_uses_a_unique_matching_publisher_keyring() {
+    let fixture = ReleaseFixture::new();
+    fixture.write_daemon(62);
+    let published: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.keyring()).unwrap()).unwrap();
+    let authorized = published[0].clone();
+    let cases = [
+        (serde_json::json!([]), "public keyring is empty"),
+        (
+            serde_json::json!([authorized, authorized]),
+            "epoch 11 duplicated",
+        ),
+        (
+            serde_json::json!([{"key_epoch": 11, "ed25519": "!", "ml-dsa-65": ""}]),
+            "invalid base64 Ed25519",
+        ),
+        (
+            serde_json::json!([{"key_epoch": 11, "ed25519": "AQ==", "ml-dsa-65": ""}]),
+            "Ed25519 public key of 1 bytes instead of 32",
+        ),
+    ];
+    let keyring = fixture.root.path().join("candidate-keyring.json");
+    for (value, expected) in cases {
+        write_json(&keyring, &value);
+        ReleaseFixture::assert_refused(fixture.bundle("1.4.0", &keyring), expected);
+    }
+    let mut other_epoch = published;
+    other_epoch[0]["key_epoch"] = serde_json::json!(12);
+    write_json(&keyring, &other_epoch);
+    ReleaseFixture::assert_refused(fixture.bundle("1.4.0", &keyring), "epoch 11 missing");
+    let another = tempfile::tempdir().unwrap();
+    let foreign = generate_keys(another.path(), "11").join("publisher-keyring.json");
+    ReleaseFixture::assert_refused(
+        fixture.bundle("1.4.0", &foreign),
+        "private keys do not match epoch 11",
+    );
+    assert!(!fixture
+        .bundle
+        .join(helios_update::bundle::BUNDLE_MANIFEST_FILE)
+        .exists());
+}
