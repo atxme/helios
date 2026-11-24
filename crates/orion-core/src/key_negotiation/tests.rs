@@ -350,6 +350,40 @@ fn a_renewal_route_is_refused_rather_than_guessed() {
     );
 }
 
+struct NeverReadIdentity;
+
+#[async_trait::async_trait]
+impl crate::key_negotiation::IdentityProvider for NeverReadIdentity {
+    async fn load(
+        &self,
+        _identity: &str,
+    ) -> anyhow::Result<crate::key_negotiation::ClientIdentity> {
+        panic!("an invalid renewal route must fail before reading a protected identity")
+    }
+}
+
+/// A profile renewal cannot fall back to the public negotiation endpoint when
+/// its tunnel route is missing or would leave the tunnel.
+#[tokio::test]
+async fn profile_renewal_refuses_an_invalid_tunnel_route_before_reading_identity() {
+    let identities = NeverReadIdentity;
+    let mut no_gateway = renewal_profile();
+    no_gateway.heliosd_url = None;
+    let error = match super::prepare_renewal_for_profile(&no_gateway, &identities).await {
+        Err(error) => error,
+        Ok(_) => panic!("missing internal gateway URL was accepted"),
+    };
+    assert!(error.to_string().contains("no internal Helios URL"));
+
+    let mut outside_tunnel = renewal_profile();
+    outside_tunnel.allowed_ips = "10.0.0.0/8".into();
+    let error = match super::prepare_renewal_for_profile(&outside_tunnel, &identities).await {
+        Err(error) => error,
+        Ok(_) => panic!("gateway outside the tunnel routes was accepted"),
+    };
+    assert!(error.to_string().contains("tunnel"));
+}
+
 #[test]
 fn the_tunnel_socket_is_bound_to_the_given_source() {
     let socket = crate::net_pin::tunnel_socket("127.0.0.1".parse().unwrap()).unwrap();

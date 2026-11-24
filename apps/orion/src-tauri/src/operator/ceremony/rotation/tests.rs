@@ -4607,6 +4607,47 @@ fn resume_without_campaign_never_reads_astra() {
     assert_eq!(gateway.calls_of("install_ca_transition"), 1);
 }
 
+/// An offline acceptance stays durable if the gateway is unavailable; a later
+/// resume installs that same transition without reopening either operator key.
+#[test]
+fn an_offline_acceptance_survives_install_failure_and_resumes_keylessly() {
+    let bench = bench_without_origin();
+    let gateway = GatewayOnly::of(&bench);
+    let mut keys = ValidatedKeys::new(&bench.path).expect("keys");
+    keys.validate(&*bench.keys[0]).expect("the first key");
+    keys.validate(&*bench.keys[1]).expect("the second key");
+    rotation::open_without_campaign(&gateway, &bench.path, keys, &terms(), NOW)
+        .expect("opened without a campaign")
+        .sign_and_journal(&bench.path, NOW)
+        .expect("signed and accepted");
+
+    let accepted = bench.journal().expect("accepted journal");
+    assert_eq!(accepted.stage, JournalStage::Accepted);
+    assert!(accepted.without_campaign);
+    let touches = bench.touches();
+    gateway.unreachable_install.store(true, Ordering::SeqCst);
+
+    let failed = bench.drive_against(&gateway, RotationGesture::Resume, Bench::all_the_way);
+
+    failed.refused(Refusal::GatewayUnavailable);
+    let applied = bench.journal().expect("applied journal retained");
+    assert_eq!(applied.stage, JournalStage::Applied);
+    assert_eq!(
+        applied.next_anchor_fingerprint,
+        accepted.next_anchor_fingerprint
+    );
+    assert_eq!(bench.touches(), touches, "resume asks for no operator key");
+
+    gateway.unreachable_install.store(false, Ordering::SeqCst);
+    let resumed = bench.drive_against(&gateway, RotationGesture::Resume, Bench::all_the_way);
+
+    resumed.done();
+    assert!(resumed.asked_no_key());
+    assert_eq!(bench.touches(), touches);
+    assert!(bench.journal().is_none());
+    assert_eq!(gateway.calls_of("install_ca_transition"), 2);
+}
+
 #[test]
 fn the_journal_view_says_whether_a_campaign_leads_it() {
     let bench = bench_without_origin();
