@@ -1452,6 +1452,8 @@ fn chain_cli_drives_a_persisted_step_and_refuses_to_skip_it() {
 /// precedes key generation and leaves no half-prepared issuer material.
 #[test]
 fn chain_open_without_a_vault_refuses_before_preparing_issuer_keys() {
+    use astra::chain::CHAIN_PLAN_FILE;
+
     let directory = tempfile::tempdir().expect("temp dir");
     assert!(bootstrap(directory.path(), &ca_public_key())
         .status
