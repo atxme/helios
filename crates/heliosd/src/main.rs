@@ -13,6 +13,10 @@ mod static_psk;
 mod uplink;
 mod vip_routing;
 
+#[cfg(all(test, feature = "tpm"))]
+#[path = "../../helios-tpm/tests/support/swtpm.rs"]
+mod swtpm;
+
 use std::path::PathBuf;
 
 use aether::NetworkConfig;

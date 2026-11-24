@@ -842,6 +842,36 @@ mod tests {
         }
     }
 
+    struct KeyTrial {
+        settings: TpmSettings,
+        #[cfg(feature = "tpm")]
+        _emulator: crate::swtpm::Swtpm,
+    }
+
+    impl KeyTrial {
+        fn start(dir: &std::path::Path) -> Option<Self> {
+            let settings = tpm_in(dir);
+            #[cfg(feature = "tpm")]
+            {
+                let emulator = crate::swtpm::Swtpm::start().expect("start isolated software TPM");
+                let Some(emulator) = emulator else {
+                    eprintln!("[out of scope] missing swtpm or loopback for WireGuard identity");
+                    return None;
+                };
+                let settings = TpmSettings {
+                    device: emulator.tcti().to_owned(),
+                    ..settings
+                };
+                Some(Self {
+                    settings,
+                    _emulator: emulator,
+                })
+            }
+            #[cfg(not(feature = "tpm"))]
+            Some(Self { settings })
+        }
+    }
+
     /// The directory the isolated scenario was given.
     fn identity_dir() -> PathBuf {
         PathBuf::from(std::env::var_os(IDENTITY_DIR_ENV).expect("isolated identity directory"))
@@ -851,7 +881,7 @@ mod tests {
     /// also defines the anti-rollback counter.
     fn boot_secret(tpm: &TpmSettings) -> SecretKey {
         BootController::unlock(tpm)
-            .expect("simulated TPM boot")
+            .expect("isolated TPM boot")
             .secret()
             .expect("a boot with a secret")
             .clone()
@@ -859,9 +889,12 @@ mod tests {
 
     /// The secret of a boot in its own directory: the one a vault is sealed
     /// under before a PCR change.
-    fn secret_in(dir: &std::path::Path) -> SecretKey {
+    fn secret_in(dir: &std::path::Path, device: &str) -> SecretKey {
         std::fs::create_dir_all(dir).expect("secret directory");
-        boot_secret(&tpm_in(dir))
+        boot_secret(&TpmSettings {
+            device: device.to_owned(),
+            ..tpm_in(dir)
+        })
     }
 
     fn raw_key(base64_key: &str) -> [u8; 32] {
@@ -903,10 +936,10 @@ mod tests {
 
     /// The state after a PCR change: the vault was sealed under a secret the
     /// current boot does not have. Returns the key pair and the current secret.
-    fn lost_vault(dir: &std::path::Path) -> (String, String, SecretKey) {
+    fn lost_vault(dir: &std::path::Path, tpm: &TpmSettings) -> (String, String, SecretKey) {
         let (private_key, public_key) = keypair();
-        seal_vault(&secret_in(&dir.join("previous")), &private_key);
-        (private_key, public_key, boot_secret(&tpm_in(dir)))
+        seal_vault(&secret_in(&dir.join("previous"), &tpm.device), &private_key);
+        (private_key, public_key, boot_secret(tpm))
     }
 
     /// The escrow is the only recovery channel after a PCR change, and the
@@ -1128,10 +1161,6 @@ mod tests {
     /// the counter is spent, the key is resealed under the current secret, and
     /// the file is erased.
     #[test]
-    #[cfg_attr(
-        feature = "tpm",
-        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
-    )]
     fn a_signed_recovery_for_the_current_counter_is_resealed_and_erased() {
         if run_isolated_identity_scenario(
             "a_signed_recovery_for_the_current_counter_is_resealed_and_erased",
@@ -1139,9 +1168,12 @@ mod tests {
             return;
         }
         let dir = identity_dir();
-        let tpm = tpm_in(&dir);
-        let (private_key, public_key, current) = lost_vault(&dir);
-        let counter = anti_rollback::current(&tpm).expect("counter");
+        let Some(trial) = KeyTrial::start(&dir) else {
+            return;
+        };
+        let tpm = &trial.settings;
+        let (private_key, public_key, current) = lost_vault(&dir, tpm);
+        let counter = anti_rollback::current(tpm).expect("counter");
         let recovery = PathBuf::from(recovery_path());
         std::fs::write(
             &recovery,
@@ -1152,17 +1184,17 @@ mod tests {
         let resolved = resolve(
             &NetworkConfig::default(),
             &BootDecision::Unsealed(current.clone()),
-            &tpm,
+            tpm,
         );
 
         assert_eq!(resolved.origin, KeyOrigin::Recovered);
         assert_eq!(resolved.private_key.expose(), private_key.as_str());
         assert!(!recovery.exists(), "the recovery file must be erased");
-        assert_eq!(anti_rollback::current(&tpm).expect("counter"), counter + 1);
+        assert_eq!(anti_rollback::current(tpm).expect("counter"), counter + 1);
         let again = resolve(
             &NetworkConfig::default(),
             &BootDecision::Unsealed(current),
-            &tpm,
+            tpm,
         );
         assert_eq!(
             again.origin,
@@ -1174,18 +1206,17 @@ mod tests {
     /// Only the publisher-signed, key-bound authorization is accepted. Each
     /// refusal leaves the file in place and the counter where it was.
     #[test]
-    #[cfg_attr(
-        feature = "tpm",
-        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
-    )]
     fn an_unsigned_or_foreign_recovery_is_left_in_place() {
         if run_isolated_identity_scenario("an_unsigned_or_foreign_recovery_is_left_in_place") {
             return;
         }
         let dir = identity_dir();
-        let tpm = tpm_in(&dir);
-        let (private_key, public_key, current) = lost_vault(&dir);
-        let counter = anti_rollback::current(&tpm).expect("counter");
+        let Some(trial) = KeyTrial::start(&dir) else {
+            return;
+        };
+        let tpm = &trial.settings;
+        let (private_key, public_key, current) = lost_vault(&dir, tpm);
+        let counter = anti_rollback::current(tpm).expect("counter");
         let (other_private_key, _) = keypair();
         let unknown_signer = PublisherSigner::from_seed_material(9, &OTHER_ED_SEED, &OTHER_ML_SEED)
             .expect("unknown signer")
@@ -1235,7 +1266,7 @@ mod tests {
             let resolved = resolve(
                 &NetworkConfig::default(),
                 &BootDecision::Unsealed(current.clone()),
-                &tpm,
+                tpm,
             );
             assert_eq!(resolved.origin, KeyOrigin::Missing, "{case}");
             assert_eq!(
@@ -1244,7 +1275,7 @@ mod tests {
                 "{case}: file kept"
             );
             assert_eq!(
-                anti_rollback::current(&tpm).expect("counter"),
+                anti_rollback::current(tpm).expect("counter"),
                 counter,
                 "{case}: counter unchanged"
             );
@@ -1266,7 +1297,7 @@ mod tests {
         }
         let dir = identity_dir();
         let tpm = tpm_in(&dir);
-        let (private_key, public_key, current) = lost_vault(&dir);
+        let (private_key, public_key, current) = lost_vault(&dir, &tpm);
         let counter_file = PathBuf::from(&tpm.simulated_counter_path);
         std::fs::write(&counter_file, b"not a counter").expect("corrupt counter file");
         let frame = frame_of(&signed_recovery(1, &public_key), &private_key);
@@ -1295,18 +1326,17 @@ mod tests {
 
     /// An authorization for another counter value is refused, and nothing moves.
     #[test]
-    #[cfg_attr(
-        feature = "tpm",
-        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
-    )]
     fn a_recovery_for_another_counter_is_refused() {
         if run_isolated_identity_scenario("a_recovery_for_another_counter_is_refused") {
             return;
         }
         let dir = identity_dir();
-        let tpm = tpm_in(&dir);
-        let (private_key, public_key, current) = lost_vault(&dir);
-        let counter = anti_rollback::current(&tpm).expect("counter");
+        let Some(trial) = KeyTrial::start(&dir) else {
+            return;
+        };
+        let tpm = &trial.settings;
+        let (private_key, public_key, current) = lost_vault(&dir, tpm);
+        let counter = anti_rollback::current(tpm).expect("counter");
         let frame = frame_of(&signed_recovery(counter + 1, &public_key), &private_key);
         let recovery = PathBuf::from(recovery_path());
         std::fs::write(&recovery, &frame).expect("operator recovery file");
@@ -1314,45 +1344,44 @@ mod tests {
         let resolved = resolve(
             &NetworkConfig::default(),
             &BootDecision::Unsealed(current),
-            &tpm,
+            tpm,
         );
 
         assert_eq!(resolved.origin, KeyOrigin::Missing);
         assert_eq!(std::fs::read(&recovery).expect("file"), frame);
-        assert_eq!(anti_rollback::current(&tpm).expect("counter"), counter);
+        assert_eq!(anti_rollback::current(tpm).expect("counter"), counter);
     }
 
     /// Once spent, the same file cannot restore the identity again, even after
     /// the vault is lost once more.
     #[test]
-    #[cfg_attr(
-        feature = "tpm",
-        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
-    )]
     fn a_consumed_recovery_cannot_be_replayed() {
         if run_isolated_identity_scenario("a_consumed_recovery_cannot_be_replayed") {
             return;
         }
         let dir = identity_dir();
-        let tpm = tpm_in(&dir);
-        let (private_key, public_key, current) = lost_vault(&dir);
-        let counter = anti_rollback::current(&tpm).expect("counter");
+        let Some(trial) = KeyTrial::start(&dir) else {
+            return;
+        };
+        let tpm = &trial.settings;
+        let (private_key, public_key, current) = lost_vault(&dir, tpm);
+        let counter = anti_rollback::current(tpm).expect("counter");
         let frame = frame_of(&signed_recovery(counter, &public_key), &private_key);
         let recovery = PathBuf::from(recovery_path());
         std::fs::write(&recovery, &frame).expect("operator recovery file");
         let first = resolve(
             &NetworkConfig::default(),
             &BootDecision::Unsealed(current.clone()),
-            &tpm,
+            tpm,
         );
         assert_eq!(first.origin, KeyOrigin::Recovered);
 
-        seal_vault(&secret_in(&dir.join("previous")), &private_key);
+        seal_vault(&secret_in(&dir.join("previous"), &tpm.device), &private_key);
         std::fs::write(&recovery, &frame).expect("replayed recovery file");
         let replay = resolve(
             &NetworkConfig::default(),
             &BootDecision::Unsealed(current),
-            &tpm,
+            tpm,
         );
 
         assert_eq!(replay.origin, KeyOrigin::Missing);
@@ -1361,29 +1390,28 @@ mod tests {
             frame,
             "replay kept"
         );
-        assert_eq!(anti_rollback::current(&tpm).expect("counter"), counter + 1);
+        assert_eq!(anti_rollback::current(tpm).expect("counter"), counter + 1);
     }
 
     /// A frame that does not decode is ignored and left for correction.
     #[test]
-    #[cfg_attr(
-        feature = "tpm",
-        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
-    )]
     fn an_invalid_recovery_frame_is_left_in_place() {
         if run_isolated_identity_scenario("an_invalid_recovery_frame_is_left_in_place") {
             return;
         }
         let dir = identity_dir();
-        let tpm = tpm_in(&dir);
-        let (_, _, current) = lost_vault(&dir);
+        let Some(trial) = KeyTrial::start(&dir) else {
+            return;
+        };
+        let tpm = &trial.settings;
+        let (_, _, current) = lost_vault(&dir, tpm);
         let recovery = PathBuf::from(recovery_path());
         std::fs::write(&recovery, b"not a recovery frame").expect("invalid recovery file");
 
         let resolved = resolve(
             &NetworkConfig::default(),
             &BootDecision::Unsealed(current),
-            &tpm,
+            tpm,
         );
 
         assert_eq!(resolved.origin, KeyOrigin::Missing);
@@ -1397,10 +1425,6 @@ mod tests {
     /// vault the recovery path is never reached: no consumption, no counter
     /// movement, in either case.
     #[test]
-    #[cfg_attr(
-        feature = "tpm",
-        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
-    )]
     fn a_recovery_file_without_a_locked_vault_is_not_consumed_or_used() {
         if run_isolated_identity_scenario(
             "a_recovery_file_without_a_locked_vault_is_not_consumed_or_used",
@@ -1408,42 +1432,41 @@ mod tests {
             return;
         }
         let dir = identity_dir();
-        let tpm = tpm_in(&dir);
-        let current = boot_secret(&tpm);
-        let counter = anti_rollback::current(&tpm).expect("counter");
+        let Some(trial) = KeyTrial::start(&dir) else {
+            return;
+        };
+        let tpm = &trial.settings;
+        let current = boot_secret(tpm);
+        let counter = anti_rollback::current(tpm).expect("counter");
         let (private_key, public_key) = keypair();
         let recovery = PathBuf::from(recovery_path());
         let frame = frame_of(&signed_recovery(counter, &public_key), &private_key);
         std::fs::write(&recovery, &frame).expect("operator recovery file");
 
         // No vault at all.
-        let resolved = resolve(&NetworkConfig::default(), &BootDecision::Disabled, &tpm);
+        let resolved = resolve(&NetworkConfig::default(), &BootDecision::Disabled, tpm);
         assert_eq!(resolved.origin, KeyOrigin::Missing);
         assert!(resolved.private_key.is_empty());
         assert_eq!(std::fs::read(&recovery).expect("file"), frame);
-        assert_eq!(anti_rollback::current(&tpm).expect("counter"), counter);
+        assert_eq!(anti_rollback::current(tpm).expect("counter"), counter);
 
         // A vault that opens under the current secret: the file is never read.
         seal_vault(&current, &private_key);
         let resolved = resolve(
             &NetworkConfig::default(),
             &BootDecision::Unsealed(current),
-            &tpm,
+            tpm,
         );
         assert_eq!(resolved.origin, KeyOrigin::Sealed);
         assert_eq!(resolved.private_key.expose(), private_key.as_str());
         assert_eq!(std::fs::read(&recovery).expect("file"), frame);
-        assert_eq!(anti_rollback::current(&tpm).expect("counter"), counter);
+        assert_eq!(anti_rollback::current(tpm).expect("counter"), counter);
     }
 
     /// A reseal that fails after the counter was spent: the recovery file
     /// stays, the counter has moved, and a replay of the same file is refused.
     #[cfg(unix)]
     #[test]
-    #[cfg_attr(
-        feature = "tpm",
-        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
-    )]
     fn a_reseal_failure_after_an_accepted_recovery_erases_it_and_restores_this_boot() {
         if run_isolated_identity_scenario(
             "a_reseal_failure_after_an_accepted_recovery_erases_it_and_restores_this_boot",
@@ -1451,8 +1474,11 @@ mod tests {
             return;
         }
         let dir = identity_dir();
-        let tpm = tpm_in(&dir);
-        let (private_key, public_key, current) = lost_vault(&dir);
+        let Some(trial) = KeyTrial::start(&dir) else {
+            return;
+        };
+        let tpm = &trial.settings;
+        let (private_key, public_key, current) = lost_vault(&dir, tpm);
         // The vault path becomes a symbolic link to the old vault. It still
         // opens under the previous secret, while the atomic write refuses a
         // symbolic link at its destination: the reseal fails without root.
@@ -1468,7 +1494,7 @@ mod tests {
             "the reseal must fail for this scenario to mean anything"
         );
 
-        let counter = anti_rollback::current(&tpm).expect("counter");
+        let counter = anti_rollback::current(tpm).expect("counter");
         let recovery = PathBuf::from(recovery_path());
         let frame = frame_of(&signed_recovery(counter, &public_key), &private_key);
         std::fs::write(&recovery, &frame).expect("operator recovery file");
@@ -1476,7 +1502,7 @@ mod tests {
         let first = resolve(
             &NetworkConfig::default(),
             &BootDecision::Unsealed(current.clone()),
-            &tpm,
+            tpm,
         );
         // The counter is spent, so the key is used for this boot even though it
         // could not be sealed; the file is erased so it cannot be used again.
@@ -1484,7 +1510,7 @@ mod tests {
         assert_eq!(first.private_key.expose(), private_key);
         assert!(!recovery.exists(), "the recovery file is erased");
         assert_eq!(
-            anti_rollback::current(&tpm).expect("counter"),
+            anti_rollback::current(tpm).expect("counter"),
             counter + 1,
             "the counter is spent"
         );
@@ -1492,12 +1518,12 @@ mod tests {
         let replay = resolve(
             &NetworkConfig::default(),
             &BootDecision::Unsealed(current),
-            &tpm,
+            tpm,
         );
         assert_eq!(replay.origin, KeyOrigin::Missing, "the replay is refused");
         assert!(replay.private_key.is_empty(), "no key is adopted");
         assert_eq!(
-            anti_rollback::current(&tpm).expect("counter"),
+            anti_rollback::current(tpm).expect("counter"),
             counter + 1,
             "the replay does not advance the counter again"
         );
@@ -1506,10 +1532,6 @@ mod tests {
     /// Rotation spends a counter value, so an authorization issued before it
     /// no longer validates.
     #[test]
-    #[cfg_attr(
-        feature = "tpm",
-        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
-    )]
     fn rotation_advances_the_counter_and_invalidates_an_older_authorization() {
         if run_isolated_identity_scenario(
             "rotation_advances_the_counter_and_invalidates_an_older_authorization",
@@ -1517,23 +1539,26 @@ mod tests {
             return;
         }
         let dir = identity_dir();
-        let tpm = tpm_in(&dir);
-        let secret = boot_secret(&tpm);
+        let Some(trial) = KeyTrial::start(&dir) else {
+            return;
+        };
+        let tpm = &trial.settings;
+        let secret = boot_secret(tpm);
         let (private_key, public_key) = keypair();
         seal_vault(&secret, &private_key);
-        let before = anti_rollback::current(&tpm).expect("counter");
+        let before = anti_rollback::current(tpm).expect("counter");
         let older = signed_recovery(before, &public_key);
 
         initialize(
             &NetworkConfig::default(),
             &BootDecision::Unsealed(secret),
             true,
-            &tpm,
+            tpm,
         )
         .expect("rotation");
 
-        assert_eq!(anti_rollback::current(&tpm).expect("counter"), before + 1);
-        let error = wg_recovery::accept(&tpm, &older, &raw_key(&private_key))
+        assert_eq!(anti_rollback::current(tpm).expect("counter"), before + 1);
+        let error = wg_recovery::accept(tpm, &older, &raw_key(&private_key))
             .expect_err("the older authorization must be refused");
         assert!(
             matches!(error, TpmError::CounterMismatch { .. }),
@@ -1544,17 +1569,16 @@ mod tests {
     /// A key update escrows the counter value it leaves in place, after the
     /// rotation.
     #[test]
-    #[cfg_attr(
-        feature = "tpm",
-        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
-    )]
     fn an_update_escrows_the_counter_after_the_rotation() {
         if run_isolated_identity_scenario("an_update_escrows_the_counter_after_the_rotation") {
             return;
         }
         let dir = identity_dir();
-        let tpm = tpm_in(&dir);
-        let secret = boot_secret(&tpm);
+        let Some(trial) = KeyTrial::start(&dir) else {
+            return;
+        };
+        let tpm = &trial.settings;
+        let secret = boot_secret(tpm);
         let (operator_private_key, operator_public_key) =
             helios_escrow::generate_operator_keypair().expect("operator keypair");
         let network = NetworkConfig {
@@ -1564,15 +1588,10 @@ mod tests {
             ..NetworkConfig::default()
         };
         let (private_key, public_key) = keypair();
-        let before = anti_rollback::current(&tpm).expect("counter");
+        let before = anti_rollback::current(tpm).expect("counter");
 
-        update_sealed(
-            &network,
-            &BootDecision::Unsealed(secret),
-            &private_key,
-            &tpm,
-        )
-        .expect("update");
+        update_sealed(&network, &BootDecision::Unsealed(secret), &private_key, tpm)
+            .expect("update");
 
         let blob = std::fs::read(dir.join("wg-key.escrow")).expect("escrow written");
         let opened = helios_escrow::open_as_operator(operator_private_key.as_ref(), &blob)
@@ -1585,10 +1604,6 @@ mod tests {
     /// The escrow records the counter and the public key of the identity it
     /// carries, so the operator can check a recovery against them.
     #[test]
-    #[cfg_attr(
-        feature = "tpm",
-        ignore = "needs the simulated TPM backend (the tpm feature selects the real device); run by the default-feature heliosd step"
-    )]
     fn the_escrow_carries_the_counter_and_the_public_key() {
         let (operator_private_key, operator_public_key) =
             helios_escrow::generate_operator_keypair().expect("operator keypair");
@@ -1600,21 +1615,26 @@ mod tests {
         };
         let (private_key, public_key) = keypair();
 
-        in_identity_dir("escrow-counter", |dir| {
-            let tpm = tpm_in(dir);
-            let _ = boot_secret(&tpm);
-            let counter = anti_rollback::current(&tpm).expect("counter");
+        if run_isolated_identity_scenario("the_escrow_carries_the_counter_and_the_public_key") {
+            return;
+        }
+        let dir = identity_dir();
+        let Some(trial) = KeyTrial::start(&dir) else {
+            return;
+        };
+        let tpm = &trial.settings;
+        let _ = boot_secret(tpm);
+        let counter = anti_rollback::current(tpm).expect("counter");
 
-            write_escrow(&network, &private_key, &tpm);
+        write_escrow(&network, &private_key, tpm);
 
-            let blob = std::fs::read(dir.join("wg-key.escrow")).expect("escrow written");
-            let metadata = helios_escrow::open_as_operator(operator_private_key.as_ref(), &blob)
-                .expect("the operator opens the escrow")
-                .metadata
-                .expect("HESC v2 metadata");
-            assert_eq!(metadata.counter, Some(counter));
-            assert_eq!(metadata.gateway_public_key, raw_key(&public_key));
-        });
+        let blob = std::fs::read(dir.join("wg-key.escrow")).expect("escrow written");
+        let metadata = helios_escrow::open_as_operator(operator_private_key.as_ref(), &blob)
+            .expect("the operator opens the escrow")
+            .metadata
+            .expect("HESC v2 metadata");
+        assert_eq!(metadata.counter, Some(counter));
+        assert_eq!(metadata.gateway_public_key, raw_key(&public_key));
     }
 
     #[test]

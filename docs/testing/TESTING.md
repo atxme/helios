@@ -608,7 +608,9 @@ temporaire supprimé à la fin du test. Les essais s’exécutent en parallèle
 sur des instances séparées. L’environnement de mesure doit disposer de
 `swtpm` pour couvrir les appels ESAPI de scellement, de descellement et
 d’accès aux index NV. Les tests d’identité gateway réutilisent ce simulateur
-pour préparer et relire les matériels scellés avec la feature `tpm`.
+pour préparer et relire les matériels scellés avec la feature `tpm`, ainsi
+que pour éprouver la récupération signée de l’identité WireGuard, la
+rotation et la concordance du compteur avec le séquestre.
 
 Le scénario de mise à jour sur simulateur vérifie que le changement de PCR 4
 consomme la fenêtre et rescelle le même secret, et qu’un changement de PCR 7

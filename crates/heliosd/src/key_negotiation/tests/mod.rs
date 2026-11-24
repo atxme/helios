@@ -11,16 +11,13 @@ mod server_startup;
 mod transaction;
 mod transaction_cancellation;
 
-#[cfg(feature = "tpm")]
-#[path = "../../../../helios-tpm/tests/support/swtpm.rs"]
-mod swtpm;
-
 /// Uses the configured software backend without a TPM device or host paths.
 pub(super) fn isolated_boot(directory: &std::path::Path) -> Option<helios_tpm::BootDecision> {
     let path = |name| directory.join(name).to_string_lossy().into_owned();
     #[cfg(feature = "tpm")]
     let device = {
-        let Some(simulator) = swtpm::Swtpm::start().expect("start isolated software TPM") else {
+        let Some(simulator) = crate::swtpm::Swtpm::start().expect("start isolated software TPM")
+        else {
             eprintln!("[out of scope] missing swtpm or loopback for sealed gateway fixture");
             return None;
         };
