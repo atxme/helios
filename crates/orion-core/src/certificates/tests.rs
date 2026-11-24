@@ -403,6 +403,20 @@ fn a_transaction_built_by_the_authority_is_applied_by_the_client() {
         anchor_public,
         service_public,
     );
+    assert_eq!(store.client_leaf_issuers().len(), 1);
+    assert_eq!(
+        store
+            .renewal_at()
+            .expect("active generation renewal instant"),
+        store
+            .state()
+            .certificates
+            .active
+            .validity()
+            .expect("validity")
+            .renewal_at()
+            .expect("threshold")
+    );
     let active = generation(4);
 
     let revocation = EmergencyCertificateRevocation {
@@ -451,6 +465,30 @@ fn a_transaction_built_by_the_authority_is_applied_by_the_client() {
         32 * 1024,
     )
     .expect("built");
+
+    // A signed manifest alone is not enough: the transaction must contain
+    // every declared chunk before any state can be applied.
+    assert!(matches!(
+        store.verify_and_apply_transaction(&manifest, &[], 1_100),
+        Err(TrustError::Certificate(
+            CertificateError::InvalidTransaction("incomplete transaction")
+        ))
+    ));
+
+    // The pinned CA may authorize offline documents and objects, but cannot
+    // stand in for Astra's per-client online coordination signature.
+    let mut ca_authorized = manifest.clone();
+    ca_authorized.manifest_authority_kind =
+        aether::certificates::transport::ManifestAuthority::CaPq;
+    let ca_authorized = ca_authorized
+        .sign(&anchor_private)
+        .expect("CA-PQ signature");
+    assert!(matches!(
+        store.verify_and_apply_transaction(&ca_authorized, &chunks, 1_100),
+        Err(TrustError::Certificate(
+            CertificateError::UnauthorizedIssuer
+        ))
+    ));
 
     let applied = store
         .verify_and_apply_transaction(&manifest, &chunks, 1_100)

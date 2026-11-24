@@ -696,6 +696,50 @@ mod http_routes {
         );
     }
 
+    /// Recovery identifiers are public handles, not credentials: absent and
+    /// malformed handles must share the same coarse refusal, and a valid
+    /// handle for an operation that is not in this process must not reveal
+    /// whether the identifier was ever issued.
+    #[tokio::test]
+    async fn recovery_reads_refuse_unknown_and_malformed_handles_coarsely() {
+        let fixture = fixture().await;
+        let unknown = request(
+            &fixture,
+            "GET",
+            "/v1/client-rotation/recovery/01010101010101010101010101010101",
+            &[],
+            b"",
+        )
+        .await;
+        let malformed = request(
+            &fixture,
+            "GET",
+            "/v1/client-rotation/recovery/not-hex",
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(unknown.0, 403);
+        assert_eq!(unknown.0, malformed.0);
+        assert_eq!(unknown.1, malformed.1);
+        assert_eq!(unknown.2, malformed.2);
+
+        // The operation id alone cannot advance the state machine. Its
+        // mutation routes require a body carrying signed protocol objects.
+        assert_eq!(
+            request(
+                &fixture,
+                "GET",
+                "/v1/client-rotation/recovery/not-hex/authorization",
+                &[],
+                b"",
+            )
+            .await
+            .0,
+            405
+        );
+    }
+
     #[tokio::test]
     async fn a_valid_scope_bound_capability_reads_the_operator_request() {
         use aether::certificates::{
