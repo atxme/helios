@@ -1299,7 +1299,7 @@ fn run_refuses_half_configured_private_channel_topologies() {
             assert_eq!(
                 &std::fs::read(directory.path().join(name)).expect("original state file"),
                 contents,
-                "startup must preserve {name}"
+                "startup must preserve {name:?}"
             );
         }
         assert!(!directory
