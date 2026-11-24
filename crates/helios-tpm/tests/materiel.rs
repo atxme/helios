@@ -587,3 +587,102 @@ fn planned_update_refuses_to_reseal_after_a_preserved_emulated_measurement_chang
     );
     assert_eq!(std::fs::read(&cfg.sealed_blob_path).unwrap(), before);
 }
+#[test]
+fn signed_firmware_maintenance_restores_the_same_root_with_esapi() {
+    use aether::sig::PublisherSigner;
+    use helios_tpm::{anti_rollback, firmware_recovery, TpmError};
+    use tss_esapi::handles::PcrHandle;
+
+    let Some(simulator) = swtpm::Swtpm::start().expect("start isolated swtpm") else {
+        eprintln!("[out of scope] the PCR-changing firmware trial requires swtpm");
+        return;
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let mut cfg = settings(directory.path(), true, simulator.tcti());
+    let initial = BootController::unlock(&cfg).expect("provision an isolated root");
+    cfg.allow_provisioning = false;
+    let original_blob = std::fs::read(&cfg.sealed_blob_path).unwrap();
+    let counter = anti_rollback::current(&cfg).expect("initialized NV counter");
+
+    let (operator_private, operator_public) =
+        helios_escrow::generate_operator_keypair().expect("temporary operator escrow keypair");
+    let export = || {
+        firmware_recovery::export(
+            &cfg,
+            &operator_public,
+            "5bc922b7bd1adb5b6f99592611404036bd9f42d0".into(),
+            "2023".into(),
+        )
+    };
+    let backup = export().expect("export the nominal root to the operator");
+    assert_eq!(backup.request.counter, counter);
+    let authorization = PublisherSigner::from_seed_material(
+        1,
+        b"helios-sign-ed25519-dev-seed-001",
+        b"helios-sign-mldsa65-dev-seed-001",
+    )
+    .expect("development publisher")
+    .sign(backup.request)
+    .expect("sign the firmware maintenance request");
+
+    firmware_recovery::preflight(&cfg, &authorization).expect("nominal firmware preflight");
+    assert_eq!(anti_rollback::current(&cfg).unwrap(), counter);
+
+    extend_emulated_pcr(&simulator, PcrHandle::Pcr0);
+    extend_emulated_pcr(&simulator, PcrHandle::Pcr7);
+    assert!(BootController::unlock(&cfg).is_err());
+    let recovered =
+        helios_escrow::open_as_operator(operator_private.as_slice(), &backup.encrypted_secret)
+            .expect("operator retrieves the root from escrow");
+    assert!(matches!(
+        firmware_recovery::restore(&cfg, &authorization, &[0x19; 32]),
+        Err(TpmError::FirmwareRecovery(_))
+    ));
+    assert_eq!(anti_rollback::current(&cfg).unwrap(), counter);
+    assert_eq!(std::fs::read(&cfg.sealed_blob_path).unwrap(), original_blob);
+
+    assert!(
+        !firmware_recovery::restore(&cfg, &authorization, &recovered.plaintext)
+            .expect("reseal the signed root on the new firmware state")
+    );
+    assert_eq!(anti_rollback::current(&cfg).unwrap(), counter + 1);
+    assert_ne!(std::fs::read(&cfg.sealed_blob_path).unwrap(), original_blob);
+    let restored = BootController::unlock(&cfg).expect("nominal boot after recovery");
+    assert!(matches!(restored, BootDecision::Unsealed(_)));
+    assert!(
+        restored.secret().unwrap().as_bytes() == initial.secret().unwrap().as_bytes(),
+        "firmware maintenance must preserve the root"
+    );
+
+    assert!(
+        firmware_recovery::restore(&cfg, &authorization, &recovered.plaintext)
+            .expect("a retry finds the already restored root")
+    );
+    assert_eq!(anti_rollback::current(&cfg).unwrap(), counter + 1);
+}
+
+#[test]
+fn firmware_export_refuses_an_active_os_update_window() {
+    use helios_tpm::{firmware_recovery, TpmError};
+
+    let Some(simulator) = swtpm::Swtpm::start().expect("start isolated swtpm") else {
+        eprintln!("[out of scope] the firmware preflight trial requires swtpm");
+        return;
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let mut cfg = settings(directory.path(), true, simulator.tcti());
+    BootController::unlock(&cfg).expect("provision an isolated root");
+    cfg.allow_provisioning = false;
+    let nominal = BootController::unlock(&cfg).expect("nominal boot before maintenance");
+    BootController::arm_update_window(&cfg, &nominal).expect("arm an OS update window");
+    let (_, operator_public) = helios_escrow::generate_operator_keypair().expect("operator key");
+    let outcome = firmware_recovery::export(
+        &cfg,
+        &operator_public,
+        "5bc922b7bd1adb5b6f99592611404036bd9f42d0".into(),
+        "2023".into(),
+    );
+    assert!(matches!(outcome, Err(TpmError::FirmwareRecovery(_))));
+    assert!(BootController::update_window_armed(&cfg).unwrap());
+    BootController::cancel_update_window(&cfg).expect("cancel pending OS maintenance");
+}
