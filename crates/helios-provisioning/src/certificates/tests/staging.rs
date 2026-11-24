@@ -658,3 +658,132 @@ fn revocation_removes_a_staged_candidate_and_refuses_the_commit() {
     ));
 }
 use super::*;
+
+/// The transport identity is checked before any body-controlled peer lookup.
+#[test]
+fn staging_unknown_peer_is_refused_without_mutating_another_peer() {
+    let mut fixture = fixture();
+    let candidate = keys();
+    let candidate_leaf = leaf(
+        &fixture.ca,
+        &candidate,
+        PqCertificateRole::Client,
+        &client_key(9),
+        3,
+    );
+    let authorization = authorization(&fixture, &candidate_leaf, 5, 5_000);
+    let authorization = ClientCertificateStageAuthorization {
+        client_wg_public_key: client_key(9),
+        ..authorization
+    }
+    .sign(&fixture.ca.private)
+    .expect("sign authorization for the absent peer");
+
+    assert!(matches!(
+        fixture
+            .registry
+            .stage(&client_key(9), &authorization, 1_100),
+        Err(RegistryError::UnknownPeer)
+    ));
+    let admitted = fixture
+        .registry
+        .peer(&client_key(2))
+        .expect("admitted peer");
+    assert!(admitted.state.pending.is_none());
+    assert!(admitted.state.next.is_none());
+}
+
+/// A commit's transport identity must match its signed client identity, and a
+/// matching identity must still be present in the registry.
+#[test]
+fn commit_refuses_wrong_transport_and_unknown_peer_without_changing_pending_state() {
+    let mut fixture = fixture();
+    let candidate = keys();
+    let candidate_leaf = leaf(
+        &fixture.ca,
+        &candidate,
+        PqCertificateRole::Client,
+        &client_key(2),
+        3,
+    );
+    let authorization = authorization(&fixture, &candidate_leaf, 5, 5_000);
+    let receipt = fixture
+        .registry
+        .stage(&client_key(2), &authorization, 1_100)
+        .expect("staging")
+        .sign(&fixture.gateway_leaf_key.private)
+        .expect("sign receipt");
+    let grant = grant_for(&fixture, &authorization, receipt);
+    let commit = commit_for(
+        &authorization,
+        &grant,
+        &fixture.active_client.private,
+        &candidate.private,
+        1_200,
+    );
+
+    assert!(matches!(
+        fixture
+            .registry
+            .commit(&client_key(9), &commit, &grant, 1_300),
+        Err(RegistryError::PeerMismatch)
+    ));
+    let absent_peer_commit = ClientCertificateStageCommit {
+        client_wg_public_key: client_key(9),
+        ..commit
+    };
+    assert!(matches!(
+        fixture
+            .registry
+            .commit(&client_key(9), &absent_peer_commit, &grant, 1_300),
+        Err(RegistryError::UnknownPeer)
+    ));
+
+    let admitted = fixture
+        .registry
+        .peer(&client_key(2))
+        .expect("admitted peer");
+    assert!(admitted.state.pending.is_some());
+    assert!(admitted.state.next.is_none());
+}
+
+/// A valid signed commit cannot advance a generation after its stage has been
+/// removed or was never persisted in this registry.
+#[test]
+fn commit_without_a_pending_stage_is_refused_without_creating_a_generation() {
+    let mut staged = fixture();
+    let candidate = keys();
+    let candidate_leaf = leaf(
+        &staged.ca,
+        &candidate,
+        PqCertificateRole::Client,
+        &client_key(2),
+        3,
+    );
+    let authorization = authorization(&staged, &candidate_leaf, 5, 5_000);
+    let receipt = staged
+        .registry
+        .stage(&client_key(2), &authorization, 1_100)
+        .expect("staging")
+        .sign(&staged.gateway_leaf_key.private)
+        .expect("sign receipt");
+    let grant = grant_for(&staged, &authorization, receipt);
+    let commit = commit_for(
+        &authorization,
+        &grant,
+        &staged.active_client.private,
+        &candidate.private,
+        1_200,
+    );
+
+    let mut empty = fixture();
+    assert!(matches!(
+        empty
+            .registry
+            .commit(&client_key(2), &commit, &grant, 1_300),
+        Err(RegistryError::Certificate(CertificateError::UnknownStage))
+    ));
+    let peer = empty.registry.peer(&client_key(2)).expect("admitted peer");
+    assert!(peer.state.pending.is_none());
+    assert!(peer.state.next.is_none());
+}

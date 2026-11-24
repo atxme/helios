@@ -792,6 +792,48 @@ fn admission_queue_replaces_the_same_identity_and_uses_private_permissions() {
     }
 }
 
+#[test]
+fn admission_queue_refuses_a_registry_path_inside_a_regular_file() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let blocked_parent = directory.path().join("not-a-directory");
+    std::fs::write(&blocked_parent, b"owned fixture").expect("write blocking file");
+    let registry_path = blocked_parent.join("certificates.json");
+    let admission = QueuedAdmission {
+        name: "workstation".into(),
+        client_wg_public_key: key(2).to_base64(),
+        tls_certificate: "public TLS leaf".into(),
+        pq_certificate: "public PQ leaf".into(),
+    };
+
+    let error = queue_admission(&registry_path, &admission)
+        .expect_err("the inbox cannot be created beneath a regular file");
+
+    assert!(format!("{error:#}").contains("creating"));
+    assert_eq!(
+        std::fs::read(&blocked_parent).expect("blocking file remains"),
+        b"owned fixture"
+    );
+    assert!(!blocked_parent.join("admissions").exists());
+}
+
+#[tokio::test]
+async fn admission_drain_ignores_a_missing_or_non_directory_inbox() {
+    let (service, directory) = service(state());
+    let missing = directory.path().join("missing-inbox");
+
+    super::admission::drain_admission_inbox(&service, &missing).await;
+
+    let not_a_directory = directory.path().join("regular-file");
+    std::fs::write(&not_a_directory, b"owned fixture").expect("write fixture");
+    super::admission::drain_admission_inbox(&service, &not_a_directory).await;
+
+    assert_eq!(
+        std::fs::read(&not_a_directory).expect("fixture remains"),
+        b"owned fixture"
+    );
+    assert!(service.registry.lock().await.state().peers.is_empty());
+}
+
 /// The block a profile carries is exactly what the registry holds, and it
 /// is readable by the consumer that will use it. Eleven values copied by
 /// hand between two shells is eleven places to paste the wrong one, and
