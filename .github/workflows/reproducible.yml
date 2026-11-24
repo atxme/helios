@@ -1,0 +1,137 @@
+name: Reproductibilité du bundle
+
+# Construit deux fois le bundle gateway, depuis deux emplacements (l'espace de
+# travail puis un second clone), en vidant les volumes de cache Docker entre les
+# deux constructions, puis compare les empreintes de chaque fichier. Le fuseau
+# horaire et l'umask ne varient que dans l'environnement de l'hôte qui lance
+# `cargo xtask bundle` : le conteneur de build force TZ=UTC et umask 022, donc
+# ces réglages n'atteignent pas le bundle. Une différence signale une entrée qui
+# n'est pas figée par le commit : chemin, horodatage, ordre de lecture,
+# environnement du conteneur.
+#
+# Déclenché sur tag, à la main, et chaque lundi à 04:00 UTC. Ne publie rien et
+# ne signe rien : seule la comparaison compte.
+on:
+  push:
+    tags:
+      - "v*"
+  # GitHub ne distribue un workflow que depuis la branche par défaut : sans ce
+  # déclencheur, il ne pourrait pas passer avant la fusion.
+  pull_request:
+    paths:
+      - "tools/build-env/**"
+      - "tools/xtask/**"
+      - "Cargo.lock"
+      - ".github/workflows/reproducible.yml"
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  double-construction:
+    name: Double construction du bundle gateway
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.100.0
+
+      # Le trousseau **public** de l'éditeur, comme dans `release.yml` : c'est
+      # l'ancre de confiance compilée dans le bundle, et il n'est pas secret.
+      - name: Ancre de confiance éditeur
+        env:
+          KEYRING: ${{ vars.HELIOS_PUBLISHER_KEYRING }}
+        run: |
+          if [ -z "$KEYRING" ]; then
+            echo "::error::La variable de dépôt HELIOS_PUBLISHER_KEYRING est absente." \
+                 "Y placer le contenu du trousseau PUBLIC de production" \
+                 "(publisher-keyring.json). Aucune clé privée ne doit y figurer."
+            exit 1
+          fi
+          printf '%s' "$KEYRING" > "$RUNNER_TEMP/publisher-keyring.json"
+          if grep -qi 'private' "$RUNNER_TEMP/publisher-keyring.json"; then
+            echo "::error::Le trousseau fourni semble contenir une clé privée. Abandon."
+            exit 1
+          fi
+
+      - name: Construction A (espace de travail)
+        env:
+          HELIOS_PUBLISHER_KEYRING_PATH: ${{ runner.temp }}/publisher-keyring.json
+        run: cargo xtask bundle
+
+      - name: Empreintes A
+        run: |
+          mkdir -p "$RUNNER_TEMP/repro"
+          (cd target/bundle && find . -type f -print0 | sort -z | xargs -0 sha256sum) \
+            > "$RUNNER_TEMP/repro/a.sha256"
+          (cd target/bundle && find . -type f -printf '%m %s %P\n' | sort) \
+            > "$RUNNER_TEMP/repro/a.meta"
+          cat "$RUNNER_TEMP/repro/a.sha256" "$RUNNER_TEMP/repro/a.meta"
+
+      # Volumes de cache vidés : la seconde construction repart de zéro, sans
+      # rien hérité de la première.
+      - name: Vidage des volumes de cache
+        run: |
+          for volume in helios-build-cargo helios-build-target; do
+            if docker volume inspect "$volume" >/dev/null 2>&1; then
+              docker volume rm "$volume"
+            fi
+          done
+
+      # Second checkout du même commit, hors de l'espace de travail, pour que
+      # les chemins absolus de la première construction ne se retrouvent pas
+      # identiques dans la seconde. `actions/checkout` refuse un chemin hors de
+      # l'espace de travail : on clone localement puis on se place sur le commit.
+      - name: Second checkout
+        run: |
+          git clone --no-checkout "$GITHUB_WORKSPACE" "$RUNNER_TEMP/b"
+          git -C "$RUNNER_TEMP/b" checkout --detach "$GITHUB_SHA"
+
+      - name: Construction B (second checkout, fuseau et umask différents)
+        working-directory: ${{ runner.temp }}/b
+        env:
+          HELIOS_PUBLISHER_KEYRING_PATH: ${{ runner.temp }}/publisher-keyring.json
+          TZ: Pacific/Auckland
+        run: |
+          umask 077
+          cargo xtask bundle
+
+      - name: Empreintes B
+        run: |
+          mkdir -p "$RUNNER_TEMP/repro"
+          (cd "$RUNNER_TEMP/b/target/bundle" && find . -type f -print0 | sort -z | xargs -0 sha256sum) \
+            > "$RUNNER_TEMP/repro/b.sha256"
+          (cd "$RUNNER_TEMP/b/target/bundle" && find . -type f -printf '%m %s %P\n' | sort) \
+            > "$RUNNER_TEMP/repro/b.meta"
+          cat "$RUNNER_TEMP/repro/b.sha256" "$RUNNER_TEMP/repro/b.meta"
+
+      - name: Listes d'empreintes en artefact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: empreintes-reproductibilite
+          path: ${{ runner.temp }}/repro/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Comparaison des deux constructions
+        run: |
+          a="$RUNNER_TEMP/repro/a.sha256"
+          b="$RUNNER_TEMP/repro/b.sha256"
+          if [ ! -s "$a" ] || [ ! -s "$b" ]; then
+            echo "::error::Une des deux listes d'empreintes est vide."
+            exit 1
+          fi
+          # Mode (bit exécutable compris) et taille, en plus des empreintes : ce
+          # sont les attributs que `collect` compare.
+          if ! diff -u "$a" "$b" || ! diff -u "${a%.sha256}.meta" "${b%.sha256}.meta"; then
+            echo "::error::Le bundle gateway n'est pas reproductible : les deux constructions diffèrent (différence ci-dessus)."
+            exit 1
+          fi
+          echo "Constructions identiques : $(wc -l < "$a") fichiers."

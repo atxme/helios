@@ -23,15 +23,20 @@
 //! a distribution, out of scope here.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
 
 use aether::{
-    sig::{BundleEntry, BundlePayload, SignedBundle, PUBLISHER_KEYS},
+    sig::{
+        BundleEntry, BundlePayload, PublisherPublicKeys, SignedBundle, ED25519_PUBLIC_KEY_LEN,
+        ML_DSA_65_PUBLIC_KEY_LEN, PUBLISHER_KEYS,
+    },
     Result,
 };
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use serde::{Deserialize, Serialize};
 
 use crate::{sha256_file, update_error, INSTALLER_VERSION, MAX_BINARY_SIZE};
 
@@ -193,18 +198,10 @@ fn verify_manifest_with_keyring(
     manifest: &SignedBundle,
     channel: &str,
     target: &str,
-    keyring: &[aether::sig::PublisherPublicKeys],
+    keyring: &[PublisherPublicKeys],
 ) -> Result<()> {
-    manifest
-        .verify(keyring)
-        .map_err(|e| update_error(format!("bundle signature rejected: {e}")))?;
+    verify_signature_with_keyring(manifest, keyring)?;
     let payload = &manifest.payload;
-    if payload.product != BUNDLE_PRODUCT {
-        return Err(update_error(format!(
-            "manifest does not target {BUNDLE_PRODUCT} but {}",
-            payload.product
-        )));
-    }
     if payload.channel != channel {
         return Err(update_error(format!(
             "channel {} refused, {channel} expected",
@@ -215,6 +212,27 @@ fn verify_manifest_with_keyring(
         return Err(update_error(format!(
             "target {} refused, {target} expected",
             payload.target
+        )));
+    }
+    Ok(())
+}
+
+/// Verifies the manifest's signature under `keyring`, and its metadata.
+///
+/// Unlike [`verify_manifest`], it does not say which channel or target the
+/// bundle is meant for: the caller decides that, or does not need to.
+pub fn verify_signature_with_keyring(
+    manifest: &SignedBundle,
+    keyring: &[PublisherPublicKeys],
+) -> Result<()> {
+    manifest
+        .verify(keyring)
+        .map_err(|e| update_error(format!("bundle signature rejected: {e}")))?;
+    let payload = &manifest.payload;
+    if payload.product != BUNDLE_PRODUCT {
+        return Err(update_error(format!(
+            "manifest does not target {BUNDLE_PRODUCT} but {}",
+            payload.product
         )));
     }
     if payload.release_sequence == 0
@@ -233,6 +251,77 @@ fn verify_manifest_with_keyring(
         .validate()
         .map_err(|e| update_error(format!("bundle content rejected: {e}")))?;
     Ok(())
+}
+
+/// One publisher epoch as written in a keyring file.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicKeyWire {
+    key_epoch: u32,
+    ed25519: String,
+    #[serde(rename = "ml-dsa-65")]
+    ml_dsa_65: String,
+}
+
+/// Parses a publisher keyring: a non-empty JSON list with one entry per epoch.
+pub fn parse_publisher_keyring(bytes: &[u8]) -> Result<Vec<PublisherPublicKeys>> {
+    let wire: Vec<PublicKeyWire> = serde_json::from_slice(bytes)
+        .map_err(|e| update_error(format!("invalid public keyring JSON: {e}")))?;
+    if wire.is_empty() {
+        return Err(update_error("the public keyring is empty"));
+    }
+    let mut epochs = HashSet::new();
+    wire.into_iter()
+        .map(|entry| {
+            if !epochs.insert(entry.key_epoch) {
+                return Err(update_error(format!(
+                    "epoch {} duplicated in the keyring",
+                    entry.key_epoch
+                )));
+            }
+            Ok(PublisherPublicKeys {
+                key_epoch: entry.key_epoch,
+                ed25519: decode_public_key::<ED25519_PUBLIC_KEY_LEN>(
+                    &entry.ed25519,
+                    "Ed25519",
+                    entry.key_epoch,
+                )?,
+                ml_dsa_65: decode_public_key::<ML_DSA_65_PUBLIC_KEY_LEN>(
+                    &entry.ml_dsa_65,
+                    "ML-DSA-65",
+                    entry.key_epoch,
+                )?,
+            })
+        })
+        .collect()
+}
+
+/// Writes a keyring in the format [`parse_publisher_keyring`] reads.
+pub fn encode_publisher_keyring(keys: &[PublisherPublicKeys]) -> Result<Vec<u8>> {
+    let wire: Vec<PublicKeyWire> = keys
+        .iter()
+        .map(|keys| PublicKeyWire {
+            key_epoch: keys.key_epoch,
+            ed25519: STANDARD.encode(keys.ed25519),
+            ml_dsa_65: STANDARD.encode(keys.ml_dsa_65),
+        })
+        .collect();
+    serde_json::to_vec_pretty(&wire)
+        .map_err(|e| update_error(format!("serializing the keyring: {e}")))
+}
+
+fn decode_public_key<const N: usize>(encoded: &str, name: &str, epoch: u32) -> Result<[u8; N]> {
+    let bytes = STANDARD.decode(encoded).map_err(|e| {
+        update_error(format!(
+            "invalid base64 {name} public key, epoch {epoch}: {e}"
+        ))
+    })?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        update_error(format!(
+            "{name} public key of {} bytes instead of {N}, epoch {epoch}",
+            bytes.len()
+        ))
+    })
 }
 
 /// Verifies that the directory's contents match the manifest **exactly**.
@@ -901,5 +990,62 @@ mod tests {
         assert!(error.contains("signature"), "message: {error}");
         let _ = fs::remove_dir_all(&source);
         let _ = fs::remove_dir_all(&target);
+    }
+
+    fn development_keys(epoch: u32, seed: u8) -> PublisherPublicKeys {
+        PublisherSigner::from_seed_material(epoch, &[seed; 32], &[seed + 1; 32])
+            .unwrap()
+            .public_keys()
+    }
+
+    #[test]
+    fn parse_publisher_keyring_matches_the_publisher_rules() {
+        let first = development_keys(1, 3);
+        let second = development_keys(2, 5);
+
+        let parsed =
+            parse_publisher_keyring(&encode_publisher_keyring(&[first, second]).expect("encoding"))
+                .expect("a keyring written by the publisher");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].key_epoch, 1);
+        assert!(parsed[0].ed25519 == first.ed25519 && parsed[0].ml_dsa_65 == first.ml_dsa_65);
+        assert_eq!(parsed[1].key_epoch, 2);
+
+        let error = |bytes: &[u8]| {
+            parse_publisher_keyring(bytes)
+                .err()
+                .expect("the keyring is refused")
+                .to_string()
+        };
+        assert!(error(b"[]").contains("empty"), "empty keyring");
+        assert!(error(b"not json").contains("JSON"), "malformed JSON");
+        let duplicated = encode_publisher_keyring(&[first, first]).expect("encoding");
+        assert!(
+            error(&duplicated).contains("duplicated"),
+            "duplicated epoch"
+        );
+        let invalid_base64 = br#"[{"key_epoch":1,"ed25519":"!!","ml-dsa-65":"AAAA"}]"#;
+        assert!(error(invalid_base64).contains("base64"), "invalid base64");
+        let wrong_length = br#"[{"key_epoch":1,"ed25519":"AAAA","ml-dsa-65":"AAAA"}]"#;
+        assert!(
+            error(wrong_length).contains("bytes instead of"),
+            "wrong length"
+        );
+    }
+
+    #[test]
+    fn verify_signature_with_keyring_rejects_another_keyring() {
+        let source = temp_dir("signature-keyring");
+        full_bundle(&source);
+        let keys = sign_bundle(&source, 6);
+        let manifest = read_manifest(&source).expect("manifest");
+        let other = development_keys(1, 9);
+
+        verify_signature_with_keyring(&manifest, &[keys]).expect("the signing keyring");
+        let error = verify_signature_with_keyring(&manifest, &[other])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("signature"), "message: {error}");
+        let _ = fs::remove_dir_all(&source);
     }
 }

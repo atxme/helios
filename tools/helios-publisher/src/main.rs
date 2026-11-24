@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -8,12 +7,11 @@ use std::{
 use aether::sig::{
     ArtifactPayload, BinaryReleasePayload, FirmwareRecoveryPayload, PublisherPublicKeys,
     PublisherSigner, ResealPayload, ResealRequest, SignedEnvelope, WireGuardRecoveryPayload,
-    ED25519_PUBLIC_KEY_LEN, ML_DSA_65_PRIVATE_KEY_LEN, ML_DSA_65_PUBLIC_KEY_LEN,
+    ML_DSA_65_PRIVATE_KEY_LEN,
 };
 use anyhow::{bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 #[derive(Parser)]
 #[command(
@@ -139,15 +137,6 @@ enum Command {
         #[arg(long)]
         keyring: PathBuf,
     },
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PublicKeyWire {
-    key_epoch: u32,
-    ed25519: String,
-    #[serde(rename = "ml-dsa-65")]
-    ml_dsa_65: String,
 }
 
 fn main() -> Result<()> {
@@ -374,12 +363,8 @@ fn keygen(key_epoch: u32, output_dir: &Path) -> Result<()> {
 
     write_new_secret(&output_dir.join("ed25519-private.pk8"), &ed25519)?;
     write_new_secret(&output_dir.join("ml-dsa-65-private.bin"), &ml_dsa_65)?;
-    let keyring = vec![PublicKeyWire {
-        key_epoch,
-        ed25519: STANDARD.encode(public.ed25519),
-        ml_dsa_65: STANDARD.encode(public.ml_dsa_65),
-    }];
-    let json = serde_json::to_vec_pretty(&keyring).context("serializing the keyring")?;
+    let json = helios_update::bundle::encode_publisher_keyring(&[public])
+        .context("serializing the keyring")?;
     write_new(&output_dir.join("publisher-keyring.json"), &json, false)?;
 
     println!(
@@ -523,47 +508,8 @@ fn load_signer(
 
 fn load_keyring(path: &Path) -> Result<Vec<PublisherPublicKeys>> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let wire: Vec<PublicKeyWire> =
-        serde_json::from_slice(&bytes).context("invalid public keyring JSON")?;
-    if wire.is_empty() {
-        bail!("the public keyring is empty");
-    }
-    let mut epochs = HashSet::new();
-    wire.into_iter()
-        .map(|entry| {
-            if !epochs.insert(entry.key_epoch) {
-                bail!("epoch {} duplicated in the keyring", entry.key_epoch);
-            }
-            let ed25519 = decode_public_key::<ED25519_PUBLIC_KEY_LEN>(
-                &entry.ed25519,
-                "Ed25519",
-                entry.key_epoch,
-            )?;
-            let ml_dsa_65 = decode_public_key::<ML_DSA_65_PUBLIC_KEY_LEN>(
-                &entry.ml_dsa_65,
-                "ML-DSA-65",
-                entry.key_epoch,
-            )?;
-            Ok(PublisherPublicKeys {
-                key_epoch: entry.key_epoch,
-                ed25519,
-                ml_dsa_65,
-            })
-        })
-        .collect()
-}
-
-fn decode_public_key<const N: usize>(encoded: &str, name: &str, epoch: u32) -> Result<[u8; N]> {
-    STANDARD
-        .decode(encoded)
-        .with_context(|| format!("invalid base64 {name} public key, epoch {epoch}"))?
-        .try_into()
-        .map_err(|bytes: Vec<u8>| {
-            anyhow::anyhow!(
-                "{name} public key of {} bytes instead of {N}, epoch {epoch}",
-                bytes.len()
-            )
-        })
+    helios_update::bundle::parse_publisher_keyring(&bytes)
+        .with_context(|| format!("invalid public keyring {}", path.display()))
 }
 
 fn create_private_dir(path: &Path) -> Result<()> {

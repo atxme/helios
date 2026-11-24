@@ -24,7 +24,7 @@ jobs:
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Toolchain Rust nightly
         uses: dtolnay/rust-toolchain@nightly
@@ -81,7 +81,7 @@ jobs:
 
       - name: Publier corpus, crashes et logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzzing-${{ github.run_id }}
           path: |

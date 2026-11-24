@@ -1,6 +1,6 @@
 [package]
 name = "helios-api"
-version = "2.1.1"
+version = "2.2.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -9,7 +9,9 @@ authors.workspace = true
 default = []
 # Embarque l'app React dans le binaire (prod). Nécessite d'avoir exécuté
 # `npm run build` dans web/ au préalable.
-embed-ui = ["dep:rust-embed"]
+# Les horodatages des fichiers ne sont pas embarqués : deux builds du même
+# arbre produisent le même binaire.
+embed-ui = ["dep:rust-embed", "rust-embed/deterministic-timestamps"]
 
 [dependencies]
 aether.workspace = true
