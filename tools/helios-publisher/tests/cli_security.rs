@@ -471,8 +471,6 @@ impl ReleaseFixture {
 
 #[test]
 fn bundle_command_signs_the_manifest_of_every_staged_file_and_preserves_it() {
-    use aether::sig::PublisherPublicKeys;
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
     use helios_update::bundle;
 
     let fixture = ReleaseFixture::new();
@@ -494,23 +492,10 @@ fn bundle_command_signs_the_manifest_of_every_staged_file_and_preserves_it() {
     assert!(stdout.contains("bundle 1.4.0 sequence 73, 2 file(s)"));
 
     let manifest = bundle::read_manifest(&fixture.bundle).unwrap();
-    let keys: serde_json::Value = serde_json::from_slice(&fs::read(&keyring).unwrap()).unwrap();
-    let keys = &keys[0];
-    manifest
-        .verify(&[PublisherPublicKeys {
-            key_epoch: 11,
-            ed25519: STANDARD
-                .decode(keys["ed25519"].as_str().unwrap())
-                .unwrap()
-                .try_into()
-                .unwrap(),
-            ml_dsa_65: STANDARD
-                .decode(keys["ml-dsa-65"].as_str().unwrap())
-                .unwrap()
-                .try_into()
-                .unwrap(),
-        }])
-        .unwrap();
+    let keys = bundle::parse_publisher_keyring(&fs::read(&keyring).unwrap()).unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].key_epoch, 11);
+    bundle::verify_signature_with_keyring(&manifest, &keys).unwrap();
     bundle::verify_contents(&fixture.bundle, &manifest.payload).unwrap();
     assert_eq!(manifest.payload.release_sequence, 73);
     assert_eq!(
