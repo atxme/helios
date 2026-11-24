@@ -1673,6 +1673,84 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_newer_firmware_authorization_resumes_the_saved_recovery_context() {
+        let (directory, path, mut plan, mut gateway) = transaction(true);
+        let (key, backup) = sealed_fixture(&directory);
+        let mut renewed = backup.request.clone();
+        renewed.counter += 1;
+        plan.backup = Some(backup);
+        plan.phase = Phase::Restoring;
+        plan.after_boot = Some("new-boot".into());
+        save_plan(&path, &plan, false).unwrap();
+        gateway.identity.boot = "new-boot".into();
+        gateway.version = "2023".into();
+        gateway.install_ok = false;
+
+        let authorization = directory.path().join("renewed.json");
+        write_firmware_authorization(&authorization, renewed.clone());
+        maintain(
+            &path,
+            Some(&authorization),
+            Some(&key),
+            MaintenanceMode::Resume {
+                confirm_installed: false,
+            },
+            1,
+            |target| {
+                assert_eq!(target, TARGET);
+                Ok(gateway)
+            },
+            |_| panic!("resuming recovery does not ask to install firmware"),
+        )
+        .expect("resume restores the expected root and checks readiness");
+
+        let result = load_plan(&path).unwrap();
+        assert_eq!(result.phase, Phase::Complete);
+        assert_eq!(result.after_boot.as_deref(), Some("new-boot"));
+        assert_eq!(result.backup.unwrap().request, renewed);
+    }
+
+    #[test]
+    fn a_firmware_authorization_for_another_version_leaves_the_plan_untouched() {
+        let (directory, path, mut plan, gateway) = transaction(true);
+        let (_, backup) = sealed_fixture(&directory);
+        let mut different = backup.request.clone();
+        different.target_version = "2024".into();
+        plan.backup = Some(backup);
+        save_plan(&path, &plan, false).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let authorization = directory.path().join("different.json");
+        write_firmware_authorization(&authorization, different);
+
+        let error = maintain(
+            &path,
+            Some(&authorization),
+            None,
+            MaintenanceMode::Update { yes: false },
+            1,
+            |_| Ok(gateway),
+            |_| panic!("a different recovery context must stop before confirmation"),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("authorization differs from the prepared backup"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    fn write_firmware_authorization(path: &Path, request: aether::sig::FirmwareRecoveryPayload) {
+        let signer = aether::sig::PublisherSigner::from_seed_material(
+            1,
+            b"helios-sign-ed25519-dev-seed-001",
+            b"helios-sign-mldsa65-dev-seed-001",
+        )
+        .unwrap();
+        let signed = signer.sign(request).unwrap();
+        std::fs::write(path, serde_json::to_vec(&signed).unwrap()).unwrap();
+    }
+
     #[test]
     fn resume_rejects_a_plan_that_never_started_installation() {
         let (_dir, path, _, gateway) = transaction(false);

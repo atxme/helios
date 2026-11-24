@@ -387,3 +387,45 @@ mod data_plane_campaign {
         assert!(stdout.contains("2 failure(s) out of 2 scenario(s)"));
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn firmware_list_reads_only_upgradable_devices_and_reports_a_missing_inventory() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = tempfile::tempdir().unwrap();
+    let fwupd = directory.path().join("fwupdmgr");
+    fs::write(
+        &fwupd,
+        r#"#!/bin/sh
+[ "$*" = 'get-updates --json' ] || exit 17
+case "$HELIOS_TEST_FWUPD" in
+  empty) exit 2 ;;
+  unavailable) printf 'inventory unavailable\n' >&2; exit 1 ;;
+  *)
+    printf '%s\n' '{"Devices":[{"DeviceId":"5bc922b7bd1adb5b6f99592611404036bd9f42d0","Name":"Secure Boot DBX","Version":"2022","Releases":[{"Version":"2023"}]},{"DeviceId":"5bc922b7bd1adb5b6f99592611404036bd9f42d1","Name":"No upgrades","Version":"2020","Releases":[]}]}'
+    ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fwupd, fs::Permissions::from_mode(0o755)).unwrap();
+    let inventory = |mode| {
+        helios(directory.path())
+            .args(["firmware", "list"])
+            .env("PATH", directory.path())
+            .env("HELIOS_TEST_FWUPD", mode)
+            .output()
+            .unwrap()
+    };
+
+    let output = successful_stdout(&inventory("updates"));
+    assert!(output.contains("Secure Boot DBX: 2022 → 2023"));
+    assert!(output.contains("5bc922b7bd1adb5b6f99592611404036bd9f42d0"));
+    assert!(!output.contains("No upgrades"));
+    assert!(successful_stdout(&inventory("empty")).contains("No firmware updates"));
+    let failure = inventory("unavailable");
+    assert!(!failure.status.success());
+    assert!(failure.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&failure.stderr).contains("inventory unavailable"));
+}
