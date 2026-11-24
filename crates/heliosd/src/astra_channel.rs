@@ -1617,4 +1617,131 @@ mod tests {
 
         assert!(initialize("10.88.0.1:8444".parse().unwrap(), &wrong, None, None, false).is_err());
     }
+
+    #[tokio::test]
+    async fn authority_relays_keep_the_resolved_identity_and_preserve_plan_guidance() {
+        use ::astra_channel::{
+            OperatorIdentity, RelayedChainStep, RelayedOperationQuery, RelayedOperatorCampaign,
+            ASTRA_INTERNAL_PREFIX, ASTRA_INTERNAL_SERVER_NAME, OPERATOR_CHAIN_NEXT_ROUTE,
+            OPERATOR_PENDING_ROUTE,
+        };
+        use aether::certificates::encoding::{Id16, WireGuardKey};
+        use axum::{extract::Path as RoutePath, http::StatusCode, routing::post, Json, Router};
+        use helios_api::certificates::TrustUpdateRefusal;
+        use helios_api::certificates::{ChainRefusal, ClientRenewalRelay, OperatorCampaignRelay};
+        use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
+
+        let identity = |name: &str, usage| {
+            let mut params = CertificateParams::new(vec![name.to_owned()]).unwrap();
+            params.is_ca = IsCa::NoCa;
+            params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+            params.extended_key_usages = vec![usage];
+            let key = KeyPair::generate().unwrap();
+            ChannelIdentity {
+                certificate_der: params.self_signed(&key).unwrap().der().to_vec(),
+                private_key_der: key.serialize_der(),
+            }
+        };
+        let authority = identity(
+            ASTRA_INTERNAL_SERVER_NAME,
+            ExtendedKeyUsagePurpose::ServerAuth,
+        );
+        let gateway = identity(CLIENT_IDENTITY_NAME, ExtendedKeyUsagePurpose::ClientAuth);
+        let authority_pin = DerCertificate::new(authority.certificate_der.clone()).unwrap();
+        let gateway_pin = DerCertificate::new(gateway.certificate_der.clone()).unwrap();
+        let server_tls = ::astra_channel::server_config(&authority, &gateway_pin).unwrap();
+        let client_tls = ::astra_channel::client_config(&gateway, &authority_pin).unwrap();
+
+        let caller = WireGuardKey::from_bytes([0x51; 32]);
+        let operator = OperatorIdentity::WireGuard { public_key: caller };
+        let operation = Id16::new([0x19; 16]).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pending = Arc::clone(&seen);
+        let chain = Arc::clone(&seen);
+        let renewal = Arc::clone(&seen);
+        let router = Router::new()
+            .route(
+                OPERATOR_PENDING_ROUTE,
+                post(
+                    move |headers: axum::http::HeaderMap,
+                          Json(input): Json<RelayedOperatorCampaign>| async move {
+                        assert!(!headers.contains_key(axum::http::header::AUTHORIZATION));
+                        pending.lock().unwrap().push(("pending", input.operator));
+                        StatusCode::FORBIDDEN
+                    },
+                ),
+            )
+            .route(
+                OPERATOR_CHAIN_NEXT_ROUTE,
+                post(move |Json(input): Json<RelayedChainStep>| async move {
+                    assert_eq!(input.expected_step, Some(7));
+                    chain.lock().unwrap().push(("chain", input.operator));
+                    (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({"message": "wait for the activation window"})),
+                    )
+                }),
+            )
+            .route(
+                &format!("{ASTRA_INTERNAL_PREFIX}operations/{{operation}}"),
+                post(
+                    move |RoutePath(operation_id): RoutePath<String>,
+                          Json(input): Json<RelayedOperationQuery>| async move {
+                        assert_eq!(operation_id, operation.to_string());
+                        renewal.lock().unwrap().push((
+                            "renewal",
+                            OperatorIdentity::WireGuard {
+                                public_key: input.caller_wg_public_key,
+                            },
+                        ));
+                        StatusCode::SERVICE_UNAVAILABLE
+                    },
+                ),
+            );
+
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let server = tokio::spawn(::astra_channel::serve(
+            address,
+            server_tls,
+            router,
+            "/internal/",
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while tokio::net::TcpStream::connect(address).await.is_err() {
+                assert!(!server.is_finished(), "the local authority must start");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the mock authority accepts loopback connections");
+
+        let relay = AstraRenewalRelay::new(::astra_channel::AstraLifecycleClient::new(
+            address, client_tls,
+        ));
+        assert_eq!(
+            relay.pending(&operator).await.unwrap_err(),
+            TrustUpdateRefusal::Rejected
+        );
+        assert_eq!(
+            relay.chain_next(&operator, Some(7)).await.unwrap_err(),
+            ChainRefusal::Reason("wait for the activation window".into())
+        );
+        assert_eq!(
+            ClientRenewalRelay::operation(&relay, &caller.to_base64(), &operation)
+                .await
+                .unwrap_err(),
+            TrustUpdateRefusal::Unavailable
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                ("pending", operator.clone()),
+                ("chain", operator.clone()),
+                ("renewal", operator)
+            ]
+        );
+        server.abort();
+    }
 }
