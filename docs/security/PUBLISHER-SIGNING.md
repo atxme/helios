@@ -165,7 +165,8 @@ flux principal est une seule commande :
 Elle construit le frontend et le seul binaire `heliosd`, signe le manifeste,
 transfère l’artefact par l’API derrière `helios0`, demande son activation puis
 attend que la gateway confirme la nouvelle séquence. La compilation incrémentale
-peut réutiliser un frontend déjà construit avec `--skip-frontend`. Pour une
+peut réutiliser un frontend déjà construit avec `--skip-frontend`, ce qui
+implique `--build-natif` (le conteneur n'a pas `web/dist`). Pour une
 gateway de laboratoire ou une URL non standard :
 
 ```sh
@@ -217,7 +218,8 @@ d’une release binaire, et son domaine l’est aussi (`helios-bundle-v1`) : une
 signature de bundle ne peut pas être rejouée comme signature de release, ni
 l’inverse.
 
-Assembler d’abord, sur le poste de build :
+Assembler d’abord, sur le poste de build (Docker est requis pour
+`cargo xtask bundle`, sinon ajouter `--native`) :
 
 ```sh
 HELIOS_PUBLISHER_KEYRING_PATH=/chemin/public/publisher-keyring.json \

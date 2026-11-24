@@ -419,6 +419,10 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    /// `extract` names its workspace after the process: two extractions at
+    /// once in the test binary would clear each other's directory.
+    static EXTRACTION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn readiness_poll_times_out_on_a_matching_version_in_simulated_mode() {
         let directory = test_directory("simulated-readiness");
@@ -530,6 +534,9 @@ mod tests {
 
     #[test]
     fn extraction_requires_an_archive_with_one_directory_root() {
+        let _serial = EXTRACTION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let directory = test_directory("archive");
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(directory.join("payload/bundle")).unwrap();
@@ -549,6 +556,48 @@ mod tests {
         assert!(root.join("manifest.json").is_file());
         fs::remove_dir_all(root.parent().unwrap()).unwrap();
         assert!(extract(&directory.join("absent.tar.gz")).is_err());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The archive is built with the options of `xtask::archive::tar_args`,
+    /// reproduced here so the installer does not depend on the build tool.
+    /// Its files then belong to UID 0, not to the operator who packed them.
+    #[cfg(unix)]
+    #[test]
+    fn extraction_accepts_a_deterministic_archive_owned_by_root() {
+        let _serial = EXTRACTION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let directory = test_directory("deterministic-archive");
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(directory.join("payload/bundle")).unwrap();
+        fs::write(directory.join("payload/bundle/manifest.json"), b"{}").unwrap();
+        fs::write(directory.join("payload/bundle/heliosd"), b"binary").unwrap();
+        let archive = directory.join("deterministic.tar.gz");
+        let status = Command::new("tar")
+            .args([
+                "--use-compress-program=gzip -n",
+                "--sort=name",
+                "--owner=0",
+                "--group=0",
+                "--numeric-owner",
+                "--mtime=@0",
+                "--format=gnu",
+                "-cf",
+            ])
+            .arg(&archive)
+            .arg("-C")
+            .arg(directory.join("payload"))
+            .args(["--", "bundle"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let root = extract(&archive).unwrap();
+        assert!(root.join("manifest.json").is_file());
+        assert_eq!(fs::read(root.join("heliosd")).unwrap(), b"binary");
+        fs::remove_dir_all(root.parent().unwrap()).unwrap();
 
         fs::remove_dir_all(directory).unwrap();
     }

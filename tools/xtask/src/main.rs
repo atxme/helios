@@ -26,7 +26,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use xtask::orion_deps;
+use xtask::{archive, container, orion_deps, verify};
 
 /// Features of the shipped gateway. A production bundle carries all of them:
 /// a `heliosd` without `netlink` or `wireguard` would refuse to start on a
@@ -89,6 +89,9 @@ enum Cmd {
         /// Does not rebuild the embedded frontend (local iteration).
         #[arg(long)]
         skip_frontend: bool,
+        /// Builds on this host instead of in the pinned build container.
+        #[arg(long)]
+        native: bool,
     },
     /// Builds the binaries and assembles the bundle directory.
     Bundle {
@@ -101,6 +104,9 @@ enum Cmd {
         /// Output directory. Default: `target/bundle/<name>`.
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Builds on this host instead of in the pinned build container.
+        #[arg(long)]
+        native: bool,
     },
     /// Builds the Orion Windows installer (MSI) on this machine.
     ///
@@ -121,6 +127,19 @@ enum Cmd {
         #[arg(long)]
         skip_npm_ci: bool,
     },
+    /// Checks a signed bundle against the commit its manifest names.
+    ///
+    /// The signature must verify under `--keyring`. The commit is then rebuilt
+    /// in the build container, and every file compared: the command fails
+    /// unless the bundle and the rebuilt commit agree file for file.
+    Verify {
+        /// Bundle directory, or the `.tar.gz` archive made by `pack`.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Public keyring the signature must verify under.
+        #[arg(long)]
+        keyring: PathBuf,
+    },
     /// Archives a **signed** bundle.
     Pack {
         /// Directory produced by `bundle`, containing `manifest.json`.
@@ -138,17 +157,20 @@ fn main() -> Result<()> {
         Cmd::App {
             target,
             skip_frontend,
-        } => app(target, skip_frontend),
+            native,
+        } => app(target, skip_frontend, native),
         Cmd::Bundle {
             target,
             skip_frontend,
             output,
-        } => bundle(target, skip_frontend, output),
+            native,
+        } => bundle(target, skip_frontend, output, native),
         Cmd::OrionMsi {
             unsigned,
             with_nsis,
             skip_npm_ci,
         } => orion_msi(unsigned, with_nsis, skip_npm_ci),
+        Cmd::Verify { bundle, keyring } => verify::run(&workspace_root()?, &bundle, &keyring),
         Cmd::Pack { dir, output } => pack(&dir, output),
     }
 }
@@ -158,14 +180,66 @@ fn orion_deps() -> Result<()> {
     orion_deps::prepare(&root)
 }
 
-fn app(target: Option<String>, skip_frontend: bool) -> Result<()> {
+fn app(target: Option<String>, skip_frontend: bool, native: bool) -> Result<()> {
     let root = workspace_root()?;
     let target = match target {
         Some(target) => target,
         None => host_target()?,
     };
-    let binary = build_gateway(&root, &target, skip_frontend)?;
+    let binary = if native {
+        build_gateway(&root, &target, skip_frontend)?
+    } else {
+        app_in_container(&root, &target, skip_frontend)?
+    };
     println!("\n==> Application ready: {}", binary.display());
+    Ok(())
+}
+
+/// Builds `heliosd` in the build container and copies it to where the native
+/// build would have left it, the path `scripts/deploy-app.sh` reads.
+fn app_in_container(root: &Path, target: &str, skip_frontend: bool) -> Result<PathBuf> {
+    container_target(target)?;
+    container_frontend(skip_frontend)?;
+    let script = format!(
+        "cargo run --locked --package xtask -- app --native --target {target} \
+         && cp /helios/target/{target}/release/heliosd /helios/out/heliosd"
+    );
+    let out = container::build_in_container(
+        root,
+        &publisher_keyring()?,
+        vec!["sh".into(), "-c".into(), script],
+    )?;
+    let binary = cargo_target_dir(root)
+        .join(target)
+        .join("release")
+        .join("heliosd");
+    let copied = container::copy_out(&out.join("heliosd"), &binary);
+    let discarded = container::discard(&out);
+    copied?;
+    discarded?;
+    Ok(binary)
+}
+
+/// Refuses `--skip-frontend` in a container build, before any Docker or build
+/// step: `web/dist` is git-ignored, so the exported tree never carries it.
+fn container_frontend(skip_frontend: bool) -> Result<()> {
+    if skip_frontend {
+        bail!(
+            "--skip-frontend reuses this host's web/dist, which the build container does not \
+             have: it needs `--native`"
+        );
+    }
+    Ok(())
+}
+
+/// Refuses a target the build container cannot produce.
+fn container_target(target: &str) -> Result<()> {
+    if target != container::CONTAINER_TARGET {
+        bail!(
+            "the build container only produces {}: build {target} on its own host with `--native`",
+            container::CONTAINER_TARGET
+        );
+    }
     Ok(())
 }
 
@@ -325,59 +399,25 @@ fn report_installers(bundle_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn bundle(target: Option<String>, skip_frontend: bool, output: Option<PathBuf>) -> Result<()> {
+fn bundle(
+    target: Option<String>,
+    skip_frontend: bool,
+    output: Option<PathBuf>,
+    native: bool,
+) -> Result<()> {
     let root = workspace_root()?;
     let target = match target {
         Some(target) => target,
         None => host_target()?,
     };
     let version = release_version(&root)?;
-
-    let heliosd = build_gateway(&root, &target, skip_frontend)?;
-
-    println!("==> helios-installer, helios");
-    run(
-        &root,
-        "cargo",
-        &[
-            "build",
-            "--release",
-            "--target",
-            &target,
-            "-p",
-            "helios-installer",
-            "-p",
-            "helios",
-        ],
-    )?;
-
     let staging = bundle_staging_dir(&root, &version, &target, output);
-    if staging.exists() {
-        std::fs::remove_dir_all(&staging)
-            .with_context(|| format!("cleaning {}", staging.display()))?;
-    }
-    std::fs::create_dir_all(staging.join("systemd"))
-        .with_context(|| format!("creating {}", staging.display()))?;
 
-    let built = cargo_target_dir(&root).join(&target).join("release");
-    copy_executable(&heliosd, &staging.join("heliosd"))?;
-    for binary in BINARIES
-        .iter()
-        .copied()
-        .filter(|binary| *binary != "heliosd")
-    {
-        copy_executable(&built.join(binary), &staging.join(binary))?;
+    if native {
+        assemble_natively(&root, &target, &staging, skip_frontend)?;
+    } else {
+        assemble_in_container(&root, &target, skip_frontend, &staging)?;
     }
-    for unit in SYSTEMD_UNITS {
-        copy_data(
-            &root.join("deploy").join("systemd").join(unit),
-            &staging.join("systemd").join(unit),
-        )?;
-    }
-    copy_data(
-        &root.join("config").join("network.toml"),
-        &staging.join("network.toml.example"),
-    )?;
 
     let files = helios_update::bundle::collect(&staging)
         .map_err(|e| anyhow::anyhow!("listing the bundle: {e}"))?;
@@ -397,6 +437,91 @@ fn bundle(target: Option<String>, skip_frontend: bool, output: Option<PathBuf>) 
     );
     println!("  cargo xtask pack --dir {}", staging.display());
     Ok(())
+}
+
+/// Builds the bundle's binaries on this host and assembles them in `staging`.
+fn assemble_natively(root: &Path, target: &str, staging: &Path, skip_frontend: bool) -> Result<()> {
+    let heliosd = build_gateway(root, target, skip_frontend)?;
+
+    println!("==> helios-installer, helios");
+    run(
+        root,
+        "cargo",
+        &[
+            "build",
+            "--locked",
+            "--release",
+            "--target",
+            target,
+            "-p",
+            "helios-installer",
+            "-p",
+            "helios",
+        ],
+    )?;
+
+    if staging.exists() {
+        std::fs::remove_dir_all(staging)
+            .with_context(|| format!("cleaning {}", staging.display()))?;
+    }
+    std::fs::create_dir_all(staging.join("systemd"))
+        .with_context(|| format!("creating {}", staging.display()))?;
+
+    let built = cargo_target_dir(root).join(target).join("release");
+    copy_executable(&heliosd, &staging.join("heliosd"))?;
+    for binary in BINARIES
+        .iter()
+        .copied()
+        .filter(|binary| *binary != "heliosd")
+    {
+        copy_executable(&built.join(binary), &staging.join(binary))?;
+    }
+    for unit in SYSTEMD_UNITS {
+        copy_data(
+            &root.join("deploy").join("systemd").join(unit),
+            &staging.join("systemd").join(unit),
+        )?;
+    }
+    copy_data(
+        &root.join("config").join("network.toml"),
+        &staging.join("network.toml.example"),
+    )?;
+    Ok(())
+}
+
+/// Runs the native assembly in the build container, then copies the bundle
+/// it produced to `staging`.
+fn assemble_in_container(
+    root: &Path,
+    target: &str,
+    skip_frontend: bool,
+    staging: &Path,
+) -> Result<()> {
+    container_target(target)?;
+    container_frontend(skip_frontend)?;
+    let name = staging
+        .file_name()
+        .context("the bundle output has no directory name")?
+        .to_string_lossy()
+        .into_owned();
+
+    let arguments = vec![
+        "bundle".to_string(),
+        "--native".into(),
+        "--target".into(),
+        target.into(),
+        "--output".into(),
+        format!("/helios/out/{name}"),
+    ];
+    let out = container::build_in_container(
+        root,
+        &publisher_keyring()?,
+        container::xtask_command(&arguments),
+    )?;
+    let copied = container::copy_out(&out.join(&name), staging);
+    let discarded = container::discard(&out);
+    copied?;
+    discarded
 }
 
 /// Builds the exact daemon shape shipped to a real gateway.
@@ -435,9 +560,10 @@ fn bundle_staging_dir(
     })
 }
 
-fn gateway_build_args(target: &str) -> [&str; 8] {
+fn gateway_build_args(target: &str) -> [&str; 9] {
     [
         "build",
+        "--locked",
         "--release",
         "--target",
         target,
@@ -495,11 +621,7 @@ fn pack(dir: &Path, output: Option<PathBuf>) -> Result<()> {
         .to_string_lossy()
         .to_string();
 
-    run(
-        &parent,
-        "tar",
-        &["-czf", &archive.to_string_lossy(), "--", &name],
-    )?;
+    archive::create(&parent, &name, &archive, archive::entry_mtime())?;
 
     let digest = helios_update::sha256_file(&archive)
         .map_err(|e| anyhow::anyhow!("archive fingerprint: {e}"))?;
@@ -761,6 +883,7 @@ mod tests {
             gateway_build_args("x86_64-unknown-linux-gnu"),
             [
                 "build",
+                "--locked",
                 "--release",
                 "--target",
                 "x86_64-unknown-linux-gnu",
@@ -832,7 +955,8 @@ mod tests {
             cli.command,
             Cmd::App {
                 target: Some(target),
-                skip_frontend: true
+                skip_frontend: true,
+                native: false,
             } if target == "aarch64-linux"
         ));
     }
@@ -854,8 +978,37 @@ mod tests {
                 target: Some(target),
                 skip_frontend: false,
                 output: Some(output),
+                native: false,
             } if target == "x86_64-linux" && output == Path::new("/tmp/staging")
         ));
+    }
+
+    #[test]
+    fn bundle_cli_accepts_native() {
+        let cli = Cli::try_parse_from(["xtask", "bundle", "--native"]).expect("valid bundle");
+        assert!(matches!(cli.command, Cmd::Bundle { native: true, .. }));
+
+        let cli = Cli::try_parse_from(["xtask", "app", "--native"]).expect("valid app");
+        assert!(matches!(cli.command, Cmd::App { native: true, .. }));
+    }
+
+    #[test]
+    fn container_build_refuses_other_targets() {
+        assert!(container_target(container::CONTAINER_TARGET).is_ok());
+        let error = container_target("aarch64-unknown-linux-gnu")
+            .expect_err("other targets are refused")
+            .to_string();
+        assert!(error.contains("--native"), "{error}");
+    }
+
+    #[test]
+    fn container_build_refuses_skip_frontend() {
+        assert!(container_frontend(false).is_ok());
+        let error = container_frontend(true)
+            .expect_err("--skip-frontend needs --native")
+            .to_string();
+        assert!(error.contains("--native"), "{error}");
+        assert!(error.contains("web/dist"), "{error}");
     }
 
     #[test]
@@ -1066,8 +1219,8 @@ mod tests {
 
         let error = pack(&root, Some(archive.clone())).expect_err("unwritable output destination");
         let message = format!("{error:#}");
-        assert!(message.contains("tar -czf"), "{message}");
-        assert!(message.contains("failed"), "{message}");
+        assert!(message.contains("tar failed"), "{message}");
+        assert!(message.contains("not written"), "{message}");
         assert!(!archive.exists());
         assert!(!archive_path(&root).expect("default archive path").exists());
     }

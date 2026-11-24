@@ -2402,7 +2402,6 @@ version = "2.0.0"
 dependencies = [
  "aether",
  "anyhow",
- "base64 0.23.1",
  "clap",
  "helios-update",
  "hex",
@@ -2437,6 +2436,7 @@ version = "1.8.0"
 dependencies = [
  "aether",
  "aws-lc-rs",
+ "base64 0.23.1",
  "hex",
  "serde",
  "serde_json",
@@ -7265,6 +7265,7 @@ dependencies = [
 name = "xtask"
 version = "1.8.7"
 dependencies = [
+ "aether",
  "anyhow",
  "clap",
  "helios-update",

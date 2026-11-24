@@ -156,6 +156,21 @@ CI collecte déjà. Ils se lancent explicitement sans build Cargo :
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/local-tests -v
 ```
 
+### Reproductibilité du bundle gateway
+
+Le workflow `.github/workflows/reproducible.yml` construit deux fois le bundle
+gateway du même commit, depuis deux emplacements, en vidant les volumes Docker
+de cache entre les deux constructions. Il compare l'empreinte SHA-256 de chaque
+fichier, avec son mode et sa taille. Il se lance sur tag, à la main, chaque
+lundi à 04:00 UTC et sur toute pull request qui touche `tools/build-env/`,
+`tools/xtask/`, `Cargo.lock` ou le workflow. Il ne publie ni ne signe rien. Son
+premier passage sur GitHub reste à faire : après la fusion (ou sur une pull
+request qui touche ces chemins).
+
+Le procès-verbal de l'acceptation locale (trois builds conteneur identiques) est
+dans [reproductibilite-f15.md](reproductibilite-f15.md). La vérification d'un
+bundle publié est décrite dans [MAINTENANCE.md](../MAINTENANCE.md#vérifier-un-bundle).
+
 ### Taille des artefacts livrables
 
 Le contrôle local `scripts/binary-size.py` ne construit, ne strippe et ne

@@ -11,6 +11,9 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/tests -p 'test
 echo '==> Retired operator tools guard'
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/tests -p 'test_retired_operator_tools.py'
 
+echo '==> Concordance des versions de toolchain'
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/toolchain_pins.py
+
 echo '==> Formatage Rust'
 cargo fmt --check
 
