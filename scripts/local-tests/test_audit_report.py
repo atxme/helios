@@ -210,6 +210,27 @@ class ProjectionTests(unittest.TestCase):
         fixture = next(row for row in report["files"] if row["path"].endswith("fixtures.rs"))
         self.assertEqual(fixture["production"]["total"], 3)
 
+    def test_parent_relative_test_module_requires_an_inventoried_source(self):
+        self.fixture = Fixture(self.root, '#[cfg(test)]\n#[path="../src/fixtures.rs"]\nmod shared;\n')
+        report = self.fixture.summarize()
+        fixture = next(row for row in report["files"] if row["path"].endswith("fixtures.rs"))
+        self.assertEqual(fixture["production"]["total"], 0)
+        self.assertEqual(fixture["exclusions"][0]["reason"], "test_only_external_module")
+
+        self.fixture = Fixture(self.root, '#[cfg(test)]\n#[path="../src/absent.rs"]\nmod shared;\n')
+        with self.assertRaisesRegex(audit.AuditError, "Shared module source missing from provenance"):
+            self.fixture.summarize()
+
+    def test_parent_relative_module_does_not_allow_production_traversal_or_root_escape(self):
+        for declaration, error in (
+            ('#[path="../src/fixtures.rs"]\nmod shared;\n', "production module path traversal"),
+            ('#[cfg(test)]\n#[path="../../../../outside.rs"]\nmod shared;\n', "outside root"),
+        ):
+            with self.subTest(declaration=declaration):
+                self.fixture = Fixture(self.root, declaration)
+                with self.assertRaisesRegex(audit.AuditError, error):
+                    self.fixture.summarize()
+
     def test_literal_production_include_prevents_test_only_exclusion(self):
         path = self.root / "crates/sample/src/lib.rs"
         path.write_text(path.read_text() + 'include!("fixtures.rs");\n')

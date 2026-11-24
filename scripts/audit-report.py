@@ -507,12 +507,24 @@ def module_usage(asts, roots, sources, features, target_cfg, owner):
                 require(len(paths) <= 1, f"Multiple module paths: {path}")
                 if paths:
                     raw = json.loads(paths[0][1])
-                    require(".." not in PurePosixPath(raw).parts and not PurePosixPath(raw).is_absolute(),
-                            f"Unsupported module path traversal: {path}: {raw}")
+                    declared = PurePosixPath(raw)
+                    require(not declared.is_absolute(), f"Unsupported absolute module path: {path}: {raw}")
                     # Rust's #[path] is relative to the containing source file for
                     # top-level modules. Inline-module path rules differ; reject.
                     require(directory == base, f"Unsupported inline #[path] module: {path}")
-                    candidates = [str(stem.parent / raw)]
+                    if ".." in declared.parts:
+                        # A fixture shared between test targets may live in a
+                        # sibling crate. It must still be an inventoried source
+                        # and does not change reachability through production.
+                        require(not active, f"Unsupported production module path traversal: {path}: {raw}")
+                        resolved = (sources.root / stem.parent / declared).resolve()
+                        require(resolved.is_relative_to(sources.root),
+                                f"Module source outside root: {path}: {raw}")
+                        candidate = resolved.relative_to(sources.root).as_posix()
+                        require(candidate in asts, f"Shared module source missing from provenance: {path}: {raw}")
+                        candidates = [candidate]
+                    else:
+                        candidates = [str(stem.parent / declared)]
                 else:
                     candidates = [str(directory / f"{name}.rs"), str(directory / name / "mod.rs")]
                 matches = [candidate for candidate in candidates if candidate in asts]
