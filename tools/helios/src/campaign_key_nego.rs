@@ -674,3 +674,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod profile_campaign_tests;
