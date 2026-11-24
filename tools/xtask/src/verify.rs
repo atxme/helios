@@ -442,10 +442,7 @@ mod tests {
         panic!("the bundle must be refused before any build")
     }
 
-    /// A complete bundle signed for `target` and `git_commit`, written in
-    /// `root`. Returns the path of the keyring that verifies it, written next
-    /// to `root`.
-    fn signed_bundle(root: &Path, target: &str, git_commit: &str) -> PathBuf {
+    fn write_bundle_files(root: &Path) {
         for (path, content) in [
             ("heliosd", "the-daemon"),
             ("helios-installer", "the-installer"),
@@ -457,6 +454,13 @@ mod tests {
             fs::create_dir_all(file.parent().expect("parent")).expect("directory");
             fs::write(file, content).expect("bundle file");
         }
+    }
+
+    /// A complete bundle signed for `target` and `git_commit`, written in
+    /// `root`. Returns the path of the keyring that verifies it, written next
+    /// to `root`.
+    fn signed_bundle(root: &Path, target: &str, git_commit: &str) -> PathBuf {
+        write_bundle_files(root);
         let payload = BundlePayload {
             product: BUNDLE_PRODUCT.into(),
             channel: "testing".into(),
@@ -488,27 +492,32 @@ mod tests {
         keyring
     }
 
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     /// A git repository holding one commit. Returns its full hash.
     fn repository_with_commit(root: &Path) -> String {
-        let git = |args: &[&str]| {
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args([
-                    "-c",
-                    "user.name=test",
-                    "-c",
-                    "user.email=test@example.invalid",
-                ])
-                .args(args)
-                .output()
-                .expect("git");
-            assert!(output.status.success(), "git {args:?} failed");
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        };
-        git(&["init", "-q"]);
-        git(&["commit", "-q", "--allow-empty", "-m", "fixture"]);
-        git(&["rev-parse", "HEAD"])
+        git(root, &["init", "-q"]);
+        git(root, &["commit", "-q", "--allow-empty", "-m", "fixture"]);
+        git(root, &["rev-parse", "HEAD"])
     }
 
     #[test]
@@ -679,6 +688,121 @@ mod tests {
         assert!(from_directory.is_empty(), "{from_directory:?}");
         assert_eq!(from_directory, from_archive);
         assert_eq!(*seen.borrow(), [commit.clone(), commit]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_rebuilds_with_the_pinned_container_and_reports_mismatches() {
+        const CHILD: &str = "HELIOS_VERIFY_FAKE_DOCKER_CHILD";
+        fn fixture(different: bool) -> Result<()> {
+            let scratch = Scratch::new("run-fake-docker-child")?;
+            let repository = scratch.path().join("repository");
+            fs::create_dir_all(repository.join("tools/build-env"))?;
+            fs::write(
+                repository.join("tools/build-env/Dockerfile"),
+                "FROM scratch\n",
+            )?;
+            write_bundle_files(&repository);
+            git(&repository, &["init", "-q"]);
+            git(&repository, &["add", "-A"]);
+            git(&repository, &["commit", "-q", "-m", "build fixture"]);
+            let commit = git(&repository, &["rev-parse", "HEAD"]);
+            let bundle_dir = scratch.path().join("bundle");
+            fs::create_dir(&bundle_dir)?;
+            let keyring = signed_bundle(&bundle_dir, CONTAINER_TARGET, &commit[..16]);
+            let result = run(&repository, &bundle_dir, &keyring);
+            let checkouts = git(&repository, &["worktree", "list", "--porcelain"]);
+            assert_eq!(
+                checkouts
+                    .lines()
+                    .filter(|line| line.starts_with("worktree "))
+                    .count(),
+                1,
+                "the detached verification checkout must be removed"
+            );
+            match result {
+                Ok(()) if !different => Ok(()),
+                Err(error) if different && error.to_string().contains("2 file(s) differ") => Ok(()),
+                Ok(()) => Err(anyhow!("a mismatching rebuild was accepted")),
+                Err(error) => Err(error),
+            }
+        }
+
+        if std::env::var_os(CHILD).is_some() {
+            fixture(std::env::var_os("HELIOS_VERIFY_DIFFERENT").is_some()).expect("verification");
+            return;
+        }
+
+        let scratch = Scratch::new("run-fake-docker").expect("scratch");
+        let docker_dir = scratch.path().join("bin");
+        fs::create_dir_all(&docker_dir).expect("fake bin");
+        let docker = docker_dir.join("docker");
+        fs::write(
+            &docker,
+            r##"#!/bin/sh
+set -eu
+if [ "$1" = info ] || [ "$1" = build ]; then exit 0; fi
+if [ "$1" = image ]; then exit 0; fi
+src=
+out=
+for arg in "$@"; do
+  case "$arg" in
+    *:/helios/src) src=${arg%:/helios/src} ;;
+    *:/helios/out) out=${arg%:/helios/out} ;;
+  esac
+done
+mkdir -p "$out/rebuilt/systemd"
+cp "$src/heliosd" "$src/helios-installer" "$src/helios" "$src/network.toml.example" "$out/rebuilt/"
+cp "$src/systemd/heliosd.service" "$out/rebuilt/systemd/"
+if [ "${HELIOS_VERIFY_DIFFERENT:-}" = 1 ]; then printf changed > "$out/rebuilt/heliosd"; fi
+"##,
+        )
+        .expect("fake docker script");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).expect("chmod");
+        for different in [false, true] {
+            let mut command = Command::new(std::env::current_exe().expect("test executable"));
+            command
+                .args([
+                    "--exact",
+                    "verify::tests::run_rebuilds_with_the_pinned_container_and_reports_mismatches",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("HELIOS_VERIFY_DIFFERENT")
+                .env("TMPDIR", scratch.path())
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        docker_dir.display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                );
+            if different {
+                command.env("HELIOS_VERIFY_DIFFERENT", "1");
+            }
+            let output = command.output().expect("child test");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if different {
+                assert!(
+                    stdout.contains("[signed manifest] changed: heliosd"),
+                    "{stdout}"
+                );
+                assert!(
+                    stdout.contains("[files on disk] changed: heliosd"),
+                    "{stdout}"
+                );
+                assert!(stdout.contains("only executables differ"), "{stdout}");
+            } else {
+                assert!(stdout.contains("matches the commit it names"), "{stdout}");
+            }
+        }
     }
 
     #[cfg(unix)]
