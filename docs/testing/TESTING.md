@@ -24,6 +24,10 @@ construit hors du graphe Cargo ; les tests natifs d'`orion-core` accompagnent
 toute compilation du client Windows.
 Les interfaces sont testées et construites quand leurs sources changent ; la
 console gateway est aussi construite quand les tests Rust doivent l'embarquer.
+**Une poussée vers `main` ne relance ni Rust Linux ni les interfaces** :
+`scripts/regression.sh` les couvre et se joue avant la fusion. Elle garde Windows,
+l'audit, le contrôle des versions, le format et les tests des scripts. Les pull
+requests et le déclenchement manuel gardent tous les contrôles.
 Les audits se déclenchent sur modification des lockfiles. Cargo utilise deux
 jobs au plus, sans compilation incrémentale ni informations de débogage Rust.
 
@@ -161,11 +165,10 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/local-tests -v
 Le workflow `.github/workflows/reproducible.yml` construit deux fois le bundle
 gateway du même commit, depuis deux emplacements, en vidant les volumes Docker
 de cache entre les deux constructions. Il compare l'empreinte SHA-256 de chaque
-fichier, avec son mode et sa taille. Il se lance sur tag, à la main, chaque
-lundi à 04:00 UTC et sur toute pull request qui touche `tools/build-env/`,
-`tools/xtask/`, `Cargo.lock` ou le workflow. Il ne publie ni ne signe rien. Son
-premier passage sur GitHub reste à faire : après la fusion (ou sur une pull
-request qui touche ces chemins).
+fichier, avec son mode et sa taille. Il se lance à la main seulement
+(`gh workflow run reproducible.yml`), par exemple avant une publication. Il ne
+publie ni ne signe rien. Premier passage vert le 24 novembre 2026, sur
+`06568672`.
 
 Le procès-verbal de l'acceptation locale (trois builds conteneur identiques) est
 dans [reproductibilite-f15.md](reproductibilite-f15.md). La vérification d'un

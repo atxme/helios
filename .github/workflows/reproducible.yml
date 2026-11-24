@@ -9,23 +9,11 @@ name: Reproductibilité du bundle
 # n'est pas figée par le commit : chemin, horodatage, ordre de lecture,
 # environnement du conteneur.
 #
-# Déclenché sur tag, à la main, et chaque lundi à 04:00 UTC. Ne publie rien et
-# ne signe rien : seule la comparaison compte.
+# Déclenché à la main seulement : la double construction coûte trop de temps de
+# CI pour tourner seule. Ne publie rien et ne signe rien : seule la comparaison
+# compte.
 on:
-  push:
-    tags:
-      - "v*"
-  # GitHub ne distribue un workflow que depuis la branche par défaut : sans ce
-  # déclencheur, il ne pourrait pas passer avant la fusion.
-  pull_request:
-    paths:
-      - "tools/build-env/**"
-      - "tools/xtask/**"
-      - "Cargo.lock"
-      - ".github/workflows/reproducible.yml"
   workflow_dispatch:
-  schedule:
-    - cron: "0 4 * * 1"
 
 permissions:
   contents: read

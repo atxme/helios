@@ -2,6 +2,8 @@ name: Régression
 
 # La CI valide les composants touchés et leurs dépendants. Les campagnes
 # scripts/regression.sh et scripts/coverage.sh restent des validations locales.
+# Un push sur main ne relance pas ce que scripts/regression.sh couvre (Rust Linux
+# et interfaces) : il garde Windows, l'audit, les versions et les scripts.
 on:
   push:
     branches: [main]
@@ -91,7 +93,7 @@ jobs:
   frontend:
     name: Interfaces web
     needs: changes
-    if: needs.changes.outputs.web == 'true' || needs.changes.outputs.orion_ui == 'true'
+    if: github.event_name != 'push' && (needs.changes.outputs.web == 'true' || needs.changes.outputs.orion_ui == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -119,7 +121,7 @@ jobs:
   rust-linux:
     name: Rust Linux — composants concernés
     needs: changes
-    if: needs.changes.outputs.linux != ''
+    if: github.event_name != 'push' && needs.changes.outputs.linux != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:

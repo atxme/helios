@@ -264,7 +264,8 @@ cargo xtask verify --bundle <répertoire signé ou archive .tar.gz> --keyring <t
   `aether/build.rs`). Le second build part de volumes neufs, d'un chemin de
   checkout différent, d'un autre `TZ` et d'un autre umask côté hôte. Le job
   échoue si les deux listes `collect` diffèrent, et publie les deux listes en
-  artefact.
+  artefact. *Amendement du 24 novembre 2026 : `workflow_dispatch` seulement, pour
+  ne pas consommer de temps de CI ; les autres déclencheurs sont retirés.*
 - **`scripts/regression.sh` n'exécute pas** le double build : trop lourd pour
   WSL (mémoire « regression-wsl-ram »). Il garde les tests unitaires de
   `xtask` (§7).
