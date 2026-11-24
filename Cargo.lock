@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "astra"
-version = "1.8.3"
+version = "1.8.4"
 dependencies = [
  "aether",
  "anyhow",
@@ -2283,7 +2283,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "helios"
-version = "6.0.0"
+version = "6.0.1"
 dependencies = [
  "aether",
  "aether-key-negotiation",
@@ -2375,7 +2375,7 @@ dependencies = [
 
 [[package]]
 name = "helios-installer"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "aether",
  "anyhow",
@@ -2386,7 +2386,7 @@ dependencies = [
 
 [[package]]
 name = "helios-provisioning"
-version = "1.10.0"
+version = "1.10.1"
 dependencies = [
  "aether",
  "base64 0.23.1",
@@ -2401,7 +2401,7 @@ dependencies = [
 
 [[package]]
 name = "helios-publisher"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "aether",
  "anyhow",
@@ -2415,7 +2415,7 @@ dependencies = [
 
 [[package]]
 name = "helios-tpm"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "aether",
  "aether-vault",
@@ -2461,7 +2461,7 @@ dependencies = [
 
 [[package]]
 name = "heliosd"
-version = "6.0.0"
+version = "6.0.1"
 dependencies = [
  "aether",
  "aether-key-negotiation",
@@ -3869,7 +3869,7 @@ dependencies = [
 
 [[package]]
 name = "orion"
-version = "7.0.1"
+version = "7.0.2"
 dependencies = [
  "aether",
  "aether-fido",
@@ -3897,7 +3897,7 @@ dependencies = [
 
 [[package]]
 name = "orion-core"
-version = "4.1.0"
+version = "4.1.1"
 dependencies = [
  "aether",
  "aether-fido",
@@ -3934,7 +3934,7 @@ dependencies = [
 
 [[package]]
 name = "orion-engine"
-version = "1.15.0"
+version = "1.15.1"
 dependencies = [
  "aether",
  "async-trait",
@@ -7266,7 +7266,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "aether",
  "anyhow",
