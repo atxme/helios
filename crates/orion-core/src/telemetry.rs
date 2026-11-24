@@ -137,7 +137,7 @@ async fn run_with_timing(
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
     async fn status_server(
         statuses: Vec<u16>,
@@ -151,14 +151,21 @@ mod tests {
         let task = tokio::spawn(async move {
             for status in statuses {
                 let (mut stream, _) = listener.accept().await.expect("status request");
-                let mut request = vec![0u8; 2048];
-                let read = stream.read(&mut request).await.expect("read request");
-                let first_line = String::from_utf8_lossy(&request[..read])
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .to_string();
-                paths.lock().unwrap().push(first_line);
+                let mut reader = BufReader::new(&mut stream);
+                let mut request_line = String::new();
+                reader
+                    .read_line(&mut request_line)
+                    .await
+                    .expect("read request");
+                paths.lock().unwrap().push(request_line);
+                loop {
+                    let mut header = String::new();
+                    let read = reader.read_line(&mut header).await.expect("read header");
+                    assert_ne!(read, 0, "request ended before the end of the headers");
+                    if header == "\r\n" {
+                        break;
+                    }
+                }
                 let reason = if status < 400 {
                     "No Content"
                 } else {
@@ -186,14 +193,18 @@ mod tests {
         let captured = Arc::clone(&events);
         let sink: EventSink = Arc::new(move |event| captured.lock().unwrap().push(event));
 
-        run_with_timing(
-            url,
-            sink,
-            &mut cancel,
-            Duration::from_millis(1),
-            Duration::from_secs(1),
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            run_with_timing(
+                url,
+                sink,
+                &mut cancel,
+                Duration::from_millis(1),
+                Duration::from_secs(5),
+            ),
         )
-        .await;
+        .await
+        .expect("telemetry must poll all scripted responses");
         server.await.unwrap();
 
         let messages: Vec<String> = events
