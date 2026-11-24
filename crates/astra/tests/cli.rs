@@ -1294,6 +1294,19 @@ fn run_refuses_half_configured_private_channel_topologies() {
         .status
         .success());
     let before = snapshot(directory.path());
+    let assert_state_preserved = || {
+        for (name, contents) in &before {
+            assert_eq!(
+                &std::fs::read(directory.path().join(name)).expect("original state file"),
+                contents,
+                "startup must preserve {name}"
+            );
+        }
+        assert!(!directory
+            .path()
+            .join(astra::door::DOOR_SOCKET_FILE)
+            .exists());
+    };
 
     let gateway_channel = astra(
         directory.path(),
@@ -1312,11 +1325,7 @@ fn run_refuses_half_configured_private_channel_topologies() {
         "{}",
         String::from_utf8_lossy(&gateway_channel.stderr)
     );
-    assert_eq!(snapshot(directory.path()), before);
-    assert!(!directory
-        .path()
-        .join(astra::door::DOOR_SOCKET_FILE)
-        .exists());
+    assert_state_preserved();
 
     let private_listener = astra(
         directory.path(),
@@ -1335,11 +1344,7 @@ fn run_refuses_half_configured_private_channel_topologies() {
         "{}",
         String::from_utf8_lossy(&private_listener.stderr)
     );
-    assert_eq!(snapshot(directory.path()), before);
-    assert!(!directory
-        .path()
-        .join(astra::door::DOOR_SOCKET_FILE)
-        .exists());
+    assert_state_preserved();
 }
 
 /// Exercise the chain command family through separate binary invocations:
