@@ -169,7 +169,7 @@ dans `RENOUVELLEMENT-CERTIFICATS.md`, §7.1 et §8).
 
 | # | Fonctionnalité | Source | Faisable ici ? |
 | --- | --- | --- | --- |
-| F15 | **Bundle reproductible** : chemins remappés, `SOURCE_DATE_EPOCH`, conteneur de build figé | ADR-004 « Limites connues » | Code : **oui**, implémenté sur `feat/f15-reproducible-bundle` (23 novembre 2026) ; validation : **non**, reste le premier passage de `reproducible.yml` après la fusion (ou sur une pull request qui touche ses chemins) |
+| F15 | **Bundle reproductible** : chemins remappés, `SOURCE_DATE_EPOCH`, conteneur de build figé | ADR-004 « Limites connues » | Code : **oui**, **fusionné dans `main` le 24 novembre 2026 (Helios 6.0.0, Orion 7.0.0)** ; reste le premier passage de `reproducible.yml` |
 
 Le choix est fait : `trim-paths` n'est stable ni en Rust 1.99 ni en 1.100, le
 bundle utilise `--remap-path-prefix`.
@@ -209,7 +209,7 @@ Faisable maintenant (sans matériel)
   outillage headless Orion · T2 · T4 compilation · T5 · T6 mesure
   D1, D6 à D8 arbitrages (D5 tranché le 21 novembre 2026)
   F14 Orion seul binaire client (enrôlement v5 d'abord), après F11
-  F15 reproductible : implémenté sur `feat/f15-reproducible-bundle`, reste le premier passage de `reproducible.yml` après la fusion (ou sur une pull request qui touche ses chemins)
+  F15 reproductible : fusionné le 24 novembre 2026, reste le premier passage de `reproducible.yml`
 
 Faisable en code, validation sur cible à planifier
   F5 (fusionné, recette TPM « Q. F5 ») · F7 (fusionné, recette Windows « P. F7 ») · F12 libsecret · F13 NSIS

@@ -78,6 +78,8 @@ pub enum RecoveryRefusalView {
     RequestMismatch,
     FrameMalformed,
     RequestMalformed,
+    /// Only built where the ceremony does not run.
+    #[cfg_attr(windows, allow(dead_code))]
     PlatformUnsupported,
 }
 
