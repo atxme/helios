@@ -54,32 +54,48 @@ pub(crate) fn init_key_negotiation(
 /// a script that has to parse JSON over SSH parses it with `sed`, and a `sed`
 /// pattern over a certificate is a defect waiting for a field to move.
 pub(crate) fn show_identity() -> anyhow::Result<()> {
-    if let Some(served) = key_negotiation::served_identity()? {
-        println!("server_name={}", served.pq_certificate.subject);
-        println!(
-            "wireguard_public_key={}",
-            served.pq_certificate.wireguard_public_key
-        );
-        println!(
-            "pq_certificate_not_after={}",
-            served.pq_certificate.not_after_unix
-        );
-    } else if let Some(request) = key_negotiation::gateway_bootstrap_request()? {
+    let fields = if let Some(served) = key_negotiation::served_identity()? {
+        identity_export_lines(Some(&served.pq_certificate), None)?
+    } else {
+        let request = key_negotiation::gateway_bootstrap_request()?;
+        identity_export_lines(None, request.as_ref())?
+    };
+    for field in fields {
+        println!("{field}");
+    }
+    Ok(())
+}
+
+/// Builds the stable key/value export consumed by the deployment script.
+/// The file reads stay at the command boundary; this keeps formatting
+/// testable with identities loaded from an isolated fixture directory.
+pub(crate) fn identity_export_lines(
+    served: Option<&aether::key_negotiation::PqCertificate>,
+    request: Option<&aether::certificates::gateway::GatewayBootstrapRequest>,
+) -> anyhow::Result<Vec<String>> {
+    if let Some(served) = served {
+        return Ok(vec![
+            format!("server_name={}", served.subject),
+            format!("wireguard_public_key={}", served.wireguard_public_key),
+            format!("pq_certificate_not_after={}", served.not_after_unix),
+        ]);
+    }
+    if let Some(request) = request {
         request
             .verify()
             .context("verifying the gateway bootstrap request")?;
-        println!("server_name={}", request.server_name);
-        println!(
-            "wireguard_public_key={}",
-            request.gateway_wg_public_key.to_base64()
-        );
-        println!("bootstrap_request_fingerprint={}", request.fingerprint());
-    } else {
-        anyhow::bail!(
-            "this gateway has no key-negotiation identity: run `heliosd init-key-negotiation`"
-        );
+        return Ok(vec![
+            format!("server_name={}", request.server_name),
+            format!(
+                "wireguard_public_key={}",
+                request.gateway_wg_public_key.to_base64()
+            ),
+            format!("bootstrap_request_fingerprint={}", request.fingerprint()),
+        ]);
     }
-    Ok(())
+    anyhow::bail!(
+        "this gateway has no key-negotiation identity: run `heliosd init-key-negotiation`"
+    )
 }
 
 /// Creates the gateway's end of the private Astra channel (spec §8.3).

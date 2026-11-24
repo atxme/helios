@@ -764,6 +764,76 @@ fn bootstrap_request_distinguishes_absence_from_invalid_or_unreadable_data() {
 }
 
 #[test]
+fn served_identity_fixture_drives_the_cli_export_and_absence_or_corruption_refuses() {
+    let directory = tempfile::tempdir().unwrap();
+    let tls_path = directory.path().join("gateway.der");
+    let pq_path = directory.path().join("pq.json");
+    let ca_path = directory.path().join("client-ca.der");
+
+    assert!(read_served_identity(&tls_path, &pq_path, &ca_path)
+        .unwrap()
+        .is_none());
+    let absent = crate::commands::identity::identity_export_lines(None, None).unwrap_err();
+    assert!(format!("{absent:#}").contains("run `heliosd init-key-negotiation`"));
+
+    let (request, _, _, ca_private, now) = bootstrap_fixture();
+    let leaf = bootstrap_leaf(
+        &request,
+        request.ml_dsa_87_public_key.as_bytes(),
+        &ca_private,
+        now - 1,
+        now + 3_600,
+    );
+    let tls = rcgen::generate_simple_self_signed(vec![request.server_name.clone()]).unwrap();
+    let ca = rcgen::generate_simple_self_signed(vec!["client-ca.example".into()]).unwrap();
+    std::fs::write(&tls_path, tls.cert.der()).unwrap();
+    std::fs::write(&pq_path, serde_json::to_vec(&leaf).unwrap()).unwrap();
+    std::fs::write(&ca_path, ca.cert.der()).unwrap();
+
+    let served = read_served_identity(&tls_path, &pq_path, &ca_path)
+        .unwrap()
+        .expect("complete fixture loads as the served identity");
+    let fields =
+        crate::commands::identity::identity_export_lines(Some(&served.pq_certificate), None)
+            .unwrap();
+    assert_eq!(
+        fields,
+        [
+            format!("server_name={}", request.server_name),
+            format!(
+                "wireguard_public_key={}",
+                request.gateway_wg_public_key.to_base64()
+            ),
+            format!("pq_certificate_not_after={}", now + 3_600),
+        ]
+    );
+
+    std::fs::write(&pq_path, b"not a certificate").unwrap();
+    let error = read_served_identity(&tls_path, &pq_path, &ca_path)
+        .err()
+        .expect("corrupt served leaf is refused");
+    assert!(format!("{error:#}").contains("pq.json"));
+}
+
+#[test]
+fn identity_export_falls_back_to_a_proven_bootstrap_request() {
+    let (request, _, _, _, _) = bootstrap_fixture();
+    let fields = crate::commands::identity::identity_export_lines(None, Some(&request)).unwrap();
+    assert_eq!(fields[0], format!("server_name={}", request.server_name));
+    assert_eq!(
+        fields[1],
+        format!(
+            "wireguard_public_key={}",
+            request.gateway_wg_public_key.to_base64()
+        )
+    );
+    assert_eq!(
+        fields[2],
+        format!("bootstrap_request_fingerprint={}", request.fingerprint())
+    );
+}
+
+#[test]
 fn served_identity_reports_which_public_artifact_is_invalid() {
     let directory = tempfile::tempdir().unwrap();
     let tls_path = directory.path().join("gateway.der");
