@@ -274,6 +274,93 @@ impl Domain {
         Self::with_primary_opening(label, |salt| fixture_opening(1, salt))
     }
 
+    /// An authority created through Astra's real initialization and CA-TLS
+    /// issuance paths, for exercising enrollment leaf issuance end to end.
+    fn new_with_real_authority(label: &str) -> Self {
+        use aether::certificates::encoding::{TrustDomainId, WireGuardKey};
+        use astra_operator::gestures::{create_authority, NewAuthority};
+        use astra_operator::signing::{self, DomainIdentity};
+        use astra_operator::vault::SlotRole;
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let directory = std::env::temp_dir().join(format!(
+            "orion-real-authority-{label}-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("directory");
+        let id = TrustDomainId::new([3; 16]).expect("domain");
+        let key = astra_operator::operations::fixtures::TestKey::new(1);
+        let created = create_authority(
+            &key,
+            &NewAuthority {
+                rp_id: "astra.example".into(),
+                trust_domain_id: id,
+                label: "quotidienne".into(),
+                role: SlotRole::Primary,
+            },
+            "",
+            now_unix(),
+        )
+        .expect("create genuine authority");
+        let gateway_key = aether::wg::generate_keypair()
+            .expect("gateway key")
+            .public_key;
+        let tls_ca = signing::issue_ca_tls(
+            &created.vault,
+            &created.opening,
+            &DomainIdentity {
+                trust_domain_id: id,
+                gateway_wg_public_key: WireGuardKey::parse(&gateway_key).expect("gateway key"),
+                server_name: SERVER_NAME.into(),
+                ca_epoch: 1,
+                ca_tls_epoch: 1,
+            },
+            now_unix().saturating_sub(600),
+            now_unix() + 365 * 86_400,
+        )
+        .expect("issue genuine CA-TLS");
+        let vault_path = directory.join("astra").join("authority-vault.json");
+        astra_operator::store::save(&vault_path, &created.vault).expect("save vault");
+        let secrets = created
+            .vault
+            .open(&created.opening.credential_id, &created.opening.secret)
+            .expect("open created vault");
+        let ca_private_key = zeroize::Zeroizing::new(
+            STANDARD
+                .decode(&secrets.ca_pq_private_key)
+                .expect("decode CA-PQ key"),
+        );
+        let ca_public_key = created.ca_pq_public_key;
+        let (_, service_public) =
+            aether::certificates::encoding::generate_ml_dsa_87_keypair().expect("service key");
+        let service_key = service_public.to_base64();
+        let mut relay = astra_operator::handoff::DomainHandoff::of(&created.vault).expect("relay");
+        relay.gateway_wg_public_key = Some(gateway_key.clone());
+        relay.server_name = Some(SERVER_NAME.into());
+        relay.ca_epoch = Some(1);
+        relay.ca_tls_epoch = Some(1);
+        relay.ca_tls_certificate = Some(tls_ca.to_base64());
+        relay.astra_service_public_key = Some(service_key.clone());
+        relay.astra_service_key_epoch = Some(1);
+        relay.astra_authority_url = Some(AUTHORITY_URL.into());
+        astra_operator::handoff::save(&astra_operator::handoff::path_beside(&vault_path), &relay)
+            .expect("save relay");
+        let mut domain = Self {
+            registry: InvitationRegistry::at(directory.join("registry")),
+            directory,
+            vault_path,
+            ca_private_key,
+            ca_public_key,
+            gateway_key,
+            gateway_leaf: String::new(),
+            service_key,
+        };
+        domain.gateway_leaf = domain.leaf(SERVER_NAME, &domain.gateway_key.clone());
+        domain
+    }
+
     fn with_primary_opening(
         label: &str,
         open_primary: impl FnOnce(&[u8; 32]) -> astra_operator::authenticator::Opened,
@@ -2035,6 +2122,106 @@ fn offline_fixture(label: &str) -> (Domain, Id16, String) {
     let (enrolment, accepted) = kept_acceptance(&domain, "laptop");
     let device = accepted.request.client_wg_public_key.to_base64();
     (domain, enrolment.invitation.invitation_id, device)
+}
+
+/// Accept issues genuine client leaves from the vault's CA-TLS and CA-PQ,
+/// keeps them, and an offline resume signs the profile without changing that
+/// issuance record.
+#[test]
+fn real_acceptance_issues_leaves_then_offline_resume_preserves_them() {
+    let domain = Domain::new_with_real_authority("real-accept-resume");
+    let enrolment = domain.enrolment("laptop", true);
+    let request_text = aether::key_negotiation::encode_request_file(&enrolment.request);
+    let (outcome, statuses, artifacts, touched) = enrollment_with_keys(
+        &domain,
+        EnrollmentGesture::Accept {
+            request: request_text,
+            validity_days: 30,
+            endpoint: "198.51.100.7:51820".into(),
+            allowed_ips: None,
+            ssh_target: None,
+        },
+        &[1],
+    );
+    outcome.expect_err("acceptance keeps its issued leaves before offline delivery");
+    assert_eq!(touched, [1]);
+    assert_eq!(
+        statuses.last().expect("terminal status").refusal,
+        Some(Refusal::GatewayUnavailable)
+    );
+
+    let id = enrolment.invitation.invitation_id;
+    let accepted = domain
+        .registry
+        .accepted(&id)
+        .expect("readable")
+        .expect("acceptance leaves were kept");
+    assert_eq!(accepted.request, enrolment.request);
+    let relay = domain.relay();
+    let ca_tls = DerCertificate::parse(
+        relay
+            .ca_tls_certificate
+            .as_deref()
+            .expect("CA-TLS in relay"),
+    )
+    .expect("CA-TLS DER");
+    aether::certificates::x509::assert_certificate_authority(&ca_tls).expect("real CA-TLS");
+    aether::certificates::x509::assert_issued_by(&accepted.tls_certificate, &ca_tls)
+        .expect("TLS leaf signed by the vault's CA-TLS");
+    aether::certificates::x509::assert_client_leaf(
+        &accepted.tls_certificate,
+        now_unix().saturating_sub(60),
+        now_unix() + 86_400,
+    )
+    .expect("client-auth TLS leaf");
+    accepted
+        .pq_certificate
+        .verify(
+            domain.ca_public_key.as_bytes(),
+            aether::key_negotiation::PqCertificateRole::Client,
+            None,
+            &accepted.request.client_wg_public_key.to_base64(),
+            now_unix(),
+        )
+        .expect("PQ leaf signed by the vault's CA-PQ");
+    assert_eq!(
+        artifacts.len(),
+        3,
+        "the stopped delivery hands out the leaves"
+    );
+
+    let before_resume = registry_snapshot(&domain, &id);
+    let device = accepted.request.client_wg_public_key.to_base64();
+    let export = export_text(&domain, &device, |_| {});
+    let (outcome, resume_statuses, artifacts, touched) = enrollment_with_keys(
+        &domain,
+        EnrollmentGesture::Resume {
+            invitation_id: id,
+            endpoint: "198.51.100.7:51820".into(),
+            allowed_ips: Some("10.0.0.0/24".into()),
+            ssh_target: None,
+            enrolment_export: Some(export),
+        },
+        &[1],
+    );
+    outcome.expect("offline resumption signs the profile");
+    assert_eq!(touched, [1]);
+    let [artifact] = artifacts.as_slice() else {
+        panic!("offline resume should deliver one signed profile");
+    };
+    let document = aether::key_negotiation::EnrollmentDocument::parse(&artifact.contents)
+        .expect("signed document");
+    document
+        .verify(&domain.ca_public_key)
+        .expect("document signed by the vault's CA-PQ");
+    assert_eq!(document.invitation_id, id);
+    assert_eq!(document.request_id, accepted.request.request_id);
+    assert_eq!(document.client_tls_certificate, accepted.tls_certificate);
+    assert_eq!(
+        resume_statuses.last().expect("completion").gesture,
+        GestureState::Done
+    );
+    assert_eq!(registry_snapshot(&domain, &id), before_resume);
 }
 
 /// A resumption with no gateway connected, reading `export`.

@@ -392,3 +392,130 @@ fn the_tunnel_socket_is_bound_to_the_given_source() {
         std::net::Ipv4Addr::LOCALHOST
     );
 }
+struct ReleaseIdentity {
+    certificate: Vec<u8>,
+    private_key: zeroize::Zeroizing<Vec<u8>>,
+}
+
+#[async_trait::async_trait]
+impl super::IdentityProvider for ReleaseIdentity {
+    async fn load(&self, identity: &str) -> anyhow::Result<super::ClientIdentity> {
+        anyhow::ensure!(identity == "orion-poste", "no identity for {identity}");
+        Ok(super::ClientIdentity {
+            certificate_chain: Vec::new(),
+            private_key: Vec::new(),
+            pq_certificate: self.certificate.clone(),
+            pq_private_key: self.private_key.to_vec(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn release_signs_the_installed_transaction_with_the_profile_identity() {
+    use aether::certificates::encoding::generate_ml_dsa_87_keypair;
+    use aether::key_negotiation::{issue_pq_certificate, AuthenticatedPskRelease};
+    use tokio::io::{AsyncBufReadExt as _, BufReader};
+
+    let mut profile = renewal_profile();
+    let client = aether::wg::generate_keypair().unwrap();
+    profile.private_key = client.private_key;
+    profile.peer_public_key = aether::wg::generate_keypair().unwrap().public_key;
+    profile.allowed_ips = "127.0.0.1/32".into();
+
+    let (issuer_private, issuer_public) = generate_ml_dsa_87_keypair().unwrap();
+    let (client_private, client_public) = generate_ml_dsa_87_keypair().unwrap();
+    let mut leaf = signed_release().certificate;
+    leaf.wireguard_public_key = client.public_key.clone();
+    leaf.ml_dsa_87_public_key = client_public.to_base64();
+    leaf.not_before_unix = 100;
+    leaf.not_after_unix = 300;
+    let certificate = issue_pq_certificate(leaf, &issuer_private).unwrap();
+    let identity = ReleaseIdentity {
+        certificate: serde_json::to_vec(&certificate).unwrap(),
+        private_key: client_private,
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    profile.heliosd_url = Some(format!("http://{}", listener.local_addr().unwrap()));
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut http = BufReader::new(stream);
+        let mut line = String::new();
+        http.read_line(&mut line).await.unwrap();
+        assert_eq!(line, "POST /api/key-negotiation/release HTTP/1.1\r\n");
+        let mut content_length = None;
+        loop {
+            line.clear();
+            assert_ne!(http.read_line(&mut line).await.unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+        }
+        let length = content_length.expect("JSON request has a Content-Length");
+        assert!(length < 64 * 1024);
+        let mut body = vec![0u8; length];
+        http.read_exact(&mut body).await.unwrap();
+        let request = serde_json::from_slice::<AuthenticatedPskRelease>(&body).unwrap();
+        http.get_mut()
+            .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        request
+    });
+
+    let installed = [9; KEY_NEGOTIATION_NONCE_LEN];
+    super::release_for_profile(&profile, &identity, installed)
+        .await
+        .expect("gateway acknowledges the tunneled release");
+    let request = server.await.unwrap();
+    request
+        .verify(
+            issuer_public.as_bytes(),
+            &certificate.fingerprint().unwrap(),
+            200,
+        )
+        .expect("gateway verifies the signature against the admitted client leaf");
+    assert_eq!(request.release.installed_transaction_id, installed);
+    assert_eq!(request.release.client_wg_public_key, client.public_key);
+    assert_eq!(
+        request.release.gateway_wg_public_key,
+        profile.peer_public_key
+    );
+}
+
+#[tokio::test]
+async fn release_keeps_missing_profile_settings_and_identity_errors_local() {
+    let installed = [9; KEY_NEGOTIATION_NONCE_LEN];
+    let mut profile = renewal_profile();
+    profile.key_negotiation = None;
+    let error = super::release_for_profile(&profile, &NeverReadIdentity, installed)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("no key-negotiation settings"));
+
+    let mut profile = renewal_profile();
+    profile.heliosd_url = None;
+    let error = super::release_for_profile(&profile, &NeverReadIdentity, installed)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("no internal Helios URL"));
+
+    let mut profile = renewal_profile();
+    profile.private_key = aether::wg::generate_keypair().unwrap().private_key;
+    profile.key_negotiation.as_mut().unwrap().identity = "missing".into();
+    let identity = ReleaseIdentity {
+        certificate: Vec::new(),
+        private_key: zeroize::Zeroizing::new(Vec::new()),
+    };
+    let error = super::release_for_profile(&profile, &identity, installed)
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("loading key-negotiation identity missing"));
+}
