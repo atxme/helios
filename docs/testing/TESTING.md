@@ -24,6 +24,10 @@ construit hors du graphe Cargo ; les tests natifs d'`orion-core` accompagnent
 toute compilation du client Windows.
 Les interfaces sont testées et construites quand leurs sources changent ; la
 console gateway est aussi construite quand les tests Rust doivent l'embarquer.
+**Une poussée vers `main` ne relance ni Rust Linux ni les interfaces** :
+`scripts/regression.sh` les couvre et se joue avant la fusion. Elle garde Windows,
+l'audit, le contrôle des versions, le format et les tests des scripts. Les pull
+requests et le déclenchement manuel gardent tous les contrôles.
 Les audits se déclenchent sur modification des lockfiles. Cargo utilise deux
 jobs au plus, sans compilation incrémentale ni informations de débogage Rust.
 
