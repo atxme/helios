@@ -1239,3 +1239,244 @@ fn gateway_identity_publish_rejects_a_bad_fingerprint() {
         );
     }
 }
+
+/// `init-channel` is an operator command with its own persisted identity pair:
+/// re-running it reuses the same pin, and rotation changes both endpoints.
+#[test]
+fn init_channel_cli_reuses_and_rotates_the_transport_pair() {
+    use astra::gateway::{
+        AUTHORITY_CERTIFICATE_FILE, AUTHORITY_KEY_FILE, CHANNEL_CERTIFICATE_FILE, CHANNEL_KEY_FILE,
+    };
+
+    fn fingerprints(output: &Output) -> (String, String) {
+        assert!(
+            output.status.success(),
+            "init-channel failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let printed = String::from_utf8_lossy(&output.stdout);
+        let value = |name: &str| {
+            printed
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}=")))
+                .expect("printed identity field")
+                .to_string()
+        };
+        (
+            value("astra_channel_fingerprint"),
+            value("astra_authority_fingerprint"),
+        )
+    }
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let first = fingerprints(&astra(directory.path(), &["init-channel"]));
+    assert!(directory.path().join(CHANNEL_CERTIFICATE_FILE).exists());
+    assert!(directory.path().join(CHANNEL_KEY_FILE).exists());
+    assert!(directory.path().join(AUTHORITY_CERTIFICATE_FILE).exists());
+    assert!(directory.path().join(AUTHORITY_KEY_FILE).exists());
+
+    assert_eq!(
+        fingerprints(&astra(directory.path(), &["init-channel"])),
+        first,
+        "ordinary setup is idempotent"
+    );
+    let rotated = fingerprints(&astra(directory.path(), &["init-channel", "--rotate"]));
+    assert_ne!(rotated.0, first.0, "the client pin rotated");
+    assert_ne!(rotated.1, first.1, "the authority pin rotated");
+}
+
+/// The two private channel directions each require a complete local pinning
+/// pair. `astra run` refuses an incomplete topology before opening its socket.
+#[test]
+fn run_refuses_half_configured_private_channel_topologies() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    assert!(bootstrap(directory.path(), &ca_public_key())
+        .status
+        .success());
+    let before = snapshot(directory.path());
+
+    let gateway_channel = astra(
+        directory.path(),
+        &[
+            "run",
+            "--bind",
+            "127.0.0.1:0",
+            "--gateway-channel",
+            "192.0.2.2:8443",
+        ],
+    );
+    assert!(!gateway_channel.status.success());
+    assert!(
+        String::from_utf8_lossy(&gateway_channel.stderr)
+            .contains("the private gateway channel needs both its address and the gateway's pinned certificate"),
+        "{}",
+        String::from_utf8_lossy(&gateway_channel.stderr)
+    );
+    assert_eq!(snapshot(directory.path()), before);
+    assert!(!directory
+        .path()
+        .join(astra::door::DOOR_SOCKET_FILE)
+        .exists());
+
+    let private_listener = astra(
+        directory.path(),
+        &[
+            "run",
+            "--bind",
+            "127.0.0.1:0",
+            "--private-bind",
+            "192.0.2.1:8444",
+        ],
+    );
+    assert!(!private_listener.status.success());
+    assert!(
+        String::from_utf8_lossy(&private_listener.stderr)
+            .contains("the private renewal listener needs both its bind address and the gateway's"),
+        "{}",
+        String::from_utf8_lossy(&private_listener.stderr)
+    );
+    assert_eq!(snapshot(directory.path()), before);
+    assert!(!directory
+        .path()
+        .join(astra::door::DOOR_SOCKET_FILE)
+        .exists());
+}
+
+/// Exercise the chain command family through separate binary invocations:
+/// open persists its issuer step, status reads it, next refuses to skip an
+/// unapplied step, and abandon removes the plan without discarding its audit.
+#[test]
+fn chain_cli_drives_a_persisted_step_and_refuses_to_skip_it() {
+    use aether::certificates::status::CampaignScope;
+    use astra::chain::{ChainPlan, CHAIN_PLAN_FILE};
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    assert!(bootstrap(directory.path(), &ca_public_key())
+        .status
+        .success());
+    copy_a_vault(directory.path());
+    let service = RunningService::start(directory.path());
+    let request_out = directory.path().join("delegation-request.json");
+    let request_out_arg = request_out.to_str().expect("UTF-8 path");
+
+    let opened = astra(
+        directory.path(),
+        &[
+            "chain",
+            "open",
+            "--reason",
+            "annual certificate chain",
+            "--requested-by",
+            "alice",
+            "--issuer-request-out",
+            request_out_arg,
+        ],
+    );
+    assert!(
+        opened.status.success(),
+        "chain open failed: {} — service: {}",
+        String::from_utf8_lossy(&opened.stderr),
+        service.log()
+    );
+    let request: serde_json::Value =
+        serde_json::from_slice(&opened.stdout).expect("issuer request");
+    assert_eq!(request["issuer_epoch"], 1);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(&request_out).expect("request file")
+        )
+        .expect("request file JSON"),
+        request,
+        "--issuer-request-out captures the public request"
+    );
+
+    let plan_path = directory.path().join(CHAIN_PLAN_FILE);
+    let first_plan_bytes = std::fs::read(&plan_path).expect("persisted chain plan");
+    let plan: ChainPlan = serde_json::from_slice(&first_plan_bytes).expect("valid plan");
+    assert_eq!(plan.current, 0);
+    assert_eq!(plan.remaining(), 4);
+    assert_eq!(plan.steps[0].scope, CampaignScope::IssuerDelegation);
+    assert!(plan.steps[0].operation_id.is_some());
+
+    let status = astra(directory.path(), &["chain", "status"]);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(String::from_utf8_lossy(&status.stderr).contains("issuer_delegation"));
+    assert!(String::from_utf8_lossy(&status.stderr).contains("l'époque 0"));
+
+    let duplicate = astra(
+        directory.path(),
+        &[
+            "chain",
+            "open",
+            "--reason",
+            "another chain",
+            "--requested-by",
+            "alice",
+        ],
+    );
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr)
+        .contains("chaîne de certificats est déjà ouverte"));
+    assert_eq!(
+        std::fs::read(&plan_path).expect("plan unchanged"),
+        first_plan_bytes
+    );
+
+    let next = astra(directory.path(), &["chain", "next"]);
+    assert!(!next.status.success());
+    assert!(String::from_utf8_lossy(&next.stderr).contains("Approuver cette étape avant d'avancer"));
+    assert_eq!(
+        std::fs::read(&plan_path).expect("plan unchanged"),
+        first_plan_bytes
+    );
+
+    let abandoned = astra(directory.path(), &["chain", "abandon"]);
+    assert!(
+        abandoned.status.success(),
+        "chain abandon failed: {} — service: {}",
+        String::from_utf8_lossy(&abandoned.stderr),
+        service.log()
+    );
+    assert!(
+        !plan_path.exists(),
+        "abandon removes only the persisted plan"
+    );
+    assert!(String::from_utf8_lossy(&abandoned.stderr).contains("abandonnée après 0 étape(s)"));
+}
+
+/// A delegation ceremony needs the operator's encrypted vault. The refusal
+/// precedes key generation and leaves no half-prepared issuer material.
+#[test]
+fn chain_open_without_a_vault_refuses_before_preparing_issuer_keys() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    assert!(bootstrap(directory.path(), &ca_public_key())
+        .status
+        .success());
+    let service = RunningService::start(directory.path());
+
+    let output = astra(
+        directory.path(),
+        &[
+            "chain",
+            "open",
+            "--reason",
+            "annual certificate chain",
+            "--requested-by",
+            "alice",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("aucun coffre chiffré"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!directory.path().join(CHAIN_PLAN_FILE).exists());
+    assert!(!directory.path().join("issuer-pq-key-1.bin").exists());
+    assert!(!directory.path().join("issuer-tls-key-1.der").exists());
+    assert!(service.log().contains("no encrypted vault"));
+}

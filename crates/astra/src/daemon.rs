@@ -1466,4 +1466,47 @@ mod tests {
         );
         assert_eq!(ledger.revocations(), 1);
     }
+
+    #[test]
+    fn an_absent_encrypted_vault_is_a_supported_startup_state() {
+        let directory = tempfile::tempdir().expect("temp dir");
+
+        let vault = load_encrypted_vault(directory.path()).expect("optional vault");
+
+        assert_eq!(vault, None);
+    }
+
+    #[test]
+    fn an_encrypted_vault_is_held_as_opaque_bytes() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let expected = [0x48, 0x56, 0x4c, 0x54, 0, 0xff, 0x01];
+        std::fs::write(directory.path().join(VAULT_FILE), expected).expect("vault file");
+
+        let vault = load_encrypted_vault(directory.path()).expect("bounded vault");
+
+        assert_eq!(vault.as_deref(), Some(expected.as_slice()));
+    }
+
+    #[test]
+    fn an_oversized_encrypted_vault_is_refused_before_contents_are_read() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join(VAULT_FILE);
+        let file = std::fs::File::create(&path).expect("vault file");
+        file.set_len(MAX_VAULT_BYTES + 1).expect("sparse file");
+
+        let error =
+            load_encrypted_vault(directory.path()).expect_err("oversized vault must fail closed");
+
+        assert!(error.to_string().contains("over the 4194304-byte ceiling"));
+    }
+
+    #[test]
+    fn a_vault_path_that_is_not_a_file_reports_the_read_failure() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir(directory.path().join(VAULT_FILE)).expect("vault directory");
+
+        let error = load_encrypted_vault(directory.path()).expect_err("directory is not a vault");
+
+        assert!(error.to_string().contains("reading"));
+    }
 }
