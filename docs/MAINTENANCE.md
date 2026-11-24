@@ -358,10 +358,10 @@ cargo xtask verify --bundle <répertoire signé ou archive .tar.gz> --keyring <t
   ou l'archive `.tar.gz` produite par `cargo xtask pack`.
 * `--keyring` est le trousseau **public** de l'éditeur. Un trousseau qui
   contiendrait une clé privée ne doit pas servir. C'est aussi une entrée du
-  build : il doit être le trousseau public compilé dans le bundle publié
-  (archiver le trousseau public de chaque époque à la publication). Un autre
-  trousseau, même s'il vérifie encore la signature, ne change que les
-  binaires.
+  build : il doit être le trousseau public compilé dans le bundle publié.
+  Les trousseaux des époques passées ne sont pas archivés : un bundle dont le
+  trousseau n'est plus disponible ne peut plus être vérifié. Un autre trousseau,
+  même s'il vérifie encore la signature, ne change que les binaires.
 * La signature du manifeste est vérifiée en premier. Un manifeste non signé ou
   mal signé est refusé avant tout build.
 * La comparaison porte sur les fichiers du bundle, `manifest.json` exclu.

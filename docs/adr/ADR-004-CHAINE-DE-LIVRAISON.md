@@ -266,8 +266,8 @@ dépôt. La commande de signature Tauri impose un horodatage RFC 3161 avec
   verify` reconstruit le commit nommé dans le conteneur de build figé et compare
   fichier à fichier. Le bundle gateway est donc reconstructible par un tiers.
   Le trousseau public donné à `verify` doit être celui compilé dans le bundle
-  publié (à archiver à chaque époque) : un autre ne donne des différences que
-  sur les binaires.
+  publié : un autre ne donne des différences que sur les binaires. Les
+  trousseaux des époques passées ne sont pas archivés.
   Ce qui n’est **pas** promis :
   * l’archive `.tar.gz` signée d’une publication à l’autre : la comparaison
     porte sur les fichiers du bundle, hors `manifest.json`, dont la signature et
