@@ -46,7 +46,7 @@ pub use config::{
 };
 pub use error::{HeliosError, Result};
 pub use events::{HeliosEvent, InstallPskRequest, ObserveHandshakeRequest, OrchestratorCmd};
-pub use policy::{FirewallPolicy, NordvpnMeshnetPolicy, PolicyMode};
+pub use policy::{FirewallPolicy, LocalService, NordvpnMeshnetPolicy, PolicyMode};
 pub use pq::{Kem, MlKem1024Kem, PqError, SharedSecret};
 pub use secret::SecretString;
 pub use speedtest::{DEFAULT_WG_SPEEDTEST_ADDR, SPEEDTEST_PORT};

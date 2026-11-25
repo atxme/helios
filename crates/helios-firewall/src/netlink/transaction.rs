@@ -341,6 +341,7 @@ mod tests {
             mss_clamp: None,
             captive_portal_gateway: None,
             nordvpn_meshnet: None,
+            local_services: vec![],
         }
     }
 
@@ -510,6 +511,38 @@ mod tests {
             assert_eq!(guards(&ipv6_guard), 2, "source and destination: {rule}");
             assert_eq!(guards(&ipv4_guard()), 0, "{rule}");
         }
+    }
+
+    /// All four coordinates of a local service reach the kernel: a match lost
+    /// in translation would leave a wider opening than the rule displays.
+    #[test]
+    fn a_local_service_translates_with_its_four_coordinates() {
+        let mut policy = client_internet_policy();
+        policy.local_services = vec![aether::LocalService {
+            name: "vault".into(),
+            iface: "vault0".into(),
+            host: std::net::Ipv4Addr::new(10, 88, 7, 17),
+            peer: std::net::Ipv4Addr::new(10, 88, 7, 18),
+            port: 9443,
+        }];
+        let rs = render(&policy, TunnelState::Down).expect("valid test policy");
+        assert!(NetlinkBackend::new().build_batch(&rs).is_ok());
+
+        let rule = rs
+            .chain(ChainKind::Output)
+            .find(|rule| rule.matches.contains(&Match::OutIface("vault0".into())))
+            .expect("the service rule");
+        let output = chain(ChainKind::Output.as_str());
+        let nf = NetlinkBackend::filter_rule(&output, &rule.matches, rule)
+            .expect("the service rule translates");
+        let expected = NfRule::default()
+            .oiface("vault0")
+            .expect("valid interface name")
+            .saddr(network("10.88.7.17").ip())
+            .daddr(network("10.88.7.18").ip())
+            .dport(9443, rustables::Protocol::TCP)
+            .accept();
+        assert_eq!(expressions(&nf), expressions(&expected));
     }
 
     #[test]

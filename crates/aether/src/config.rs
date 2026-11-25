@@ -12,8 +12,10 @@ use crate::error::{HeliosError, Result};
 use crate::net::{
     format_vip_v6, parse_vip_v4, parse_vip_v6, AddressError, PeerVips, TunnelPrefixV6,
 };
-use crate::policy::{FirewallPolicy, NordvpnMeshnetPolicy, PolicyMode};
+use crate::policy::{FirewallPolicy, LocalService, NordvpnMeshnetPolicy, PolicyMode};
 use crate::speedtest::SPEEDTEST_PORT;
+
+mod local_services;
 
 const NETWORK_CONFIG_PATH: &str = "/var/lib/helios/network.toml";
 
@@ -257,6 +259,13 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub nordvpn_meshnet: Option<NordvpnMeshnetConfig>,
 
+    /// Operator services on local bridges that the gateway itself may reach.
+    ///
+    /// Empty by default. See [`LocalService`] for the little it can open, and
+    /// [`Self::validate`] for what it refuses.
+    #[serde(default)]
+    pub local_services: Vec<LocalService>,
+
     // ── WireGuard data plane (server role) ──────────────────────────────
     /// Name of the WireGuard interface created by the gateway.
     #[serde(default = "default_wg_iface")]
@@ -493,6 +502,10 @@ struct PersistedNetworkConfig<'a> {
     admin_iface: &'a Option<String>,
     split_tunnel_cidrs: &'a [String],
     nordvpn_meshnet: Option<PersistedNordvpnMeshnetConfig<'a>>,
+    /// Written only when present, so a file that never set it comes back
+    /// byte for byte.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    local_services: &'a [LocalService],
     wg_iface: &'a str,
     wg_private_key: &'a str,
     wg_address: &'a str,
@@ -564,6 +577,7 @@ impl<'a> PersistedNetworkConfig<'a> {
                     allow_icmp: meshnet.allow_icmp,
                 }
             }),
+            local_services: &config.local_services,
             wg_iface: &config.wg_iface,
             // The one place the identity may legitimately reach a
             // serializer, and only under the two named exceptions. Every
@@ -893,6 +907,7 @@ impl NetworkConfig {
             admin_iface: self.admin_iface.clone(),
             split_tunnel_cidrs: self.split_tunnel_cidrs.clone(),
             nordvpn_meshnet: self.nordvpn_meshnet.clone(),
+            local_services: self.local_services.clone(),
             wg_iface: self.wg_iface.clone(),
             wg_private_key: self.wg_private_key.duplicate(),
             wg_address: self.wg_address.clone(),
@@ -1158,6 +1173,7 @@ impl NetworkConfig {
     pub fn validate(&self) -> Result<()> {
         self.validate_peer_identities()?;
         self.validate_peer_vips_v6()?;
+        self.validate_local_services()?;
         if let Some(servers) = &self.client_dns {
             crate::client_dns::validate_resolvers(servers)
                 .map_err(|error| HeliosError::Config(format!("client_dns: {error}")))?;
@@ -1563,6 +1579,7 @@ impl NetworkConfig {
             mss_clamp: None,
             captive_portal_gateway: None,
             nordvpn_meshnet: self.nordvpn_meshnet.as_ref().map(Into::into),
+            local_services: self.local_services.clone(),
         }
     }
 }

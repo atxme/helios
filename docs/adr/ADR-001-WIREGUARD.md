@@ -735,6 +735,40 @@ fail-closed de la passerelle et le format du profil `.orion`. Restent hors de
 périmètre : le DNS sur IPv6, DoH/DoT, un résolveur sur la passerelle et le split
 DNS par domaine.
 
+## Amendement du 25 novembre 2026 — services locaux de l'opérateur
+
+Un opérateur peut faire tourner sur la gateway un service qui n'appartient pas
+à Helios, dans un conteneur sur un pont Docker dédié. Sous `output` en `drop`,
+l'hôte ne peut pas le joindre : jusqu'ici, seuls les ponts d'Astra avaient des
+règles, et elles sont fixes.
+
+**Décision.** `network.toml` accepte une liste `[[local_services]]`, absente par
+défaut. Chaque entrée produit une règle `output` et une seule, à quatre
+coordonnées : interface, adresse de l'hôte, adresse du service, port TCP. Le
+type ne sait exprimer ni entrée, ni traversée, ni NAT, ni autre protocole.
+
+- **Tous les états du tunnel.** Ce trafic ne quitte pas la machine ; le
+  kill-switch, qui protège ce que la gateway relaie, n'a rien à y protéger.
+- **Le conteneur ne gagne rien.** Il n'ouvre aucune connexion vers l'hôte, et
+  `forward` reste fermé ; les réponses passent par `established`.
+- **Refus au chargement**, jamais de correction : clé inconnue, plus de quatre
+  services, doublon de nom, d'interface ou d'adresse et port, interface qui
+  tient déjà un rôle, adresse non RFC 1918, adresse d'Astra (`10.88.7.0/28`) ou
+  du réseau du tunnel, IPv6.
+- **Rechargement à chaud.** Ajouter ou retirer la section s'applique sans
+  redémarrage, dans la transaction atomique habituelle. La retirer est le retour
+  arrière.
+
+Helios ne sait rien du service : il ne l'installe pas, ne le surveille pas et
+n'en connaît que ces quatre coordonnées. Sa publication vers l'extérieur reste
+hors de Helios.
+
+**Limites connues.** IPv6 n'est pas accepté, faute de besoin. Comme
+`nordvpn_meshnet`, la liste est absente de `GET /api/network` : un
+`POST /api/network` dont le corps l'omet la retire. La console ne poste pas
+cette route, et la commande `helios` y envoie le fichier entier de l'opérateur. Un `heliosd` antérieur ignore la section et la retire à sa première
+réécriture du fichier.
+
 ## Conséquences sur le workspace
 
 Chiffres vérifiés contre l'arbre au 2026-07-17.

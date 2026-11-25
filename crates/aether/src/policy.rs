@@ -1,3 +1,5 @@
+use std::net::Ipv4Addr;
+
 use serde::{Deserialize, Serialize};
 
 /// NordVPN Meshnet traffic explicitly admitted alongside the Helios tunnel.
@@ -25,6 +27,28 @@ pub struct NordvpnMeshnetPolicy {
     pub inbound_udp_ports: Vec<u16>,
     /// Answers ICMP arriving from those peers through the Meshnet interface.
     pub allow_icmp: bool,
+}
+
+/// A service the operator runs in a container on the gateway, reached by the
+/// gateway itself over a dedicated bridge.
+///
+/// The type can express one thing only: the host opening a TCP connection to
+/// one address and one port, through one interface. It has no inbound, no
+/// forwarding and no NAT form, so declaring a service never exposes the
+/// gateway, nor the service to anything but the gateway.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalService {
+    /// Label of the rule. Lowercase letters, digits and hyphens.
+    pub name: String,
+    /// Bridge the service lives on, exact name.
+    pub iface: String,
+    /// Gateway's address on that bridge.
+    pub host: Ipv4Addr,
+    /// Service's address on that bridge.
+    pub peer: Ipv4Addr,
+    /// TCP port the service listens on.
+    pub port: u16,
 }
 
 /// Firewall behavior when the tunnel is not operational.
@@ -234,6 +258,12 @@ pub struct FirewallPolicy {
     pub iperf_port: Option<u16>,
     /// Optional NordVPN Meshnet overlay. Absent means no Meshnet opening.
     pub nordvpn_meshnet: Option<NordvpnMeshnetPolicy>,
+    /// Operator services on local bridges, reachable from the gateway only.
+    ///
+    /// Empty by default. Like the Astra openings, they hold in every tunnel
+    /// state: what the gateway says to a container on its own machine never
+    /// crosses the tunnel, so the kill-switch has nothing to protect there.
+    pub local_services: Vec<LocalService>,
 }
 
 impl FirewallPolicy {

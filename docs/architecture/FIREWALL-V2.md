@@ -81,6 +81,7 @@ Les nouveaux concepts structurés sont :
 | `mss_clamp` | policy runtime, acceptée seulement si le backend l’annonce | `Ruleset::mss_clamp` si trafic autorisé | capacité non annoncée par Netlink ; refus défensif avant envoi |
 | `captive_portal_gateway` | `kill_switch::state_gated_openings` | `output` : `OutIface(wan)`, `DestNet` si la passerelle est connue, TCP 80/443, une règle par WAN ; `forward` : `InIface(lan)` + `OutIface(wan)` puis la même suite, une règle par interface LAN et par WAN ; aucune en `forward` sans `lan_ifaces` | `Meta`, famille réseau, `Payload`, `Cmp` |
 | `nordvpn_meshnet` | `meshnet::nordvpn_meshnet` | marque, interface, pairs, ports ; `Icmp` et drops des réseaux locaux de la famille du pair (`PRIVATE_IPV4_CIDRS` ou `PRIVATE_IPV6_CIDRS`) avant ses accepts | `Meta`, famille réseau, `Payload`, `Cmp` |
+| `local_services` | `local_service::outbound` | `output` seul, une règle par service : `OutIface`, `SourceNet`, `DestNet` (adresses IPv4 uniques), TCP dport ; aucune en `input`, `forward` ni NAT ; tous les états | `Meta`, famille réseau, `Payload`, `Cmp` |
 
 Les invariants sans champ de configuration sont compilés directement :
 

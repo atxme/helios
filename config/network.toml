@@ -267,6 +267,30 @@ nordvpn_meshnet = { iface = "nordlynx", fwmark = 0xe1f1, peer_cidrs = ["100.70.3
 # qu'il a authentifié.
 # allow_ssh_over_tunnel = true
 
+# ── Services locaux (local_services) ────────────────────────────────────────
+# Absent par défaut. Un service que l'opérateur fait tourner dans un conteneur
+# sur la gateway, et que la gateway doit joindre sur son pont Docker.
+#
+# Une entrée ouvre une seule chose : l'hôte vers `peer`, en TCP, sur `port`, par
+# `iface`, avec `host` pour source. Rien en entrée, rien en traversée, aucun
+# NAT, et le conteneur ne peut ouvrir aucune connexion vers l'hôte. L'ouverture
+# vaut dans tous les états du tunnel, comme celles d'Astra.
+#
+# Refusés au chargement : clé inconnue, plus de quatre services, nom, interface
+# ou adresse:port en double, interface qui tient déjà un rôle (WAN, LAN,
+# tunnel, administration, Meshnet, Astra, lo), adresse non RFC 1918, adresse
+# d'Astra (10.88.7.0/28) ou du tunnel, IPv6.
+#
+# À écrire APRÈS toutes les clés simples : ce qui suit une table lui appartient.
+# Retirer la section referme l'ouverture, sans redémarrage.
+#
+# [[local_services]]
+# name = "vault"
+# iface = "vault0"
+# host = "10.88.7.17"
+# peer = "10.88.7.18"
+# port = 9443
+
 # ── Pairs autorisés ──────────────────────────────────────────────────────────
 # Ne plus éditer cette liste à la main : l'admission dérive la VIP de la clé
 # publique (ADR-004 §5), et une adresse choisie au jugé crée une seconde vérité.

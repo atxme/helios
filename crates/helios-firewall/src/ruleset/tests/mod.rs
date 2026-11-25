@@ -5,6 +5,7 @@ mod egress;
 mod golden;
 mod ipv6_relay;
 mod link_ipv6;
+mod local_service;
 mod meshnet_ipv6;
 mod support;
 mod transport;

@@ -26,6 +26,7 @@ pub(super) fn policy() -> FirewallPolicy {
         mss_clamp: None,
         captive_portal_gateway: None,
         nordvpn_meshnet: None,
+        local_services: vec![],
     }
 }
 

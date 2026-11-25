@@ -1142,6 +1142,24 @@ règles `drop` RFC1918 doivent précéder ces acceptations. La marque affichée 
 des octets reçus ; le rendu et la transaction Netlink sont automatisés, mais ce
 dernier effet exige la gateway réelle.
 
+Vérification d'un service local (`[[local_services]]`) sur cible, avec
+l'exemple de `config/network.toml` :
+
+```sh
+sudo nft list table inet helios | grep vault0
+sudo nft list table inet nordvpn
+ip route get 10.88.7.18
+curl -kv --max-time 5 https://10.88.7.18:9443/
+```
+
+La première commande doit montrer une règle, en `output` seulement. Comparer la
+table complète avant et après : aucune autre ligne ne change. La deuxième n'est
+pas rendue par Helios, mais une chaîne de base NordVPN peut aussi jeter le
+paquet. Vérifier enfin, depuis le conteneur, que `10.88.7.17`, Astra, le LAN et
+Internet sont injoignables, puis que retirer la section referme l'ouverture sans
+redémarrage. Le rendu, la traduction Netlink et les refus sont automatisés ; la
+joignabilité réelle exige la gateway.
+
 ## Limites connues
 
 - le backend réel dépend du noyau, des pilotes et des privilèges de chaque OS ;

@@ -1,6 +1,7 @@
 use super::*;
 
 mod ipv6;
+mod local_services;
 
 /// A configuration reloaded from disk carries no secret — by design.
 ///

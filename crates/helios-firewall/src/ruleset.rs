@@ -63,6 +63,7 @@ mod client_ipv6_egress;
 mod gateway_wan;
 mod kill_switch;
 mod link_ipv6;
+mod local_service;
 mod meshnet;
 mod nftables;
 mod transport;
@@ -164,6 +165,7 @@ pub fn render(policy: &FirewallPolicy, state: TunnelState) -> Result<Ruleset> {
     }
 
     astra_channel::lifecycle_and_public_origin(&mut rules)?;
+    local_service::outbound(&mut rules, policy);
     transport::wireguard_listener(&mut rules, policy, &wan_ifaces);
     transport::key_negotiation_listener(&mut rules, policy, &wan_ifaces);
     transport::site_to_site_peers(&mut rules, policy, &wan_ifaces)?;
