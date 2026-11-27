@@ -816,6 +816,154 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn native_bundle_assembles_the_inventory_after_the_expected_builds() {
+        let fixture = TestDirectory::new("native-bundle");
+        let root = fixture.path();
+        let commands = root.join("commands");
+        let log = root.join("commands.log");
+        std::fs::create_dir(&commands).expect("tool fixtures");
+        for tool in ["npm", "cargo"] {
+            executable_script(
+                &commands,
+                tool,
+                r#"printf '%s %s\n' "${0##*/}" "$*" >> "$HELIOS_XTASK_TEST_COMMAND_LOG"
+if [ "${0##*/}" = npm ] && [ "$HELIOS_XTASK_TEST_FAIL_FRONTEND" = 1 ]; then
+    exit 7
+fi"#,
+            );
+        }
+
+        let target = "x86_64-unknown-linux-gnu";
+        let build_output = root.join("built").join(target).join("release");
+        std::fs::create_dir_all(&build_output).expect("build fixture directory");
+        for binary in BINARIES {
+            std::fs::write(build_output.join(binary), binary).expect("write fixture binary");
+        }
+        let units = root.join("deploy/systemd");
+        std::fs::create_dir_all(&units).expect("unit fixture directory");
+        for unit in SYSTEMD_UNITS {
+            std::fs::write(units.join(unit), unit).expect("write fixture unit");
+        }
+        std::fs::create_dir(root.join("config")).expect("configuration fixture directory");
+        std::fs::write(root.join("config/network.toml"), "[interface]\n")
+            .expect("write fixture configuration");
+        let staging = root.join("staging");
+        std::fs::create_dir(&staging).expect("existing staging");
+        std::fs::write(staging.join("stale"), "old bundle file").expect("write stale file");
+        let keyring = root.join("public-keyring.json");
+        std::fs::write(&keyring, "{}").expect("fixture public keyring path");
+
+        let run_probe = |keyring: &Path, skip_frontend: bool, fail_frontend: bool| {
+            std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "tests::native_bundle_assembly_probe",
+                    "--nocapture",
+                ])
+                .env("HELIOS_XTASK_TEST_ROOT", root)
+                .env("HELIOS_XTASK_TEST_COMMAND_LOG", &log)
+                .env(
+                    "HELIOS_XTASK_TEST_SKIP_FRONTEND",
+                    u8::from(skip_frontend).to_string(),
+                )
+                .env(
+                    "HELIOS_XTASK_TEST_FAIL_FRONTEND",
+                    u8::from(fail_frontend).to_string(),
+                )
+                .env("HELIOS_PUBLISHER_KEYRING_PATH", keyring)
+                .env("CARGO_TARGET_DIR", root.join("built"))
+                .env("PATH", &commands)
+                .output()
+                .expect("run isolated assembly test")
+        };
+
+        let refused = run_probe(&root.join("missing-keyring.json"), false, false);
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("public keyring not found"));
+        assert!(staging.join("stale").is_file());
+        assert!(!log.exists());
+
+        let failed_frontend = run_probe(&keyring, false, true);
+        assert!(!failed_frontend.status.success());
+        assert!(String::from_utf8_lossy(&failed_frontend.stderr).contains("exit status: 7"));
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "npm ci --prefix web\n"
+        );
+        assert!(staging.join("stale").is_file());
+        std::fs::remove_file(&log).expect("reset the fixture command log");
+
+        let assembled = run_probe(&keyring, false, false);
+        assert!(
+            assembled.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&assembled.stdout),
+            String::from_utf8_lossy(&assembled.stderr)
+        );
+        let commands = std::fs::read_to_string(&log).expect("read fixture command log");
+        let expected = [
+            "npm ci --prefix web".into(),
+            "npm run build --prefix web".into(),
+            format!("cargo build --locked --release --target {target} -p heliosd --features {GATEWAY_FEATURES}"),
+            format!("cargo build --locked --release --target {target} -p helios-installer -p helios"),
+        ];
+        assert_eq!(commands.lines().collect::<Vec<_>>(), expected);
+        assert!(!staging.join("stale").exists());
+
+        let inventory = helios_update::bundle::collect(&staging).expect("collect fixture bundle");
+        assert_eq!(inventory.len(), BINARIES.len() + SYSTEMD_UNITS.len() + 1);
+        for binary in BINARIES {
+            assert_eq!(
+                std::fs::read(staging.join(binary)).unwrap(),
+                binary.as_bytes()
+            );
+            assert!(inventory
+                .iter()
+                .any(|entry| entry.path == *binary && entry.executable));
+        }
+        for unit in SYSTEMD_UNITS {
+            assert_eq!(
+                std::fs::read(staging.join("systemd").join(unit)).unwrap(),
+                unit.as_bytes()
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(staging.join("network.toml.example")).unwrap(),
+            "[interface]\n"
+        );
+
+        std::fs::remove_file(&log).expect("reset the fixture command log");
+        let reused = run_probe(&keyring, true, false);
+        assert!(
+            reused.status.success(),
+            "{}",
+            String::from_utf8_lossy(&reused.stderr)
+        );
+        let commands = std::fs::read_to_string(&log).expect("read fixture command log");
+        assert_eq!(commands.lines().collect::<Vec<_>>(), expected[2..]);
+        assert_eq!(
+            helios_update::bundle::collect(&staging).expect("collect fixture bundle"),
+            inventory
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_bundle_assembly_probe() {
+        let Some(root) = std::env::var_os("HELIOS_XTASK_TEST_ROOT").map(PathBuf::from) else {
+            return;
+        };
+        assemble_natively(
+            &root,
+            "x86_64-unknown-linux-gnu",
+            &root.join("staging"),
+            std::env::var("HELIOS_XTASK_TEST_SKIP_FRONTEND").as_deref() == Ok("1"),
+        )
+        .expect("assemble fixture bundle");
+    }
+
     #[test]
     fn the_version_is_the_daemon_s_own() {
         let root = workspace_root().expect("root");

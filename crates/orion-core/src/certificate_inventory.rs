@@ -704,6 +704,144 @@ mod tests {
         assert!(inventory.faults.is_empty());
     }
 
+    /// The installed protected root belongs to the isolated process.
+    #[test]
+    fn client_inventory_reports_the_protected_slot_for_a_configured_identity() {
+        const CHILD: &str = "ORION_CERTIFICATE_INVENTORY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "certificate_inventory::tests::client_inventory_reports_the_protected_slot_for_a_configured_identity",
+                ])
+                .env(CHILD, "1")
+                .env_remove("ORION_IDENTITY_DIR")
+                .status()
+                .expect("spawn isolated inventory test");
+            assert!(status.success(), "isolated inventory test failed: {status}");
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("protected identity directory");
+        crate::protected_root::install(crate::protected_root::EnginePaths::under(directory.path()))
+            .expect("install isolated protected root");
+        let domain = domain();
+        let mut settings = settings(&domain);
+        settings.gateway_ca_der = STANDARD.encode(domain.tls_ca_der.as_bytes());
+        settings.trust = None;
+
+        let absent = inventory(Some(&settings), NOW);
+        assert!(!absent.identity_sealed);
+        assert!(absent.client_tls.is_none());
+        assert!(absent.client_pq.is_none());
+        assert!(absent.previous_identity.is_none());
+        assert!(absent.faults.is_empty());
+
+        #[cfg(windows)]
+        assert_sealed_client_inventory(&domain, &mut settings);
+    }
+
+    #[cfg(windows)]
+    fn assert_sealed_client_inventory(
+        domain: &crate::test_domain::Domain,
+        settings: &mut KeyNegotiationSettings,
+    ) {
+        let original = crate::test_domain::bundle(domain);
+        let identity = original.identity.clone();
+        let store = ProtectedIdentityStore::for_current_user().expect("current user store");
+        store.store(&original).expect("seal original identity");
+
+        let mut replacement = original.duplicate();
+        replacement.private_key = STANDARD.encode([8u8; 64]).into();
+        assert!(store
+            .promote_with_previous(&identity, &replacement, NOW - 10, NOW + 100)
+            .expect("retain previous identity"));
+
+        settings.identity = format!(" {identity} ");
+        let mut found = CertificateInventory::default();
+        client_inventory(settings, NOW, &mut found);
+
+        assert!(found.identity_sealed);
+        assert_eq!(
+            found.previous_identity,
+            Some(PreviousIdentityStatus {
+                available_from: NOW - 10,
+                available_until: NOW + 100,
+                phase: crate::PreviousIdentityPhase::Available,
+                selected: false,
+            })
+        );
+        assert_eq!(
+            found
+                .client_tls
+                .as_ref()
+                .map(|facts| facts.fingerprint.as_str()),
+            Some(domain.active_client_tls.fingerprint().to_hex().as_str())
+        );
+        assert_eq!(
+            found
+                .client_pq
+                .as_ref()
+                .map(|facts| facts.fingerprint.as_str()),
+            Some(
+                domain
+                    .active_client_leaf
+                    .fingerprint()
+                    .expect("client PQ fingerprint")
+                    .as_str()
+            )
+        );
+        assert!(found.faults.is_empty(), "{:?}", found.faults);
+    }
+
+    /// The public entry point assembles independent gateway observations and
+    /// the profile's trust floor into one renderable inventory.
+    #[test]
+    fn inventory_synthesizes_gateway_facts_and_trust_epoch_together() {
+        let domain = domain();
+        let mut settings = settings(&domain);
+        settings.gateway_pq_certificate = STANDARD.encode(
+            serde_json::to_vec(&domain.gateway_leaf).expect("encode gateway PQ certificate"),
+        );
+        settings.gateway_ca_der = STANDARD.encode(domain.tls_ca_der.as_bytes());
+        settings.identity.clear();
+        settings
+            .trust
+            .as_mut()
+            .expect("fixture trust material")
+            .credential_registry_epoch = 12;
+
+        let found = inventory(Some(&settings), NOW);
+
+        assert_eq!(
+            found.gateway_pq.as_ref().map(|facts| facts.phase),
+            Some(CertificatePhase::Valid)
+        );
+        let ca_fingerprint = domain.tls_ca_der.fingerprint().to_hex();
+        assert_eq!(
+            found
+                .gateway_ca_tls
+                .as_ref()
+                .map(|facts| facts.fingerprint.as_str()),
+            Some(ca_fingerprint.as_str())
+        );
+        assert_eq!(
+            found
+                .operator_credentials
+                .as_ref()
+                .map(|item| item.registry_epoch),
+            Some(12)
+        );
+        assert_eq!(
+            found.operator_credentials.as_ref().map(|item| item.detail),
+            Some(OperatorCredentialDetail::EpochOnly)
+        );
+        assert!(found.client_tls.is_none());
+        assert!(found.client_pq.is_none());
+        assert!(!found.identity_sealed);
+        assert!(found.faults.is_empty());
+    }
+
     #[test]
     fn an_unreadable_gateway_pq_pin_does_not_hide_the_valid_tls_anchor() {
         let domain = domain();

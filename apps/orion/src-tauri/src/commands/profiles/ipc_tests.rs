@@ -808,6 +808,36 @@ async fn explicit_associated_profile_path_imports_without_consuming_startup_queu
 
 #[cfg(not(windows))]
 #[tokio::test]
+async fn associated_import_read_failure_preserves_the_queued_path_and_skips_the_engine() {
+    let scratch = Scratch::new();
+    let missing = scratch.0.join("missing.orion");
+    let queued = scratch.0.join("next.orion");
+    let (client, _engine) = scripted_engine().await;
+    let app = command_app(client);
+    app.state::<crate::AppState>()
+        .pending_profile_paths
+        .lock()
+        .expect("pending paths")
+        .push_back(queued.clone());
+
+    let error = import_profile_path(app.state(), Some(missing.display().to_string()))
+        .await
+        .expect_err("a missing associated profile must fail before IPC");
+
+    assert!(error.starts_with("ouverture de "));
+    assert!(error.contains("missing.orion"));
+    assert_eq!(
+        app.state::<crate::AppState>()
+            .pending_profile_paths
+            .lock()
+            .expect("pending paths")
+            .front(),
+        Some(&queued)
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
 async fn vault_posture_commands_keep_read_and_explicit_waiver_distinct() {
     let (client, mut engine) = scripted_engine().await;
     let app = command_app(client);
