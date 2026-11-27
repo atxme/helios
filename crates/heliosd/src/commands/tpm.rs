@@ -426,4 +426,63 @@ mod tests {
         assert!(validate_provisioning_request(&enabled).is_ok());
         assert!(!absent_blob.exists());
     }
+
+    #[cfg(feature = "tpm")]
+    #[test]
+    fn offline_update_commands_arm_and_expire_the_window_on_software_tpm() {
+        let Some(emulator) = crate::swtpm::Swtpm::start().expect("start isolated software TPM")
+        else {
+            eprintln!("[out of scope] offline update commands require swtpm");
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = |name| directory.path().join(name).to_string_lossy().into_owned();
+        let mut settings = TpmSettings {
+            enabled: true,
+            allow_provisioning: true,
+            device: emulator.tcti().into(),
+            sealed_blob_path: path("sealed.key"),
+            ticket_path: path("reseal-ticket.json"),
+            update_window_marker_path: path("update-window.marker"),
+            counter_status_path: path("anti-rollback.json"),
+            update_window_seconds: 300,
+            ..TpmSettings::default()
+        };
+        assert!(matches!(
+            BootController::unlock(&settings).unwrap(),
+            BootDecision::Provisioned(_)
+        ));
+        settings.allow_provisioning = false;
+        let marker = std::path::PathBuf::from(&settings.update_window_marker_path);
+
+        update_readiness(&settings).expect("the sealed root is ready");
+        expire_update_window(&settings).expect("timer tolerates an absent window");
+        assert!(!marker.exists());
+        assert!(!BootController::update_window_armed(&settings).unwrap());
+
+        let before = std::fs::read(&settings.sealed_blob_path).unwrap();
+        let counter = helios_tpm::anti_rollback::current(&settings).unwrap();
+        let reseal: aether::sig::ResealRequest =
+            serde_json::from_str(&reseal_request_json(&settings).unwrap()).unwrap();
+        assert_eq!(reseal.counter, counter);
+        assert_eq!(
+            reseal.sealed_blob_anchor,
+            *aether::certificates::encoding::Fingerprint::of(&before).as_bytes()
+        );
+
+        prepare_update(&settings, false).expect("arm the window without rebooting");
+        expire_update_window(&settings).expect("timer leaves a live window armed");
+        assert!(marker.exists());
+        assert!(BootController::update_window_armed(&settings).unwrap());
+
+        std::fs::write(&marker, b"incomplete marker file").unwrap();
+        expire_update_window(&settings).expect("timer revokes a window with an unreadable marker");
+        assert!(!marker.exists());
+        assert!(!BootController::update_window_armed(&settings).unwrap());
+        assert_eq!(std::fs::read(&settings.sealed_blob_path).unwrap(), before);
+        assert_eq!(
+            helios_tpm::anti_rollback::current(&settings).unwrap(),
+            counter
+        );
+    }
 }

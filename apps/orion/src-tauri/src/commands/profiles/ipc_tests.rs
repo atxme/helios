@@ -761,6 +761,53 @@ async fn import_profile_path_command_returns_none_without_contacting_the_engine(
 
 #[cfg(not(windows))]
 #[tokio::test]
+async fn explicit_associated_profile_path_imports_without_consuming_startup_queue() {
+    let scratch = Scratch::new();
+    let requested = scratch.0.join("selected.orion");
+    std::fs::write(&requested, "selected profile contents").expect("write requested profile");
+    let queued = scratch.0.join("startup.orion");
+    std::fs::write(&queued, "startup profile contents").expect("write queued profile");
+
+    let (client, mut engine) = scripted_engine().await;
+    let app = command_app(client);
+    app.state::<crate::AppState>()
+        .pending_profile_paths
+        .lock()
+        .expect("pending paths")
+        .push_back(queued.clone());
+
+    let (result, ()) = tokio::join!(
+        import_profile_path(app.state(), Some(requested.display().to_string())),
+        async move {
+            engine
+                .reply(|command| {
+                    assert_import_command(command, "selected.orion", "selected profile contents");
+                    Ok(imported_reply("selected"))
+                })
+                .await;
+        }
+    );
+
+    assert_eq!(
+        result
+            .expect("explicit associated import")
+            .expect("explicit path was supplied")
+            .profile
+            .name,
+        "selected"
+    );
+    assert_eq!(
+        app.state::<crate::AppState>()
+            .pending_profile_paths
+            .lock()
+            .expect("pending paths")
+            .front(),
+        Some(&queued)
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
 async fn vault_posture_commands_keep_read_and_explicit_waiver_distinct() {
     let (client, mut engine) = scripted_engine().await;
     let app = command_app(client);

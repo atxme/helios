@@ -490,6 +490,49 @@ fn loading_refuses_private_material_that_does_not_match_the_delegation() {
     ));
 }
 
+/// A restarted daemon reconstructs ordinary renewal capability from the
+/// durable trust record and epoch-addressed issuer keys. This exercises the
+/// persisted installation boundary, not just the in-memory key matcher.
+#[test]
+fn a_persisted_delegation_and_its_private_keys_load_as_an_issuer_after_restart() {
+    let policy = automatic_policy_fingerprint();
+    let mut domain = domain_pinned_to(policy);
+    let authorization = delegation_naming(
+        &domain.ca_private,
+        domain.issuer_public.clone(),
+        domain.intermediate_der.clone(),
+        policy,
+    );
+    let directory = domain._directory.path();
+    let pq_key = super::pq_key_path(directory, authorization.issuer_epoch);
+    let tls_key = super::tls_key_path(directory, authorization.issuer_epoch);
+    std::fs::copy(&domain.pq_key, &pq_key).expect("store the fixture PQ key for this epoch");
+    std::fs::copy(&domain.tls_key, &tls_key).expect("store the fixture TLS key for this epoch");
+    adopt(
+        &mut domain.registry,
+        authorization.clone(),
+        &pq_key,
+        &tls_key,
+        500,
+    )
+    .expect("persist signed delegation and key files");
+
+    let restarted = crate::registry::AstraRegistry::load_allowing_unattended_tail(
+        &directory.join("astra.json"),
+        None,
+    )
+    .expect("reload persisted trust");
+    let issuer = load_from_registry(directory, &restarted)
+        .expect("check persisted delegation")
+        .expect("active ordinary-renewal issuer");
+    assert_eq!(issuer.authorization, authorization);
+
+    std::fs::remove_file(&tls_key).expect("remove fixture key");
+    assert!(load_from_registry(directory, &restarted)
+        .expect("an unavailable key disables ordinary renewals")
+        .is_none());
+}
+
 /// The four things the delegation withholds, checked before any signature
 /// exists — so a compromised Astra never produces the object at all.
 #[test]

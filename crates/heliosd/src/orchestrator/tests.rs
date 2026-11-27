@@ -2280,6 +2280,50 @@ async fn a_reload_the_firewall_refuses_keeps_the_running_configuration() {
     assert!(message.contains("10.0.0.0/33"), "{message}");
 }
 
+#[tokio::test]
+async fn reloading_local_services_adds_and_removes_rules_while_the_tunnel_stays_up() {
+    let running = configured_network();
+    let shared_network = Arc::new(RwLock::new(running.duplicate()));
+    let wireguard = helios_wireguard::DryRunBackend::new();
+    let (iface, peers) = wg_config(&running, &Ipv6TunnelStatus::NotConfigured);
+    wireguard
+        .up(&iface, &peers)
+        .await
+        .expect("initial interface");
+
+    let service = aether::LocalService {
+        name: "operator-vault".into(),
+        iface: "vault0".into(),
+        host: "10.88.7.17".parse().unwrap(),
+        peer: "10.88.7.18".parse().unwrap(),
+        port: 9443,
+    };
+    for expected in [vec![service], Vec::new()] {
+        let mut incoming = running.duplicate();
+        incoming.local_services.clone_from(&expected);
+        let (result, events, policy, state, shared_policy) =
+            reload_on_live_tunnel(&shared_network, incoming, &wireguard, &DryRunBackend).await;
+
+        result.expect("local services can be reloaded on a live tunnel");
+        assert_eq!(shared_network.read().await.local_services, expected);
+        let mut expected_policy = running.firewall_policy();
+        expected_policy.local_services = expected;
+        assert_eq!(policy, expected_policy);
+        assert_eq!(*shared_policy.read().await, expected_policy);
+        assert_eq!(*state.read().await, TunnelState::Up);
+        assert_eq!(
+            wireguard.peers().await.unwrap()[0].public_key_b64(),
+            PEER_KEY
+        );
+        assert!(wireguard.is_up());
+        assert!(matches!(
+            events.as_slice(),
+            [HeliosEvent::Log { level, message }]
+                if level == "info" && message == "Network configuration applied"
+        ));
+    }
+}
+
 // ─── IPv6 on the data plane (`ADRESSAGE-IPV6.md` §6.1, §6.2) ─────────────────
 
 const PREFIX: &str = "fd3c:91a2:7e04::1/64";

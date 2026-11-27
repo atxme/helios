@@ -1618,17 +1618,13 @@ mod tests {
         assert!(initialize("10.88.0.1:8444".parse().unwrap(), &wrong, None, None, false).is_err());
     }
 
-    #[tokio::test]
-    async fn authority_relays_keep_the_resolved_identity_and_preserve_plan_guidance() {
-        use ::astra_channel::{
-            OperatorIdentity, RelayedChainStep, RelayedOperationQuery, RelayedOperatorCampaign,
-            ASTRA_INTERNAL_PREFIX, ASTRA_INTERNAL_SERVER_NAME, OPERATOR_CHAIN_NEXT_ROUTE,
-            OPERATOR_PENDING_ROUTE,
-        };
-        use aether::certificates::encoding::{Id16, WireGuardKey};
-        use axum::{extract::Path as RoutePath, http::StatusCode, routing::post, Json, Router};
-        use helios_api::certificates::TrustUpdateRefusal;
-        use helios_api::certificates::{ChainRefusal, ClientRenewalRelay, OperatorCampaignRelay};
+    async fn local_authority(
+        router: axum::Router,
+    ) -> (
+        AstraRenewalRelay,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        use ::astra_channel::ASTRA_INTERNAL_SERVER_NAME;
         use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
 
         let identity = |name: &str, usage| {
@@ -1652,6 +1648,40 @@ mod tests {
         let server_tls = ::astra_channel::server_config(&authority, &gateway_pin).unwrap();
         let client_tls = ::astra_channel::client_config(&gateway, &authority_pin).unwrap();
 
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let server = tokio::spawn(::astra_channel::serve(
+            address,
+            server_tls,
+            router,
+            "/internal/",
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while tokio::net::TcpStream::connect(address).await.is_err() {
+                assert!(!server.is_finished(), "the local authority must start");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the mock authority accepts loopback connections");
+
+        let relay = AstraRenewalRelay::new(::astra_channel::AstraLifecycleClient::new(
+            address, client_tls,
+        ));
+        (relay, server)
+    }
+
+    #[tokio::test]
+    async fn authority_relays_keep_the_resolved_identity_and_preserve_plan_guidance() {
+        use ::astra_channel::{
+            OperatorIdentity, RelayedChainStep, RelayedOperationQuery, RelayedOperatorCampaign,
+            ASTRA_INTERNAL_PREFIX, OPERATOR_CHAIN_NEXT_ROUTE, OPERATOR_PENDING_ROUTE,
+        };
+        use aether::certificates::encoding::{Id16, WireGuardKey};
+        use axum::{extract::Path as RoutePath, http::StatusCode, routing::post, Json, Router};
+        use helios_api::certificates::TrustUpdateRefusal;
+        use helios_api::certificates::{ChainRefusal, ClientRenewalRelay, OperatorCampaignRelay};
         let caller = WireGuardKey::from_bytes([0x51; 32]);
         let operator = OperatorIdentity::WireGuard { public_key: caller };
         let operation = Id16::new([0x19; 16]).unwrap();
@@ -1699,27 +1729,7 @@ mod tests {
                 ),
             );
 
-        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = reserved.local_addr().unwrap();
-        drop(reserved);
-        let server = tokio::spawn(::astra_channel::serve(
-            address,
-            server_tls,
-            router,
-            "/internal/",
-        ));
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while tokio::net::TcpStream::connect(address).await.is_err() {
-                assert!(!server.is_finished(), "the local authority must start");
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the mock authority accepts loopback connections");
-
-        let relay = AstraRenewalRelay::new(::astra_channel::AstraLifecycleClient::new(
-            address, client_tls,
-        ));
+        let (relay, server) = local_authority(router).await;
         assert_eq!(
             relay.pending(&operator).await.unwrap_err(),
             TrustUpdateRefusal::Rejected
@@ -1742,6 +1752,178 @@ mod tests {
                 ("renewal", operator)
             ]
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn operator_relay_carries_campaign_publication_and_vault_results() {
+        use ::astra_channel::{
+            bearer_token, OperatorGatewayPublish, OperatorGatewayPublished, OperatorIdentity,
+            OperatorOpenAction, OperatorOpenRequest, OperatorOpened, OperatorVaultCopied,
+            OperatorVaultCopy, RelayedOperatorCampaign, RelayedOperatorGatewayPublish,
+            RelayedOperatorOpen, RelayedOperatorVaultCopy, OPERATOR_CHAIN_ABANDON_ROUTE,
+            OPERATOR_GATEWAY_PUBLISH_ROUTE, OPERATOR_OPEN_ROUTE, OPERATOR_VAULT_COPY_ROUTE,
+            OPERATOR_VAULT_ROUTE,
+        };
+        use aether::certificates::{
+            encoding::{Fingerprint, Id16, WireGuardKey},
+            status::CampaignScope,
+        };
+        use axum::{
+            extract::Path as RoutePath,
+            http::{HeaderMap, StatusCode},
+            routing::post,
+            Json, Router,
+        };
+        use helios_api::certificates::OperatorCampaignRelay;
+
+        let operator = OperatorIdentity::WireGuard {
+            public_key: WireGuardKey::from_bytes([0x55; 32]),
+        };
+        let operation = Id16::new([0x27; 16]).unwrap();
+        let campaign = Id16::new([0x28; 16]).unwrap();
+        let transition = Fingerprint::of(b"transition fixture");
+        let ciphertext = b"opaque encrypted vault fixture";
+        let fingerprint = Fingerprint::of(ciphertext);
+        let router = Router::new()
+            .route(
+                OPERATOR_OPEN_ROUTE,
+                post({
+                    let operator = operator.clone();
+                    move |headers: HeaderMap, Json(input): Json<RelayedOperatorOpen>| async move {
+                        assert_eq!(input.operator, operator);
+                        assert!(bearer_token(&headers).is_none());
+                        assert_eq!(input.request.action, OperatorOpenAction::FleetLeafs);
+                        assert_eq!(input.request.window_secs, 120);
+                        Json(OperatorOpened {
+                            operation_id: operation,
+                            campaign_id: campaign,
+                            campaign_fingerprint: Fingerprint::of(b"campaign fixture"),
+                            scope: CampaignScope::FleetLeafs,
+                            target_count: 3,
+                            required_credentials: 2,
+                            expires_at: 240,
+                            revocation_expiries: None,
+                            delegation_request: None,
+                            gateway_certificate: None,
+                        })
+                    }
+                }),
+            )
+            .route(
+                OPERATOR_GATEWAY_PUBLISH_ROUTE,
+                post({
+                    let operator = operator.clone();
+                    move |Json(input): Json<RelayedOperatorGatewayPublish>| async move {
+                        assert_eq!(input.operator, operator);
+                        assert_eq!(input.request.transition_fingerprint, transition);
+                        Json(OperatorGatewayPublished {
+                            epoch: input.request.epoch,
+                            relayed: true,
+                        })
+                    }
+                }),
+            )
+            .route(
+                OPERATOR_VAULT_COPY_ROUTE,
+                post({
+                    let operator = operator.clone();
+                    move |Json(input): Json<RelayedOperatorVaultCopy>| async move {
+                        use base64::Engine as _;
+                        assert_eq!(input.operator, operator);
+                        assert!(!input.copy.replace_newer);
+                        let forwarded = base64::engine::general_purpose::STANDARD
+                            .decode(&input.copy.vault_base64)
+                            .unwrap();
+                        Json(OperatorVaultCopied {
+                            fingerprint: Fingerprint::of(&forwarded),
+                            credential_registry_epoch: None,
+                        })
+                    }
+                }),
+            )
+            .route(
+                OPERATOR_VAULT_ROUTE,
+                post({
+                    let operator = operator.clone();
+                    move |RoutePath(name): RoutePath<String>,
+                          headers: HeaderMap,
+                          Json(input): Json<RelayedOperatorCampaign>| async move {
+                        assert_eq!(input.operator, operator);
+                        assert_eq!(name, fingerprint.to_string());
+                        assert_eq!(bearer_token(&headers), Some("vault-test-token"));
+                        ciphertext.as_slice()
+                    }
+                }),
+            )
+            .route(
+                OPERATOR_CHAIN_ABANDON_ROUTE,
+                post({
+                    let operator = operator.clone();
+                    move |Json(input): Json<RelayedOperatorCampaign>| async move {
+                        assert_eq!(input.operator, operator);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+        let (relay, server) = local_authority(router).await;
+
+        let opened = OperatorCampaignRelay::open(
+            &relay,
+            &operator,
+            OperatorOpenRequest {
+                action: OperatorOpenAction::FleetLeafs,
+                reason: "routine certificate renewal".into(),
+                requested_by: "fixture operator".into(),
+                window_secs: 120,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened.operation_id, operation);
+        assert_eq!(opened.campaign_id, campaign);
+        assert_eq!(opened.target_count, 3);
+        assert_eq!(opened.required_credentials, 2);
+
+        let published = relay
+            .publish_gateway_transition(
+                &operator,
+                OperatorGatewayPublish {
+                    epoch: 2,
+                    transition_fingerprint: transition,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            published,
+            OperatorGatewayPublished {
+                epoch: 2,
+                relayed: true
+            }
+        );
+
+        use base64::Engine as _;
+        let copied = relay
+            .vault_copy(
+                &operator,
+                OperatorVaultCopy {
+                    vault_base64: base64::engine::general_purpose::STANDARD.encode(ciphertext),
+                    credentials: None,
+                    replace_newer: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(copied.fingerprint, fingerprint);
+        assert_eq!(
+            relay
+                .encrypted_vault(&operator, &fingerprint, "vault-test-token")
+                .await
+                .unwrap(),
+            ciphertext
+        );
+        relay.chain_abandon(&operator).await.unwrap();
         server.abort();
     }
 }
