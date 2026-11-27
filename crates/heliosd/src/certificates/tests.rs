@@ -1400,6 +1400,136 @@ async fn astra_reads_peer_records_and_the_identity_the_gateway_serves() {
     assert_eq!(gateway.gateway_decision_epoch, 3);
 }
 
+/// A registry snapshot after the signed transition has been accepted.
+fn staged_gateway_publication() -> (RegistryState, ::astra_channel::GatewayTransitionPublished) {
+    let mut state = state();
+    let epoch = state.gateway.gateway_decision_epoch + 1;
+    let transition_fingerprint = Fingerprint::of(b"staged gateway transition");
+    state.gateway.gateway_decision_epoch = epoch;
+    state.gateway.next_gateway_identity_epoch = Some(epoch);
+    state.gateway.next_transition_fingerprint = Some(transition_fingerprint);
+    state.gateway.next_gateway_certificate = Some(signed_leaf(
+        PqCertificateRole::Gateway,
+        "gateway.example",
+        3,
+    ));
+    state.gateway.activation_at = Some(200);
+    state.gateway.retire_active_at = Some(300);
+    (
+        state,
+        ::astra_channel::GatewayTransitionPublished {
+            gateway_identity_epoch: epoch,
+            transition_fingerprint,
+        },
+    )
+}
+
+#[tokio::test]
+async fn astra_publication_is_durable_and_replayed_after_gateway_restart() {
+    use ::astra_channel::AstraChannelHandler;
+
+    let (state, publication) = staged_gateway_publication();
+    let outgoing_epoch = state.gateway.active_gateway_identity_epoch;
+    let outgoing_fingerprint = state
+        .gateway
+        .active_pq_fingerprint()
+        .expect("active PQ leaf");
+    let (service, directory) = service(state);
+    let path = directory.path().join("certificates.json");
+    let before = std::fs::read(&path).expect("read unpublished registry");
+
+    service
+        .gateway_transition_published(publication.clone())
+        .await
+        .expect("acknowledge publication of the staged transition");
+    let published = std::fs::read(&path).expect("read published registry");
+    assert_ne!(published, before);
+
+    let signer = service.signer.clone();
+    drop(service);
+    let reopened = CertificateRegistry::load(&path)
+        .expect("load persisted registry")
+        .expect("published registry exists");
+    let gateway = &reopened.state().gateway;
+    assert!(gateway.published);
+    assert_eq!(gateway.active_gateway_identity_epoch, outgoing_epoch);
+    assert_eq!(
+        gateway.active_pq_fingerprint().unwrap(),
+        outgoing_fingerprint
+    );
+    assert_eq!(
+        gateway.next_gateway_identity_epoch,
+        Some(publication.gateway_identity_epoch)
+    );
+    assert_eq!(
+        gateway.next_transition_fingerprint,
+        Some(publication.transition_fingerprint)
+    );
+
+    let restarted = CertificateService::new(Arc::new(Mutex::new(reopened)), signer);
+    restarted
+        .gateway_transition_published(publication)
+        .await
+        .expect("confirm a repeated publication after restart");
+    assert_eq!(std::fs::read(&path).unwrap(), published);
+}
+
+#[tokio::test]
+async fn astra_publication_refuses_a_report_before_staging() {
+    use ::astra_channel::AstraChannelHandler;
+
+    let (service, directory) = service(state());
+    let publication = ::astra_channel::GatewayTransitionPublished {
+        gateway_identity_epoch: 4,
+        transition_fingerprint: Fingerprint::of(b"not staged yet"),
+    };
+    let path = directory.path().join("certificates.json");
+    let unchanged = std::fs::read(&path).expect("read active registry");
+    assert_eq!(
+        service.gateway_transition_published(publication).await,
+        Err(TrustUpdateRefusal::Rejected)
+    );
+    let registry = service.registry.lock().await;
+    assert!(!registry.state().gateway.published);
+    assert!(registry
+        .state()
+        .gateway
+        .next_gateway_identity_epoch
+        .is_none());
+    assert_eq!(std::fs::read(&path).unwrap(), unchanged);
+}
+
+#[tokio::test]
+async fn astra_publication_reports_an_unavailable_registry_path_and_retries_after_repair() {
+    use ::astra_channel::AstraChannelHandler;
+
+    let (state, publication) = staged_gateway_publication();
+    let (service, directory) = service(state);
+    let path = directory.path().join("certificates.json");
+    let backup = directory.path().join("saved-certificates.json");
+    std::fs::rename(&path, &backup).expect("move the registry aside");
+    std::fs::create_dir(&path).expect("prevent replacement of the registry file");
+
+    assert_eq!(
+        service
+            .gateway_transition_published(publication.clone())
+            .await,
+        Err(TrustUpdateRefusal::Internal)
+    );
+    assert!(!service.registry.lock().await.state().gateway.published);
+    std::fs::remove_dir(&path).expect("allow atomic replacement again");
+    std::fs::rename(&backup, &path).expect("restore the unpublished registry");
+
+    service
+        .gateway_transition_published(publication)
+        .await
+        .expect("publish after the path becomes available");
+    let reopened = CertificateRegistry::load(&path)
+        .expect("load registry after repair")
+        .expect("registry remains on disk");
+    assert!(reopened.state().gateway.published);
+}
+
 fn live_distribution() -> ::astra_channel::TrustDistribution {
     let mut pending = distribution(0, 1);
     let now = now_unix();

@@ -593,6 +593,34 @@ fn a_signed_abort_consumes_the_epoch_and_removes_only_its_local_candidate() {
                 );
             }
             assert!(document.is_file(), "the operator's input stays available");
+
+            let aborted_registry = registry_bytes();
+            let missing_document = abort_gateway_transition(&document)
+                .expect_err("the command requires the retained signed transition");
+            assert!(format!("{missing_document:#}").contains("no staged transition document"));
+            assert_eq!(registry_bytes(), aborted_registry);
+
+            let staged_document = root.join("staged.json");
+            fs::write(
+                &staged_document,
+                serde_json::to_vec_pretty(&transition).expect("encode the signed transition"),
+            )
+            .expect("model a retained document after an already persisted abort");
+            abort_gateway_transition(&document).expect("replay the accepted signed abort");
+            let reopened = fixture.reload();
+            assert_eq!(registry_bytes(), aborted_registry);
+            assert_eq!(reopened.state().gateway.gateway_decision_epoch, 2);
+            assert_eq!(
+                reopened
+                    .state()
+                    .gateway
+                    .last_aborted_transition
+                    .as_ref()
+                    .expect("durable abort tombstone")
+                    .abort_fingerprint,
+                abort.fingerprint()
+            );
+            assert!(!root.join("candidate.der").exists());
         },
     );
 }

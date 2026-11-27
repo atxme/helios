@@ -1555,6 +1555,106 @@ async fn an_accepted_live_reload_synchronizes_wireguard_peers() {
     )));
 }
 
+/// A restart-only change on a live tunnel is refused before touching either
+/// the active peer table or the running configuration.
+#[tokio::test]
+async fn a_live_reload_with_a_new_tunnel_prefix_keeps_the_existing_data_plane() {
+    let running = dual_stack_network();
+    let shared_network = Arc::new(RwLock::new(running.duplicate()));
+    let (iface, peers) = wg_config(&running, &Ipv6TunnelStatus::Installed);
+    let wireguard = helios_wireguard::DryRunBackend::new();
+    wireguard
+        .up(&iface, &peers)
+        .await
+        .expect("initial interface");
+    let before = wireguard.peers().await.expect("initial peer table");
+
+    let mut incoming = running.duplicate();
+    incoming.wg_address_v6 = Some("fd00:1:2::1/64".parse().expect("new prefix"));
+    incoming.peers[0].address_v6 = Some("fd00:1:2::2".parse().expect("new VIP"));
+    incoming.peers[0].name = "must not be applied".into();
+    let (result, events, _, _, _) =
+        reload_on_live_tunnel(&shared_network, incoming, &wireguard, &DryRunBackend).await;
+
+    result.expect("a refused reload does not stop the orchestrator");
+    assert_eq!(*shared_network.read().await, running);
+    let after = wireguard.peers().await.expect("active peer table");
+    assert_eq!(after.len(), before.len());
+    assert_eq!(after[0].public_key, before[0].public_key);
+    assert_eq!(after[0].allowed_ips, before[0].allowed_ips);
+    assert!(wireguard.is_up());
+    assert!(
+        matches!(events.as_slice(), [HeliosEvent::Log { level, message }]
+        if level == "warn" && message.contains("restart"))
+    );
+}
+
+/// A firewall refusal on a live reload happens before peer synchronization;
+/// the established tunnel and its peer table stay usable on the old policy.
+#[tokio::test]
+async fn a_live_reload_firewall_refusal_leaves_wireguard_untouched() {
+    let running = two_peer_test_network();
+    let shared_network = Arc::new(RwLock::new(running.duplicate()));
+    let (iface, peers) = wg_config(&running, &Ipv6TunnelStatus::NotConfigured);
+    let wireguard = helios_wireguard::DryRunBackend::new();
+    wireguard
+        .up(&iface, &peers)
+        .await
+        .expect("initial interface");
+    let mut incoming = running.duplicate();
+    incoming.peers.remove(0);
+    incoming.split_tunnel_cidrs = vec!["10.0.0.0/8".into()];
+
+    let (result, events, policy, state, shared_policy) =
+        reload_on_live_tunnel(&shared_network, incoming, &wireguard, &RefusingFirewall).await;
+
+    result.expect("the loop continues after rejecting the candidate");
+    assert_eq!(*shared_network.read().await, running);
+    assert_eq!(policy, running.firewall_policy());
+    assert_eq!(*shared_policy.read().await, running.firewall_policy());
+    assert_eq!(*state.read().await, TunnelState::Up);
+    assert!(wireguard.is_up());
+    assert_eq!(
+        wireguard.peers().await.expect("active peers").len(),
+        peers.len()
+    );
+    assert!(events.iter().any(|event| matches!(event,
+        HeliosEvent::Log { level, message }
+            if level == "error" && message.contains("running one stays in force"))));
+}
+
+/// A successful live revocation applies the reduced peer table without
+/// disturbing another admitted peer or taking the interface down.
+#[tokio::test]
+async fn a_live_reload_revokes_only_the_removed_peer() {
+    let running = two_peer_test_network();
+    let shared_network = Arc::new(RwLock::new(running.duplicate()));
+    let (iface, peers) = wg_config(&running, &Ipv6TunnelStatus::NotConfigured);
+    let wireguard = helios_wireguard::DryRunBackend::new();
+    wireguard
+        .up(&iface, &peers)
+        .await
+        .expect("initial interface");
+    let retained_key = peers[1].public_key.clone();
+    let mut incoming = running.duplicate();
+    incoming.peers.remove(0);
+
+    let (result, events, _, state, _) =
+        reload_on_live_tunnel(&shared_network, incoming, &wireguard, &DryRunBackend).await;
+
+    result.expect("the compatible revocation applies");
+    let installed = wireguard.peers().await.expect("active peer table");
+    assert_eq!(installed.len(), 1);
+    assert_eq!(installed[0].public_key_b64(), retained_key);
+    assert_eq!(installed[0].allowed_ips, ["100.64.1.3/32"]);
+    assert!(wireguard.is_up());
+    assert_eq!(*state.read().await, TunnelState::Up);
+    assert_eq!(shared_network.read().await.peers.len(), 1);
+    assert!(events.iter().any(|event| matches!(event,
+        HeliosEvent::Log { level, message }
+            if level == "info" && message == "Network configuration applied")));
+}
+
 /// A failed, partially mutating peer synchronization must keep the running
 /// configuration and secrets, apply the fail-closed firewall state, and tear
 /// down the interface before returning the error.

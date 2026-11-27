@@ -146,9 +146,29 @@ where
 }
 
 pub(crate) async fn run(
+    network: NetworkConfig,
+    dry_run: bool,
+    firewall_mode: orchestrator::FirewallMode,
+) -> anyhow::Result<()> {
+    run_with_settings(
+        network,
+        dry_run,
+        firewall_mode,
+        TpmSettings::default(),
+        service_binds,
+    )
+    .await
+}
+
+async fn run_with_settings(
     mut network: NetworkConfig,
     dry_run: bool,
     firewall_mode: orchestrator::FirewallMode,
+    tpm: TpmSettings,
+    bind_services: impl FnOnce(
+        &NetworkConfig,
+        bool,
+    ) -> anyhow::Result<(std::net::SocketAddr, std::net::SocketAddr)>,
 ) -> anyhow::Result<()> {
     // Before the TPM unseal below, which is where the first key appears.
     forbid_core_dumps(dry_run)?;
@@ -166,7 +186,6 @@ pub(crate) async fn run(
     // setting alone decides whether it opens.
 
     // TPM integrity validation — BEFORE any network access.
-    let tpm = TpmSettings::default();
     let boot = BootController::unlock(&tpm)
         .map_err(|e| anyhow::anyhow!("TPM unsealing failed — stopping: {e}"))?;
     match &boot {
@@ -263,7 +282,7 @@ pub(crate) async fn run(
     // API out of every client's reach.
     let (api_bind, raw_speedtest_bind) = {
         let network = shared_network.read().await;
-        service_binds(&network, dry_run)?
+        bind_services(&network, dry_run)?
     };
     info!("web interface on http://{api_bind}");
     info!("raw speedtest on {raw_speedtest_bind} (WireGuard TCP/UDP)");
@@ -491,6 +510,9 @@ pub(crate) async fn run(
     raw_speedtest_shutdown.store(true, Ordering::Release);
     result
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod process_tests;
 
 #[cfg(test)]
 mod tests {
