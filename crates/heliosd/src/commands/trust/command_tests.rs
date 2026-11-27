@@ -518,6 +518,99 @@ fn a_gateway_transition_cannot_stage_until_its_candidate_is_held() {
     );
 }
 
+#[cfg(feature = "tpm")]
+#[test]
+fn a_recovery_request_reopens_and_renews_the_same_sealed_candidate() {
+    isolated(
+        "a_recovery_request_reopens_and_renews_the_same_sealed_candidate",
+        |root| {
+            let Some(emulator) = crate::swtpm::Swtpm::start().expect("start isolated software TPM")
+            else {
+                eprintln!("[out of scope] preparing a sealed recovery candidate requires swtpm");
+                return;
+            };
+            let fixture = Fixture::new(root);
+            fixture.persist();
+            let temp = |file| root.join(file).display().to_string();
+            let settings = TpmSettings {
+                enabled: true,
+                allow_provisioning: true,
+                device: emulator.tcti().into(),
+                sealed_blob_path: temp("sealed.key"),
+                ticket_path: temp("reseal-ticket.json"),
+                update_window_marker_path: temp("update-window.marker"),
+                counter_status_path: temp("anti-rollback.json"),
+                ..TpmSettings::default()
+            };
+            let boot = helios_tpm::BootController::unlock(&settings)
+                .expect("provision the simulated gateway TPM");
+            let secret = boot.secret().expect("unsealed fixture secret");
+            let registry = fixture.reload();
+            let prepared = gateway_rotation::prepare_request(
+                &registry,
+                Some(secret),
+                false,
+                true,
+                false,
+                true,
+                fixture.now,
+            )
+            .expect("prepare and seal a replacement identity");
+            assert!(!prepared.reused);
+            assert_eq!(prepared.path, root.join("request.json"));
+            assert_eq!(prepared.request.gateway_identity_epoch, 2);
+            assert!(prepared.request.current_key_authorization.is_none());
+            let tls = prepared.tls_certificate.expect("public candidate TLS leaf");
+            let sealed = fs::read(root.join("candidate.sealed")).expect("sealed candidate");
+            assert_eq!(
+                fs::read(root.join("candidate.der")).unwrap(),
+                tls.as_bytes()
+            );
+            drop(registry);
+
+            let reopened = fixture.reload();
+            let resumed = gateway_rotation::prepare_request(
+                &reopened,
+                None,
+                false,
+                true,
+                false,
+                true,
+                fixture.now + 1,
+            )
+            .expect("reuse the already signed request after reopening the registry");
+            assert!(resumed.reused);
+            assert_eq!(resumed.request, prepared.request);
+            assert_eq!(resumed.tls_certificate.as_ref(), Some(&tls));
+
+            let fresh = gateway_rotation::prepare_request(
+                &reopened,
+                Some(secret),
+                false,
+                true,
+                false,
+                true,
+                prepared.request.expires_at,
+            )
+            .expect("renew the expired request over the existing sealed candidate");
+            assert!(!fresh.reused);
+            assert_ne!(fresh.request.request_id, prepared.request.request_id);
+            assert_eq!(fresh.request.gateway_identity_epoch, 2);
+            assert_eq!(
+                fresh.request.new_ml_dsa_87_public_key,
+                prepared.request.new_ml_dsa_87_public_key
+            );
+            assert_eq!(fresh.tls_certificate.as_ref(), Some(&tls));
+            assert_eq!(fs::read(root.join("candidate.sealed")).unwrap(), sealed);
+            let stored: aether::certificates::gateway::GatewayCertificateRequest =
+                serde_json::from_slice(&fs::read(fresh.path).expect("re-read public request"))
+                    .expect("decode the renewed request");
+            assert_eq!(stored, fresh.request);
+            assert_eq!(fixture.reload().state().gateway.gateway_decision_epoch, 1);
+        },
+    );
+}
+
 #[test]
 fn a_signed_abort_consumes_the_epoch_and_removes_only_its_local_candidate() {
     isolated(
