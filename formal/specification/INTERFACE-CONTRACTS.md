@@ -30,7 +30,8 @@ L’équipe de validation fournit une trace datée et la provenance de chaque
 observation. L’équipe modèle décrit les comportements admis par le contrat,
 avec une portée par backend. L’équipe Rust examine où les instantanés, leur
 comparaison et la génération sont utilisés. La revue statue sur ce que ces
-éléments permettent d’établir et sur les cas encore ouverts.
+éléments permettent d’établir et sur les cas encore ouverts. `CMP-05`
+assemble ces quatre apports en un argument par backend.
 
 ## Règle de composition
 

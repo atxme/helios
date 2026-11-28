@@ -27,6 +27,21 @@ governance:
   - PROP-GATE
   - REV-GATE
   final_handoff: IND-04
+  coordination_scope:
+  - formal/README.md
+  - formal/AGENTS.md
+  - formal/MASTER-PLAN.md
+  - formal/ACCEPTANCE-CRITERIA.md
+  - formal/CLAUDE-PROMPT.md
+  - formal/TASK-REGISTRY.yaml
+  - formal/governance/DECISIONS.md
+  - formal/governance/OPEN-QUESTIONS.md
+  proposals_integrated_after_gate:
+    AUD-GATE:
+    - formal/specification/NORMATIVE-COVERAGE.md
+    SPEC-GATE:
+    - formal/specification/MODEL-SEMANTICS.md
+    - formal/specification/INTERFACE-CONTRACTS.md
   on_campaign_stop: >-
     Préparer IND-03 et IND-04 avec les éléments disponibles, même en cas d'arrêt par limite de
     ressources ou épuisement des travaux réalisables. Indiquer ce qui reste à instruire et pourquoi.
@@ -85,7 +100,19 @@ tasks:
   title: Dossier de lancement
   depends_on: []
   deliverable: Plan directeur, règles, critères, registre et journal
-  write_scope: formal/governance/gov-plan/
+  write_scope:
+  - formal/README.md
+  - formal/AGENTS.md
+  - formal/MASTER-PLAN.md
+  - formal/ACCEPTANCE-CRITERIA.md
+  - formal/CLAUDE-PROMPT.md
+  - formal/TASK-REGISTRY.yaml
+  - formal/governance/DECISIONS.md
+  - formal/governance/OPEN-QUESTIONS.md
+  - formal/specification/NORMATIVE-COVERAGE.md
+  - formal/specification/MODEL-SEMANTICS.md
+  - formal/specification/INTERFACE-CONTRACTS.md
+  - formal/governance/gov-approval/APPROVAL.md
   status: accepted
   accepted_scope: Mise à disposition de la révision de cadrage pour le lancement et la revue.
 - id: GOV-REVIEW
@@ -404,6 +431,7 @@ tasks:
   - ENR-01
   - ENR-02
   - ENR-03
+  - ENR-05
   - ENR-06
   - ENR-07
   - ENR-08
@@ -442,6 +470,7 @@ tasks:
   obligations:
   - AUT-01
   - AUT-02
+  - ETAT-06
   write_scope: formal/models/tamarin/tam-04/
 - id: TAM-FRA-02
   phase: '04'
@@ -449,6 +478,7 @@ tasks:
   depends_on:
   - TAM-03
   - PROP-FRA
+  - AUD-08
   deliverable: Lemmes, trace nominale, mutation, verdict et correspondance Rust
   obligations:
   - FRA-02
@@ -490,6 +520,7 @@ tasks:
   obligations:
   - CLE-01
   - CLE-02
+  - CLE-05
   write_scope: formal/models/tamarin/tam-06/
 - id: TAM-07
   phase: '04'
@@ -595,6 +626,7 @@ tasks:
   deliverable: Entrelacements entre transactions et consommations
   obligations:
   - ETAT-01
+  - FRA-01
   - FRA-02
   write_scope: formal/models/tla/tla-02/
 - id: TLA-03
@@ -616,6 +648,7 @@ tasks:
   deliverable: Transitions de la confirmation au point de non-retour
   obligations:
   - AUT-03
+  - FIL-03
   - ETAT-03
   - ETAT-04
   - ETAT-06
@@ -634,13 +667,15 @@ tasks:
   write_scope: formal/models/tla/tla-05/
 - id: TLA-06
   phase: '05'
-  title: Persistance du plancher et de l’invitation
+  title: Persistance du plancher, de l’invitation et de l’amorçage
   depends_on:
   - TLA-04
   - PROP-ENR
-  deliverable: États durables, synchronisation et propriétés de monotonie
+  deliverable: États durables, synchronisation, autorisations d’émission et propriétés de monotonie
   obligations:
+  - ENR-02
   - ENR-04
+  - ENR-08
   - ETAT-04
   - ETAT-09
   write_scope: formal/models/tla/tla-06/
@@ -662,9 +697,12 @@ tasks:
   - TLA-02
   - TLA-05
   - SPEC-INTERFACES
-  deliverable: Révocation, rechargement et générations obsolètes
+  - PROP-IDE
+  deliverable: Révocation, rechargement, unicité des empreintes et générations obsolètes
   obligations:
   - ENR-05
+  - IDE-02
+  - IDE-03
   - ETAT-07
   write_scope: formal/models/tla/tla-08/
 - id: TLA-09
@@ -679,6 +717,7 @@ tasks:
   - VIE-01
   - VIE-02
   - VIE-03
+  - VIE-09
   write_scope: formal/models/tla/tla-09/
 - id: TLA-10
   phase: '05'
@@ -686,8 +725,10 @@ tasks:
   depends_on:
   - TLA-08
   - PROP-VIE
-  deliverable: Retrait, récupération et causalité des observations
+  - PROP-OBS
+  deliverable: Retrait, statuts du release, récupération et causalité des observations
   obligations:
+  - OBS-02
   - VIE-04
   - VIE-05
   - VIE-06
@@ -863,12 +904,14 @@ tasks:
   depends_on:
   - CMP-01
   - TAM-06
+  - TAM-08
   - SPEC-INTERFACES
-  deliverable: Argument de confidentialité et séparation dans la portée annoncée
+  deliverable: Argument de confidentialité et séparation dans la portée annoncée, avec les hypothèses d’aléa
   obligations:
   - CLE-01
   - CLE-02
   - CLE-03
+  - CLE-04
   write_scope: formal/models/composition/cmp-02/
 - id: CMP-03
   phase: '07'
@@ -890,17 +933,38 @@ tasks:
   write_scope: formal/models/composition/cmp-04/
   owner: Opus indépendant spécialisé
   reviewer: Fable et second relecteur
+- id: CMP-05
+  phase: '07'
+  title: Composer la preuve de handshake d’ETAT-03
+  depends_on:
+  - TLA-04
+  - TIM-06
+  - EXP-03
+  - EXP-04
+  - RUST-08
+  deliverable: >-
+    Argument reliant, par backend, le contrat IFC-04, le modèle d’état, les traces sur cible et les
+    transitions Rust à l’usage du candidat de la transaction courante
+  obligations:
+  - ETAT-03
+  write_scope: formal/models/composition/cmp-05/
 - id: RUST-01
   phase: '08'
-  title: Encodages et décodages
+  title: Encodages, décodages et octets authentifiés
   depends_on:
   - AUD-08
   - PROP-IDE
+  - PROP-CLE
   - TOOLS-PIN
-  deliverable: Vérification de fonctions, corpus et correspondance des octets
+  deliverable: >-
+    Vérification de fonctions, corpus et correspondance des octets signés, des entrées de dérivation
+    et des contrôles de certificat
   obligations:
+  - IDE-04
   - FIL-01
   - FIL-02
+  - AUT-01
+  - CLE-01
   write_scope: formal/implementation/rust-01/
 - id: RUST-02
   phase: '08'
@@ -957,8 +1021,9 @@ tasks:
   - PROP-CLE
   - PROP-OBS
   - AUD-08
-  deliverable: Audit de cycle de vie et limites de validation
+  deliverable: Audit de cycle de vie, chemin du PSK statique et limites de validation
   obligations:
+  - CLE-03
   - CLE-05
   - OBS-05
   write_scope: formal/implementation/rust-06/
@@ -982,6 +1047,37 @@ tasks:
   - AUD-08
   deliverable: Cartographie versionnée des transitions, points d’observation et tests
   write_scope: formal/implementation/rust-08/
+- id: RUST-09
+  phase: '08'
+  title: Enrôlement, import et amorçage
+  depends_on:
+  - AUD-08
+  - PROP-ENR
+  - TOOLS-PIN
+  deliverable: >-
+    Vérification des preuves de possession, du refus X25519 nul, de la vérification JCS à l’import
+    et audit des clés privées hors des fichiers échangés
+  obligations:
+  - ENR-03
+  - ENR-06
+  - ENR-07
+  write_scope: formal/implementation/rust-09/
+- id: RUST-10
+  phase: '08'
+  title: Surface publique et configuration du canal
+  depends_on:
+  - AUD-08
+  - PROP-IDE
+  - PROP-OBS
+  - TOOLS-PIN
+  deliverable: >-
+    Audit des codes et formes de rejet, des statuts du release et de la configuration QUIC/TLS
+    (ALPN, TLS 1.3 mutuel, absence de reprise et de 0-RTT)
+  obligations:
+  - IDE-01
+  - OBS-01
+  - OBS-02
+  write_scope: formal/implementation/rust-10/
 - id: RUST-RESULTS
   phase: '08'
   title: Intégrer la conformité d’implémentation
@@ -994,6 +1090,8 @@ tasks:
   - RUST-06
   - RUST-07
   - RUST-08
+  - RUST-09
+  - RUST-10
   deliverable: État de la correspondance par obligation
   write_scope: formal/implementation/rust-results/
 - id: EXP-PLAN
@@ -1009,8 +1107,9 @@ tasks:
   title: Handshake WireGuard Linux
   depends_on:
   - EXP-PLAN
-  deliverable: Trace et contrat d’observation Linux
+  deliverable: Trace et contrat d’observation Linux, ordre pose–handshake–confirmation côté Orion
   obligations:
+  - AUT-03
   - ETAT-03
   write_scope: formal/validation/exp-01/
 - id: EXP-02
@@ -1018,8 +1117,9 @@ tasks:
   title: Handshake WireGuard-NT
   depends_on:
   - EXP-PLAN
-  deliverable: Trace et contrat d’observation Windows
+  deliverable: Trace et contrat d’observation Windows, ordre pose–handshake–confirmation côté Orion
   obligations:
+  - AUT-03
   - ETAT-03
   write_scope: formal/validation/exp-02/
 - id: EXP-03
@@ -1116,6 +1216,18 @@ tasks:
   - OBS-03
   - OBS-04
   write_scope: formal/validation/exp-11/
+- id: EXP-12
+  phase: '09'
+  title: Seuils de durée et de volume sur cible
+  depends_on:
+  - EXP-PLAN
+  - PROP-VIE
+  deliverable: >-
+    Suspension, recul d’horloge, remise à zéro des compteurs et latence de la boucle d’observation
+    sur Linux et Windows
+  obligations:
+  - VIE-03
+  write_scope: formal/validation/exp-12/
 - id: EXP-RESULTS
   phase: '09'
   title: Intégrer les validations externes
@@ -1129,6 +1241,7 @@ tasks:
   - EXP-09
   - EXP-10
   - EXP-11
+  - EXP-12
   deliverable: Contrats établis, partiels ou ouverts par cible
   write_scope: formal/validation/exp-results/
 - id: REV-PLAN
@@ -1169,6 +1282,7 @@ tasks:
   depends_on:
   - REV-PLAN
   - CMP-04
+  - CMP-05
   - EXP-RESULTS
   deliverable: Vérification de la composition, indépendance et cycles d’hypothèses
   write_scope: formal/reviews/rev-comp/

@@ -18,6 +18,8 @@ organise la construction des modèles, les preuves et leur validation.
 - [Sémantique commune](specification/MODEL-SEMANTICS.md) et
   [contrats d'interface](specification/INTERFACE-CONTRACTS.md) — propositions
   à valider avant les modèles.
+- [Autorisation initiale](governance/gov-approval/APPROVAL.md) — moyens,
+  plafonds, outils et cibles à signer avant le lancement.
 - [Décisions](governance/DECISIONS.md) et
   [questions ouvertes](governance/OPEN-QUESTIONS.md) — arbitrages et effets sur
   les conclusions.

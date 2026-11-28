@@ -14,6 +14,7 @@ visibles dans les [questions ouvertes](OPEN-QUESTIONS.md).
 | DEC-06 | Retenue | `GOV-APPROVAL` consigne l’autorisation initiale unique. Fable arbitre les étapes intermédiaires et la décision humaine suivante porte sur le dossier remis via `IND-04`. |
 | DEC-07 | Retenue | Une dépendance ouverte borne les seuls résultats qui l’importent. Les jalons publient les portions utilisables, conditionnelles ou ouvertes. La campagne continue sur résolutions alternatives et lots indépendants. |
 | DEC-08 | Retenue | La coordination conserve dans Git des points de reprise réguliers et remet un dossier indiquant ce qui reste ouvert ou incomplet si une limite autorisée met fin à la campagne. |
+| DEC-09 | Proposée | Chaque nature déclarée par le catalogue pour une obligation est portée par au moins un lot de la méthode correspondante. Corrections du 2026-11-28 : `RUST-09`, `RUST-10`, `EXP-12` et `CMP-05` ajoutés, obligations complétées dans `TAM-01`, `TAM-04`, `TAM-06`, `TLA-02`, `TLA-04`, `TLA-06`, `TLA-08` à `TLA-10`, `CMP-02`, `RUST-01`, `RUST-06`, `EXP-01` et `EXP-02`. `PROP-SCHEMA` intègre ce contrôle au validateur du registre. |
 
 Pour enregistrer une décision, indiquer l’auteur, le relecteur, la
 portée de l’arbitrage de Fable, la révision des sources et les

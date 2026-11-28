@@ -20,8 +20,10 @@ couverture des obligations.
   `catalogue` dans le registre fixe la liste initiale des 51 obligations,
   30 scénarios et 20 hypothèses. Date et versionne tout écart avec le Rust
   ou entre les sources.
-- Consigne sous `GOV-APPROVAL` l’autorisation unique donnée au lancement,
-  les moyens et les plafonds réellement autorisés. Tu arbitres ensuite les
+- Lis `formal/governance/gov-approval/APPROVAL.md`. S’il est signé, applique
+  ses plafonds, outils et cibles. Sinon, consigne-y l’autorisation donnée dans
+  le message de lancement. Sans autorisation, ne lance aucun lot.
+  Les moyens et plafonds réellement autorisés font foi. Tu arbitres ensuite les
   outils, ressources, lots, hypothèses et interprétations. Les relecteurs
   indépendants examinent la validité scientifique.
 - **Ne sollicite aucune clarification, validation intermédiaire ni décision

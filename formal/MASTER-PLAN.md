@@ -49,7 +49,7 @@ dossier. Les sources normatives demeurent la référence des vérifications.
 | 04 — Cryptographie symbolique | Noyau Tamarin, profils de menace et preuves par raffinement. | Chaque conclusion indique les propriétés de trace ou d’équivalence, ses hypothèses et les contrôles de non-vacuité et de sensibilité. |
 | 05 — Machines d’état | Modèle TLA+ des opérations, concurrence, persistance, pannes, révocation et cycle du slot. | Le modèle représente l’effet backend sans acquittement lorsque le contrat le permet. Les résultats identifient la configuration et la portée de l’exploration. |
 | 06 — Temps | Justification du choix entre temps discret en TLA+ et automates temporisés, puis résultats sur seuils et échéances. | Les bornes distinguent temps, observation et disponibilité. Les limites de résolution et d’ordonnancement sont explicites. |
-| 07 — Composition crypto | Argument ML-KEM–HKDF–PSK–WireGuard, selon les secrets divulgués et l’horizon temporel. | Les conclusions symboliques et computationnelles sont séparément justifiées. Un relecteur indépendant contrôle toute revendication sur le trafic capturé. |
+| 07 — Composition | Argument ML-KEM–HKDF–PSK–WireGuard, selon les secrets divulgués et l’horizon temporel. Argument `ETAT-03` reliant contrat backend, modèle d’état, traces sur cible et transitions Rust (`CMP-05`). | Les conclusions symboliques et computationnelles sont séparément justifiées. Un relecteur indépendant contrôle toute revendication sur le trafic capturé. |
 | 08 — Rust | Fonctions, invariants et correspondance des traces aux fonctions, transitions et tests existants. | Les correspondances vérifiées, partielles ou ouvertes sont identifiées avec la révision du code et les limites des outils. |
 | 09 — Validation expérimentale | Contrats WireGuard Linux et Windows, effets du changement de PSK, erreurs backend, stockage et observations du réseau. | Les protocoles de mesure, plateformes, versions, limites et traces sont archivés. La relation de l’observation au candidat est instruite pour `ETAT-03`. |
 | 10 — Revue indépendante | Audit des abstractions, reproductibilité, non-vacuité, restrictions, mutations et cohérence intermodèles. | Fable consolide les revues indépendantes. Une objection peut réviser un verdict ou rester ouverte avec sa portée et sa justification. |
@@ -97,6 +97,9 @@ flowchart TD
   TAM --> CMP[Argument de composition]
   NOTES --> CMP
   EXP --> CMP
+  TLA --> CMP
+  TIM --> CMP
+  RUST --> CMP
   TAM --> REV[Revue indépendante]
   TIM --> REV
   TLA --> REV
