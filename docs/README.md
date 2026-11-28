@@ -68,6 +68,8 @@ foi en cas de doute (voir [AGENTS.md](../AGENTS.md)).
   historique.
 - [Négociation v5](specification/NEGOCIATION-DE-CLE-V5.md) — protocole servi,
   avec ses lots encore ouverts.
+- [Vérification formelle de la négociation v5](specification/VERIFICATION-FORMELLE-NEGOCIATION-V5.md)
+  — catalogue initial des propriétés et hypothèses à vérifier.
 - [Rotation des certificats](specification/ROTATION-CERTIFICATS.md) — cycle de
   vie cible des certificats TLS/PQ.
 - [Adressage IPv6](specification/ADRESSAGE-IPV6.md) — modèle d'adressage
