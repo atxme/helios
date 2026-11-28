@@ -1,0 +1,1207 @@
+# Registre de lancement. Les affectations de rôle restent à valider.
+schema_version: 1
+baseline_revision: fced071d8946c6a9c04ce050b06a9d36b11aafc3
+catalogue: docs/specification/VERIFICATION-FORMELLE-NEGOCIATION-V5.md
+defaults:
+  status: planned
+  roles: Un lot hérite du propriétaire et du relecteur de sa phase, sauf indication contraire. Attribuer
+    des personnes ou agents distincts avant exécution.
+  execution: Le propriétaire peut déléguer l’écriture et l’exécution à Sonnet. Toute attribution et tout
+    changement de périmètre sont enregistrés.
+  acceptance: formal/ACCEPTANCE-CRITERIA.md
+  dependencies: Un prérequis doit être accepté pour utiliser ses résultats. Un résultat ouvert peut être
+    accepté avec une limite explicitement propagée.
+phases:
+  '00':
+    name: Gouvernance
+    owner: Fable
+    reviewer: Relecteur indépendant
+  '01':
+    name: Audit normatif
+    owner: Opus audit
+    reviewer: Opus sémantique
+  '02':
+    name: Référentiel commun
+    owner: Opus sémantique
+    reviewer: Opus audit
+  '03':
+    name: Formalisation des obligations
+    owner: Fable et Opus de domaine
+    reviewer: Opus sémantique
+  '04':
+    name: Vérification cryptographique
+    owner: Opus Tamarin
+    reviewer: Opus indépendant
+  '05':
+    name: Machines d’état
+    owner: Opus TLA+
+    reviewer: Opus indépendant
+  '06':
+    name: Vérification temporelle
+    owner: Opus temps
+    reviewer: Opus indépendant
+  '07':
+    name: Composition cryptographique
+    owner: Opus composition
+    reviewer: Opus indépendant spécialisé
+  08:
+    name: Vérification Rust
+    owner: Opus Rust
+    reviewer: Opus indépendant
+  09:
+    name: Validation expérimentale
+    owner: Opus validation
+    reviewer: Opus indépendant
+  '10':
+    name: Revue indépendante
+    owner: Opus indépendants
+    reviewer: Coordination et second relecteur
+  '11':
+    name: Industrialisation
+    owner: Fable et Opus intégration
+    reviewer: Responsable humain et relecteur indépendant
+tasks:
+- id: GOV-PLAN
+  phase: '00'
+  title: Dossier de lancement
+  depends_on: []
+  deliverable: Plan directeur, règles, critères, registre et journal
+  write_scope: formal/
+  status: proposed
+- id: GOV-REVIEW
+  phase: '00'
+  title: Relecture indépendante du lancement
+  depends_on:
+  - GOV-PLAN
+  deliverable: Deux comptes rendus séparés, zones de désaccord et résolution proposée
+  write_scope: formal/governance/gov-review/
+  owner: Deux Opus indépendants
+  reviewer: Fable
+- id: GOV-APPROVAL
+  phase: '00'
+  title: Validation humaine du plan
+  depends_on:
+  - GOV-REVIEW
+  deliverable: Décision signée ou consignée sur le périmètre, les rôles et le lancement
+  write_scope: formal/governance/gov-approval/
+  owner: Responsable humain du projet
+  reviewer: Fable
+- id: TOOLS-PIN
+  phase: '00'
+  title: Figer les chaînes de vérification
+  depends_on:
+  - GOV-APPROVAL
+  deliverable: Versions, empreintes, prérequis, limites de calcul et procédure de reproduction par outil
+  write_scope: formal/governance/tools-pin/
+- id: AUD-01
+  phase: '01'
+  title: Relever les clauses du contrat v5
+  depends_on:
+  - GOV-APPROVAL
+  deliverable: Inventaire des clauses normatives
+  write_scope: formal/specification/audit/aud-01/
+- id: AUD-02
+  phase: '01'
+  title: Auditer les amendements ADR-005
+  depends_on:
+  - GOV-APPROVAL
+  deliverable: Matrice des décisions v5 et des dispositions historiques
+  write_scope: formal/specification/audit/aud-02/
+- id: AUD-03
+  phase: '01'
+  title: Contrôler la couverture du §17
+  depends_on:
+  - AUD-01
+  deliverable: Matrice clause–obligation vérifiée
+  write_scope: formal/specification/audit/aud-03/
+- id: AUD-04
+  phase: '01'
+  title: Relever les contradictions normatives
+  depends_on:
+  - AUD-01
+  - AUD-02
+  deliverable: Registre des clauses en conflit et options d’arbitrage
+  write_scope: formal/specification/audit/aud-04/
+- id: AUD-05
+  phase: '01'
+  title: Relever les ambiguïtés
+  depends_on:
+  - AUD-01
+  deliverable: Questions ouvertes et portées concernées
+  write_scope: formal/specification/audit/aud-05/
+- id: AUD-06
+  phase: '01'
+  title: Relever les exigences implicites
+  depends_on:
+  - AUD-01
+  - AUD-02
+  deliverable: Exigences inférées, avec statut et justification
+  write_scope: formal/specification/audit/aud-06/
+- id: AUD-07
+  phase: '01'
+  title: Auditer la frontière Astra
+  depends_on:
+  - GOV-APPROVAL
+  deliverable: Inventaire des garanties de confiance et étapes visibles
+  write_scope: formal/specification/audit/aud-07/
+- id: AUD-08
+  phase: '01'
+  title: Auditer les écarts avec Rust
+  depends_on:
+  - GOV-APPROVAL
+  deliverable: Cartographie initiale code–contrat et écarts datés
+  write_scope: formal/specification/audit/aud-08/
+- id: AUD-09
+  phase: '01'
+  title: Dresser le bilan de couverture
+  depends_on:
+  - AUD-03
+  - AUD-04
+  - AUD-05
+  - AUD-06
+  - AUD-07
+  - AUD-08
+  deliverable: Lacunes, exclusions motivées et propositions de propriétés
+  write_scope: formal/specification/audit/aud-09/
+- id: AUD-GATE
+  phase: '01'
+  title: Accepter le référentiel audité
+  depends_on:
+  - AUD-09
+  deliverable: Périmètre et écarts arbitrés ou explicitement isolés
+  write_scope: formal/specification/audit/aud-gate/
+  owner: Fable
+- id: SPEC-EVENTS
+  phase: '02'
+  title: Définir les événements partagés
+  depends_on:
+  - AUD-01
+  deliverable: Catalogue des événements et points de linéarisation à vérifier
+  write_scope: formal/specification/reference/spec-events/
+- id: SPEC-STATE
+  phase: '02'
+  title: Définir les domaines d’état
+  depends_on:
+  - SPEC-EVENTS
+  deliverable: États initiaux, transitions et conditions de projection
+  write_scope: formal/specification/reference/spec-state/
+- id: SPEC-ADVERSARY
+  phase: '02'
+  title: Définir les capacités et divulgations
+  depends_on:
+  - AUD-01
+  - AUD-07
+  deliverable: Profils adverses et correspondance MEN
+  write_scope: formal/specification/reference/spec-adversary/
+- id: SPEC-HYPOTHESES
+  phase: '02'
+  title: Justifier les hypothèses communes
+  depends_on:
+  - SPEC-ADVERSARY
+  - AUD-05
+  deliverable: Hypothèses HYP, portée, preuves importées et dépendances
+  write_scope: formal/specification/reference/spec-hypotheses/
+- id: SPEC-INTERFACES
+  phase: '02'
+  title: Définir les contrats entre modèles et dépendances
+  depends_on:
+  - SPEC-EVENTS
+  - SPEC-STATE
+  - SPEC-HYPOTHESES
+  - AUD-08
+  deliverable: Contrats IFC, producteur, consommateur et limites
+  write_scope: formal/specification/reference/spec-interfaces/
+- id: SPEC-SEMANTICS
+  phase: '02'
+  title: Fixer les projections par outil
+  depends_on:
+  - SPEC-INTERFACES
+  deliverable: Règles de traduction des événements, des observables et de la portée
+  write_scope: formal/specification/reference/spec-semantics/
+- id: SPEC-GATE
+  phase: '02'
+  title: Accepter le référentiel commun
+  depends_on:
+  - SPEC-SEMANTICS
+  - AUD-GATE
+  deliverable: Revue des interfaces et des écarts qui bloquent une conclusion
+  write_scope: formal/specification/reference/spec-gate/
+  owner: Fable
+  reviewer: Opus indépendants
+- id: PROP-SCHEMA
+  phase: '03'
+  title: Définir le format du registre de propriétés et des résultats
+  depends_on:
+  - SPEC-EVENTS
+  - SPEC-HYPOTHESES
+  deliverable: Schéma, identifiants, exemples et critères de non-vacuité
+  write_scope: formal/properties/prop-schema/
+- id: PROP-ENR
+  phase: '03'
+  title: Décomposer enrôlement et confiance
+  depends_on:
+  - SPEC-GATE
+  - PROP-SCHEMA
+  deliverable: Propriétés élémentaires et traces nominales
+  obligations:
+  - ENR-01
+  - ENR-02
+  - ENR-03
+  - ENR-04
+  - ENR-05
+  - ENR-06
+  - ENR-07
+  - ENR-08
+  write_scope: formal/properties/prop-enr/
+- id: PROP-IDE
+  phase: '03'
+  title: Décomposer identité, format et authentification
+  depends_on:
+  - SPEC-GATE
+  - PROP-SCHEMA
+  deliverable: Propriétés élémentaires et traces nominales
+  obligations:
+  - IDE-01
+  - IDE-02
+  - IDE-03
+  - IDE-04
+  - FIL-01
+  - FIL-02
+  - FIL-03
+  - AUT-01
+  - AUT-02
+  - AUT-03
+  write_scope: formal/properties/prop-ide/
+- id: PROP-FRA
+  phase: '03'
+  title: Décomposer fraîcheur et rejeu
+  depends_on:
+  - SPEC-GATE
+  - PROP-SCHEMA
+  deliverable: Propriétés élémentaires, cas de replay et traces nominales
+  obligations:
+  - FRA-01
+  - FRA-02
+  - FRA-03
+  - FRA-04
+  write_scope: formal/properties/prop-fra/
+- id: PROP-CLE
+  phase: '03'
+  title: Décomposer dérivation et confidentialité
+  depends_on:
+  - SPEC-GATE
+  - PROP-SCHEMA
+  deliverable: Propriétés élémentaires par mode et divulgation
+  obligations:
+  - CLE-01
+  - CLE-02
+  - CLE-03
+  - CLE-04
+  - CLE-05
+  - CLE-06
+  write_scope: formal/properties/prop-cle/
+- id: PROP-ETAT
+  phase: '03'
+  title: Décomposer les transactions et la persistance
+  depends_on:
+  - SPEC-GATE
+  - PROP-SCHEMA
+  deliverable: Invariants, propriétés de transition, pannes et atteignabilité
+  obligations:
+  - ETAT-01
+  - ETAT-02
+  - ETAT-03
+  - ETAT-04
+  - ETAT-05
+  - ETAT-06
+  - ETAT-07
+  - ETAT-08
+  - ETAT-09
+  write_scope: formal/properties/prop-etat/
+- id: PROP-VIE
+  phase: '03'
+  title: Décomposer le cycle du PSK
+  depends_on:
+  - SPEC-GATE
+  - PROP-SCHEMA
+  deliverable: Propriétés de renouvellement, de retrait et de vivacité
+  obligations:
+  - VIE-01
+  - VIE-02
+  - VIE-03
+  - VIE-04
+  - VIE-05
+  - VIE-06
+  - VIE-07
+  - VIE-08
+  - VIE-09
+  write_scope: formal/properties/prop-vie/
+- id: PROP-OBS
+  phase: '03'
+  title: Décomposer les observations et limites
+  depends_on:
+  - SPEC-GATE
+  - PROP-SCHEMA
+  deliverable: Équivalences, observables, limites et validations
+  obligations:
+  - OBS-01
+  - OBS-02
+  - OBS-03
+  - OBS-04
+  - OBS-05
+  write_scope: formal/properties/prop-obs/
+- id: PROP-GATE
+  phase: '03'
+  title: Accepter la couverture des propriétés
+  depends_on:
+  - PROP-ENR
+  - PROP-IDE
+  - PROP-FRA
+  - PROP-CLE
+  - PROP-ETAT
+  - PROP-VIE
+  - PROP-OBS
+  deliverable: Registre agréé des propriétés élémentaires
+  write_scope: formal/properties/prop-gate/
+  owner: Fable
+- id: TAM-00
+  phase: '04'
+  title: Noyau cryptographique et canaux
+  depends_on:
+  - SPEC-GATE
+  - TOOLS-PIN
+  deliverable: Primitives abstraites, canaux, profils adverses et traces de base
+  write_scope: formal/models/tamarin/tam-00/
+- id: TAM-01
+  phase: '04'
+  title: Enrôlement et preuves de possession
+  depends_on:
+  - TAM-00
+  - PROP-ENR
+  deliverable: Modèle d’enrôlement, preuves d’accord et traces nominales
+  obligations:
+  - ENR-01
+  - ENR-02
+  - ENR-03
+  - ENR-06
+  - ENR-07
+  - ENR-08
+  write_scope: formal/models/tamarin/tam-01/
+- id: TAM-02
+  phase: '04'
+  title: Admission et identité
+  depends_on:
+  - TAM-00
+  - PROP-IDE
+  deliverable: Liaisons mTLS, PQ, WireGuard et admission
+  obligations:
+  - IDE-01
+  - IDE-02
+  - IDE-03
+  - IDE-04
+  write_scope: formal/models/tamarin/tam-02/
+- id: TAM-03
+  phase: '04'
+  title: Négociation nominale ML-KEM
+  depends_on:
+  - TAM-02
+  - PROP-CLE
+  deliverable: Négociation intégrée atteignable et accord sur la dérivation
+  obligations:
+  - AUT-01
+  - CLE-01
+  write_scope: formal/models/tamarin/tam-03/
+- id: TAM-04
+  phase: '04'
+  title: Authentification et accord injectif
+  depends_on:
+  - TAM-03
+  - PROP-IDE
+  deliverable: Propriétés d’accord et d’authentification
+  obligations:
+  - AUT-01
+  - AUT-02
+  write_scope: formal/models/tamarin/tam-04/
+- id: TAM-FRA-02
+  phase: '04'
+  title: Pilote de traçabilité du challenge
+  depends_on:
+  - TAM-03
+  - PROP-FRA
+  deliverable: Lemmes, trace nominale, mutation, verdict et correspondance Rust
+  obligations:
+  - FRA-02
+  write_scope: formal/models/tamarin/tam-fra-02/
+  threats:
+  - MEN-08
+  - MEN-09
+  assumptions_to_evaluate:
+  - HYP-01
+  - HYP-02
+  - HYP-04
+  - HYP-07
+  - HYP-15
+  acceptance_detail:
+  - Distinguer émission, consommation et acceptation applicative.
+  - Vérifier unicité, liaison à la connexion et atteignabilité nominale.
+  - Enregistrer les mutations et les limites de la correspondance Rust.
+- id: TAM-05
+  phase: '04'
+  title: Fraîcheur et anti-rejeu
+  depends_on:
+  - TAM-04
+  - TAM-FRA-02
+  - PROP-FRA
+  deliverable: Couverture multi-session et multi-gateway et résultats
+  obligations:
+  - FRA-01
+  - FRA-02
+  - FRA-03
+  - FRA-04
+  write_scope: formal/models/tamarin/tam-05/
+- id: TAM-06
+  phase: '04'
+  title: Confidentialité et isolation des PSK
+  depends_on:
+  - TAM-03
+  - PROP-CLE
+  deliverable: Propriétés de secret et portée par session
+  obligations:
+  - CLE-01
+  - CLE-02
+  write_scope: formal/models/tamarin/tam-06/
+- id: TAM-07
+  phase: '04'
+  title: Compromissions partielles
+  depends_on:
+  - TAM-04
+  - TAM-06
+  - SPEC-ADVERSARY
+  deliverable: Matrice de divulgation, exceptions et résultats
+  obligations:
+  - IDE-02
+  - IDE-03
+  - AUT-02
+  - CLE-02
+  write_scope: formal/models/tamarin/tam-07/
+- id: TAM-08
+  phase: '04'
+  title: Mode PSK statique
+  depends_on:
+  - TAM-03
+  - PROP-CLE
+  deliverable: Modèle statique, engagements et divulgations
+  obligations:
+  - CLE-03
+  write_scope: formal/models/tamarin/tam-08/
+- id: TAM-09
+  phase: '04'
+  title: Rotation des identités et révocation
+  depends_on:
+  - TAM-02
+  - SPEC-INTERFACES
+  - PROP-ETAT
+  deliverable: Aspects symboliques de la rotation et de l’admission courante
+  obligations:
+  - IDE-03
+  - FRA-03
+  - ETAT-07
+  write_scope: formal/models/tamarin/tam-09/
+- id: TAM-10
+  phase: '04'
+  title: Renouvellement et release
+  depends_on:
+  - TAM-03
+  - PROP-VIE
+  - SPEC-INTERFACES
+  deliverable: Propriétés symboliques du retrait et du renouvellement
+  obligations:
+  - VIE-01
+  - VIE-02
+  - VIE-04
+  write_scope: formal/models/tamarin/tam-10/
+- id: TAM-11
+  phase: '04'
+  title: Équivalence observationnelle
+  depends_on:
+  - TAM-08
+  - PROP-OBS
+  deliverable: Observables définies et comparaison des vues
+  obligations:
+  - OBS-01
+  - OBS-02
+  - CLE-03
+  write_scope: formal/models/tamarin/tam-11/
+- id: TAM-12
+  phase: '04'
+  title: Déchiffrement classique différé
+  depends_on:
+  - TAM-06
+  - TAM-07
+  deliverable: Traces et propriétés symboliques sous divulgations différées
+  obligations:
+  - CLE-02
+  write_scope: formal/models/tamarin/tam-12/
+- id: TAM-RESULTS
+  phase: '04'
+  title: Intégrer les résultats symboliques
+  depends_on:
+  - TAM-01
+  - TAM-05
+  - TAM-07
+  - TAM-09
+  - TAM-10
+  - TAM-11
+  - TAM-12
+  deliverable: Résultats revus par modèle et tests de sensibilité
+  write_scope: formal/models/tamarin/tam-results/
+- id: TLA-01
+  phase: '05'
+  title: Réservation et propriété des slots
+  depends_on:
+  - PROP-ETAT
+  - TOOLS-PIN
+  deliverable: Noyau d’état et invariants de propriété
+  obligations:
+  - ETAT-01
+  write_scope: formal/models/tla/tla-01/
+- id: TLA-02
+  phase: '05'
+  title: Négociations concurrentes
+  depends_on:
+  - TLA-01
+  - PROP-FRA
+  deliverable: Entrelacements entre transactions et consommations
+  obligations:
+  - ETAT-01
+  - FRA-02
+  write_scope: formal/models/tla/tla-02/
+- id: TLA-03
+  phase: '05'
+  title: Pose backend et acquittement
+  depends_on:
+  - TLA-01
+  - SPEC-INTERFACES
+  deliverable: Modèle des effets et retours backend séparés
+  obligations:
+  - ETAT-02
+  - ETAT-03
+  write_scope: formal/models/tla/tla-03/
+- id: TLA-04
+  phase: '05'
+  title: Confirmation et commit
+  depends_on:
+  - TLA-03
+  deliverable: Transitions de la confirmation au point de non-retour
+  obligations:
+  - AUT-03
+  - ETAT-03
+  - ETAT-04
+  - ETAT-06
+  write_scope: formal/models/tla/tla-04/
+- id: TLA-05
+  phase: '05'
+  title: Rollback et nettoyage
+  depends_on:
+  - TLA-02
+  - TLA-03
+  - TLA-04
+  deliverable: Restaurations, pannes et justice d’ordonnancement
+  obligations:
+  - ETAT-05
+  - VIE-08
+  write_scope: formal/models/tla/tla-05/
+- id: TLA-06
+  phase: '05'
+  title: Persistance du plancher et de l’invitation
+  depends_on:
+  - TLA-04
+  - PROP-ENR
+  deliverable: États durables, synchronisation et propriétés de monotonie
+  obligations:
+  - ENR-04
+  - ETAT-04
+  - ETAT-09
+  write_scope: formal/models/tla/tla-06/
+- id: TLA-07
+  phase: '05'
+  title: Crash et redémarrage
+  depends_on:
+  - TLA-05
+  - TLA-06
+  deliverable: Reprise et invariants au redémarrage
+  obligations:
+  - ETAT-08
+  - VIE-07
+  write_scope: formal/models/tla/tla-07/
+- id: TLA-08
+  phase: '05'
+  title: Révocation et réadmission
+  depends_on:
+  - TLA-02
+  - TLA-05
+  - SPEC-INTERFACES
+  deliverable: Révocation, rechargement et générations obsolètes
+  obligations:
+  - ENR-05
+  - ETAT-07
+  write_scope: formal/models/tla/tla-08/
+- id: TLA-09
+  phase: '05'
+  title: Renouvellement
+  depends_on:
+  - TLA-04
+  - TLA-05
+  - PROP-VIE
+  deliverable: Bascule de génération et remplacement
+  obligations:
+  - VIE-01
+  - VIE-02
+  - VIE-03
+  write_scope: formal/models/tla/tla-09/
+- id: TLA-10
+  phase: '05'
+  title: Release et vieillissement
+  depends_on:
+  - TLA-08
+  - PROP-VIE
+  deliverable: Retrait, récupération et causalité des observations
+  obligations:
+  - VIE-04
+  - VIE-05
+  - VIE-06
+  write_scope: formal/models/tla/tla-10/
+- id: TLA-11
+  phase: '05'
+  title: Quotas et ressources
+  depends_on:
+  - TLA-01
+  - PROP-OBS
+  deliverable: Permis, bornes et libération
+  obligations:
+  - OBS-03
+  - OBS-04
+  write_scope: formal/models/tla/tla-11/
+- id: TLA-12
+  phase: '05'
+  title: Vivacité et récupération
+  depends_on:
+  - TLA-05
+  - TLA-07
+  - TLA-10
+  deliverable: Atteignabilité, progression et reprise sous hypothèses
+  obligations:
+  - VIE-07
+  - VIE-08
+  write_scope: formal/models/tla/tla-12/
+- id: TLA-13
+  phase: '05'
+  title: Modèle d’état intégré
+  depends_on:
+  - TLA-09
+  - TLA-10
+  - TLA-11
+  - TLA-12
+  deliverable: Modèle commun, configurations et verdicts conditionnels
+  write_scope: formal/models/tla/tla-13/
+- id: TIM-00
+  phase: '06'
+  title: Choisir la représentation du temps
+  depends_on:
+  - SPEC-GATE
+  - TOOLS-PIN
+  deliverable: Critères justifiant TLA+ discret ou automate temporisé par propriété
+  write_scope: formal/models/timed/tim-00/
+- id: TIM-01
+  phase: '06'
+  title: Expiration du challenge
+  depends_on:
+  - TIM-00
+  - PROP-FRA
+  deliverable: Borne de validité, horloges et points d’émission
+  obligations:
+  - FRA-01
+  - FRA-04
+  write_scope: formal/models/timed/tim-01/
+- id: TIM-02
+  phase: '06'
+  title: Délai de confirmation
+  depends_on:
+  - TIM-00
+  - PROP-IDE
+  deliverable: Bornes et ordre de confirmation
+  obligations:
+  - FIL-03
+  write_scope: formal/models/timed/tim-02/
+- id: TIM-03
+  phase: '06'
+  title: Durée de vie du PSK
+  depends_on:
+  - TIM-00
+  - TLA-09
+  deliverable: Horloges, début de durée et échéances
+  obligations:
+  - VIE-03
+  write_scope: formal/models/timed/tim-03/
+- id: TIM-04
+  phase: '06'
+  title: Seuils de renouvellement
+  depends_on:
+  - TIM-03
+  deliverable: Propriété du premier seuil temps ou volume
+  obligations:
+  - VIE-03
+  write_scope: formal/models/timed/tim-04/
+- id: TIM-05
+  phase: '06'
+  title: Seuils de retrait
+  depends_on:
+  - TIM-03
+  - TLA-10
+  deliverable: Franchissement, observation et retrait effectif
+  obligations:
+  - VIE-03
+  - VIE-06
+  write_scope: formal/models/timed/tim-05/
+- id: TIM-06
+  phase: '06'
+  title: Retard d’observation WireGuard
+  depends_on:
+  - TIM-00
+  - TLA-03
+  deliverable: Bornes d’observation et impact sur la preuve
+  obligations:
+  - ETAT-03
+  - VIE-06
+  write_scope: formal/models/timed/tim-06/
+- id: TIM-07
+  phase: '06'
+  title: Suspension et reprise
+  depends_on:
+  - TIM-03
+  deliverable: Comportement avec suspension et reset de compteur
+  obligations:
+  - VIE-03
+  write_scope: formal/models/timed/tim-07/
+- id: TIM-08
+  phase: '06'
+  title: Reconnexion et récupération
+  depends_on:
+  - TIM-05
+  - TLA-12
+  deliverable: Budget, plusieurs boucles de reprise et disponibilité
+  obligations:
+  - VIE-07
+  - VIE-08
+  write_scope: formal/models/timed/tim-08/
+- id: TIM-09
+  phase: '06'
+  title: Recul d’horloge
+  depends_on:
+  - TIM-00
+  - PROP-VIE
+  deliverable: Domaine des horloges et changements de temps
+  obligations:
+  - FRA-04
+  - VIE-03
+  write_scope: formal/models/timed/tim-09/
+- id: TIM-10
+  phase: '06'
+  title: Respect des bornes de ressources
+  depends_on:
+  - TIM-00
+  - TLA-11
+  deliverable: Fenêtres, échéances absolues et permis
+  obligations:
+  - OBS-03
+  write_scope: formal/models/timed/tim-10/
+- id: TIM-RESULTS
+  phase: '06'
+  title: Intégrer les résultats temporels
+  depends_on:
+  - TIM-01
+  - TIM-02
+  - TIM-04
+  - TIM-06
+  - TIM-07
+  - TIM-08
+  - TIM-09
+  - TIM-10
+  deliverable: Verdicts temporels et conditions de mesure
+  write_scope: formal/models/timed/tim-results/
+- id: CMP-01
+  phase: '07'
+  title: Rechercher les résultats de composition applicables
+  depends_on:
+  - GOV-APPROVAL
+  deliverable: Corpus primaire et carte des notions de sécurité
+  write_scope: formal/models/composition/cmp-01/
+- id: CMP-02
+  phase: '07'
+  title: Relier ML-KEM, HKDF et PSK Helios
+  depends_on:
+  - CMP-01
+  - TAM-06
+  - SPEC-INTERFACES
+  deliverable: Argument de confidentialité et séparation dans la portée annoncée
+  obligations:
+  - CLE-01
+  - CLE-02
+  - CLE-03
+  write_scope: formal/models/composition/cmp-02/
+- id: CMP-03
+  phase: '07'
+  title: Composer avec WireGuard et le trafic capturé
+  depends_on:
+  - CMP-02
+  - TAM-12
+  - EXP-03
+  deliverable: Garanties sur les clés de transport, données capturées et limites
+  obligations:
+  - CLE-02
+  write_scope: formal/models/composition/cmp-03/
+- id: CMP-04
+  phase: '07'
+  title: Valider l’argument de composition
+  depends_on:
+  - CMP-03
+  deliverable: Relecture scientifique indépendante et verdict motivé
+  write_scope: formal/models/composition/cmp-04/
+  owner: Opus indépendant spécialisé
+  reviewer: Fable et second relecteur
+- id: RUST-01
+  phase: 08
+  title: Encodages et décodages
+  depends_on:
+  - AUD-08
+  - PROP-IDE
+  - TOOLS-PIN
+  deliverable: Vérification de fonctions, corpus et correspondance des octets
+  obligations:
+  - FIL-01
+  - FIL-02
+  write_scope: formal/implementation/rust-01/
+- id: RUST-02
+  phase: 08
+  title: Bornes et calculs
+  depends_on:
+  - AUD-08
+  - PROP-FRA
+  - TOOLS-PIN
+  deliverable: Vérification des calculs et longueurs
+  obligations:
+  - FIL-03
+  - FRA-04
+  write_scope: formal/implementation/rust-02/
+- id: RUST-03
+  phase: 08
+  title: Invariants des transitions
+  depends_on:
+  - AUD-08
+  - TLA-01
+  - TOOLS-PIN
+  deliverable: Correspondance des invariants et vérification des fonctions pures
+  obligations:
+  - ETAT-01
+  - ETAT-07
+  write_scope: formal/implementation/rust-03/
+- id: RUST-04
+  phase: 08
+  title: Concurrence et annulations
+  depends_on:
+  - TLA-03
+  - TLA-05
+  - TOOLS-PIN
+  deliverable: Choix d’outil justifié, points d’annulation et validations
+  obligations:
+  - ETAT-02
+  - ETAT-05
+  write_scope: formal/implementation/rust-04/
+- id: RUST-05
+  phase: 08
+  title: Comportements indéfinis et entrées
+  depends_on:
+  - AUD-08
+  - PROP-IDE
+  - TOOLS-PIN
+  deliverable: Inventaire des surfaces, résultats ciblés de l’outillage retenu
+  obligations:
+  - FIL-01
+  - OBS-04
+  write_scope: formal/implementation/rust-05/
+- id: RUST-06
+  phase: 08
+  title: Zéroïsation et secrets
+  depends_on:
+  - PROP-CLE
+  - PROP-OBS
+  - AUD-08
+  deliverable: Audit de cycle de vie et limites de validation
+  obligations:
+  - CLE-05
+  - OBS-05
+  write_scope: formal/implementation/rust-06/
+- id: RUST-07
+  phase: 08
+  title: Dépendances cryptographiques
+  depends_on:
+  - PROP-CLE
+  - AUD-08
+  deliverable: Versions, contrats et preuves externes utilisées
+  obligations:
+  - CLE-04
+  - CLE-06
+  - OBS-05
+  write_scope: formal/implementation/rust-07/
+- id: RUST-08
+  phase: 08
+  title: Correspondance des événements et des traces
+  depends_on:
+  - SPEC-GATE
+  - AUD-08
+  deliverable: Cartographie versionnée des transitions, points d’observation et tests
+  write_scope: formal/implementation/rust-08/
+- id: RUST-RESULTS
+  phase: 08
+  title: Intégrer la conformité d’implémentation
+  depends_on:
+  - RUST-01
+  - RUST-02
+  - RUST-03
+  - RUST-04
+  - RUST-05
+  - RUST-06
+  - RUST-07
+  - RUST-08
+  deliverable: État de la correspondance par obligation
+  write_scope: formal/implementation/rust-results/
+- id: EXP-PLAN
+  phase: 09
+  title: Définir les protocoles de mesure sur cible
+  depends_on:
+  - SPEC-INTERFACES
+  - TOOLS-PIN
+  deliverable: Plateformes, instrumentation, hypothèses, accès et conditions de validation
+  write_scope: formal/validation/exp-plan/
+- id: EXP-01
+  phase: 09
+  title: Handshake WireGuard Linux
+  depends_on:
+  - EXP-PLAN
+  deliverable: Trace et contrat d’observation Linux
+  obligations:
+  - ETAT-03
+  write_scope: formal/validation/exp-01/
+- id: EXP-02
+  phase: 09
+  title: Handshake WireGuard-NT
+  depends_on:
+  - EXP-PLAN
+  deliverable: Trace et contrat d’observation Windows
+  obligations:
+  - ETAT-03
+  write_scope: formal/validation/exp-02/
+- id: EXP-03
+  phase: 09
+  title: Effet du changement de PSK
+  depends_on:
+  - EXP-01
+  - EXP-02
+  deliverable: Mesures sur les clés de transport et la transition
+  obligations:
+  - ETAT-03
+  - VIE-09
+  write_scope: formal/validation/exp-03/
+- id: EXP-04
+  phase: 09
+  title: Observations anciennes ou retardées
+  depends_on:
+  - EXP-01
+  - EXP-02
+  deliverable: Provenance et délais de publication
+  obligations:
+  - ETAT-03
+  - VIE-06
+  write_scope: formal/validation/exp-04/
+- id: EXP-05
+  phase: 09
+  title: Annulation après effet backend
+  depends_on:
+  - EXP-PLAN
+  deliverable: Traces d’interruption et d’acquittement
+  obligations:
+  - ETAT-02
+  - ETAT-05
+  write_scope: formal/validation/exp-05/
+- id: EXP-06
+  phase: 09
+  title: Persistance après crash
+  depends_on:
+  - EXP-PLAN
+  deliverable: Tests de l’état durable et fenêtres de panne
+  obligations:
+  - ENR-04
+  - ETAT-04
+  - ETAT-08
+  write_scope: formal/validation/exp-06/
+- id: EXP-07
+  phase: 09
+  title: Limites QUIC et mTLS
+  depends_on:
+  - EXP-PLAN
+  deliverable: Observations du canal, reprise et bornes de transport
+  obligations:
+  - IDE-01
+  - OBS-04
+  write_scope: formal/validation/exp-07/
+- id: EXP-08
+  phase: 09
+  title: Protection des secrets en mémoire
+  depends_on:
+  - EXP-PLAN
+  deliverable: Observations ciblées et limites par plateforme
+  obligations:
+  - CLE-05
+  - OBS-05
+  write_scope: formal/validation/exp-08/
+- id: EXP-09
+  phase: 09
+  title: Pare-feu et routage IPv4/IPv6
+  depends_on:
+  - EXP-PLAN
+  deliverable: Observations de provenance, routage et état de tunnel
+  obligations:
+  - VIE-01
+  - VIE-04
+  - VIE-09
+  write_scope: formal/validation/exp-09/
+- id: EXP-10
+  phase: 09
+  title: Temps de rejet
+  depends_on:
+  - EXP-PLAN
+  - PROP-OBS
+  deliverable: Protocole de mesure et observations reproductibles
+  obligations:
+  - OBS-01
+  write_scope: formal/validation/exp-10/
+- id: EXP-11
+  phase: 09
+  title: Ressources sous charge
+  depends_on:
+  - EXP-PLAN
+  deliverable: Mesures sur les cibles de validation autorisées et limites du contrat
+  obligations:
+  - OBS-03
+  - OBS-04
+  write_scope: formal/validation/exp-11/
+- id: EXP-RESULTS
+  phase: 09
+  title: Intégrer les validations externes
+  depends_on:
+  - EXP-03
+  - EXP-04
+  - EXP-05
+  - EXP-06
+  - EXP-07
+  - EXP-08
+  - EXP-09
+  - EXP-10
+  - EXP-11
+  deliverable: Contrats établis, partiels ou ouverts par cible
+  write_scope: formal/validation/exp-results/
+- id: REV-PLAN
+  phase: '10'
+  title: Distribuer les revues indépendantes
+  depends_on:
+  - GOV-APPROVAL
+  - PROP-SCHEMA
+  deliverable: Affectations auteur–relecteur et grille de contrôle
+  write_scope: formal/reviews/rev-plan/
+- id: REV-TAM
+  phase: '10'
+  title: Revoir les résultats symboliques
+  depends_on:
+  - REV-PLAN
+  - TAM-RESULTS
+  deliverable: Reproduction, mutations et audit adversaire
+  write_scope: formal/reviews/rev-tam/
+- id: REV-TLA
+  phase: '10'
+  title: Revoir les résultats d’état
+  depends_on:
+  - REV-PLAN
+  - TLA-13
+  deliverable: Reproduction, interleavings et validation des abstractions
+  write_scope: formal/reviews/rev-tla/
+- id: REV-TIM
+  phase: '10'
+  title: Revoir les résultats temporels
+  depends_on:
+  - REV-PLAN
+  - TIM-RESULTS
+  deliverable: Audit des horloges, des bornes et de l’équité
+  write_scope: formal/reviews/rev-tim/
+- id: REV-COMP
+  phase: '10'
+  title: Revoir la composition et les interfaces
+  depends_on:
+  - REV-PLAN
+  - CMP-04
+  - EXP-RESULTS
+  deliverable: Vérification de la composition, indépendance et cycles d’hypothèses
+  write_scope: formal/reviews/rev-comp/
+- id: REV-RUST
+  phase: '10'
+  title: Revoir les correspondances et expériences
+  depends_on:
+  - REV-PLAN
+  - RUST-RESULTS
+  - EXP-RESULTS
+  deliverable: Vérification du rattachement au code et des preuves expérimentales
+  write_scope: formal/reviews/rev-rust/
+- id: REV-GATE
+  phase: '10'
+  title: Valider la revue du dossier
+  depends_on:
+  - REV-TAM
+  - REV-TLA
+  - REV-TIM
+  - REV-COMP
+  - REV-RUST
+  deliverable: Objections résolues, résultats à réviser et conclusions ouvertes
+  write_scope: formal/reviews/rev-gate/
+- id: IND-01
+  phase: '11'
+  title: Définir le format durable et le suivi
+  depends_on:
+  - PROP-SCHEMA
+  - TOOLS-PIN
+  deliverable: Schéma versionné, import des résultats et métriques
+  write_scope: formal/results/ind-01/
+- id: IND-02
+  phase: '11'
+  title: Intégrer les vérifications continues
+  depends_on:
+  - IND-01
+  - REV-PLAN
+  deliverable: Contrôles de PR, exécutions coûteuses et invalidation des résultats périmés
+  write_scope: formal/results/ind-02/
+- id: IND-03
+  phase: '11'
+  title: Assembler le dossier reproductible
+  depends_on:
+  - IND-02
+  - PROP-GATE
+  - REV-GATE
+  deliverable: Verdicts des obligations, limites, contre-exemples et état Rust
+  write_scope: formal/results/ind-03/
+- id: IND-04
+  phase: '11'
+  title: Valider les revendications finales
+  depends_on:
+  - IND-03
+  deliverable: Décision humaine et rapport de synthèse publié
+  write_scope: formal/results/ind-04/
+  owner: Responsable humain du projet
+  reviewer: Fable
