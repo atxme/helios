@@ -19,7 +19,11 @@ organise la construction des modèles, les preuves et leur validation.
 - [Décisions](governance/DECISIONS.md) et
   [questions ouvertes](governance/OPEN-QUESTIONS.md) — arbitrages et effets sur
   les conclusions.
+- [Revue de préparation](governance/gov-review/CONSOLIDATION.md) — rapports
+  indépendants et suites proposées pour la coordination.
 
-Le dossier est **proposé pour validation**. Le registre décrit le travail à
-faire. Les verdicts et mesures seront associés aux révisions effectivement
-vérifiées.
+Le dossier décrit une campagne autonome après l’autorisation initiale
+`GOV-APPROVAL`. Fable organise les contrôles intermédiaires et poursuit les
+lots indépendants des questions encore ouvertes. Le responsable humain
+décide de l’acceptation du dossier remis via `IND-04`. Les verdicts et
+mesures seront associés aux révisions effectivement vérifiées.

@@ -1,4 +1,4 @@
-# Registre de lancement. Les affectations de rôle restent à valider.
+# Registre de lancement. Fable attribue les rôles dans le cadre de la délégation initiale.
 schema_version: 1
 baseline_revision: fced071d8946c6a9c04ce050b06a9d36b11aafc3
 catalogue: docs/specification/VERIFICATION-FORMELLE-NEGOCIATION-V5.md
@@ -9,8 +9,27 @@ defaults:
   execution: Le propriétaire peut déléguer l’écriture et l’exécution à Sonnet. Toute attribution et tout
     changement de périmètre sont enregistrés.
   acceptance: formal/ACCEPTANCE-CRITERIA.md
-  dependencies: Un prérequis doit être accepté pour utiliser ses résultats. Un résultat ouvert peut être
-    accepté avec une limite explicitement propagée.
+  dependencies: >-
+    Un lot consomme les portions pertinentes et revues de ses prérequis. Leur état peut être utilisable,
+    conditionnel ou ouvert, indépendamment du statut opérationnel de la tâche.
+  on_open_dependency: >-
+    Propager la limite aux conclusions concernées. Fable peut scinder ou réordonner le lot,
+    instruire des variantes et poursuivre les travaux indépendants.
+  on_interruption: >-
+    Enregistrer dans Git le point de reprise, les révisions, l'état de la revue,
+    les résultats partiels et le travail restant.
+governance:
+  launch_authorization: GOV-APPROVAL
+  independent_initial_review: GOV-REVIEW
+  autonomous_checkpoints:
+  - AUD-GATE
+  - SPEC-GATE
+  - PROP-GATE
+  - REV-GATE
+  final_handoff: IND-04
+  on_campaign_stop: >-
+    Préparer IND-03 et IND-04 avec les éléments disponibles, même en cas d'arrêt par limite de
+    ressources ou épuisement des travaux réalisables. Indiquer ce qui reste à instruire et pourquoi.
 phases:
   '00':
     name: Gouvernance
@@ -44,11 +63,11 @@ phases:
     name: Composition cryptographique
     owner: Opus composition
     reviewer: Opus indépendant spécialisé
-  08:
+  '08':
     name: Vérification Rust
     owner: Opus Rust
     reviewer: Opus indépendant
-  09:
+  '09':
     name: Validation expérimentale
     owner: Opus validation
     reviewer: Opus indépendant
@@ -66,23 +85,24 @@ tasks:
   title: Dossier de lancement
   depends_on: []
   deliverable: Plan directeur, règles, critères, registre et journal
-  write_scope: formal/
-  status: proposed
+  write_scope: formal/governance/gov-plan/
+  status: accepted
+  accepted_scope: Mise à disposition de la révision de cadrage pour le lancement et la revue.
 - id: GOV-REVIEW
   phase: '00'
-  title: Relecture indépendante du lancement
+  title: Revue indépendante automatique après autorisation initiale
   depends_on:
-  - GOV-PLAN
-  deliverable: Deux comptes rendus séparés, zones de désaccord et résolution proposée
+  - GOV-APPROVAL
+  deliverable: Deux rapports indépendants, objections conservées et arbitrage de Fable par périmètre
   write_scope: formal/governance/gov-review/
   owner: Deux Opus indépendants
   reviewer: Fable
 - id: GOV-APPROVAL
   phase: '00'
-  title: Validation humaine du plan
+  title: Autorisation initiale unique et délégation de la campagne
   depends_on:
-  - GOV-REVIEW
-  deliverable: Décision signée ou consignée sur le périmètre, les rôles et le lancement
+  - GOV-PLAN
+  deliverable: Autorisation initiale consignée, ressources autorisées et délégation à Fable jusqu’à la remise
   write_scope: formal/governance/gov-approval/
   owner: Responsable humain du projet
   reviewer: Fable
@@ -165,10 +185,11 @@ tasks:
   write_scope: formal/specification/audit/aud-09/
 - id: AUD-GATE
   phase: '01'
-  title: Accepter le référentiel audité
+  title: Arbitrer le référentiel audité par périmètre
   depends_on:
   - AUD-09
-  deliverable: Périmètre et écarts arbitrés ou explicitement isolés
+  - GOV-REVIEW
+  deliverable: Interprétations et écarts consignés par bloc, avec limites et questions ouvertes
   write_scope: formal/specification/audit/aud-gate/
   owner: Fable
 - id: SPEC-EVENTS
@@ -220,11 +241,11 @@ tasks:
   write_scope: formal/specification/reference/spec-semantics/
 - id: SPEC-GATE
   phase: '02'
-  title: Accepter le référentiel commun
+  title: Valider scientifiquement les portions du référentiel commun
   depends_on:
   - SPEC-SEMANTICS
   - AUD-GATE
-  deliverable: Revue des interfaces et des écarts qui bloquent une conclusion
+  deliverable: Contrats revus et statut utilisable, conditionnel ou ouvert pour chaque portion
   write_scope: formal/specification/reference/spec-gate/
   owner: Fable
   reviewer: Opus indépendants
@@ -352,7 +373,7 @@ tasks:
   write_scope: formal/properties/prop-obs/
 - id: PROP-GATE
   phase: '03'
-  title: Accepter la couverture des propriétés
+  title: Consolider les propriétés validées après revue
   depends_on:
   - PROP-ENR
   - PROP-IDE
@@ -361,7 +382,7 @@ tasks:
   - PROP-ETAT
   - PROP-VIE
   - PROP-OBS
-  deliverable: Registre agréé des propriétés élémentaires
+  deliverable: Registre revu des propriétés, limites et stratégies par bloc
   write_scope: formal/properties/prop-gate/
   owner: Fable
 - id: TAM-00
@@ -870,7 +891,7 @@ tasks:
   owner: Opus indépendant spécialisé
   reviewer: Fable et second relecteur
 - id: RUST-01
-  phase: 08
+  phase: '08'
   title: Encodages et décodages
   depends_on:
   - AUD-08
@@ -882,7 +903,7 @@ tasks:
   - FIL-02
   write_scope: formal/implementation/rust-01/
 - id: RUST-02
-  phase: 08
+  phase: '08'
   title: Bornes et calculs
   depends_on:
   - AUD-08
@@ -894,7 +915,7 @@ tasks:
   - FRA-04
   write_scope: formal/implementation/rust-02/
 - id: RUST-03
-  phase: 08
+  phase: '08'
   title: Invariants des transitions
   depends_on:
   - AUD-08
@@ -906,7 +927,7 @@ tasks:
   - ETAT-07
   write_scope: formal/implementation/rust-03/
 - id: RUST-04
-  phase: 08
+  phase: '08'
   title: Concurrence et annulations
   depends_on:
   - TLA-03
@@ -918,7 +939,7 @@ tasks:
   - ETAT-05
   write_scope: formal/implementation/rust-04/
 - id: RUST-05
-  phase: 08
+  phase: '08'
   title: Comportements indéfinis et entrées
   depends_on:
   - AUD-08
@@ -930,7 +951,7 @@ tasks:
   - OBS-04
   write_scope: formal/implementation/rust-05/
 - id: RUST-06
-  phase: 08
+  phase: '08'
   title: Zéroïsation et secrets
   depends_on:
   - PROP-CLE
@@ -942,7 +963,7 @@ tasks:
   - OBS-05
   write_scope: formal/implementation/rust-06/
 - id: RUST-07
-  phase: 08
+  phase: '08'
   title: Dépendances cryptographiques
   depends_on:
   - PROP-CLE
@@ -954,7 +975,7 @@ tasks:
   - OBS-05
   write_scope: formal/implementation/rust-07/
 - id: RUST-08
-  phase: 08
+  phase: '08'
   title: Correspondance des événements et des traces
   depends_on:
   - SPEC-GATE
@@ -962,7 +983,7 @@ tasks:
   deliverable: Cartographie versionnée des transitions, points d’observation et tests
   write_scope: formal/implementation/rust-08/
 - id: RUST-RESULTS
-  phase: 08
+  phase: '08'
   title: Intégrer la conformité d’implémentation
   depends_on:
   - RUST-01
@@ -976,7 +997,7 @@ tasks:
   deliverable: État de la correspondance par obligation
   write_scope: formal/implementation/rust-results/
 - id: EXP-PLAN
-  phase: 09
+  phase: '09'
   title: Définir les protocoles de mesure sur cible
   depends_on:
   - SPEC-INTERFACES
@@ -984,7 +1005,7 @@ tasks:
   deliverable: Plateformes, instrumentation, hypothèses, accès et conditions de validation
   write_scope: formal/validation/exp-plan/
 - id: EXP-01
-  phase: 09
+  phase: '09'
   title: Handshake WireGuard Linux
   depends_on:
   - EXP-PLAN
@@ -993,7 +1014,7 @@ tasks:
   - ETAT-03
   write_scope: formal/validation/exp-01/
 - id: EXP-02
-  phase: 09
+  phase: '09'
   title: Handshake WireGuard-NT
   depends_on:
   - EXP-PLAN
@@ -1002,7 +1023,7 @@ tasks:
   - ETAT-03
   write_scope: formal/validation/exp-02/
 - id: EXP-03
-  phase: 09
+  phase: '09'
   title: Effet du changement de PSK
   depends_on:
   - EXP-01
@@ -1013,7 +1034,7 @@ tasks:
   - VIE-09
   write_scope: formal/validation/exp-03/
 - id: EXP-04
-  phase: 09
+  phase: '09'
   title: Observations anciennes ou retardées
   depends_on:
   - EXP-01
@@ -1024,7 +1045,7 @@ tasks:
   - VIE-06
   write_scope: formal/validation/exp-04/
 - id: EXP-05
-  phase: 09
+  phase: '09'
   title: Annulation après effet backend
   depends_on:
   - EXP-PLAN
@@ -1034,7 +1055,7 @@ tasks:
   - ETAT-05
   write_scope: formal/validation/exp-05/
 - id: EXP-06
-  phase: 09
+  phase: '09'
   title: Persistance après crash
   depends_on:
   - EXP-PLAN
@@ -1045,7 +1066,7 @@ tasks:
   - ETAT-08
   write_scope: formal/validation/exp-06/
 - id: EXP-07
-  phase: 09
+  phase: '09'
   title: Limites QUIC et mTLS
   depends_on:
   - EXP-PLAN
@@ -1055,7 +1076,7 @@ tasks:
   - OBS-04
   write_scope: formal/validation/exp-07/
 - id: EXP-08
-  phase: 09
+  phase: '09'
   title: Protection des secrets en mémoire
   depends_on:
   - EXP-PLAN
@@ -1065,7 +1086,7 @@ tasks:
   - OBS-05
   write_scope: formal/validation/exp-08/
 - id: EXP-09
-  phase: 09
+  phase: '09'
   title: Pare-feu et routage IPv4/IPv6
   depends_on:
   - EXP-PLAN
@@ -1076,7 +1097,7 @@ tasks:
   - VIE-09
   write_scope: formal/validation/exp-09/
 - id: EXP-10
-  phase: 09
+  phase: '09'
   title: Temps de rejet
   depends_on:
   - EXP-PLAN
@@ -1086,7 +1107,7 @@ tasks:
   - OBS-01
   write_scope: formal/validation/exp-10/
 - id: EXP-11
-  phase: 09
+  phase: '09'
   title: Ressources sous charge
   depends_on:
   - EXP-PLAN
@@ -1096,7 +1117,7 @@ tasks:
   - OBS-04
   write_scope: formal/validation/exp-11/
 - id: EXP-RESULTS
-  phase: 09
+  phase: '09'
   title: Intégrer les validations externes
   depends_on:
   - EXP-03
@@ -1162,22 +1183,24 @@ tasks:
   write_scope: formal/reviews/rev-rust/
 - id: REV-GATE
   phase: '10'
-  title: Valider la revue du dossier
+  title: Consolider les revues indépendantes
   depends_on:
   - REV-TAM
   - REV-TLA
   - REV-TIM
   - REV-COMP
   - REV-RUST
-  deliverable: Objections résolues, résultats à réviser et conclusions ouvertes
+  deliverable: Résultats et objections revus, dissensions et conclusions ouvertes conservées
   write_scope: formal/reviews/rev-gate/
+  owner: Fable
+  reviewer: Relecteurs indépendants
 - id: IND-01
   phase: '11'
-  title: Définir le format durable et le suivi
+  title: Intégrer le format de résultats et le suivi
   depends_on:
   - PROP-SCHEMA
   - TOOLS-PIN
-  deliverable: Schéma versionné, import des résultats et métriques
+  deliverable: Import et suivi des résultats au format versionné de PROP-SCHEMA
   write_scope: formal/results/ind-01/
 - id: IND-02
   phase: '11'
@@ -1198,10 +1221,11 @@ tasks:
   write_scope: formal/results/ind-03/
 - id: IND-04
   phase: '11'
-  title: Valider les revendications finales
+  title: Remettre le dossier pour acceptation humaine finale
   depends_on:
   - IND-03
-  deliverable: Décision humaine et rapport de synthèse publié
+  deliverable: Dossier remis avec les revendications, verdicts ouverts, arbitrages et limites de campagne
   write_scope: formal/results/ind-04/
-  owner: Responsable humain du projet
-  reviewer: Fable
+  owner: Fable
+  reviewer: Relecteurs indépendants
+  acceptance_authority: Responsable humain du projet
