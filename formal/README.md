@@ -5,8 +5,10 @@ avec 51 obligations, 30 scénarios de menace et 20 hypothèses. Le catalogue
 reste l'entrée commune pour ces trois ensembles. L'espace `formal/`
 organise la construction des modèles, les preuves et leur validation.
 
+- [Prompt Claude Fable](CLAUDE-PROMPT.md) — mission complète à copier,
+  sous-agents à lancer et livrables à remettre.
 - [Plan directeur](MASTER-PLAN.md) — phases, responsabilités, dépendances et
-  décisions à valider avant la campagne.
+  conditions de lancement.
 - [Règles de travail](AGENTS.md) et [critères d'acceptation](ACCEPTANCE-CRITERIA.md)
   — contrat d'exécution et de revue.
 - [Registre des tâches](TASK-REGISTRY.yaml) — lots prévus, pilotes, preuves
