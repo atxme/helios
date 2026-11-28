@@ -14,39 +14,12 @@ d'interface. Le mode WireGuard générique `classic` intervient uniquement comme
 frontière de version et de profil. La migration v4 intervient par le refus des
 anciens formats et par l'absence de repli vers un protocole retiré.
 
-## Modèle de menace et hypothèses à expliciter
+## Modèle de menace
 
-- Réseau actif. L'adversaire peut enregistrer, retarder, perdre, réordonner et
-  rejouer les messages ou ouvrir des sessions concurrentes. Il peut posséder
-  une identité admise distincte et viser plusieurs gateways. Préciser quels
-  événements du canal ces capacités permettent effectivement, une fois le mTLS
-  ou le tunnel établi.
-- Compromissions distinctes. Indiquer pour chaque propriété quels secrets
-  restent intacts, à quel moment et chez quel acteur. Distinguer les clés TLS,
-  ML-DSA et WireGuard, la CA opérateur, la clé privée ML-KEM éphémère et le PSK
-  statique ou dérivé. Traiter la compromission d'une clé de long terme après la
-  session séparément de la compromission pendant la session. Les deux modes
-  n'ont pas les mêmes garanties après divulgation d'un secret.
-- Enregistrement à long terme. Pour « récolter maintenant, déchiffrer plus
-  tard », préciser les traces capturées et ce que l'adversaire pourra apprendre
-  si les protections classiques de TLS et de WireGuard cèdent après la
-  session. Expliciter les hypothèses post-quantiques et le sort des secrets
-  éphémères. Distinguer l'authentification pendant une session de la
-  confidentialité des données capturées évaluée après cette session.
-- État et pannes. Prévoir les échecs d'E/S, l'annulation, la perte d'un résultat
-  après application d'une opération, le redémarrage et le rechargement
-  à chaud. Préciser ce que l'acquittement du backend et la synchronisation
-  disque garantissent. Distinguer l'état matériel du slot, le propriétaire
-  logique et les données durables.
-- Temps, observation et progression. Distinguer l'heure murale, le temps
-  écoulé, le moment où WireGuard réussit un handshake et celui où Helios
-  l'observe. Pour une garantie de progression, préciser la disponibilité
-  requise du réseau et du backend, la fréquence d'observation et les
-  opérations qui doivent finir par s'exécuter.
-- Périmètre des observations. Distinguer les messages, tailles, codes,
-  fermetures et temps de réponse vus sur le réseau. La saturation du lien,
-  la protection d'un poste déjà compromis et le tunnelage du DNS restent
-  hors du contrat v5, conformément aux §2.2 et §17.3.
+Le [modèle de menace v5](MODELE-DE-MENACE-NEGOCIATION-V5.md) définit les
+acteurs, les frontières de confiance, les capacités adverses et les cas
+de compromission. Ses scénarios référencent les obligations ci-dessous.
+Chaque résultat de vérification doit déclarer les hypothèses qu'il utilise.
 
 ## Obligations
 
