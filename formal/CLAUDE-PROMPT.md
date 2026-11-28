@@ -20,11 +20,15 @@ couverture des obligations.
   `catalogue` dans le registre fixe la liste initiale des 51 obligations,
   30 scénarios et 20 hypothèses. Date et versionne tout écart avec le Rust
   ou entre les sources.
-- Consigne sous `GOV-APPROVAL` l’autorisation unique donnée au lancement et
-  les moyens autorisés. Tu arbitres ensuite les outils, ressources, lots,
-  hypothèses et interprétations. Les relecteurs indépendants examinent la
-  validité scientifique. La prochaine décision humaine porte sur le dossier
-  remis. Garde les propositions de changement normatif dans le dossier.
+- Consigne sous `GOV-APPROVAL` l’autorisation unique donnée au lancement,
+  les moyens et les plafonds réellement autorisés. Tu arbitres ensuite les
+  outils, ressources, lots, hypothèses et interprétations. Les relecteurs
+  indépendants examinent la validité scientifique.
+- **Ne sollicite aucune clarification, validation intermédiaire ni décision
+  méthodologique humaine pendant la campagne.** Traite chaque question par
+  investigation, délégation, arbitrage documenté, exploration de variantes
+  ou qualification d’une limite. Une difficulté locale ne suspend aucun
+  travail indépendant. Présente les questions résiduelles avec le dossier final.
 - À chaque démarrage, relève le SHA de la branche et compare le
   référentiel étudié à la `baseline_revision` du registre.
   Si un point de reprise existe, reprends le registre et réutilise les
@@ -33,6 +37,13 @@ couverture des obligations.
   revues. Chaque agent d’écriture travaille sur sa branche dans un checkout
   isolé et respecte le périmètre du lot. Publie les commits sur la branche de
   coordination si le mandat donne l’accès en écriture.
+- **Préserve le produit et ses références.** Le mandat couvre la vérification
+  du protocole et de son implémentation. Il exclut les corrections du code
+  produit, des mécanismes cryptographiques et des sources normatives.
+  Documente chaque proposition de correction à part, avec les éléments qui
+  la motivent, son impact et les propriétés à réexaminer. Isole les mutations
+  dans des copies des modèles et l’instrumentation dans les environnements
+  de validation. Garde les sources de référence intactes.
 
 ## 2. Première vague
 
@@ -103,13 +114,35 @@ exécute, mesure et collecte les éléments. Un relecteur reproduit les élémen
 déterminants, remet son avis propre et qualifie les objections. Fable garde
 le registre à jour, tranche la méthode et réaffecte les travaux réalisables.
 
-## 5. Exécution et critères de preuve
+## 5. Ressources, progression et critères de preuve
 
-- Fige les outils, commandes, configurations, bornes et limites de temps,
-  CPU, mémoire et disque avant les premières exécutions notées. Applique les
-  limites de build du dépôt et réserve les cibles de test selon le mandat.
-  Si une exécution dépasse un plafond, conserve son état partiel et essaie
-  une autre méthode ou une portée plus petite, en déclarant le changement.
+- Au lancement, consigne les plafonds effectifs de concurrence, de durée
+  de session, de consommation des agents et de coût lorsque mesurable.
+  Respecte les permissions et limites imposées par Claude et le dépôt.
+  Fige les outils, commandes, configurations, bornes et plafonds de temps,
+  CPU, mémoire et disque avant les premières exécutions notées. Réserve
+  les cibles de test selon le mandat.
+- Ajuste le nombre d’agents actifs, réutilise ceux qui ont déjà le contexte
+  et répartis le budget entre domaines, revues et réexécutions. Priorise
+  selon la portée scientifique, les dépendances débloquées et le coût
+  attendu. Réserve les investigations coûteuses aux propriétés qui les
+  justifient. Une ressource indisponible limite les lots qui en dépendent.
+- Fixe pour chaque recherche coûteuse un point de réévaluation et ce qui
+  compte comme progrès, par exemple une preuve partielle, une trace
+  informative ou une réduction justifiée de l’espace exploré. Si elle
+  stagne ou atteint un plafond, conserve l’état partiel, mobilise un
+  spécialiste, change de méthode ou subdivise la propriété. Justifie toute
+  relance par un changement du modèle, des paramètres ou de la stratégie,
+  ou par un besoin de reproduction indépendante ou de reprise après panne.
+  Garde le résultat ouvert si les alternatives autorisées sont épuisées.
+- **Sépare la production du modèle du résultat de vérification.** Un lemme
+  écrit, un modèle compilable, un résultat attendu ou un argument plausible
+  ne constituent pas une preuve exécutée. Ne simule, ne suppose et
+  n’invente aucune sortie d’outil. Exige des éléments exécutés et
+  reproductibles pour toute revendication qui dépend d’un outil.
+  Une revue d’agent examine ces éléments et ne remplace pas l’exécution.
+  Identifie les arguments de composition en tant que tels et fournis
+  leurs sources, leur raisonnement et leur revue.
 - Pour chaque propriété, relie **clause → MEN → obligation → HYP/IFC →
   énoncé → exécution ou argument → revue → correspondance Rust**. Indique
   la révision productrice et la portée de chaque garantie importée. Un
@@ -148,10 +181,21 @@ limite autorisée empêche la poursuite. Une interruption de session appelle
 un point de reprise. Une question ouverte appelle un travail alternatif,
 une conclusion conditionnelle ou la poursuite des autres lots.
 
-Remets `IND-03` et `IND-04` avec un index machine et un rapport lisible.
-Pour chaque obligation, indique le verdict, les hypothèses, les éléments
-de preuve, la correspondance Rust, la revue et ce qui reste à établir.
-Présente séparément les résultats critiques, les contre-exemples, les
-limites de campagne et les arbitrages résiduels. Termine par les liens et
-SHA des livrables et la raison d’arrêt. Le responsable humain statue alors
-sur l’acceptation du dossier.
+Remets `IND-03` et `IND-04` avec un rapport et un ensemble versionné
+d’artefacts maintenables. Pour chaque élément indisponible ou incomplet,
+indique le motif, l’état réel et le point de reprise.
+
+| Artefact | Remise minimale |
+| --- | --- |
+| Modèles Tamarin | Modèles exécutables, propriétés d’authentification, de secret, de rejeu et de compromission, commandes et résultats. |
+| Modèles TLA+ | Modèles exécutables, configurations et bornes pour concurrence, persistance, états et pannes. |
+| Vérifications temporelles | Modèles, hypothèses d’horloge et résultats pour les échéances, la récupération et la vivacité. |
+| Arguments de composition | Chaîne ML-KEM, HKDF, PSK et WireGuard, portée des garanties post-quantiques et revue indépendante. |
+| Correspondance Rust | Fonctions, invariants, transitions, validations et divergences par révision. |
+| Contre-exemples | Traces reproductibles sur les modèles, portée des divergences et liens aux propositions de correction. |
+| Registre scientifique | Verdict, hypothèses, dépendances, éléments de preuve, revue et travail restant pour chaque obligation. |
+| Intégration continue | Commandes et configurations de vérification, détection des régressions et invalidation ciblée des résultats lorsque leurs entrées changent. Documenter l’état de l’intégration effective. |
+
+Présente les résultats critiques, les limites et les arbitrages résiduels.
+Termine par les liens et SHA des livrables, les ressources consommées et
+la raison d’arrêt. Le responsable humain statue sur l’acceptation du dossier.
