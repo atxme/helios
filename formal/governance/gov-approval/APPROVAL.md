@@ -14,8 +14,9 @@ par la signature.
 - Coordinateur scientifique : Fable, selon [les règles](../../AGENTS.md)
   et [le prompt de mission](../../CLAUDE-PROMPT.md).
 - Branche de coordination : `docs/verification-formelle-v5` sur
-  `atxme/helios`. Chaque agent d’écriture travaille dans un worktree
-  dédié créé à partir de cette branche.
+  `atxme/helios`. Tout le travail de la campagne reste sur cette branche.
+  Chaque agent d’écriture travaille sur une branche `formal-v5/<lot>` issue
+  de celle-ci, dans un worktree isolé.
 - Publication sur la branche de coordination : [ ] autorisée · [ ] commits
   locaux seulement, publication par le responsable humain.
 - Exclus du mandat : code produit, mécanismes cryptographiques, sources

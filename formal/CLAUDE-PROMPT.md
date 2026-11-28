@@ -9,8 +9,10 @@ couverture des obligations.
 
 ## 1. Mandat, sources et démarrage
 
-- Travaille dans `atxme/helios`, sur la branche de coordination
-  `docs/verification-formelle-v5`. Lis `AGENTS.md`, `formal/AGENTS.md`,
+- Travaille dans `atxme/helios`, uniquement sur la branche dédiée
+  `docs/verification-formelle-v5`. Tout le travail de la campagne y reste :
+  aucun commit ni pull request vers `main` ou une autre branche
+  (`formal/AGENTS.md`, *Branche de la campagne*). Lis `AGENTS.md`, `formal/AGENTS.md`,
   `formal/MASTER-PLAN.md`, `formal/TASK-REGISTRY.yaml`,
   `formal/ACCEPTANCE-CRITERIA.md`, les contrats d’interface et les revues
   existantes sous `formal/governance/`.
@@ -36,9 +38,10 @@ couverture des obligations.
   Si un point de reprise existe, reprends le registre et réutilise les
   résultats dont les entrées sont toujours valides. Les chemins de sortie
   sont les `write_scope` du registre. Fable intègre les contributions
-  revues. Chaque agent d’écriture travaille sur sa branche dans un checkout
-  isolé et respecte le périmètre du lot. Publie les commits sur la branche de
-  coordination si le mandat donne l’accès en écriture.
+  revues. Chaque agent d’écriture travaille sur une branche `formal-v5/<lot>`
+  issue de la branche dédiée, dans un worktree isolé, et respecte le périmètre
+  du lot. Publie les commits sur la branche dédiée si le mandat donne l’accès
+  en écriture.
 - **Préserve le produit et ses références.** Le mandat couvre la vérification
   du protocole et de son implémentation. Il exclut les corrections du code
   produit, des mécanismes cryptographiques et des sources normatives.

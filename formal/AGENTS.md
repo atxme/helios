@@ -34,10 +34,25 @@ du dossier.
   lorsqu’une limite autorisée empêche la poursuite. Présenter au
   responsable humain les limites, contre-exemples et arbitrages résiduels.
 
+## Branche de la campagne
+
+Tout le travail de la campagne vit sur la branche dédiée
+`docs/verification-formelle-v5`. Aucun commit de la campagne ne va sur
+`main` ni sur une autre branche du dépôt, et aucune pull request n’est
+ouverte vers `main`.
+
+- Chaque agent d’écriture part de la tête de la branche dédiée, sur une
+  branche `formal-v5/<lot>` dans un worktree isolé.
+- Fable intègre les contributions revues dans la branche dédiée, puis
+  supprime les branches `formal-v5/<lot>` intégrées.
+- Les propositions de correction du code produit ou des sources normatives
+  restent des documents de la branche dédiée. Le responsable humain décide
+  de leur suite après `IND-04`, comme de toute fusion vers `main`.
+
 ## Exécution et revue
 
 - Attribuer chaque lot à un propriétaire et à un relecteur distinct.
-  Utiliser une branche et un checkout isolé par agent d’écriture.
+  Utiliser la branche et le worktree prévus ci-dessus par agent d’écriture.
   Protéger le périmètre du lot et désigner un intégrateur pour les
   noyaux partagés de modèles.
 - Relier la clause normative, l’obligation, les scénarios, les hypothèses,
